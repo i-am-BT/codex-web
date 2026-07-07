@@ -1,0 +1,33 @@
+# Example Codex config for /root/.codex/config.toml.
+# Replace provider names, base_url values, env_key values, and models for your setup.
+
+model_provider = "openai"
+model = "gpt-5.5"
+review_model = "gpt-5.5"
+disable_response_storage = true
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+personality = "pragmatic"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "chat"
+requires_openai_auth = true
+
+[model_providers.custom]
+name = "Custom Provider"
+base_url = "https://example.com/v1"
+env_key = "CUSTOM_PROVIDER_API_KEY"
+wire_api = "chat"
+requires_openai_auth = false
+
+[projects."/"]
+trust_level = "trusted"
+
+[projects."/opt/codex-web"]
+trust_level = "trusted"
+
+[projects."/root"]
+trust_level = "trusted"

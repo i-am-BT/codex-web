@@ -28,11 +28,20 @@ npm install
 
 项目会从 `.env` 和本机 Codex 配置文件读取运行配置。
 
-常见配置项示例：
+复制示例文件后再填写本机配置：
 
 ```bash
-PORT=36354
+cp .env.example .env
 ```
+
+`.env.example` 只包含脱敏占位符，可以提交到仓库；真实 `.env` 不要提交。
+
+如果是新设备首次运行，还需要准备 Codex 配置：
+
+- `/root/.codex/.env`：保存服务商 API Key，可参考 `codex.env.example`
+- `/root/.codex/config.toml`：保存服务商和模型配置，可参考 `codex.config.example.toml`
+
+也可以先启动 Web 界面，再通过“服务商管理”添加服务商和 API Key。
 
 不要把 `.env`、`runtime/`、`node_modules/` 提交到 GitHub。它们已经在 `.gitignore` 中排除。
 
