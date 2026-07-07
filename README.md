@@ -47,7 +47,7 @@ cp .env.example .env
 
 也可以先启动 Web 界面，再通过“服务商管理”添加服务商和 API Key。
 
-不要把 `.env`、`runtime/`、`node_modules/` 提交到 GitHub。它们已经在 `.gitignore` 中排除。
+本仓库已默认忽略 `.env`、`runtime/` 和 `node_modules/`。请勿手动移除忽略规则或强制提交这些本地敏感/运行时文件。
 
 ## 启动
 
