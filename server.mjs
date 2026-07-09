@@ -1,7 +1,7 @@
 import express from 'express';
 import { spawn } from 'child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { createServer } from 'http';
 import { homedir } from 'os';
 import path from 'path';
@@ -10,8 +10,10 @@ import net from 'net';
 const ROOT = '/opt/codex-web';
 const RUNTIME_DIR = path.join(ROOT, 'runtime');
 const CONVERSATIONS_FILE = path.join(RUNTIME_DIR, 'conversations.json');
+const APPEARANCE_FILE = path.join(RUNTIME_DIR, 'appearance.json');
 const IMAGE_DIR = path.join(RUNTIME_DIR, 'images');
 const FILE_DIR = path.join(RUNTIME_DIR, 'files');
+const BACKGROUND_DIR = path.join(RUNTIME_DIR, 'backgrounds');
 const ENV_FILE = path.join(ROOT, '.env');
 const CODEX_ENV_FILE = '/root/.codex/.env';
 
@@ -39,6 +41,7 @@ if (!PASSWORD) {
 mkdirSync(RUNTIME_DIR, { recursive: true });
 mkdirSync(IMAGE_DIR, { recursive: true });
 mkdirSync(FILE_DIR, { recursive: true });
+mkdirSync(BACKGROUND_DIR, { recursive: true });
 
 const app = express();
 const sessions = new Map();
@@ -81,6 +84,7 @@ app.get('/api/session', (req, res) => {
 
 app.use('/assets/images', requireAuth, express.static(IMAGE_DIR, { fallthrough: false }));
 app.use('/assets/files', requireAuth, express.static(FILE_DIR, { fallthrough: false }));
+app.use('/assets/backgrounds', requireAuth, express.static(BACKGROUND_DIR, { fallthrough: false }));
 
 app.post('/api/uploads/image', requireAuth, (req, res) => {
   try {
@@ -100,6 +104,36 @@ app.post('/api/uploads/file', requireAuth, (req, res) => {
   }
 });
 
+app.patch('/api/appearance', requireAuth, (req, res) => {
+  try {
+    const appearance = saveAppearance(req.body || {});
+    res.json({ ok: true, appearance });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/appearance/background', requireAuth, (req, res) => {
+  try {
+    const background = saveUploadedBackground(req.body || {});
+    const current = readAppearance();
+    const customBackgrounds = [...current.customBackgrounds.filter((item) => item.value !== background.value), background];
+    const appearance = saveAppearance({ chatBackground: background.value, customBackgrounds });
+    res.json({ ok: true, appearance, background });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/appearance/background', requireAuth, (req, res) => {
+  try {
+    const appearance = deleteCustomBackground(req.body?.value);
+    res.json({ ok: true, appearance });
+  } catch (err) {
+    res.status(err.statusCode || 400).json({ error: err.message });
+  }
+});
+
 app.get('/api/config', requireAuth, (req, res) => {
   const defaults = readCodexDefaults();
   res.json({
@@ -112,6 +146,7 @@ app.get('/api/config', requireAuth, (req, res) => {
     },
     providers: readProviders(),
     conversations: conversations.map(({ id, title, createdAt, status }) => ({ id, title, createdAt, status })),
+    appearance: readAppearance(),
   });
 });
 
@@ -557,6 +592,131 @@ function saveUploadedAttachment(body, options = {}) {
     url: `${isImage ? '/assets/images' : '/assets/files'}/${filename}`,
     filePath,
   };
+}
+
+function readAppearance() {
+  const fallback = { theme: 'light', chatBackground: 'default', customBackgrounds: [] };
+  try {
+    if (!existsSync(APPEARANCE_FILE)) return fallback;
+    const data = JSON.parse(readFileSync(APPEARANCE_FILE, 'utf8'));
+    const customBackgrounds = normalizeCustomBackgrounds(data.customBackgrounds);
+    if (isBackgroundAssetUrl(data.customBackgroundUrl)) {
+      const value = backgroundValueFromUrl(data.customBackgroundUrl);
+      if (value && !customBackgrounds.some((item) => item.value === value)) {
+        customBackgrounds.push({ name: '自定义背景', value, url: data.customBackgroundUrl });
+      }
+    }
+    const legacyCustom = data.chatBackground === 'custom' && isBackgroundAssetUrl(data.customBackgroundUrl)
+      ? backgroundValueFromUrl(data.customBackgroundUrl)
+      : '';
+    return {
+      theme: data.theme === 'dark' ? 'dark' : 'light',
+      chatBackground: cleanChatBackground(legacyCustom || data.chatBackground, customBackgrounds),
+      customBackgrounds,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function saveAppearance(next) {
+  const current = readAppearance();
+  const appearance = {
+    theme: next.theme === undefined ? current.theme : next.theme === 'dark' ? 'dark' : 'light',
+    customBackgrounds: next.customBackgrounds === undefined ? current.customBackgrounds : normalizeCustomBackgrounds(next.customBackgrounds),
+  };
+  appearance.chatBackground = next.chatBackground === undefined
+    ? cleanChatBackground(current.chatBackground, appearance.customBackgrounds)
+    : cleanChatBackground(next.chatBackground, appearance.customBackgrounds);
+  writeFileSync(APPEARANCE_FILE, JSON.stringify(appearance, null, 2), { mode: 0o600 });
+  return appearance;
+}
+
+function saveUploadedBackground(body) {
+  const data = String(body.data || '');
+  const match = data.match(/^data:([^;,]*);base64,([A-Za-z0-9+/=\r\n]+)$/);
+  if (!match) throw new Error('上传内容格式无效');
+  const type = String(body.type || match[1] || '').toLowerCase();
+  if (!/^image\/(?:png|jpeg|webp|gif)$/.test(type)) throw new Error('只支持 PNG、JPG、WEBP 或 GIF 图片');
+  const buffer = Buffer.from(match[2].replace(/\s/g, ''), 'base64');
+  if (!buffer.length) throw new Error('图片内容为空');
+  if (buffer.length > 10 * 1024 * 1024) throw new Error('背景图片不能超过 10MB');
+  const ext = uploadExtension(String(body.name || 'background'), type);
+  if (!['png', 'jpg', 'webp', 'gif'].includes(ext)) throw new Error('不支持此图片类型');
+  const filename = `background-${Date.now()}-${randomBytes(6).toString('hex')}.${ext}`;
+  const filePath = path.join(BACKGROUND_DIR, filename);
+  writeFileSync(filePath, buffer, { mode: 0o600 });
+  return {
+    name: cleanBackgroundName(body.name || 'background'),
+    type,
+    size: buffer.length,
+    value: `bg:${filename}`,
+    url: `/assets/backgrounds/${filename}`,
+  };
+}
+
+function deleteCustomBackground(value) {
+  const current = readAppearance();
+  const target = current.customBackgrounds.find((item) => item.value === String(value || ''));
+  if (!target) {
+    const err = new Error('自定义背景不存在');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const filename = target.value.replace(/^bg:/, '');
+  if (!/^[A-Za-z0-9_.-]+$/.test(filename)) throw new Error('背景文件无效');
+  const filePath = path.join(BACKGROUND_DIR, filename);
+  if (path.resolve(filePath).startsWith(path.resolve(BACKGROUND_DIR) + path.sep) && existsSync(filePath)) {
+    unlinkSync(filePath);
+  }
+
+  const customBackgrounds = current.customBackgrounds.filter((item) => item.value !== target.value);
+  const chatBackground = current.chatBackground === target.value ? 'default' : current.chatBackground;
+  return saveAppearance({ chatBackground, customBackgrounds });
+}
+
+function cleanChatBackground(value, customBackgrounds = []) {
+  const text = String(value || '');
+  if (['default', 'plain', 'paper', 'grid'].includes(text)) return text;
+  if (customBackgrounds.some((item) => item.value === text)) return text;
+  return 'default';
+}
+
+function isBackgroundAssetUrl(value) {
+  return /^\/assets\/backgrounds\/[A-Za-z0-9_.-]+$/.test(String(value || ''));
+}
+
+function backgroundValueFromUrl(url) {
+  const match = String(url || '').match(/^\/assets\/backgrounds\/([A-Za-z0-9_.-]+)$/);
+  return match ? `bg:${match[1]}` : '';
+}
+
+function backgroundUrlFromValue(value) {
+  const match = String(value || '').match(/^bg:([A-Za-z0-9_.-]+)$/);
+  return match ? `/assets/backgrounds/${match[1]}` : '';
+}
+
+function normalizeCustomBackgrounds(items) {
+  const seen = new Set();
+  const list = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    const url = isBackgroundAssetUrl(item?.url) ? item.url : backgroundUrlFromValue(item?.value);
+    const value = backgroundValueFromUrl(url);
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    list.push({
+      name: cleanBackgroundName(item?.name),
+      value,
+      url,
+    });
+  }
+  return list.slice(-20);
+}
+
+function cleanBackgroundName(name) {
+  const text = String(name || '').replace(/[\r\n\t]/g, ' ').trim();
+  return text ? text.slice(0, 80) : '自定义背景';
 }
 
 function uploadExtension(name, type) {
@@ -1055,31 +1215,37 @@ function pageHtml(authenticated) {
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
 :root{color-scheme:dark;--bg:#080b10;--panel:#0f141d;--panel2:#121926;--line:#253142;--text:#e6edf3;--muted:#8b98a8;--blue:#6aa8ff;--green:#37c871;--red:#ff6b6b;--user:#175ddc}
+body[data-theme="light"]{color-scheme:light;--bg:#f6f8fb;--panel:#ffffff;--panel2:#eef3f8;--line:#d6deea;--text:#172033;--muted:#627084;--blue:#2563eb;--green:#16a34a;--red:#dc2626;--user:#2563eb}
 *{box-sizing:border-box}body{margin:0;height:100vh;background:radial-gradient(circle at top left,#172033,#080b10 46%);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.hidden{display:none!important}
 button,input,textarea,select{font:inherit}button{border:0;cursor:pointer}.login{height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(420px,100%);background:rgba(15,20,29,.88);border:1px solid var(--line);border-radius:22px;padding:28px;box-shadow:0 24px 90px rgba(0,0,0,.42);backdrop-filter:blur(18px)}.brand{font-size:28px;font-weight:780;letter-spacing:-.04em}.sub{margin:8px 0 24px;color:var(--muted)}.field{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}.field label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}.field input,.field textarea,.field select{width:100%;background:#090d14;color:var(--text);border:1px solid var(--line);border-radius:12px;padding:12px 13px;outline:none}.field input:focus,.field textarea:focus,.field select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(106,168,255,.12)}.primary{width:100%;padding:12px 16px;border-radius:12px;background:linear-gradient(135deg,#2f81f7,#7c5cff);color:white;font-weight:700}.errorText{color:var(--red);font-size:13px;min-height:18px;margin-top:12px}
-.app{height:100vh;display:grid;grid-template-columns:292px 1fr}.side{background:rgba(8,12,18,.82);border-right:1px solid var(--line);padding:18px;display:flex;flex-direction:column;gap:16px;overflow:auto}.logo{font-weight:800;font-size:22px;letter-spacing:-.04em}.pill{display:inline-flex;align-items:center;gap:6px;background:#122017;color:#94f0b1;border:1px solid #214c2c;border-radius:999px;padding:4px 9px;font-size:12px}.settings{display:grid;gap:11px}.settings .field{margin:0}.smallrow{display:grid;grid-template-columns:1fr 1fr;gap:9px}.providerBox{background:rgba(18,25,38,.74);border:1px solid var(--line);border-radius:14px;padding:10px}.providerBox summary{cursor:pointer;color:var(--text);font-weight:700;font-size:13px}.providerBox form{margin-top:12px}.miniPrimary{width:100%;padding:10px;border-radius:11px;background:var(--blue);color:#06101f;font-weight:800}.miniSecondary{align-self:end;width:100%;padding:10px;border-radius:11px;background:#1b2533;color:var(--text);border:1px solid var(--line);font-weight:700}.miniDanger{width:100%;padding:10px;border-radius:11px;background:#221114;color:#ff9da5;border:1px solid #613039;font-weight:800}.miniDanger:hover{background:#3a161c}.history{flex:1.35;overflow:auto;display:flex;flex-direction:column;gap:10px;min-height:220px}.hist{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:13px 12px;color:var(--muted);font-size:13px;min-height:54px;cursor:pointer}.hist:hover{border-color:var(--blue);color:var(--text);background:#151d2b}.hist.active{border-color:var(--blue);color:var(--text);background:rgba(106,168,255,.14);box-shadow:inset 3px 0 0 var(--blue)}.histOpen{background:transparent;color:inherit;border:0;text-align:left;padding:0;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.35;cursor:pointer}.histRename{background:#172033;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:6px 8px;font-size:12px}.histRename:hover{border-color:var(--blue);background:#1b2533}.histDelete{background:#221114;color:#ff9da5;border:1px solid #613039;border-radius:9px;padding:6px 8px;font-size:12px}.histDelete:hover{background:#3a161c}.logout{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:11px;padding:10px}
+.app{height:100vh;display:grid;grid-template-columns:292px 1fr}.side{background:rgba(8,12,18,.82);border-right:1px solid var(--line);padding:18px;display:flex;flex-direction:column;gap:16px;overflow:auto}.brandRow{display:flex;align-items:center;justify-content:space-between;gap:10px}.logo{font-weight:800;font-size:22px;letter-spacing:-.04em}.pill{display:inline-flex;align-items:center;gap:6px;background:#122017;color:#94f0b1;border:1px solid #214c2c;border-radius:999px;padding:4px 9px;font-size:12px}.sideActions{display:grid;gap:10px;align-items:center}.themeToggle{display:grid;place-items:center;flex:0 0 auto;width:34px;height:34px;border-radius:11px;background:#172033;color:var(--text);border:1px solid var(--line);font-size:17px;font-weight:800}.themeToggle:hover{border-color:var(--blue);background:#1b2533}.settings{display:grid;gap:11px}.settings .field{margin:0}.smallrow{display:grid;grid-template-columns:1fr 1fr;gap:9px}.backgroundControls{display:grid;gap:8px;align-items:end}.backgroundRow{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}.backgroundControls .field{margin:0}.providerBox{background:rgba(18,25,38,.74);border:1px solid var(--line);border-radius:14px;padding:10px}.providerBox summary{cursor:pointer;color:var(--text);font-weight:700;font-size:13px}.providerBox form{margin-top:12px}.miniPrimary{width:100%;padding:10px;border-radius:11px;background:var(--blue);color:#06101f;font-weight:800}.miniSecondary{align-self:end;width:100%;padding:10px;border-radius:11px;background:#1b2533;color:var(--text);border:1px solid var(--line);font-weight:700}.miniDanger{width:100%;padding:10px;border-radius:11px;background:#221114;color:#ff9da5;border:1px solid #613039;font-weight:800}.miniDanger:hover{background:#3a161c}.backgroundDelete{width:auto;min-width:56px;align-self:end}.history{flex:1.35;overflow:auto;display:flex;flex-direction:column;gap:10px;min-height:220px}.hist{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:13px 12px;color:var(--muted);font-size:13px;min-height:54px;cursor:pointer}.hist:hover{border-color:var(--blue);color:var(--text);background:#151d2b}.hist.active{border-color:var(--blue);color:var(--text);background:rgba(106,168,255,.14);box-shadow:inset 3px 0 0 var(--blue)}.histOpen{background:transparent;color:inherit;border:0;text-align:left;padding:0;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.35;cursor:pointer}.histRename{background:#172033;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:6px 8px;font-size:12px}.histRename:hover{border-color:var(--blue);background:#1b2533}.histDelete{background:#221114;color:#ff9da5;border:1px solid #613039;border-radius:9px;padding:6px 8px;font-size:12px}.histDelete:hover{background:#3a161c}.logout{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:11px;padding:10px}
 .main{display:flex;flex-direction:column;min-width:0}.top{height:62px;border-bottom:1px solid var(--line);background:rgba(15,20,29,.75);display:flex;align-items:center;justify-content:space-between;padding:0 22px}.title{font-weight:720}.meta{color:var(--muted);font-size:13px}.chat{flex:1;overflow:auto;padding:26px;display:flex;flex-direction:column;gap:18px}.empty{margin:auto;text-align:center;color:var(--muted)}.empty b{display:block;color:var(--text);font-size:30px;letter-spacing:-.05em;margin-bottom:8px}.msg{max-width:min(880px,88%);border-radius:18px;padding:14px 16px;line-height:1.65;word-break:break-word}.msg.user{align-self:flex-end;background:linear-gradient(135deg,var(--user),#7147e8);color:white}.msg.assistant{align-self:flex-start;background:rgba(18,25,38,.86);border:1px solid var(--line)}.msg.log{align-self:flex-start;background:#0b1119;border:1px dashed var(--line);color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.msgActions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:8px -4px -4px 0}.msgActions .tag{margin:0;margin-right:auto}.copyMsg,.rollbackMsg{display:grid;place-items:center;flex:0 0 auto;width:26px;height:24px;border:1px solid rgba(139,152,168,.28);border-radius:8px;background:rgba(8,12,18,.38);color:var(--muted);padding:0;font-size:13px;line-height:1}.copyMsg:hover,.rollbackMsg:hover{border-color:var(--blue);color:var(--text);background:rgba(106,168,255,.12)}.msg.user .copyMsg,.msg.user .rollbackMsg{border-color:rgba(255,255,255,.22);background:rgba(255,255,255,.1);color:rgba(255,255,255,.76)}.msg.user .copyMsg:hover,.msg.user .rollbackMsg:hover{color:#fff;background:rgba(255,255,255,.18)}.msgBody{white-space:pre-wrap}.composer{border-top:1px solid var(--line);background:rgba(15,20,29,.9);padding:16px 22px}.box{display:flex;gap:12px;align-items:flex-end}.box textarea{flex:1;min-height:52px;max-height:180px;resize:none;background:#090d14;border:1px solid var(--line);color:var(--text);border-radius:16px;padding:14px;outline:none}.box.drag textarea{border-color:var(--blue);box-shadow:0 0 0 3px rgba(106,168,255,.14)}.attachBtn{width:52px;height:52px;border-radius:16px;background:#172033;color:var(--text);border:1px solid var(--line);font-size:24px;line-height:1}.attachBtn:hover{border-color:var(--blue);background:#1b2533}.attachmentTray{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.attachmentChip{display:flex;align-items:center;gap:8px;max-width:280px;background:#0b1119;border:1px solid var(--line);border-radius:12px;padding:6px 8px;color:var(--muted);font-size:12px}.attachmentChip img,.attachmentIcon{width:42px;height:42px;flex:0 0 42px;border-radius:8px}.attachmentChip img{object-fit:cover}.attachmentIcon{display:grid;place-items:center;background:#172033;border:1px solid var(--line);color:var(--blue);font-weight:800;font-size:11px;text-transform:uppercase}.attachmentText{min-width:0;display:flex;flex-direction:column;gap:2px}.attachmentText span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.attachmentMeta{color:#627084;font-size:11px}.attachmentChip button{display:grid;place-items:center;width:22px;height:22px;border-radius:7px;background:#221114;color:#ff9da5;border:1px solid #613039}.composerControls{display:flex;align-items:end;flex-wrap:wrap;gap:8px;margin-top:10px}.composerControls .field{width:96px;margin:0;gap:5px}.composerControls .field label{font-size:10px}.composerControls .field select{padding:6px 7px;border-radius:9px;font-size:12px}.send{width:92px;height:52px;border-radius:16px;background:var(--green);color:#07100a;font-weight:800}.send:disabled{opacity:.55;cursor:not-allowed}.hint{margin-top:8px;color:var(--muted);font-size:12px}.safety{flex:1 1 360px;min-width:260px;border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.35;background:#0b1119;color:var(--muted)}.safety.safe{border-color:#254a33;color:#9ee8b5}.safety.warn{border-color:#6f5522;color:#ffd98a}.safety.danger{border-color:#743232;color:#ffabab;background:#190d0d}.spinner{display:inline-block;width:10px;height:10px;border:2px solid #405064;border-top-color:var(--blue);border-radius:50%;animation:spin .9s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:820px){.app{grid-template-columns:1fr}.side{display:none}.chat{padding:16px}.msg{max-width:100%}.composerControls .field{width:calc(50% - 4px)}.safety{flex-basis:100%;min-width:0}}
 .menuBtn{display:none}.scrim{display:none}@media(max-width:820px){html,body{height:100%;overflow:hidden}.app{display:block;height:100dvh;overflow:hidden}.main{height:100dvh;display:flex;flex-direction:column;overflow:hidden}.menuBtn{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border-radius:13px;background:#101722;border:1px solid var(--line);color:var(--text);font-size:24px;line-height:1}.side{display:flex;position:fixed;z-index:30;left:0;top:0;bottom:0;width:min(86vw,330px);transform:translateX(-105%);transition:transform .22s ease;background:rgba(8,12,18,.96);box-shadow:26px 0 80px rgba(0,0,0,.45)}.app.menuOpen .side{transform:translateX(0)}.scrim{display:block;position:fixed;z-index:20;inset:0;background:rgba(0,0,0,.48);opacity:0;pointer-events:none;transition:opacity .2s}.app.menuOpen .scrim{opacity:1;pointer-events:auto}.top{flex:0 0 auto;min-height:58px;height:auto;padding:calc(env(safe-area-inset-top,0px) + 8px) 14px 8px;gap:12px;justify-content:flex-start}.top .meta:last-child{margin-left:auto}.chat{flex:1 1 auto;min-height:0;overflow:auto;padding:14px}.composer{flex:0 0 auto;padding:12px 12px calc(env(safe-area-inset-bottom,0px) + 12px)}.box{gap:8px}.send{width:72px}.msg{max-width:100%}}
 .msg.image{padding:8px;background:rgba(18,25,38,.86);border:1px solid var(--line)}.msg.image img{display:block;max-width:min(520px,100%);border-radius:14px}.msg.image a{display:inline-block;margin-top:8px;color:var(--blue);font-size:13px;text-decoration:none}
 .msg{font-size:13px}.msg.user,.msg.assistant{font-size:13px}.msg.process,.msg.tool,.msg.thinking{align-self:flex-start;max-width:min(780px,92%);padding:8px 10px;border-radius:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.45;color:#8f9bad;background:#091018;border:1px dashed #263244}.msg.thinking{color:#b8a8ff;border-color:#3e3568;background:#100d1b}.msg.tool{color:#8fd7ff;border-color:#244a60;background:#08141d}.msg.process{color:#9ee8b5;border-color:#254a33;background:#0b1510}
 .msg .tag{display:block;margin-bottom:4px;opacity:.75;font-weight:800;letter-spacing:.08em;font-size:10px}
 .settingsToggle{width:100%;padding:10px;border-radius:11px;background:#172033;color:var(--text);border:1px solid var(--line);font-weight:800}.settingsToggle:hover{border-color:var(--blue)}.settingsPanel{display:none;gap:12px}.settingsPanel.open{display:grid}
+body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body[data-theme="light"] .card{background:rgba(255,255,255,.9);box-shadow:0 24px 70px rgba(31,41,55,.16)}body[data-theme="light"] .side{background:rgba(247,250,252,.92)}body[data-theme="light"] .top,body[data-theme="light"] .composer{background:rgba(255,255,255,.9)}body[data-theme="light"] .field input,body[data-theme="light"] .field textarea,body[data-theme="light"] .field select,body[data-theme="light"] .box textarea{background:#fff}body[data-theme="light"] .providerBox,body[data-theme="light"] .hist,body[data-theme="light"] .msg.assistant,body[data-theme="light"] .msg.image{background:rgba(255,255,255,.86)}body[data-theme="light"] .hist:hover{background:#eef4ff}body[data-theme="light"] .hist.active{background:rgba(37,99,235,.1)}body[data-theme="light"] .miniSecondary,body[data-theme="light"] .settingsToggle,body[data-theme="light"] .themeToggle,body[data-theme="light"] .histRename,body[data-theme="light"] .attachBtn,body[data-theme="light"] .menuBtn{background:#eef3f8}body[data-theme="light"] .msg.log,body[data-theme="light"] .attachmentChip,body[data-theme="light"] .safety{background:#f8fafc}body[data-theme="light"] .msg.process{background:#edfdf2}body[data-theme="light"] .msg.tool{background:#eef7ff}body[data-theme="light"] .msg.thinking{background:#f5f1ff}
+body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
 </head>
 <body>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">Codex Web</div><div class="sub">输入访问密码后使用本机 Codex CLI。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside class="side"><div><div class="logo">Codex Web</div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><button id="newChat" class="miniPrimary">新建会话</button><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><button id="saveDefault" class="miniSecondary">设为默认模型</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="/root"></div></div><details class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" aria-label="打开设置">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div class="meta">codex exec</div></div><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，Shift+Enter 换行；可拖入图片或文件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">权限按“整次任务”生效，不会逐条命令弹窗确认。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside class="side"><div><div class="brandRow"><div class="logo">Codex Web</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="plain">纯净</option><option value="paper">纸张</option><option value="grid">网格</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><button id="saveDefault" class="miniSecondary">设为默认模型</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="/root"></div></div><details class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" aria-label="打开设置">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div class="meta">codex exec</div></div><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，Shift+Enter 换行；可拖入图片或文件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">权限按“整次任务”生效，不会逐条命令弹窗确认。</div></div></main></section>
 <script>
 const login = document.getElementById('login'), app = document.getElementById('app'), loginForm = document.getElementById('loginForm'), loginError = document.getElementById('loginError');
 const chat = document.getElementById('chat'), input = document.getElementById('input'), sendBtn = document.getElementById('send'), cancelBtn = document.getElementById('cancelRun'), statusEl = document.getElementById('status');
 const dropZone = document.getElementById('dropZone'), attachFile = document.getElementById('attachFile'), fileInput = document.getElementById('fileInput'), attachmentTray = document.getElementById('attachmentTray');
 const provider = document.getElementById('provider'), model = document.getElementById('model'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
+const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
 let currentConversationId = '';
 let conversationLoadSeq = 0;
 let dangerConfirmed = false;
 let pendingAttachments = [];
+let appearance = {theme:'light',chatBackground:'default',customBackgrounds:[]};
+applyAppearance();
 loginForm?.addEventListener('submit', async (e)=>{e.preventDefault();loginError.textContent='';const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});if(res.ok){login.classList.add('hidden');app.classList.remove('hidden');await boot();input.focus()}else{loginError.textContent=(await res.json()).error||'登录失败'}});
 document.getElementById('logout')?.addEventListener('click', async()=>{await fetch('/api/logout',{method:'POST'});location.reload()});
 document.getElementById('newChat')?.addEventListener('click', newChat);
@@ -1092,6 +1258,10 @@ providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerM
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',()=>loadModels(provider.value));
 sandbox?.addEventListener('change',()=>{dangerConfirmed=false;updateSafetyHint()});
+themeToggle?.addEventListener('click',toggleTheme);
+chatBackground?.addEventListener('change',handleChatBackgroundChange);
+chatBackgroundFile?.addEventListener('change',()=>handleCustomBackground(chatBackgroundFile.files?.[0]));
+deleteBackground?.addEventListener('click',deleteSelectedBackground);
 sendBtn?.addEventListener('click', send);input?.addEventListener('keydown',(e)=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});input?.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px'});
 attachFile?.addEventListener('click',()=>fileInput?.click());
 fileInput?.addEventListener('change',()=>{handleAttachmentFiles(fileInput.files);fileInput.value=''});
@@ -1102,7 +1272,17 @@ dropZone?.addEventListener('paste',handleAttachmentPaste);
 input?.addEventListener('paste',handleAttachmentPaste);
 cancelBtn?.addEventListener('click', cancelRun);
 if (${authenticated ? 'true' : 'false'}) boot();
-async function boot(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();cwd.value=data.defaults.cwd;sandbox.value=data.defaults.sandbox;approval.value=data.defaults.approval;provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';await loadModels(provider.value,data.defaults.model);renderHistory(data.conversations);updateSafetyHint()}
+async function toggleTheme(){const next=appearance.theme==='dark'?'light':'dark';await saveAppearance({theme:next})}
+function applyAppearance(){const theme=appearance.theme==='dark'?'dark':'light';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const bg=custom?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.chatBg=bg;document.body.style.setProperty('--custom-chat-bg',custom?'url("'+custom.url+'")':'none');if(themeToggle){themeToggle.textContent=theme==='dark'?'☀':'☾';themeToggle.title=theme==='dark'?'切换明亮模式':'切换黑暗模式';themeToggle.setAttribute('aria-label',themeToggle.title)}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
+async function saveAppearance(patch){const res=await fetch('/api/appearance',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'外观保存失败';applyAppearance();return null}appearance=data.appearance;applyAppearance();return appearance}
+function renderBackgroundOptions(selected){if(!chatBackground)return;const options=[['default','默认'],['plain','纯净'],['paper','纸张'],['grid','网格']];for(const item of appearance.customBackgrounds||[])options.push([item.value,item.name]);options.push(['custom','自定义']);chatBackground.innerHTML='';for(const [value,label] of options){const opt=document.createElement('option');opt.value=value;opt.textContent=label;chatBackground.appendChild(opt)}chatBackground.value=options.some(([value])=>value===selected)?selected:'default'}
+function cleanBackgroundValue(value){const text=String(value||'');if(['default','plain','paper','grid'].includes(text))return text;return findCustomBackground(text)?text:'default'}
+function findCustomBackground(value){return (appearance.customBackgrounds||[]).find((item)=>item.value===value&&item.url)}
+function updateDeleteBackgroundButton(selected){if(!deleteBackground)return;deleteBackground.classList.toggle('hidden',!findCustomBackground(selected));deleteBackground.disabled=!findCustomBackground(selected)}
+async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
+async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
+async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
+async function boot(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();cwd.value=data.defaults.cwd;sandbox.value=data.defaults.sandbox;approval.value=data.defaults.approval;provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';await loadModels(provider.value,data.defaults.model);renderHistory(data.conversations);updateSafetyHint()}
 async function refreshHistory(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
 async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认模型已设为 '+data.model;statusEl.textContent='Default: '+data.provider+' / '+data.model}
