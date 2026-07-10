@@ -194,13 +194,14 @@ app.post('/api/conversations/:id/rollback', requireAuth, (req, res) => {
   const target = conversation.messages[messageIndex];
   if (!target || target.role !== 'user') return res.status(400).json({ error: '只能回退到用户消息' });
 
-  conversation.messages = conversation.messages.slice(0, messageIndex + 1);
+  const draft = extractUserDraft(target.content);
+  conversation.messages = conversation.messages.slice(0, messageIndex);
   conversation.status = 'done';
   conversation.updatedAt = new Date().toISOString();
   conversations.splice(conversations.indexOf(conversation), 1);
   conversations.unshift(conversation);
   saveConversations();
-  res.json({ ok: true, conversation });
+  res.json({ ok: true, conversation, draft });
 });
 
 app.post('/api/cancel', requireAuth, (req, res) => {
@@ -776,6 +777,10 @@ function appendAttachmentPrompt(message, attachments) {
   return lines.join('\n').trim();
 }
 
+function extractUserDraft(content) {
+  return String(content || '').split(/\n\n用户上传了\s+\d+\s+个附件（/u, 1)[0].trim();
+}
+
 function extractImage(event, conversationId) {
   const payload = event.payload || event.item || event.msg || event;
   const type = payload?.type || event.type || '';
@@ -1310,7 +1315,7 @@ function toggleSettings(){settingsPanel.classList.toggle('open');settingsToggle.
 function newChat(){conversationLoadSeq++;currentConversationId='';updateActiveHistory();chat.innerHTML='<div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div>';statusEl.textContent='New chat';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
 async function loadConversation(id){const seq=++conversationLoadSeq;currentConversationId=id;updateActiveHistory();statusEl.textContent='Loading...';const res=await fetch('/api/conversations/'+encodeURIComponent(id));if(seq!==conversationLoadSeq)return;if(!res.ok){statusEl.textContent='加载失败';return}const data=await res.json();if(seq!==conversationLoadSeq)return;currentConversationId=data.conversation.id;updateActiveHistory();chat.innerHTML='';(data.conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:index}));statusEl.textContent='Loaded '+new Date(data.conversation.updatedAt||data.conversation.createdAt).toLocaleString();closeMenu();scrollChatToLatest()}
-async function rollbackConversation(messageIndex){if(!currentConversationId)return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('回退到这条用户消息？它之后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id);await refreshHistory();statusEl.textContent='已回退到所选消息'}
+async function rollbackConversation(messageIndex){if(!currentConversationId)return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id);input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
 function addMsg(role,text,options={}){const empty=chat.querySelector('.empty');if(empty)empty.remove();const el=document.createElement('div');el.className='msg '+role;if(role==='image'){const img=document.createElement('img');img.src=text;img.alt='generated image';const a=document.createElement('a');a.href=text;a.target='_blank';a.rel='noopener';a.textContent='打开图片';el.appendChild(img);el.appendChild(a)}else{const body=document.createElement('div');body.className='msgBody';body.textContent=text;const actions=document.createElement('div');actions.className='msgActions';if(['process','thinking','tool','log'].includes(role)){const tag=document.createElement('span');tag.className='tag';tag.textContent=role==='process'?'过程':role==='thinking'?'思考':role==='tool'?'工具':'日志';actions.appendChild(tag)}if(role==='user'&&Number.isInteger(options.messageIndex)){const rollback=document.createElement('button');rollback.type='button';rollback.className='rollbackMsg';rollback.textContent='↩';rollback.title='回退到这条消息';rollback.setAttribute('aria-label','回退到这条消息');rollback.addEventListener('click',(e)=>{e.stopPropagation();rollbackConversation(options.messageIndex)});actions.appendChild(rollback)}const copy=document.createElement('button');copy.type='button';copy.className='copyMsg';copy.textContent='⧉';copy.title='复制此消息';copy.setAttribute('aria-label','复制此消息');copy.addEventListener('click',(e)=>{e.stopPropagation();copyText(text,copy)});actions.appendChild(copy);el.appendChild(body);el.appendChild(actions)}chat.appendChild(el);scrollChatToLatest();return el}
 async function copyText(text,button){try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text)}else{const tmp=document.createElement('textarea');tmp.value=text;tmp.setAttribute('readonly','');tmp.style.position='fixed';tmp.style.left='-9999px';document.body.appendChild(tmp);tmp.select();document.execCommand('copy');tmp.remove()}button.textContent='✓';setTimeout(()=>{button.textContent='⧉'},1200)}catch(e){button.textContent='!';setTimeout(()=>{button.textContent='⧉'},1200)}}
 function hasFileDrag(e){return [...(e.dataTransfer?.items||[])].some((item)=>item.kind==='file')}
