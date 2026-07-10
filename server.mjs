@@ -384,10 +384,9 @@ app.post('/api/chat', requireAuth, (req, res) => {
   let finished = false;
   res.on('close', () => {
     if (!finished && activeProcess === child) {
-      appendMessage(convo, 'log', '客户端连接已断开，任务已取消。', 'cancelled');
-      terminateProcess(child);
-      activeProcess = null;
-      activeConversationId = '';
+      appendMessage(convo, 'log', '客户端连接已断开，任务继续在后台运行。', 'client_disconnected');
+      convo.updatedAt = new Date().toISOString();
+      saveConversations();
     }
   });
 
@@ -899,12 +898,22 @@ function flattenContent(content) {
 }
 
 function writeEvent(res, data) {
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  if (!res || res.destroyed || res.writableEnded) return;
+  try {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch {
+    // The browser can close the stream while the background task continues.
+  }
 }
 
 function endStream(res) {
-  res.write('data: [DONE]\n\n');
-  res.end();
+  if (!res || res.destroyed || res.writableEnded) return;
+  try {
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch {
+    // The result is still persisted in the conversation history.
+  }
 }
 
 function safeEqual(a, b) {
