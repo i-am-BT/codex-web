@@ -32,6 +32,8 @@ const DEFAULT_PROVIDER = process.env.DEFAULT_PROVIDER || '';
 const DEFAULT_CWD = process.env.DEFAULT_CWD || '/root';
 const DEFAULT_SANDBOX = process.env.DEFAULT_SANDBOX || 'read-only';
 const DEFAULT_APPROVAL = process.env.DEFAULT_APPROVAL || 'never';
+const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
+const HOMEPAGE_MODEL_CACHE_MS = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60) * 1000;
 
 if (!PASSWORD) {
   console.error('CODEX_WEB_PASSWORD is required in /opt/codex-web/.env');
@@ -48,12 +50,35 @@ const sessions = new Map();
 const conversations = loadConversations();
 let activeProcess = null;
 let activeConversationId = '';
+let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '25mb' }));
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, port: server.address()?.port || null });
+});
+
+app.get('/api/homepage/stats', requireHomepageToken, async (req, res) => {
+  try {
+    const providers = readProviderDetails();
+    const provider = providers.find((item) => item.name === DEFAULT_PROVIDER) || providers[0];
+    let models = 0;
+    if (provider) {
+      const now = Date.now();
+      if (homepageModelCache.provider === provider.name && homepageModelCache.expiresAt > now) {
+        models = homepageModelCache.count;
+      } else {
+        const apiKey = process.env[provider.envKey] || readEnvVar(CODEX_ENV_FILE, provider.envKey);
+        models = (await fetchModels(provider.baseUrl, apiKey)).length;
+        homepageModelCache = { provider: provider.name, count: models, expiresAt: now + HOMEPAGE_MODEL_CACHE_MS };
+      }
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ conversations: conversations.length, providers: providers.length, models, running: activeProcess ? 1 : 0 });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
 
 app.get('/favicon.svg', (req, res) => {
@@ -470,6 +495,13 @@ server.listen(listenPort, HOST, () => {
 function requireAuth(req, res, next) {
   if (validateSession(req)) return next();
   res.status(401).json({ error: '未登录' });
+}
+
+function requireHomepageToken(req, res, next) {
+  if (!HOMEPAGE_API_TOKEN) return res.status(503).json({ error: 'Homepage API 未配置' });
+  const token = String(req.get('X-API-Token') || '');
+  if (!safeEqual(token, HOMEPAGE_API_TOKEN)) return res.status(401).json({ error: '无效的 API Token' });
+  next();
 }
 
 function validateSession(req) {

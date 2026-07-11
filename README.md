@@ -60,6 +60,8 @@ cp .env.example .env
 | `CODEX_WEB_PASSWORD` | Web 登录密码，必填 |
 | `SESSION_SECRET` | 登录会话签名密钥，建议设置为稳定的随机字符串 |
 | `SESSION_TTL_HOURS` | 登录有效期，默认 168 小时 |
+| `HOMEPAGE_API_TOKEN` | Homepage 统计接口访问令牌；未设置时接口禁用 |
+| `HOMEPAGE_MODEL_CACHE_SECONDS` | Homepage 模型数量缓存秒数，默认 60 |
 | `HOST` | 监听地址，默认 `0.0.0.0` |
 | `PORT` | 固定监听端口，示例为 `36354` |
 | `DEFAULT_PROVIDER` | 新会话默认服务商 |
@@ -113,6 +115,43 @@ rg '"type":"turn_context"' "$latest" | tail -1
 ```
 
 其中的 `effort` 可确认 Codex CLI 是否收到所选档位。第三方服务商是否完整支持该档位，仍取决于其上游实现。
+
+## Homepage 小组件
+
+设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Web 会话数、服务商数、默认服务商模型数和运行中任务数。请求必须携带 `X-API-Token` 请求头：
+
+```bash
+curl -H "X-API-Token: $HOMEPAGE_API_TOKEN" http://localhost:36354/api/homepage/stats
+```
+
+Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
+
+```yaml
+- AI 工具:
+    - Codex Web:
+        icon: codex-web.svg
+        href: http://192.168.10.10:36354
+        widget:
+          type: customapi
+          url: http://192.168.10.10:36354/api/homepage/stats
+          headers:
+            X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
+          mappings:
+            - field: conversations
+              label: 会话
+              format: number
+            - field: providers
+              label: 供应商
+              format: number
+            - field: models
+              label: 模型
+              format: number
+            - field: running
+              label: 运行中
+              format: number
+```
+
+模型数量按当前默认服务商的 `/models` 返回结果统计，并使用短期缓存，避免 Homepage 刷新时频繁访问上游。
 
 ## 会话说明
 
