@@ -263,9 +263,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '输入变成了一大段'));
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '我想 UI 和这个一样\n\n图片附件'));
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content === '助手进度'));
-    assert.ok(conversation.messages.some((message) => (
-      message.role === 'thinking' && message.content === '检查现状\n实现队列'
-    )));
+    assert.equal(conversation.messages.some((message) => message.role === 'thinking'), false);
     assert.ok(conversation.messages.some((message) => message.role === 'tool' && message.content.includes('exec_command')));
     assert.ok(conversation.messages.some((message) => (
       message.role === 'context'

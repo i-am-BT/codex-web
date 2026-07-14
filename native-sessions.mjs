@@ -492,14 +492,8 @@ function applyNativeRecord(cache, record, maxMessages) {
       applyMessageRecord(cache, record, payload, maxMessages);
       break;
     case 'reasoning':
-      appendNativeMessage(
-        cache,
-        'thinking',
-        (payload.summary || []).map((item) => item?.text).filter(Boolean).join('\n'),
-        record,
-        maxMessages,
-        'reasoning',
-      );
+      // Codex App presents user-facing commentary as progress. Raw reasoning
+      // summaries are model internals and are commonly emitted in English.
       break;
     case 'function_call':
     case 'custom_tool_call': {

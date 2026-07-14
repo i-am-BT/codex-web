@@ -901,11 +901,7 @@ function extractProcessEvent(event) {
   if (type === 'agent_message' && payload.phase && payload.phase !== 'final_answer') {
     return { role: 'process', type: `agent_${payload.phase}`, content: `Codex ${payload.phase}\n${payload.message || ''}` };
   }
-  if (type === 'reasoning') {
-    const summary = Array.isArray(payload.summary) ? payload.summary.map((x) => x.text || x.content || '').filter(Boolean).join('\n') : '';
-    const encrypted = payload.encrypted_content ? '\n已收到加密 reasoning 内容，CLI 不暴露完整思维链。' : '';
-    return { role: 'thinking', type: 'reasoning', content: summary ? `思考摘要\n${summary}` : `模型思考事件${encrypted}` };
-  }
+  if (type === 'reasoning') return null;
   if (type === 'function_call') {
     const args = typeof payload.arguments === 'string' ? payload.arguments : JSON.stringify(payload.arguments || {});
     let brief = args;
@@ -1305,16 +1301,7 @@ function handleAppServerNotification(event) {
   const params = event.params || {};
   const threadId = cleanNativeThreadId(params.threadId || params.thread?.id);
 
-  if (method === 'item/reasoning/summaryTextDelta' && threadId) {
-    broadcastNativeRuntime({
-      type: 'delta',
-      role: 'thinking',
-      threadId,
-      turnId: String(params.turnId || ''),
-      itemId: String(params.itemId || ''),
-      delta: String(params.delta || ''),
-    });
-  } else if (method === 'item/agentMessage/delta' && threadId) {
+  if (method === 'item/agentMessage/delta' && threadId) {
     broadcastNativeRuntime({
       type: 'delta',
       role: 'assistant',
@@ -2139,7 +2126,7 @@ button,input,textarea,select{font:inherit}button{border:0;cursor:pointer}.login{
 .app{height:100vh;display:grid;grid-template-columns:292px 1fr}.side{background:rgba(8,12,18,.82);border-right:1px solid var(--line);padding:18px;display:flex;flex-direction:column;gap:16px;overflow:auto}.brandRow{display:flex;align-items:center;justify-content:space-between;gap:10px}.logo{font-weight:800;font-size:22px;letter-spacing:-.04em}.pill{display:inline-flex;align-items:center;gap:6px;background:#122017;color:#94f0b1;border:1px solid #214c2c;border-radius:999px;padding:4px 9px;font-size:12px}.sideActions{display:grid;gap:10px;align-items:center}.themeToggle{display:grid;place-items:center;flex:0 0 auto;width:34px;height:34px;border-radius:11px;background:#172033;color:var(--text);border:1px solid var(--line);font-size:17px;font-weight:800}.themeToggle:hover{border-color:var(--blue);background:#1b2533}.settings{display:grid;gap:11px}.settings .field{margin:0}.smallrow{display:grid;grid-template-columns:1fr 1fr;gap:9px}.backgroundControls{display:grid;gap:8px;align-items:end}.backgroundRow{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}.backgroundControls .field{margin:0}.providerBox{background:rgba(18,25,38,.74);border:1px solid var(--line);border-radius:14px;padding:10px}.providerBox summary{cursor:pointer;color:var(--text);font-weight:700;font-size:13px}.providerBox form{margin-top:12px}.miniPrimary{width:100%;padding:10px;border-radius:11px;background:var(--blue);color:#06101f;font-weight:800}.miniSecondary{align-self:end;width:100%;padding:10px;border-radius:11px;background:#1b2533;color:var(--text);border:1px solid var(--line);font-weight:700}.miniDanger{width:100%;padding:10px;border-radius:11px;background:#221114;color:#ff9da5;border:1px solid #613039;font-weight:800}.miniDanger:hover{background:#3a161c}.backgroundDelete{width:auto;min-width:56px;align-self:end}.history{flex:1.35;overflow:auto;display:flex;flex-direction:column;gap:15px;min-height:220px}.historyProject{display:grid;gap:7px;min-width:0}.historyProjectHead{display:grid;gap:2px;min-width:0;padding:0 2px}.historyProjectTitle{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.historyProjectName{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-size:12px;font-weight:800;letter-spacing:0}.historyProjectCount{flex:0 0 auto;color:var(--muted);font-size:10px;font-variant-numeric:tabular-nums}.historyProjectPath{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font:10px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}.historyProjectItems{display:grid;gap:7px}.hist{display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--muted);font-size:13px;min-height:48px;cursor:pointer}.hist.native{grid-template-columns:minmax(0,1fr) auto auto auto}.hist:hover{border-color:var(--blue);color:var(--text);background:#151d2b}.hist.active{border-color:var(--blue);color:var(--text);background:rgba(106,168,255,.14);box-shadow:inset 3px 0 0 var(--blue)}.histOpen{background:transparent;color:inherit;border:0;text-align:left;padding:0;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.35;cursor:pointer}.histSource{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:24px;border:1px solid #31527a;border-radius:6px;background:#0b1a2a;color:#8fc3ff;font-size:10px;font-weight:800}.histRename{background:#172033;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px 7px;font-size:12px}.histRename:hover{border-color:var(--blue);background:#1b2533}.histDelete{background:#221114;color:#ff9da5;border:1px solid #613039;border-radius:6px;padding:5px 7px;font-size:12px}.histDelete:hover{background:#3a161c}.logout{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:11px;padding:10px}
 .main{display:flex;flex-direction:column;min-width:0}.top{height:62px;border-bottom:1px solid var(--line);background:rgba(15,20,29,.75);display:flex;align-items:center;justify-content:space-between;padding:0 22px}.title{font-weight:720}.meta{color:var(--muted);font-size:13px}.chat{flex:1;overflow:auto;padding:26px;display:flex;flex-direction:column;gap:18px}.empty{margin:auto;text-align:center;color:var(--muted)}.empty b{display:block;color:var(--text);font-size:30px;letter-spacing:-.05em;margin-bottom:8px}.msg{max-width:min(880px,88%);border-radius:18px;padding:14px 16px;line-height:1.65;word-break:break-word}.msg.user{align-self:flex-end;background:linear-gradient(135deg,var(--user),#7147e8);color:white}.msg.assistant{align-self:flex-start;background:rgba(18,25,38,.86);border:1px solid var(--line)}.msg.log{align-self:flex-start;background:#0b1119;border:1px dashed var(--line);color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.msgActions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:8px -4px -4px 0}.msgActions .tag{margin:0;margin-right:auto}.copyMsg,.rollbackMsg{display:grid;place-items:center;flex:0 0 auto;width:26px;height:24px;border:1px solid rgba(139,152,168,.28);border-radius:8px;background:rgba(8,12,18,.38);color:var(--muted);padding:0;font-size:13px;line-height:1}.copyMsg:hover,.rollbackMsg:hover{border-color:var(--blue);color:var(--text);background:rgba(106,168,255,.12)}.msg.user .copyMsg,.msg.user .rollbackMsg{border-color:rgba(255,255,255,.22);background:rgba(255,255,255,.1);color:rgba(255,255,255,.76)}.msg.user .copyMsg:hover,.msg.user .rollbackMsg:hover{color:#fff;background:rgba(255,255,255,.18)}.msgBody{white-space:pre-wrap}.markdownBody{min-width:0;white-space:normal}.markdownBody>:first-child{margin-top:0}.markdownBody>:last-child{margin-bottom:0}.markdownBody p{margin:0 0 10px}.markdownBody h1,.markdownBody h2,.markdownBody h3,.markdownBody h4,.markdownBody h5,.markdownBody h6{margin:16px 0 8px;line-height:1.3;letter-spacing:0}.markdownBody h1{font-size:18px}.markdownBody h2{font-size:16px}.markdownBody h3{font-size:14px}.markdownBody h4,.markdownBody h5,.markdownBody h6{font-size:13px}.markdownBody ul,.markdownBody ol{margin:6px 0 10px;padding-left:22px}.markdownBody li+li{margin-top:3px}.markdownBody li>p{margin-bottom:4px}.markdownBody blockquote{margin:10px 0;padding:2px 0 2px 12px;border-left:3px solid var(--blue);color:var(--muted)}.markdownBody a{color:var(--blue);text-decoration-thickness:1px;text-underline-offset:2px}.markdownBody code{border:1px solid var(--line);border-radius:5px;background:var(--panel2);padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;word-break:break-word}.markdownBody pre{max-width:100%;margin:10px 0;overflow:auto;border:1px solid var(--line);border-radius:7px;background:#080d14;padding:11px 12px;color:#d9e6f2}.markdownBody pre code{border:0;background:transparent;padding:0;color:inherit;word-break:normal}.markdownBody table{display:block;max-width:100%;margin:10px 0;overflow-x:auto;border-collapse:collapse}.markdownBody th,.markdownBody td{min-width:90px;border:1px solid var(--line);padding:6px 9px;text-align:left}.markdownBody th{background:var(--panel2);font-weight:800}.markdownBody hr{height:1px;margin:14px 0;border:0;background:var(--line)}.composer{border-top:1px solid var(--line);background:rgba(15,20,29,.9);padding:16px 22px}.nativeNotice{margin-bottom:10px;border:1px solid #31527a;border-radius:10px;background:#0b1a2a;color:#9bc9ff;padding:9px 11px;font-size:12px;font-weight:700}.box{display:flex;gap:12px;align-items:flex-end}.box textarea{flex:1;min-height:52px;max-height:180px;resize:none;background:#090d14;border:1px solid var(--line);color:var(--text);border-radius:16px;padding:14px;outline:none}.box textarea:disabled{cursor:not-allowed;color:var(--muted);background:#0b1119}.box.drag textarea{border-color:var(--blue);box-shadow:0 0 0 3px rgba(106,168,255,.14)}.attachBtn{width:52px;height:52px;border-radius:16px;background:#172033;color:var(--text);border:1px solid var(--line);font-size:24px;line-height:1}.attachBtn:hover{border-color:var(--blue);background:#1b2533}.attachBtn:disabled{opacity:.45;cursor:not-allowed}.attachmentTray{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.attachmentChip{display:flex;align-items:center;gap:8px;max-width:280px;background:#0b1119;border:1px solid var(--line);border-radius:12px;padding:6px 8px;color:var(--muted);font-size:12px}.attachmentChip img,.attachmentIcon{width:42px;height:42px;flex:0 0 42px;border-radius:8px}.attachmentChip img{object-fit:cover}.attachmentIcon{display:grid;place-items:center;background:#172033;border:1px solid var(--line);color:var(--blue);font-weight:800;font-size:11px;text-transform:uppercase}.attachmentText{min-width:0;display:flex;flex-direction:column;gap:2px}.attachmentText span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.attachmentMeta{color:#627084;font-size:11px}.attachmentChip button{display:grid;place-items:center;width:22px;height:22px;border-radius:7px;background:#221114;color:#ff9da5;border:1px solid #613039}.composerControls{display:flex;align-items:end;flex-wrap:wrap;gap:8px;margin-top:10px}.composerControls .field{width:96px;margin:0;gap:5px}.composerControls .field label{font-size:10px}.composerControls .field select{padding:6px 7px;border-radius:9px;font-size:12px}.send{width:92px;height:52px;border-radius:16px;background:var(--green);color:#07100a;font-weight:800}.send:disabled{opacity:.55;cursor:not-allowed}.hint{margin-top:8px;color:var(--muted);font-size:12px}.safety{flex:1 1 360px;min-width:260px;border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.35;background:#0b1119;color:var(--muted)}.safety.safe{border-color:#254a33;color:#9ee8b5}.safety.warn{border-color:#6f5522;color:#ffd98a}.safety.danger{border-color:#743232;color:#ffabab;background:#190d0d}.spinner{display:inline-block;width:10px;height:10px;border:2px solid #405064;border-top-color:var(--blue);border-radius:50%;animation:spin .9s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:820px){.app{grid-template-columns:1fr}.side{display:none}.chat{padding:16px}.msg{max-width:100%}.composerControls .field{width:calc(50% - 4px)}.safety{flex-basis:100%;min-width:0}}
 .menuBtn{display:none}.scrim{display:none}@media(max-width:820px){html,body{height:100%;overflow:hidden}.app{display:block;height:100dvh;overflow:hidden}.main{height:100dvh;display:flex;flex-direction:column;overflow:hidden}.menuBtn{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border-radius:13px;background:#101722;border:1px solid var(--line);color:var(--text);font-size:24px;line-height:1}.side{display:flex;position:fixed;z-index:30;left:0;top:0;bottom:0;width:min(86vw,330px);transform:translateX(-105%);transition:transform .22s ease;background:rgba(8,12,18,.96);box-shadow:26px 0 80px rgba(0,0,0,.45)}.app.menuOpen .side{transform:translateX(0)}.scrim{display:block;position:fixed;z-index:20;inset:0;background:rgba(0,0,0,.48);opacity:0;pointer-events:none;transition:opacity .2s}.app.menuOpen .scrim{opacity:1;pointer-events:auto}.top{flex:0 0 auto;min-height:58px;height:auto;padding:calc(env(safe-area-inset-top,0px) + 8px) 14px 8px;gap:12px;justify-content:flex-start}.top .meta:last-child{margin-left:auto}.chat{flex:1 1 auto;min-height:0;overflow:auto;padding:14px}.composer{flex:0 0 auto;padding:12px 12px calc(env(safe-area-inset-bottom,0px) + 12px)}.box{gap:8px}.send{width:72px}.msg{max-width:100%}}
-.msg.image{padding:8px;background:rgba(18,25,38,.86);border:1px solid var(--line)}.msg.image img{display:block;max-width:min(520px,100%);border-radius:14px}.msg.image a{display:inline-block;margin-top:8px;color:var(--blue);font-size:13px;text-decoration:none}
+.msg.image{padding:8px;background:rgba(18,25,38,.86);border:1px solid var(--line)}.msg.image img{display:block;max-width:min(520px,100%);border-radius:14px}
 .msg{font-size:13px}.msg.user,.msg.assistant{font-size:13px}.msg.process,.msg.tool,.msg.thinking{align-self:flex-start;max-width:min(780px,92%);padding:8px 10px;border-radius:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.45;color:#8f9bad;background:#091018;border:1px dashed #263244}.msg.thinking{color:#b8a8ff;border-color:#3e3568;background:#100d1b}.msg.tool{color:#8fd7ff;border-color:#244a60;background:#08141d}.msg.process{color:#9ee8b5;border-color:#254a33;background:#0b1510}
 .msg .tag{display:block;margin-bottom:4px;opacity:.75;font-weight:800;letter-spacing:.08em;font-size:10px}
 .msg.tool,.msg.thinking{flex:0 0 auto;min-width:0;padding:0;overflow:hidden}.toolDetails{min-width:0}.toolDetails summary{display:list-item;min-height:34px;padding:8px 10px;cursor:pointer;outline:none}.toolDetails summary::marker{color:currentColor}.toolDetails summary:hover,.toolDetails[open] summary{background:rgba(106,168,255,.08)}.toolDetails summary:focus-visible{box-shadow:inset 0 0 0 2px var(--blue)}.toolSummaryRow{display:inline-flex;align-items:center;gap:8px;width:calc(100% - 18px);min-width:0;vertical-align:middle}.toolSummaryTag{display:inline-flex!important;flex:0 0 auto;margin:0!important}.toolSummaryText{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:inherit;font-weight:700}.toolContent{padding:8px 10px 10px;border-top:1px dashed var(--line)}.toolContent .msgBody{max-height:min(52vh,520px);overflow:auto;overscroll-behavior:contain;padding-right:4px}.toolContent .msgActions{margin-bottom:-2px}.msg.thinking.streaming{border-style:solid;box-shadow:0 0 0 1px rgba(184,168,255,.16)}.msg.thinking.streaming .toolSummaryText::after{content:' · 输出中';color:var(--muted);font-weight:500}
@@ -2189,9 +2176,6 @@ let latestFinalAssistantElement = null;
 let turnProcessElements = [];
 let visibleTurnProcessElement = null;
 let collectingTurnProcess = false;
-let turnActivityGroup = null;
-let turnActivityList = null;
-let turnActivityLabel = null;
 let currentNativeRequest = null;
 let dangerConfirmed = false;
 let pendingAttachments = [];
@@ -2218,6 +2202,10 @@ let settingsDialog = null;
 let settingsClose = null;
 let passwordForm = null;
 let passwordStatus = null;
+let imagePreview = null;
+let imagePreviewImage = null;
+let imagePreviewClose = null;
+let imagePreviewReturnFocus = null;
 let appearance = {theme:'light',chatBackground:'default',customBackgrounds:[]};
 const desktopSidebarMedia=window.matchMedia('(min-width: 821px)');
 const SIDEBAR_STORAGE_KEY='codexWeb.sidebarCollapsed';
@@ -2744,7 +2732,7 @@ function openSettings(){
   if(!settingsOverlay)return;
   closeComposerPopovers();
   settingsOverlay.classList.remove('hidden');
-  document.body.classList.add('modalOpen');
+  syncModalOpenState();
   settingsToggle.setAttribute('aria-expanded','true');
   settingsToggle.title='关闭设置';
   requestAnimationFrame(()=>settingsClose?.focus());
@@ -2752,12 +2740,60 @@ function openSettings(){
 function closeSettings(){
   if(!settingsOverlay||settingsOverlay.classList.contains('hidden'))return;
   settingsOverlay.classList.add('hidden');
-  document.body.classList.remove('modalOpen');
+  syncModalOpenState();
   settingsToggle.setAttribute('aria-expanded','false');
   settingsToggle.title='设置';
   passwordForm?.reset();
   if(passwordStatus){passwordStatus.textContent='';passwordStatus.classList.remove('success')}
   settingsToggle.focus();
+}
+function syncModalOpenState(){
+  const settingsOpen=settingsOverlay&&!settingsOverlay.classList.contains('hidden');
+  const previewOpen=imagePreview&&!imagePreview.classList.contains('hidden');
+  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||previewOpen));
+}
+function ensureImagePreview(){
+  if(imagePreview)return;
+  imagePreview=document.createElement('div');
+  imagePreview.className='imagePreview hidden';
+  imagePreview.setAttribute('role','presentation');
+  const dialog=document.createElement('div');
+  dialog.className='imagePreviewDialog';
+  dialog.setAttribute('role','dialog');
+  dialog.setAttribute('aria-modal','true');
+  dialog.setAttribute('aria-label','图片预览');
+  imagePreviewImage=document.createElement('img');
+  imagePreviewImage.className='imagePreviewImage';
+  imagePreviewClose=document.createElement('button');
+  imagePreviewClose.type='button';
+  imagePreviewClose.className='imagePreviewClose';
+  imagePreviewClose.title='关闭图片预览';
+  imagePreviewClose.setAttribute('aria-label','关闭图片预览');
+  setIconLabel(imagePreviewClose,'x','关闭图片预览',false);
+  dialog.appendChild(imagePreviewImage);
+  dialog.appendChild(imagePreviewClose);
+  imagePreview.appendChild(dialog);
+  document.body.appendChild(imagePreview);
+  imagePreviewClose.addEventListener('click',closeImagePreview);
+  imagePreview.addEventListener('click',(event)=>{if(event.target===imagePreview||event.target===dialog)closeImagePreview()});
+  refreshIcons(imagePreview);
+}
+function openImagePreview(src,alt,trigger){
+  ensureImagePreview();
+  imagePreviewReturnFocus=trigger||document.activeElement;
+  imagePreviewImage.src=String(src||'');
+  imagePreviewImage.alt=String(alt||'图片预览');
+  imagePreview.classList.remove('hidden');
+  syncModalOpenState();
+  requestAnimationFrame(()=>imagePreviewClose?.focus());
+}
+function closeImagePreview(){
+  if(!imagePreview||imagePreview.classList.contains('hidden'))return;
+  imagePreview.classList.add('hidden');
+  imagePreviewImage.removeAttribute('src');
+  syncModalOpenState();
+  if(imagePreviewReturnFocus?.isConnected)imagePreviewReturnFocus.focus();
+  imagePreviewReturnFocus=null;
 }
 function trapSettingsFocus(event){
   if(event.key!=='Tab'||!settingsDialog)return;
@@ -2877,7 +2913,7 @@ settingsToggle?.addEventListener('click', toggleSettings);
 menuBtn?.addEventListener('click', toggleMenu);
 document.getElementById('scrim')?.addEventListener('click', closeMenu);
 desktopSidebarMedia.addEventListener?.('change',()=>{app.classList.remove('menuOpen');syncMenuButton()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',async()=>{await loadModels(provider.value);syncComposerChrome()});
@@ -3476,12 +3512,80 @@ function shortActivityText(value,max=100){const clean=String(value||'').replace(
 function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){current={verb:match[1],icon:match[2],target:activityFileLabel(line.slice(match[0].length)),added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
 function commandActivityPresentation(command){const source=String(command||'');const clean=shortActivityText(source,120);const files=extractActivityFiles(source);if(/(?:^|\\s)(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files.join('、')||clean,icon:'book-open'};if(/\\brg\\b/.test(source)){const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';return{verb:'已搜索',target:(files.join('、')||'内容')+(query?' · “'+shortActivityText(query,48)+'”':''),icon:'search'}}if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files.join('、')||shortActivityText(source.split('\\n')[0],84),icon:'circle-check'};if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};return{verb:'已运行',target:files.join('、')||clean||'工具调用',icon:'terminal'}}
 function toolActivityPresentations(text){const descriptor=toolCallDescriptor(text);if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:activityFileLabel(descriptor.detail),icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name+(descriptor.detail?' · '+descriptor.detail:''),100),icon:'wrench'}]}
-function createToolActivityItem(presentation,rawText){const item=document.createElement('details');item.className='activityItem';item.dataset.messageText=String(rawText||'');const summary=document.createElement('summary');summary.className='activityItemSummary';const iconWrap=document.createElement('span');iconWrap.className='activityItemIcon';const icon=document.createElement('i');icon.setAttribute('data-lucide',presentation.icon||'wrench');icon.setAttribute('aria-hidden','true');iconWrap.appendChild(icon);const verb=document.createElement('span');verb.className='activityVerb';verb.textContent=presentation.verb||'已调用';const target=document.createElement('span');target.className='activityTarget';target.textContent=presentation.target||'工具';target.title=target.textContent;summary.appendChild(iconWrap);summary.appendChild(verb);summary.appendChild(target);if(presentation.meta){const meta=document.createElement('span');meta.className='activityMeta';meta.textContent=presentation.meta;summary.appendChild(meta)}const content=document.createElement('div');content.className='activityItemContent';const raw=document.createElement('pre');raw.className='activityRaw';raw.textContent=String(rawText||'');const copy=document.createElement('button');copy.type='button';copy.className='copyMsg activityCopy';copy.title='复制工具调用';copy.setAttribute('aria-label','复制工具调用');setIconLabel(copy,'copy','复制工具调用',false);copy.addEventListener('click',(event)=>{event.stopPropagation();copyText(item.dataset.messageText||'',copy)});content.appendChild(raw);content.appendChild(copy);item.appendChild(summary);item.appendChild(content);return item}
-function ensureTurnActivityGroup(){if(turnActivityGroup)return turnActivityGroup;const group=document.createElement('details');group.className='msg activityGroup';group.dataset.messageKind='activity_group';group.open=true;const summary=document.createElement('summary');summary.className='activityGroupSummary';const chevron=document.createElement('i');chevron.className='activityGroupChevron';chevron.setAttribute('data-lucide','chevron-right');chevron.setAttribute('aria-hidden','true');const label=document.createElement('span');label.className='activityGroupLabel';label.textContent='正在处理';summary.appendChild(chevron);summary.appendChild(label);const list=document.createElement('div');list.className='activityList';group.appendChild(summary);group.appendChild(list);group._messageLabel=label;group._messageBody=document.createElement('div');group._thinkingTexts=new Set();group._liveThinkingItem=null;turnActivityGroup=group;turnActivityList=list;turnActivityLabel=label;activateTurnProcessElement(group);refreshIcons(group);return group}
-function thinkingActivityLines(text){return String(text||'').split('\\n').map((line)=>thinkingMessageTitle(line)).filter((line)=>line&&line!=='正在思考')}
-function createThinkingActivityItem(text,streaming=false){const item=document.createElement('div');item.className='activityThinking'+(streaming?' streaming':'');const iconWrap=document.createElement('span');iconWrap.className='activityItemIcon thinkingIcon';const icon=document.createElement('i');icon.setAttribute('data-lucide','brain');icon.setAttribute('aria-hidden','true');const content=document.createElement('span');content.className='activityThinkingText';content.textContent=text;content.title=text;iconWrap.appendChild(icon);item.appendChild(iconWrap);item.appendChild(content);item._thinkingText=content;return item}
-function appendTurnThinking(text,options={}){const group=ensureTurnActivityGroup();const lines=thinkingActivityLines(text);const label=lines[lines.length-1]||'正在思考';turnActivityLabel.textContent=label;turnActivityLabel.title=label;group.dataset.messageText=String(text||'');group.classList.toggle('streaming',Boolean(options.streaming));if(options.streaming&&lines.length){if(!group._liveThinkingItem){group._liveThinkingItem=createThinkingActivityItem(label,true);turnActivityList.appendChild(group._liveThinkingItem)}group._liveThinkingItem._thinkingText.textContent=label;group._liveThinkingItem._thinkingText.title=label}else if(lines.length){if(group._liveThinkingItem){group._liveThinkingItem.classList.remove('streaming');const liveText=group._liveThinkingItem._thinkingText.textContent;if(liveText)group._thinkingTexts.add(liveText);group._liveThinkingItem=null}for(const line of lines){if(group._thinkingTexts.has(line))continue;group._thinkingTexts.add(line);turnActivityList.appendChild(createThinkingActivityItem(line))}}group.open=true;activateTurnProcessElement(group);refreshIcons(group);return group}
-function appendTurnTool(text){const group=ensureTurnActivityGroup();for(const presentation of toolActivityPresentations(text))turnActivityList.appendChild(createToolActivityItem(presentation,text));group.open=true;activateTurnProcessElement(group);refreshIcons(group);return group}
+function createToolActivityItem(presentation,rawText){
+  const expandable=presentation.expandable!==false;
+  const item=document.createElement(expandable?'details':'div');
+  item.className='activityItem'+(expandable?'':' static');
+  item.dataset.messageText=String(rawText||'');
+  const summary=document.createElement(expandable?'summary':'div');
+  summary.className='activityItemSummary'+(presentation.target?'':' standalone');
+  const iconWrap=document.createElement('span');
+  iconWrap.className='activityItemIcon';
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide',presentation.icon||'wrench');
+  icon.setAttribute('aria-hidden','true');
+  iconWrap.appendChild(icon);
+  const verb=document.createElement('span');
+  verb.className='activityVerb';
+  verb.textContent=presentation.verb||'已调用';
+  summary.appendChild(iconWrap);
+  summary.appendChild(verb);
+  if(presentation.target){
+    const target=document.createElement('span');
+    target.className='activityTarget';
+    target.textContent=presentation.target;
+    target.title=target.textContent;
+    summary.appendChild(target);
+  }
+  if(presentation.meta){
+    const meta=document.createElement('span');
+    meta.className='activityMeta';
+    meta.textContent=presentation.meta;
+    summary.appendChild(meta);
+  }
+  item.appendChild(summary);
+  if(expandable){
+    const content=document.createElement('div');
+    content.className='activityItemContent';
+    const raw=document.createElement('pre');
+    raw.className='activityRaw';
+    raw.textContent=String(rawText||'');
+    const copy=document.createElement('button');
+    copy.type='button';
+    copy.className='copyMsg activityCopy';
+    copy.title='复制工具调用';
+    copy.setAttribute('aria-label','复制工具调用');
+    setIconLabel(copy,'copy','复制工具调用',false);
+    copy.addEventListener('click',(event)=>{event.stopPropagation();copyText(item.dataset.messageText||'',copy)});
+    content.appendChild(raw);
+    content.appendChild(copy);
+    item.appendChild(content);
+  }
+  return item;
+}
+function createActivityBatch(presentations,rawText,kind){
+  const batch=document.createElement('div');
+  batch.className='msg activityBatch';
+  batch.dataset.messageKind=kind||'activity';
+  batch.dataset.messageText=String(rawText||'');
+  for(const presentation of presentations)batch.appendChild(createToolActivityItem(presentation,rawText));
+  return batch;
+}
+function appendTurnTool(text){
+  const batch=createActivityBatch(toolActivityPresentations(text),text,'tool_activity');
+  activateTurnProcessElement(batch);
+  refreshIcons(batch);
+  return batch;
+}
+function appendTurnProcessActivity(text,kind){
+  const presentation=kind==='context_compacted'
+    ?{verb:'上下文已自动压缩',icon:'scan-text',expandable:false}
+    :{verb:String(text||'过程'),icon:'activity',expandable:false};
+  const batch=createActivityBatch([presentation],text,kind);
+  activateTurnProcessElement(batch);
+  refreshIcons(batch);
+  return batch;
+}
 function toolMessageTitle(text){const lines=String(text||'').split('\\n').map((line)=>line.trim()).filter(Boolean);if(!lines.length)return '工具调用';let title=lines[0].replace(/^调用工具:\\s*/,'').trim()||'工具调用';const output=/\\soutput$/i.test(title)||['工具返回','搜索结果'].includes(title);if(!output){const detail=lines.slice(1).find((line)=>!/^call_id=/.test(line)&&!/^workdir=/.test(line)&&!['[',']','{','}','],','},'].includes(line));if(detail)title+=' · '+detail}title=title.replace(/\\s+/g,' ');return title.length>120?title.slice(0,117)+'...':title}
 function thinkingMessageTitle(text){const line=String(text||'').split('\\n').map((item)=>item.trim()).find(Boolean)||'正在思考';const clean=line.replace(/[*_~\`#]/g,'').replace(/\\s+/g,' ').trim()||'正在思考';return clean.length>120?clean.slice(0,117)+'...':clean}
 function contextMessageTitle(text,kind){const lines=String(text||'').split('\\n').map((line)=>line.trim()).filter(Boolean);if(kind==='environment_context'){const date=lines.find((line)=>line.startsWith('日期 '))?.slice(3);const workspace=lines.find((line)=>line.startsWith('工作区 '))?.slice(4);return ['环境',date,workspace?workspace+' 个工作区':''].filter(Boolean).join(' · ')}if(kind==='browser_context'){const page=lines.find((line)=>line.startsWith('当前页面 '))?.slice(5);return page?'浏览器 · '+page:'浏览器上下文'}if(kind==='goal_context')return'持续目标';if(kind==='turn_aborted')return'任务已中断';return'上下文'}
@@ -3502,18 +3606,12 @@ function resetTurnProcessCollection(){
   turnProcessElements=[];
   visibleTurnProcessElement=null;
   collectingTurnProcess=false;
-  turnActivityGroup=null;
-  turnActivityList=null;
-  turnActivityLabel=null;
 }
 function beginTurnProcessCollection(){
   if(visibleTurnProcessElement?.parentNode===chat)visibleTurnProcessElement.remove();
   turnProcessElements=[];
   visibleTurnProcessElement=null;
   collectingTurnProcess=true;
-  turnActivityGroup=null;
-  turnActivityList=null;
-  turnActivityLabel=null;
 }
 function activateTurnProcessElement(element){
   if(!collectingTurnProcess||!element)return;
@@ -3528,7 +3626,7 @@ function takeTurnProcessElements(){
   return elements;
 }
 function isTurnProcessMessage(role,kind){
-  return role==='tool'||role==='thinking'||role==='process'||(role==='assistant'&&['commentary','live_progress'].includes(kind));
+  return role==='tool'||role==='process'||(role==='assistant'&&['commentary','live_progress'].includes(kind));
 }
 function collectTurnArtifactsFromDom(anchor,elements){
   const collected=[...elements];
@@ -3543,7 +3641,7 @@ function collectTurnArtifactsFromDom(anchor,elements){
     const child=children[index];
     if(child===anchor||!child.classList?.contains('msg'))continue;
     const kind=child.dataset.messageKind||'';
-    const process=child.classList.contains('tool')||child.classList.contains('thinking')||(child.classList.contains('process')&&!child.classList.contains('completionSummary'));
+    const process=child.classList.contains('tool')||child.classList.contains('activityBatch')||(child.classList.contains('process')&&!child.classList.contains('completionSummary'));
     const assistant=child.classList.contains('assistant')&&['commentary','live_progress','final_answer'].includes(kind);
     if((process||assistant)&&!collected.includes(child))collected.push(child);
   }
@@ -3568,7 +3666,7 @@ function createCompletionMessage(text,processElements=[]){
     timeline.className='completionTimeline';
     for(const item of processElements){
       item.classList.remove('streaming');
-      if(item.tagName==='DETAILS')item.open=item.classList.contains('activityGroup');
+      if(item.tagName==='DETAILS')item.open=false;
       timeline.appendChild(item);
     }
     content.appendChild(timeline);
@@ -3581,6 +3679,7 @@ function createCompletionMessage(text,processElements=[]){
 }
 function addMsg(role,text,options={}){
   const kind=String(options.kind||'');
+  if(role==='thinking')return null;
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind))return null;
   if(role==='process'&&kind==='task_started'){
     beginTurnProcessCollection();
@@ -3588,6 +3687,13 @@ function addMsg(role,text,options={}){
     latestAssistantElement=null;
     latestFinalAssistantElement=null;
     return null;
+  }
+  if(role==='process'&&kind==='context_compacted'){
+    if(!collectingTurnProcess)beginTurnProcessCollection();
+    chat.querySelector('.empty')?.remove();
+    const activity=appendTurnProcessActivity(text,kind);
+    if(options.autoScroll!==false)scrollChatToLatest();
+    return activity;
   }
   if(role==='user'){
     if(!collectingTurnProcess)beginTurnProcessCollection();
@@ -3610,20 +3716,16 @@ function addMsg(role,text,options={}){
     if(options.autoScroll!==false)scrollChatToLatest();
     return completion;
   }
-  if(collectingTurnProcess&&role==='thinking'){
-    const group=appendTurnThinking(text,options);
-    if(options.autoScroll!==false)scrollChatToLatest();
-    return group;
-  }
   if(collectingTurnProcess&&role==='tool'){
-    const group=appendTurnTool(text);
-    latestToolElement=group;
+    const activity=appendTurnTool(text);
+    latestToolElement=activity;
     if(options.autoScroll!==false)scrollChatToLatest();
-    return group;
+    return activity;
   }
   const collapsible=role==='tool'||role==='thinking'||role==='context';
   const el=document.createElement(collapsible?'details':'div');
   el.className='msg '+role+(collapsible?' toolDetails':'')+(options.streaming?' streaming':'');
+  if(role==='assistant'&&['commentary','live_progress'].includes(kind))el.classList.add('progressCommentary');
   if(role==='image'&&kind==='input_image')el.classList.add('inputImage');
   el.dataset.messageText=String(text||'');
   el.dataset.messageKind=kind;
@@ -3634,13 +3736,16 @@ function addMsg(role,text,options={}){
     img.alt=kind==='input_image'?'用户上传的图片':'生成的图片';
     img.loading='lazy';
     img.decoding='async';
-    const a=document.createElement('a');
-    a.href=text;
-    a.target='_blank';
-    a.rel='noopener';
-    a.textContent='查看原图';
+    img.tabIndex=0;
+    img.setAttribute('role','button');
+    img.setAttribute('aria-label','放大查看图片');
+    img.addEventListener('click',()=>openImagePreview(text,img.alt,img));
+    img.addEventListener('keydown',(event)=>{
+      if(!['Enter',' '].includes(event.key))return;
+      event.preventDefault();
+      openImagePreview(text,img.alt,img);
+    });
     el.appendChild(img);
-    el.appendChild(a);
   }else{
     const body=document.createElement('div');
     body.className='msgBody';
@@ -3730,11 +3835,10 @@ function updateNativeLiveDelta(runtime){
   if(!collectingTurnProcess)beginTurnProcessCollection();
   let live=nativeLiveItems.get(itemId);
   if(!live){
-    const role=runtime.role==='thinking'?'thinking':'assistant';
-    const element=addMsg(role,'',{streaming:true,kind:'live_progress'});
-    live={role,element,text:'',targetText:'',complete:false,renderTimer:null};
+    const element=addMsg('assistant','',{streaming:true,kind:'live_progress'});
+    live={role:'assistant',element,text:'',targetText:'',complete:false,renderTimer:null};
     nativeLiveItems.set(itemId,live);
-    statusEl.textContent=role==='thinking'?'Codex App · 正在思考':'Codex App · 正在回答';
+    statusEl.textContent='Codex App · 正在处理';
     statusEl.classList.add('running');
   }
   activateTurnProcessElement(live.element);
@@ -3763,22 +3867,11 @@ function pumpNativeLiveRender(live){
 }
 function renderNativeLiveItem(live){
   live.element.dataset.messageText=live.text;
-  if(live.role==='thinking'&&live.element.classList.contains('activityGroup')){
-    appendTurnThinking(live.text,{streaming:true});
-  }else if(live.element._messageBody){
-    renderAssistantMarkdown(live.element._messageBody,live.text);
-  }
-  if(live.role==='thinking'&&live.element._messageLabel&&!live.element.classList.contains('activityGroup')){
-    live.element._messageLabel.textContent=thinkingMessageTitle(live.text);
-    live.element._messageLabel.title=live.element._messageLabel.textContent;
-    live.element.open=true;
-  }
+  if(live.element._messageBody)renderAssistantMarkdown(live.element._messageBody,live.text);
   scrollChatToLatest();
 }
 function settleNativeLiveItem(live){
   live.element.classList.remove('streaming');
-  if(live.role==='thinking'&&live.element.classList.contains('activityGroup'))appendTurnThinking(live.text);
-  if(live.role==='thinking'&&!live.element.classList.contains('activityGroup'))live.element.open=false;
 }
 function finishNativeLiveItem(itemId){
   const live=nativeLiveItems.get(String(itemId||''));

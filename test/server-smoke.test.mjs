@@ -300,6 +300,10 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
+    assert.match(uiStyles, /\.msg\.assistant\s*\{[^}]*width:\s*min\(780px, 100%\)/s);
+    assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*100%/s);
+    assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
+    assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.settingsDialog/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
@@ -320,7 +324,9 @@ if (args[0] === 'app-server') {
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
-    assert.match(page, /activityGroup/);
+    assert.match(page, /activityBatch/);
+    assert.match(page, /上下文已自动压缩/);
+    assert.doesNotMatch(page, /function appendTurnThinking/);
     assert.match(page, /id="sidePanel"/);
     assert.match(page, /function syncMenuButton/);
     assert.match(page, /sideCollapsed/);
@@ -335,6 +341,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /function dispatchNextQueuedPrompt/);
     assert.match(page, /function formatMessageTime/);
     assert.match(page, /function enhanceSettingsModal/);
+    assert.match(page, /function openImagePreview/);
+    assert.doesNotMatch(page, /查看原图/);
     assert.match(page, /\/api\/password/);
     assert.match(page, /codexWeb\.promptQueue\.v1/);
     assert.match(page, /inputImage/);

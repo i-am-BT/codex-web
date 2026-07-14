@@ -1016,12 +1016,19 @@ body .msg.user {
 }
 
 body[data-theme] .msg.assistant {
+  width: min(780px, 100%);
+  max-width: min(780px, 100%);
   border: 0;
   border-radius: 0;
   background: transparent;
   padding: 2px 0;
   font-size: 14px;
   line-height: 1.68;
+}
+
+body .msg.assistant > .msgBody,
+body .msg.assistant > .msgActions {
+  width: 100%;
 }
 
 body[data-theme] .msg.image {
@@ -1038,7 +1045,13 @@ body[data-theme] .msg.image.inputImage {
 }
 
 .msg.image img {
+  cursor: zoom-in;
   border-radius: var(--radius-sm);
+}
+
+.msg.image img:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
 }
 
 .msg.image.inputImage img {
@@ -1046,6 +1059,60 @@ body[data-theme] .msg.image.inputImage {
   max-width: 100%;
   max-height: min(44vh, 420px);
   object-fit: contain;
+}
+
+.imagePreview {
+  position: fixed;
+  z-index: 120;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 10, 14, 0.9);
+  padding: max(18px, env(safe-area-inset-top, 0px)) max(18px, env(safe-area-inset-right, 0px)) max(18px, env(safe-area-inset-bottom, 0px)) max(18px, env(safe-area-inset-left, 0px));
+  backdrop-filter: blur(6px);
+}
+
+.imagePreviewDialog {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+}
+
+.imagePreviewImage {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: var(--radius-sm);
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.42);
+  object-fit: contain;
+}
+
+.imagePreviewClose {
+  position: fixed;
+  z-index: 1;
+  top: max(14px, env(safe-area-inset-top, 0px));
+  right: max(14px, env(safe-area-inset-right, 0px));
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: var(--radius-sm);
+  background: rgba(12, 15, 20, 0.76);
+  color: #ffffff;
+  padding: 0;
+  backdrop-filter: blur(10px);
+}
+
+.imagePreviewClose:hover {
+  border-color: rgba(255, 255, 255, 0.42);
+  background: rgba(28, 33, 42, 0.9);
+}
+
+.imagePreviewClose .lucide {
+  width: 18px;
+  height: 18px;
 }
 
 .msgActions {
@@ -1196,7 +1263,7 @@ body[data-theme] .requestDetail {
 }
 
 .memoryCitations {
-  width: min(680px, 100%);
+  width: 100%;
   margin-top: 12px;
   border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
   padding-top: 5px;
@@ -1533,16 +1600,14 @@ body .completionSummary {
   margin-bottom: 10px;
   overflow: auto;
   overscroll-behavior: contain;
-  border-left: 1px solid var(--border);
-  color: var(--text-subtle);
-  padding: 3px 0 3px 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 10px;
+  color: var(--text);
+  padding: 5px 0 7px;
+  font-size: 13px;
 }
 
 .completionTimeline {
   display: grid;
-  gap: 5px;
+  gap: 12px;
 }
 
 .completionTimeline > .msg {
@@ -1552,17 +1617,18 @@ body .completionSummary {
 }
 
 body[data-theme] .completionTimeline > .msg.assistant {
-  color: var(--text-muted);
-  padding: 5px 2px;
-  font-size: 11px;
-  line-height: 1.55;
+  color: var(--text);
+  padding: 1px 0;
+  font-size: 13px;
+  line-height: 1.7;
 }
 
-.completionTimeline .msgActions {
-  margin-top: 3px;
+.progressCommentary .msgActions,
+.completionTimeline .progressCommentary .msgActions {
+  display: none;
 }
 
-body[data-theme] .activityGroup {
+body[data-theme] .activityBatch {
   width: min(780px, 100%);
   max-width: min(780px, 100%);
   border: 0;
@@ -1574,50 +1640,15 @@ body[data-theme] .activityGroup {
   font-size: 12px;
 }
 
-.activityGroup > summary::marker,
-.activityGroup > summary::-webkit-details-marker,
 .activityItem > summary::marker,
 .activityItem > summary::-webkit-details-marker {
   display: none;
   content: "";
 }
 
-.activityGroupSummary {
-  display: flex;
-  min-height: 28px;
-  align-items: center;
-  gap: 5px;
-  cursor: pointer;
-  color: var(--text-muted);
-  list-style: none;
-}
-
-.activityGroupChevron {
-  width: 13px;
-  height: 13px;
-  flex: 0 0 13px;
-  transition: transform 160ms var(--ease);
-}
-
-.activityGroup[open] > .activityGroupSummary .activityGroupChevron {
-  transform: rotate(90deg);
-}
-
-.activityGroupLabel {
-  min-width: 0;
-  overflow: hidden;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.activityList {
+.activityBatch {
   display: grid;
-  max-height: min(42vh, 360px);
-  gap: 1px;
-  overflow: auto;
-  overscroll-behavior: contain;
-  padding: 2px 0 4px 18px;
+  gap: 3px;
 }
 
 .activityItem {
@@ -1625,42 +1656,30 @@ body[data-theme] .activityGroup {
   color: var(--text-muted);
 }
 
-.activityThinking {
-  display: grid;
-  min-height: 25px;
-  grid-template-columns: 16px minmax(0, 1fr);
-  align-items: center;
-  gap: 5px;
-  color: var(--text-subtle);
-}
-
-.activityThinking.streaming {
-  color: var(--thinking);
-}
-
-.activityThinkingText {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.activityThinking.streaming .thinkingIcon {
-  animation: streamDot 1s ease-in-out infinite;
-}
-
 .activityItemSummary {
   display: grid;
-  min-height: 25px;
+  min-height: 27px;
   grid-template-columns: 16px auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   cursor: pointer;
   list-style: none;
 }
 
+.activityItemSummary.standalone {
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+}
+
+.activityItem.static .activityItemSummary {
+  cursor: default;
+}
+
 .activityItemSummary:hover {
   color: var(--text);
+}
+
+.activityItem.static .activityItemSummary:hover {
+  color: var(--text-muted);
 }
 
 .activityItemIcon {
@@ -1685,10 +1704,13 @@ body[data-theme] .activityGroup {
   min-width: 0;
   overflow: hidden;
   color: var(--text-muted);
-  text-decoration: underline dotted color-mix(in srgb, var(--text-muted) 58%, transparent);
-  text-underline-offset: 3px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.activityItem:not(.static) .activityTarget {
+  text-decoration: underline dotted color-mix(in srgb, var(--text-muted) 58%, transparent);
+  text-underline-offset: 3px;
 }
 
 .activityMeta {
@@ -1722,11 +1744,6 @@ body[data-theme] .activityGroup {
   position: absolute;
   top: 3px;
   right: 2px;
-}
-
-.activityGroup.streaming .activityGroupLabel::after {
-  color: var(--thinking);
-  content: " · 实时生成";
 }
 
 body[data-theme] .msg.tool,
