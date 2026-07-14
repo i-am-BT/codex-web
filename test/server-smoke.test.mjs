@@ -300,7 +300,11 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
-    assert.match(uiStyles, /\.msg\.assistant\s*\{[^}]*width:\s*min\(780px, 100%\)/s);
+    assert.match(uiStyles, /--conversation-width:\s*780px/);
+    assert.match(uiStyles, /\.msg\.assistant\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\)/s);
+    assert.match(uiStyles, /\.chat\s*\{[^}]*calc\(\(100% - var\(--conversation-width\)\) \/ 2\)/s);
+    assert.match(uiStyles, /\.composer\s*\{[^}]*calc\(\(100% - var\(--conversation-width\)\) \/ 2\)/s);
+    assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);

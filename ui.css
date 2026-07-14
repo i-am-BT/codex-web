@@ -27,6 +27,7 @@
   --code-bg: #080a0d;
   --sidebar-width: 316px;
   --header-height: 60px;
+  --conversation-width: 780px;
   --radius: 8px;
   --radius-sm: 6px;
   --shadow-lg: 0 22px 70px rgba(0, 0, 0, 0.34);
@@ -970,7 +971,7 @@ body .chat {
   min-height: 0;
   gap: 13px;
   background: var(--canvas);
-  padding: 22px clamp(22px, 4vw, 50px) 30px;
+  padding: 22px max(13px, calc((100% - var(--conversation-width)) / 2)) 30px;
   scroll-padding-block: 24px;
 }
 
@@ -995,7 +996,7 @@ body .empty span {
 }
 
 body .msg {
-  max-width: min(780px, calc(100% - 32px));
+  max-width: min(var(--conversation-width), calc(100% - 32px));
   border-radius: var(--radius);
   color: var(--text);
   font-size: 13.5px;
@@ -1016,8 +1017,8 @@ body .msg.user {
 }
 
 body[data-theme] .msg.assistant {
-  width: min(780px, 100%);
-  max-width: min(780px, 100%);
+  width: min(var(--conversation-width), 100%);
+  max-width: min(var(--conversation-width), 100%);
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -1903,12 +1904,12 @@ body .composer {
   flex: 0 0 auto;
   border-top: 0;
   background: var(--surface);
-  padding: 10px clamp(14px, 3vw, 34px) 14px;
+  padding: 10px max(13px, calc((100% - var(--conversation-width)) / 2)) 14px;
 }
 
 .composer > * {
-  width: min(920px, 100%);
-  margin-inline: auto;
+  width: 100%;
+  margin-inline: 0;
 }
 
 body .nativeNotice {
@@ -2604,7 +2605,7 @@ body[data-chat-bg="custom"] .chat {
   }
 
   body .composer {
-    padding: 9px 10px calc(env(safe-area-inset-bottom, 0px) + 10px);
+    padding: 9px 13px calc(env(safe-area-inset-bottom, 0px) + 10px);
   }
 
   body .nativeNotice {
