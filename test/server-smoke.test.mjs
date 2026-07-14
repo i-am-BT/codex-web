@@ -307,6 +307,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
+    assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
     assert.match(uiStyles, /\.settingsDialog/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
@@ -329,6 +330,9 @@ if (args[0] === 'app-server') {
     assert.match(page, /function toolActivityPresentations/);
     assert.match(page, /activityBatch/);
     assert.match(page, /liveProcessPanel/);
+    assert.match(page, /function appendInputImageToUser/);
+    assert.match(page, /latestUserElement/);
+    assert.match(page, /addMsg\('image',attachment\.url,\{kind:'input_image'\}\)/);
     assert.match(page, /function runningActivityVerb/);
     assert.match(page, /turnProcessAutoFollow/);
     assert.match(page, /上下文已自动压缩/);

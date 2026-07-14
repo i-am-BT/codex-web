@@ -2173,6 +2173,7 @@ let nativeLiveItems = new Map();
 let latestToolElement = null;
 let latestAssistantElement = null;
 let latestFinalAssistantElement = null;
+let latestUserElement = null;
 let turnProcessElements = [];
 let visibleTurnProcessElement = null;
 let collectingTurnProcess = false;
@@ -2435,7 +2436,7 @@ function showNativePromptOptimistically(item){
   clearNativeOptimisticElements();
   nativeOptimisticElements.push(addMsg('user',item.message||'请分析上传的附件。'));
   for(const attachment of item.attachments||[]){
-    if(attachment.kind==='image')nativeOptimisticElements.push(addMsg('image',attachment.url));
+    if(attachment.kind==='image')nativeOptimisticElements.push(addMsg('image',attachment.url,{kind:'input_image'}));
     else nativeOptimisticElements.push(addMsg('log','已上传文件: '+(attachment.name||'attachment')+'\\n'+attachment.filePath));
   }
   nativeRunningElement=addMsg('assistant','');
@@ -3146,7 +3147,7 @@ function applyConversationMode(){
   syncComposerChrome();
   renderPromptQueue();
 }
-function newChat(){closeComposerPopovers();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
+function newChat(){closeComposerPopovers();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
 async function loadConversation(id,source='web'){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return}
@@ -3157,6 +3158,7 @@ async function loadConversation(id,source='web'){
   latestToolElement=null;
   latestAssistantElement=null;
   latestFinalAssistantElement=null;
+  latestUserElement=null;
   resetTurnProcessCollection();
   currentConversationId=id;
   currentConversationSource=source==='codex'?'codex':'web';
@@ -3785,8 +3787,37 @@ function createCompletionMessage(text,processElements=[]){
   el.appendChild(content);
   return el;
 }
+function appendInputImageToUser(userElement,source,at){
+  if(!userElement||userElement.parentNode!==chat||!userElement._messageBody)return null;
+  const userAt=String(userElement.dataset.messageAt||'');
+  const imageAt=String(at||'');
+  if(userAt&&imageAt&&userAt!==imageAt)return null;
+  let stack=userElement.querySelector(':scope > .userAttachmentStack');
+  if(!stack){
+    stack=document.createElement('div');
+    stack.className='userAttachmentStack';
+    userElement.insertBefore(stack,userElement._messageBody);
+  }
+  const item=document.createElement('button');
+  item.type='button';
+  item.className='userAttachment';
+  item.title='放大查看图片';
+  item.setAttribute('aria-label','放大查看图片');
+  const img=document.createElement('img');
+  img.src=source;
+  img.alt='用户上传的图片';
+  img.loading='lazy';
+  img.decoding='async';
+  item.appendChild(img);
+  item.addEventListener('click',()=>openImagePreview(source,img.alt,item));
+  stack.appendChild(item);
+  userElement.classList.add('hasInputImage');
+  return item;
+}
 function addMsg(role,text,options={}){
   const kind=String(options.kind||'');
+  const inputImage=role==='image'&&kind==='input_image';
+  if(role!=='user'&&!inputImage)latestUserElement=null;
   if(role==='thinking')return null;
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
     settleTurnTool(latestToolElement);
@@ -3829,6 +3860,14 @@ function addMsg(role,text,options={}){
     if(options.autoScroll!==false)scrollChatToLatest();
     return activity;
   }
+  if(inputImage){
+    const attachment=appendInputImageToUser(latestUserElement,text,options.at);
+    if(attachment){
+      if(options.autoScroll!==false)scrollChatToLatest();
+      return attachment;
+    }
+    latestUserElement=null;
+  }
   const collapsible=role==='tool'||role==='thinking'||role==='context';
   const el=document.createElement(collapsible?'details':'div');
   el.className='msg '+role+(collapsible?' toolDetails':'')+(options.streaming?' streaming':'');
@@ -3836,6 +3875,7 @@ function addMsg(role,text,options={}){
   if(role==='image'&&kind==='input_image')el.classList.add('inputImage');
   el.dataset.messageText=String(text||'');
   el.dataset.messageKind=kind;
+  el.dataset.messageAt=String(options.at||'');
   if(options.streaming&&collapsible)el.open=true;
   if(role==='image'){
     const img=document.createElement('img');
@@ -3931,6 +3971,7 @@ function addMsg(role,text,options={}){
     latestAssistantElement=el;
     if(kind==='final_answer')latestFinalAssistantElement=el;
   }
+  if(role==='user')latestUserElement=el;
   if(options.autoScroll!==false)scrollChatToLatest();
   return el;
 }
