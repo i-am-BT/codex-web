@@ -1016,8 +1016,8 @@ body .msg.user {
 }
 
 body[data-theme] .msg.assistant {
-  width: min(780px, 100%);
-  max-width: min(780px, 100%);
+  width: 100%;
+  max-width: 100%;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -1029,6 +1029,10 @@ body[data-theme] .msg.assistant {
 body .msg.assistant > .msgBody,
 body .msg.assistant > .msgActions {
   width: 100%;
+}
+
+body .msg.assistant > .msgBody > :not(.memoryCitations) {
+  max-width: min(780px, 100%);
 }
 
 body[data-theme] .msg.image {
