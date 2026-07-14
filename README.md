@@ -66,6 +66,8 @@ cp .env.example .env
 | `CODEX_WEB_PASSWORD` | Web 登录密码，必填 |
 | `SESSION_SECRET` | 登录会话签名密钥，建议设置为稳定的随机字符串 |
 | `SESSION_TTL_HOURS` | 登录有效期，默认 168 小时 |
+| `HOMEPAGE_API_TOKEN` | Homepage 统计接口访问令牌；未设置时接口禁用 |
+| `HOMEPAGE_MODEL_CACHE_SECONDS` | Homepage 模型数量缓存秒数，默认 60 |
 | `HOST` | 监听地址，默认 `127.0.0.1` |
 | `PORT` | 固定监听端口，示例为 `36354` |
 | `CODEX_BIN` | Codex CLI 路径；初始化脚本会优先发现 ChatGPT/Codex App 内置版本 |
@@ -126,7 +128,7 @@ rg '"type":"turn_context"' "$latest" | tail -1
 
 ## Homepage 小组件
 
-设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Web 会话数、服务商数、默认服务商模型数和运行中任务数。请求必须携带 `X-API-Token` 请求头：
+设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Codex App 原生会话数、服务商数、默认服务商模型数和运行中任务数。请求必须携带 `X-API-Token` 请求头：
 
 ```bash
 curl -H "X-API-Token: $HOMEPAGE_API_TOKEN" http://localhost:36354/api/homepage/stats

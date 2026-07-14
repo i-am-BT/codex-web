@@ -57,6 +57,9 @@ const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAG
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
 const NATIVE_SESSION_POLL_MS = Number(process.env.NATIVE_SESSION_POLL_MS || 3000);
 const APP_SERVER_REQUEST_TIMEOUT_MS = Number(process.env.APP_SERVER_REQUEST_TIMEOUT_MS || 30000);
+const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
+const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
+const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
 const NATIVE_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 if (!PASSWORD) {
@@ -120,19 +123,25 @@ app.get('/api/homepage/stats', requireHomepageToken, async (req, res) => {
   try {
     const providers = readProviderDetails();
     const provider = providers.find((item) => item.name === DEFAULT_PROVIDER) || providers[0];
+    const nativeSessionList = nativeSessionSummaries();
     let models = 0;
     if (provider) {
       const now = Date.now();
       if (homepageModelCache.provider === provider.name && homepageModelCache.expiresAt > now) {
         models = homepageModelCache.count;
       } else {
-        const apiKey = process.env[provider.envKey] || readEnvVar(CODEX_ENV_FILE, provider.envKey);
+        const apiKey = providerCredential(provider);
         models = (await fetchModels(provider.baseUrl, apiKey)).length;
         homepageModelCache = { provider: provider.name, count: models, expiresAt: now + HOMEPAGE_MODEL_CACHE_MS };
       }
     }
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ conversations: conversations.length, providers: providers.length, models, running: activeProcess ? 1 : 0 });
+    res.json({
+      conversations: nativeSessionList.length,
+      providers: providers.length,
+      models,
+      running: nativeSessionList.filter((session) => session.status === 'running').length + (activeProcess ? 1 : 0),
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -757,6 +766,13 @@ function shutdown(signal) {
 function requireAuth(req, res, next) {
   if (validateSession(req)) return next();
   res.status(401).json({ error: '未登录' });
+}
+
+function requireHomepageToken(req, res, next) {
+  if (!HOMEPAGE_API_TOKEN) return res.status(503).json({ error: 'Homepage API 未配置' });
+  const token = String(req.get('X-API-Token') || '');
+  if (!safeEqual(token, HOMEPAGE_API_TOKEN)) return res.status(401).json({ error: '无效的 API Token' });
+  next();
 }
 
 function requireConfigWrite(req, res, next) {
@@ -2354,7 +2370,7 @@ dropZone?.addEventListener('paste',handleAttachmentPaste);
 input?.addEventListener('paste',handleAttachmentPaste);
 cancelBtn?.addEventListener('click', cancelRun);
 nativeRequestForm?.addEventListener('submit',(e)=>e.preventDefault());
-if (${authenticated ? 'true' : 'false'}) boot();
+if (${authenticated ? 'true' : 'false'}) boot(true);
 async function toggleTheme(){const next=appearance.theme==='dark'?'light':'dark';await saveAppearance({theme:next})}
 function applyAppearance(){const theme=appearance.theme==='dark'?'dark':'light';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const bg=custom?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.chatBg=bg;document.body.style.setProperty('--custom-chat-bg',custom?'url("'+custom.url+'")':'none');if(themeToggle){setIconLabel(themeToggle,theme==='dark'?'sun':'moon','',false);themeToggle.title=theme==='dark'?'切换明亮模式':'切换黑暗模式';themeToggle.setAttribute('aria-label',themeToggle.title)}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
 async function saveAppearance(patch){const res=await fetch('/api/appearance',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'外观保存失败';applyAppearance();return null}appearance=data.appearance;applyAppearance();return appearance}
@@ -2365,7 +2381,7 @@ function updateDeleteBackgroundButton(selected){if(!deleteBackground)return;dele
 async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
-async function boot(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();cwd.value=data.defaults.cwd;sandbox.value=data.defaults.sandbox;approval.value=data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model)}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();cwd.value=data.defaults.cwd;sandbox.value=data.defaults.sandbox;approval.value=data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
 async function refreshHistory(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
 async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
 async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}

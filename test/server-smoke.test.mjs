@@ -273,6 +273,9 @@ if (args[0] === 'app-server') {
     assert.equal(health.status, 200);
     assert.equal((await health.json()).ok, true);
 
+    const homepageDisabled = await fetch(`${baseUrl}/api/homepage/stats`);
+    assert.equal(homepageDisabled.status, 503);
+
     const markedAsset = await fetch(`${baseUrl}/vendor/marked.js`);
     assert.equal(markedAsset.status, 200);
     assert.match(await markedAsset.text(), /marked v18/);
@@ -319,6 +322,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /function renderMemoryCitations/);
     assert.match(page, /function enhanceComposer/);
     assert.match(page, /inputImage/);
+    assert.match(page, /boot\(true\)/);
+    assert.match(page, /async function boot\(selectRecent=false\)/);
     const inlineScript = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert.ok(inlineScript);
     assert.doesNotThrow(() => new Function(inlineScript));
