@@ -1,4 +1,4 @@
-# Example Codex config for /root/.codex/config.toml.
+# Example Codex config for $CODEX_HOME/config.toml.
 # Replace provider names, base_url values, env_key values, and models for your setup.
 
 model_provider = "openai"
@@ -26,8 +26,5 @@ requires_openai_auth = false
 [projects."/"]
 trust_level = "trusted"
 
-[projects."/opt/codex-web"]
-trust_level = "trusted"
-
-[projects."/root"]
+[projects."/absolute/path/to/codex-web"]
 trust_level = "trusted"
