@@ -27,7 +27,6 @@
   --code-bg: #080a0d;
   --sidebar-width: 316px;
   --header-height: 60px;
-  --conversation-width: 780px;
   --radius: 8px;
   --radius-sm: 6px;
   --shadow-lg: 0 22px 70px rgba(0, 0, 0, 0.34);
@@ -971,7 +970,7 @@ body .chat {
   min-height: 0;
   gap: 13px;
   background: var(--canvas);
-  padding: 22px max(13px, calc((100% - var(--conversation-width)) / 2)) 30px;
+  padding: 22px clamp(22px, 4vw, 50px) 30px;
   scroll-padding-block: 24px;
 }
 
@@ -996,7 +995,7 @@ body .empty span {
 }
 
 body .msg {
-  max-width: min(var(--conversation-width), calc(100% - 32px));
+  max-width: min(780px, calc(100% - 32px));
   border-radius: var(--radius);
   color: var(--text);
   font-size: 13.5px;
@@ -1017,8 +1016,8 @@ body .msg.user {
 }
 
 body[data-theme] .msg.assistant {
-  width: min(var(--conversation-width), 100%);
-  max-width: min(var(--conversation-width), 100%);
+  width: min(780px, 100%);
+  max-width: min(780px, 100%);
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -1563,20 +1562,21 @@ body .completionSummary {
   width: min(780px, 100%);
   max-width: min(780px, 100%);
   margin: 0 0 4px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 0;
   padding: 0;
 }
 
 .completionSummary > summary {
   display: flex;
-  min-height: 34px;
-  width: max-content;
+  min-height: 40px;
+  width: 100%;
   align-items: center;
   gap: 5px;
+  border-bottom: 1px solid var(--border);
   cursor: pointer;
   color: var(--text-muted);
-  padding: 0 0 9px;
-  font-size: 12px;
+  padding: 0 0 11px;
+  font-size: 14px;
   list-style: none;
 }
 
@@ -1597,18 +1597,22 @@ body .completionSummary {
 }
 
 .completionContent {
-  max-height: min(56vh, 560px);
+  max-height: min(64vh, 680px);
   margin-bottom: 10px;
   overflow: auto;
   overscroll-behavior: contain;
   color: var(--text);
-  padding: 5px 0 7px;
-  font-size: 13px;
+  padding: 17px 0 8px;
+  font-size: 14px;
 }
 
 .completionTimeline {
   display: grid;
-  gap: 12px;
+  gap: 15px;
+}
+
+.completionTimeline > .activityBatch + .activityBatch {
+  margin-top: -10px;
 }
 
 .completionTimeline > .msg {
@@ -1620,8 +1624,8 @@ body .completionSummary {
 body[data-theme] .completionTimeline > .msg.assistant {
   color: var(--text);
   padding: 1px 0;
-  font-size: 13px;
-  line-height: 1.7;
+  font-size: 14px;
+  line-height: 1.68;
 }
 
 .progressCommentary .msgActions,
@@ -1638,7 +1642,16 @@ body[data-theme] .activityBatch {
   color: var(--text-muted);
   padding: 0;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 12px;
+  font-size: 13px;
+}
+
+.liveProcessPanel {
+  margin-bottom: 0;
+}
+
+.liveProcessPanel .completionContent {
+  margin-bottom: 0;
+  padding-bottom: 10px;
 }
 
 .activityItem > summary::marker,
@@ -1659,16 +1672,16 @@ body[data-theme] .activityBatch {
 
 .activityItemSummary {
   display: grid;
-  min-height: 27px;
-  grid-template-columns: 16px auto minmax(0, 1fr) auto;
+  min-height: 28px;
+  grid-template-columns: 18px auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   cursor: pointer;
   list-style: none;
 }
 
 .activityItemSummary.standalone {
-  grid-template-columns: 16px minmax(0, 1fr) auto;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
 }
 
 .activityItem.static .activityItemSummary {
@@ -1685,15 +1698,15 @@ body[data-theme] .activityBatch {
 
 .activityItemIcon {
   display: grid;
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   place-items: center;
   color: var(--text-subtle);
 }
 
 .activityItemIcon .lucide {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
 }
 
 .activityVerb {
@@ -1712,6 +1725,11 @@ body[data-theme] .activityBatch {
 .activityItem:not(.static) .activityTarget {
   text-decoration: underline dotted color-mix(in srgb, var(--text-muted) 58%, transparent);
   text-underline-offset: 3px;
+}
+
+.activityBatch.streaming .activityItem:last-child .activityItemIcon {
+  color: var(--text-muted);
+  animation: streamDot 1.1s ease-in-out infinite;
 }
 
 .activityMeta {
@@ -1904,12 +1922,12 @@ body .composer {
   flex: 0 0 auto;
   border-top: 0;
   background: var(--surface);
-  padding: 10px max(13px, calc((100% - var(--conversation-width)) / 2)) 14px;
+  padding: 10px clamp(14px, 3vw, 34px) 14px;
 }
 
 .composer > * {
-  width: 100%;
-  margin-inline: 0;
+  width: min(920px, 100%);
+  margin-inline: auto;
 }
 
 body .nativeNotice {
@@ -2605,7 +2623,7 @@ body[data-chat-bg="custom"] .chat {
   }
 
   body .composer {
-    padding: 9px 13px calc(env(safe-area-inset-bottom, 0px) + 10px);
+    padding: 9px 10px calc(env(safe-area-inset-bottom, 0px) + 10px);
   }
 
   body .nativeNotice {
