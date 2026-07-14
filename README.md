@@ -1,6 +1,6 @@
 # Codex Web
 
-一个轻量级的 Codex Web 界面，用来在浏览器中运行和管理 Codex CLI 任务与会话。
+一个轻量级的 Codex Web 界面，用来在浏览器中直接运行和管理 Codex App 原生任务与会话。
 
 ## 安全提醒
 
@@ -8,37 +8,43 @@
 
 ## 功能
 
-- 在浏览器里创建、切换和继续 Codex 会话
-- 支持会话改名、删除和历史记录管理
-- 支持流式显示助手回复
+- 在浏览器里创建、切换和继续 Codex App 原生会话
+- 通过持久 `codex app-server` 实现 Web 与 Codex App 双向同步
+- 只显示 Codex App 中未归档的普通用户会话，不显示自动化任务
+- 最近会话按工作目录分组，显示项目名与完整路径
+- 支持会话改名、归档和历史记录管理
+- 支持流式显示助手回复与思考摘要；历史思考和工具调用默认折叠
+- 每轮只保留最新一次工具调用，助手输出支持安全 Markdown
+- 支持取消任务以及命令、文件、权限、用户输入和 MCP 请求确认
 - 浏览器断开后，已启动的任务会继续在服务端运行
 - 支持上传图片、PDF、文本和代码附件
 - 支持管理模型服务商和默认模型
 - 支持为已有服务商重新获取最新模型列表
 - 支持选择并保存模型思考档位：默认、low、medium、high、xhigh
 - 支持删除服务商，且会防止删除最后一个服务商
-- 支持回退并重新编辑用户消息：删除该消息及后续回答，并将原消息恢复到输入框
-- 如果任务因异常、配置、网络或其他原因执行失败，允许回退到之前的消息后重新执行
 - 支持界面外观设置和自定义聊天背景
 - 提供健康检查接口：`/api/health`
 
 ## 环境要求
 
-- Node.js 18 或更高版本
+- Node.js 22.5 或更高版本（原生会话索引依赖 `node:sqlite`）
 - npm
-- 本机已安装并配置可用的 Codex CLI
+- 运行主机已安装并配置可用的 Codex CLI
 
 ## 安装
 
 ```bash
 npm install
+npm run setup
 ```
+
+`npm run setup` 会生成仅监听 `127.0.0.1` 的 `.env`，自动发现 Codex CLI，并创建随机登录密码和会话密钥。也可以跳过该命令，手动复制并编辑 `.env.example`。
 
 ## 配置
 
-项目会从项目目录的 `.env` 和本机 Codex 配置文件读取运行配置。
+项目会从项目目录的 `.env` 和 `CODEX_HOME` 下的 Codex 配置文件读取运行配置。
 
-复制示例文件后再填写本机配置：
+手动配置时，复制示例文件后再填写当前主机的配置：
 
 ```bash
 cp .env.example .env
@@ -48,10 +54,10 @@ cp .env.example .env
 
 如果是新设备首次运行，还需要准备 Codex 配置：
 
-- `/root/.codex/.env`：保存服务商 API Key，可参考 `codex.env.example`
-- `/root/.codex/config.toml`：保存服务商和模型配置，可参考 `codex.config.example.toml`
+- `${CODEX_HOME:-$HOME/.codex}/.env`：保存服务商 API Key，可参考 `codex.env.example`
+- `${CODEX_HOME:-$HOME/.codex}/config.toml`：保存服务商和模型配置，可参考 `codex.config.example.toml`
 
-也可以先启动 Web 界面，再通过“服务商管理”添加服务商和 API Key。
+默认以只读方式使用主机 Codex 配置。只有显式设置 `CODEX_CONFIG_WRITABLE=true` 后，Web 中的服务商管理和默认设置写入功能才会显示。
 
 主要环境变量：
 
@@ -60,10 +66,12 @@ cp .env.example .env
 | `CODEX_WEB_PASSWORD` | Web 登录密码，必填 |
 | `SESSION_SECRET` | 登录会话签名密钥，建议设置为稳定的随机字符串 |
 | `SESSION_TTL_HOURS` | 登录有效期，默认 168 小时 |
-| `HOMEPAGE_API_TOKEN` | Homepage 统计接口访问令牌；未设置时接口禁用 |
-| `HOMEPAGE_MODEL_CACHE_SECONDS` | Homepage 模型数量缓存秒数，默认 60 |
-| `HOST` | 监听地址，默认 `0.0.0.0` |
+| `HOST` | 监听地址，默认 `127.0.0.1` |
 | `PORT` | 固定监听端口，示例为 `36354` |
+| `CODEX_BIN` | Codex CLI 路径；初始化脚本会优先发现 ChatGPT/Codex App 内置版本 |
+| `CODEX_HOME` | Codex 配置、索引和原生会话目录，默认 `$HOME/.codex` |
+| `APP_SERVER_REQUEST_TIMEOUT_MS` | `codex app-server` 单次协议请求超时，默认 30000 毫秒 |
+| `NATIVE_SESSION_POLL_MS` | 原生会话文件监听的轮询兜底间隔 |
 | `DEFAULT_PROVIDER` | 新会话默认服务商 |
 | `DEFAULT_MODEL` | 新会话默认模型 |
 | `DEFAULT_CWD` | 新会话默认工作目录 |
@@ -88,7 +96,7 @@ http://localhost:36354
 
 ## 模型与服务商
 
-服务商配置保存在本机 Codex 配置中，API Key 保存在 `/root/.codex/.env`。Web 不会在仓库中保存真实密钥。
+服务商配置保存在 `CODEX_HOME` 中，API Key 默认保存在 `$CODEX_HOME/.env`。Web 不会在仓库中保存真实密钥。
 
 更新已有服务商的模型列表：
 
@@ -102,15 +110,15 @@ http://localhost:36354
 
 思考档位：
 
-1. 在设置中的 Reasoning 选择 `默认`、`low`、`medium`、`high` 或 `xhigh`。
-2. 当前选择会随每次 Web 任务显式传给 Codex CLI。
+1. 在设置中的 Reasoning 选择 `默认`、`low`、`medium`、`high`、`xhigh` 或 `max`。
+2. 当前选择会随每次 Web 任务显式传给 Codex App。
 3. 点击“设为默认模型”时，服务商、模型和思考档位会一起保存到本机 Codex 配置。
 4. 选择“默认”表示不覆盖档位，由模型或上游决定默认行为。
 
 任务开始信息会显示实际传入的 `reasoning` 值。还可以在任务完成后检查最新 Codex 原生会话中的 `turn_context`：
 
 ```bash
-latest=$(find /root/.codex/sessions -type f -name '*.jsonl' | sort | tail -1)
+latest=$(find "${CODEX_HOME:-$HOME/.codex}/sessions" -type f -name '*.jsonl' | sort | tail -1)
 rg '"type":"turn_context"' "$latest" | tail -1
 ```
 
@@ -155,14 +163,18 @@ Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
 
 ## 会话说明
 
-- Web 会话历史由项目自行保存，并不等同于 Codex App/CLI 的原生会话恢复。
-- 点击用户消息旁的回退按钮，会删除该消息及其后的所有消息，并把原消息恢复到输入框。
+- Web 新建和续聊都直接使用 Codex App 原生线程，不再创建独立的 Web 会话。
+- 最近会话来自 Codex App 本机索引，只显示未归档的普通用户线程；归档线程、自动化任务和子代理线程不会显示。
+- 新建、续聊、取消、改名、归档与审批通过持久 `codex app-server --stdio` 写回同一原生线程。
+- 消息历史直接读取 `CODEX_HOME/session_index.jsonl`、`CODEX_HOME/state_5.sqlite` 与 `CODEX_HOME/sessions/`，通过文件监听和轮询兜底增量刷新。
+- 旧版 `runtime/conversations.json` 仅保留兼容读取，不再显示在最近会话中。
 - 浏览器关闭或 SSE 连接中断后，已经启动的 Codex 任务仍会在服务端继续运行；重新打开对应会话可查看结果。
 - 同一时间运行任务时，部分会话编辑操作会被暂时禁止，以避免破坏执行中的数据。
 
 ## 数据存储
 
-- 会话历史保存在 `runtime/conversations.json`
+- Codex App 原生会话保存在 `CODEX_HOME/state_5.sqlite`、`CODEX_HOME/session_index.jsonl` 与 `CODEX_HOME/sessions/`
+- 旧版 Web 会话可能仍保存在 `runtime/conversations.json`，仅作兼容数据保留
 - 上传附件保存在 `runtime/uploads/`
 - 外观设置和自定义背景保存在 `runtime/` 下
 - 服务运行日志和临时文件也应保留在本地
