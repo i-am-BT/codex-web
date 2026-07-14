@@ -1558,9 +1558,9 @@ body[data-theme] .msg.process {
   font-size: 11px;
 }
 
-body .completionSummary {
-  width: min(780px, 100%);
-  max-width: min(780px, 100%);
+body .msg.process.completionSummary {
+  width: 100%;
+  max-width: 100%;
   margin: 0 0 4px;
   border-bottom: 0;
   padding: 0;
