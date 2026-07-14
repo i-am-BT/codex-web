@@ -3299,7 +3299,7 @@ function memoryCitationSource(file){
 function renderMemoryCitations(body,citations){
   const group=document.createElement('details');
   group.className='memoryCitations';
-  group.open=citations.length<=3;
+  group.open=false;
   group.setAttribute('aria-label',citations.length+' 条记忆引用');
   const summary=document.createElement('summary');
   summary.className='memoryCitationsSummary';

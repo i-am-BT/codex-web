@@ -328,6 +328,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /codexWeb\.historyProjectsCollapsed/);
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);
+    assert.match(page, /group\.open=false/);
     assert.match(page, /function enhanceComposer/);
     assert.match(page, /function enqueuePrompt/);
     assert.match(page, /function steerQueuedPrompt/);
