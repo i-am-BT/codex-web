@@ -16,6 +16,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const fakeCodex = path.join(temporary, 'fake-codex.mjs');
   const traceFile = path.join(temporary, 'codex-trace.json');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
+  const webEnv = path.join(temporary, 'web.env');
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
   const createdNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa799';
   const archivedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa730';
@@ -245,6 +246,9 @@ if (args[0] === 'app-server') {
           });
         }
       }
+      else if (message.method === 'turn/steer') {
+        send({ id: message.id, result: { turnId: message.params.expectedTurnId } });
+      }
       else if (['thread/name/set', 'thread/archive', 'turn/interrupt'].includes(message.method)) {
         send({ id: message.id, result: {} });
       }
@@ -293,6 +297,10 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.memoryCitationItem\[open\]/);
     assert.match(uiStyles, /\.composerModelToggle/);
     assert.match(uiStyles, /\.composerPermissionToggle/);
+    assert.match(uiStyles, /\.promptQueueRow/);
+    assert.match(uiStyles, /\.box\.runActive/);
+    assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
+    assert.match(uiStyles, /\.settingsDialog/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
     assert.equal(unauthorized.status, 401);
@@ -321,6 +329,13 @@ if (args[0] === 'app-server') {
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);
     assert.match(page, /function enhanceComposer/);
+    assert.match(page, /function enqueuePrompt/);
+    assert.match(page, /function steerQueuedPrompt/);
+    assert.match(page, /function dispatchNextQueuedPrompt/);
+    assert.match(page, /function formatMessageTime/);
+    assert.match(page, /function enhanceSettingsModal/);
+    assert.match(page, /\/api\/password/);
+    assert.match(page, /codexWeb\.promptQueue\.v1/);
     assert.match(page, /inputImage/);
     assert.match(page, /boot\(true\)/);
     assert.match(page, /async function boot\(selectRecent=false\)/);
@@ -513,6 +528,18 @@ if (args[0] === 'app-server') {
       }),
     });
     assert.equal(continued.status, 202);
+    const continuedPayload = await continued.json();
+
+    const steered = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'change direction while running',
+        turnId: continuedPayload.turnId,
+      }),
+    });
+    assert.equal(steered.status, 202);
+    assert.equal((await steered.json()).turnId, continuedPayload.turnId);
 
     const pendingRequest = await waitForPendingRequest(baseUrl, cookie);
     assert.equal(pendingRequest.method, 'item/commandExecution/requestApproval');
@@ -533,16 +560,67 @@ if (args[0] === 'app-server') {
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/resume'));
     assert.ok(protocolMessages.some((message) => message.method === 'turn/start'));
+    const steerMessage = protocolMessages.find((message) => message.method === 'turn/steer');
+    assert.equal(steerMessage.params.expectedTurnId, continuedPayload.turnId);
+    assert.deepEqual(steerMessage.params.input, [{ type: 'text', text: 'change direction while running' }]);
     assert.ok(protocolMessages.some((message) => message.method === 'turn/interrupt'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/name/set'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/archive'));
     assert.ok(protocolMessages.some((message) => message.id === 'approval-1' && message.result?.decision === 'accept'));
 
+    const secondLogin = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'test-password' }),
+    });
+    assert.equal(secondLogin.status, 200);
+    const secondCookie = secondLogin.headers.get('set-cookie').split(';', 1)[0];
+
+    const wrongCurrentPassword = await fetch(`${baseUrl}/api/password`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        currentPassword: 'wrong-password',
+        newPassword: 'new-test-password',
+        confirmPassword: 'new-test-password',
+      }),
+    });
+    assert.equal(wrongCurrentPassword.status, 401);
+
+    const changedPassword = await fetch(`${baseUrl}/api/password`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        currentPassword: 'test-password',
+        newPassword: 'new-test-password',
+        confirmPassword: 'new-test-password',
+      }),
+    });
+    assert.equal(changedPassword.status, 200);
+    assert.match(await readFile(webEnv, 'utf8'), /^CODEX_WEB_PASSWORD="new-test-password"$/m);
+
+    const staleSession = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: secondCookie } });
+    assert.equal(staleSession.status, 401);
+    const currentSession = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
+    assert.equal(currentSession.status, 200);
+    const oldPasswordLogin = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'test-password' }),
+    });
+    assert.equal(oldPasswordLogin.status, 401);
+    const newPasswordLogin = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'new-test-password' }),
+    });
+    assert.equal(newPasswordLogin.status, 200);
+
     await stopServer(child);
     child = undefined;
     await unlink(path.join(runtime, 'port'));
 
-    child = await startServer({ temporary, runtime, codexHome, fakeCodex, traceFile, appServerTraceFile });
+    child = await startServer({ temporary, runtime, codexHome, fakeCodex, traceFile, appServerTraceFile, webEnv });
     port = await waitForServer(child, runtime);
     const restored = await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { Cookie: cookie } });
     assert.equal(restored.status, 200);

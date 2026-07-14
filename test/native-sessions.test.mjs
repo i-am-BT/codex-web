@@ -163,7 +163,13 @@ This block is automatically supplied ambient UI state, not part of the user's re
       {
         timestamp: '2026-07-11T04:52:32.004Z',
         type: 'response_item',
-        payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: '思考摘要' }] },
+        payload: {
+          type: 'reasoning',
+          summary: [
+            { type: 'summary_text', text: '检查现状' },
+            { type: 'summary_text', text: '实现队列' },
+          ],
+        },
       },
       {
         timestamp: '2026-07-11T04:52:32.005Z',
@@ -257,7 +263,9 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '输入变成了一大段'));
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '我想 UI 和这个一样\n\n图片附件'));
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content === '助手进度'));
-    assert.ok(conversation.messages.some((message) => message.role === 'thinking' && message.content === '思考摘要'));
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'thinking' && message.content === '检查现状\n实现队列'
+    )));
     assert.ok(conversation.messages.some((message) => message.role === 'tool' && message.content.includes('exec_command')));
     assert.ok(conversation.messages.some((message) => (
       message.role === 'context'
