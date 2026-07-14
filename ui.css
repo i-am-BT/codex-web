@@ -1015,6 +1015,15 @@ body .msg.user {
   box-shadow: none;
 }
 
+body .msg.user::after {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  width: min(124px, 100%);
+  height: 6px;
+  content: "";
+}
+
 body .msg.user.hasInputImage {
   width: min(420px, 92%);
   max-width: min(420px, 92%);
@@ -1203,12 +1212,13 @@ body .msg.user .rollbackMsg:hover {
 body .msg.user .msgActions {
   position: absolute;
   z-index: 3;
-  top: calc(100% + 4px);
+  top: calc(100% - 1px);
   right: 0;
-  min-height: 26px;
+  min-height: 29px;
   margin: 0;
   color: var(--text-subtle);
   opacity: 0;
+  padding: 5px 0 0 8px;
   pointer-events: none;
   transform: translateY(-3px);
   transition: opacity 140ms var(--ease), transform 140ms var(--ease);
