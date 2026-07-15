@@ -371,6 +371,11 @@ if (args[0] === 'app-server') {
     assert.match(page, /addMsg\('image',attachment\.url,\{kind:'input_image'\}\)/);
     assert.match(page, /function runningActivityVerb/);
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
+    assert.match(page, /function scheduleNativeCompletionSync/);
+    assert.match(page, /function reconcileNativeCompletion/);
+    assert.match(page, /document\.addEventListener\('visibilitychange',syncNativeAfterPageResume\)/);
+    assert.match(page, /window\.addEventListener\('pageshow',syncNativeAfterPageResume\)/);
+    assert.doesNotMatch(page, /setTimeout\(\(\)=>\{if\(currentConversationSource==='codex'.*loadConversation\(completedId,'codex'\)/);
     assert.match(page, /turnProcessAutoFollow/);
     assert.match(page, /上下文已自动压缩/);
     assert.doesNotMatch(page, /function appendTurnThinking/);

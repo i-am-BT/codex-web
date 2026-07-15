@@ -2267,6 +2267,8 @@ let nativeCursor = 0;
 let nativeGeneration = 0;
 let sessionEvents = null;
 let nativeSyncTimer = null;
+let nativeCompletionSync = null;
+let nativeCompletionTimer = null;
 let webRunActive = false;
 let steerSubmitting = false;
 let activeNativeTurnId = '';
@@ -3047,6 +3049,9 @@ dropZone?.addEventListener('paste',handleAttachmentPaste);
 input?.addEventListener('paste',handleAttachmentPaste);
 cancelBtn?.addEventListener('click', cancelRun);
 nativeRequestForm?.addEventListener('submit',(e)=>e.preventDefault());
+document.addEventListener('visibilitychange',syncNativeAfterPageResume);
+window.addEventListener('pageshow',syncNativeAfterPageResume);
+window.addEventListener('online',syncNativeAfterPageResume);
 if (${authenticated ? 'true' : 'false'}) boot(true);
 async function toggleTheme(){const next=appearance.theme==='dark'?'light':'dark';await saveAppearance({theme:next})}
 function applyAppearance(){const theme=appearance.theme==='dark'?'dark':'light';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const bg=custom?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.chatBg=bg;document.body.style.setProperty('--custom-chat-bg',custom?'url("'+custom.url+'")':'none');if(themeToggle){setIconLabel(themeToggle,theme==='dark'?'sun':'moon','',false);themeToggle.title=theme==='dark'?'切换明亮模式':'切换黑暗模式';themeToggle.setAttribute('aria-label',themeToggle.title)}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
@@ -3253,10 +3258,11 @@ function applyConversationMode(){
   syncComposerChrome();
   renderPromptQueue();
 }
-function newChat(){closeComposerPopovers();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
+function newChat(){closeComposerPopovers();clearNativeCompletionSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
 async function loadConversation(id,source='web'){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
+  clearNativeCompletionSync();
   const seq=++conversationLoadSeq;
   nativeOptimisticElements=[];
   nativeRunningElement=null;
@@ -3352,7 +3358,7 @@ function connectSessionEvents(){
   sessionEvents=new EventSource('/api/session-events');
   sessionEvents.addEventListener('open',async()=>{
     await refreshHistory();
-    if(currentConversationSource==='codex'&&currentConversationId)await syncCurrentNativeConversation();
+    syncNativeAfterPageResume();
   });
   sessionEvents.addEventListener('sessions',(event)=>{
     let changedIds=[];
@@ -3374,7 +3380,8 @@ function connectSessionEvents(){
     }else if(runtime.type==='item-completed'){
       finishNativeLiveItem(runtime.itemId);
     }else if(runtime.type==='turn'){
-      activeNativeTurnId=runtime.turnId||activeNativeTurnId;
+      const runtimeTurnId=runtime.turnId||activeNativeTurnId;
+      activeNativeTurnId=runtimeTurnId;
       webRunActive=runtime.status==='running';
       if(!webRunActive){
         activeNativeTurnId='';
@@ -3383,9 +3390,10 @@ function connectSessionEvents(){
         statusEl.textContent=runtime.status==='error'?'Codex App 任务失败':runtime.status==='interrupted'?'Codex App 任务已取消':'Codex App 任务完成';
         playTaskCompleteSound();
         const completedId=currentConversationId;
-        setTimeout(()=>{if(currentConversationSource==='codex'&&currentConversationId===completedId)loadConversation(completedId,'codex')},220);
+        scheduleNativeCompletionSync(completedId,runtimeTurnId,220);
         schedulePromptQueueDispatch(completedId,320);
       }else{
+        clearNativeCompletionSync();
         statusEl.textContent='Codex App · 运行中';
       }
       applyConversationMode();
@@ -3404,20 +3412,91 @@ async function syncCurrentNativeConversation(){
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
   const data=await res.json();
   const conversation=data.conversation;
-  if(conversation.reset){await loadConversation(id,'codex');return}
+  if(conversation.reset){
+    if(webRunActive||nativeLiveItems.size){
+      nativeCursor=Number(conversation.cursor||nativeCursor);
+      nativeGeneration=Number(conversation.generation||nativeGeneration);
+      if(conversation.status!=='running')scheduleNativeCompletionSync(id,nativeCompletionSync?.turnId||activeNativeTurnId,120);
+      return;
+    }
+    await loadConversation(id,'codex');return;
+  }
+  const wasRunning=webRunActive;
+  const completingTurnId=activeNativeTurnId;
   if((conversation.messages||[]).length){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
   }
-  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if(webRunActive&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoScroll:false,kind:msg.kind,at:msg.at})}
+  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoScroll:false,kind:msg.kind,at:msg.at})}
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
   activeNativeTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
   webRunActive=conversation.status==='running';
+  if(wasRunning&&!webRunActive){
+    activeNativeTurnId='';
+    finishAllNativeLiveItems();
+    if(nativeTerminalPersisted(conversation,completingTurnId)&&nativeLiveItems.size){
+      clearNativeCompletionSync();
+      await loadConversation(id,'codex');
+      return;
+    }
+    scheduleNativeCompletionSync(id,completingTurnId,120);
+  }
   updateConversationStatus(conversation);
   applyConversationMode();
   if(!webRunActive)schedulePromptQueueDispatch(id,180);
   if(nearBottom&&(conversation.messages||[]).length)scrollChatToLatest();
+}
+function nativeTerminalPersisted(conversation,turnId){
+  const id=String(turnId||'');
+  if(!id)return false;
+  return (conversation.messages||[]).some((message)=>(
+    message.turnId===id
+    && message.role==='process'
+    && ['task_complete','task_error','turn_aborted','error'].includes(message.kind)
+  ));
+}
+function clearNativeCompletionSync(){
+  if(nativeCompletionTimer)clearTimeout(nativeCompletionTimer);
+  nativeCompletionTimer=null;
+  nativeCompletionSync=null;
+}
+function scheduleNativeCompletionSync(threadId,turnId,delay=180){
+  const cleanThreadId=String(threadId||'');
+  const cleanTurnId=String(turnId||'');
+  if(!cleanThreadId||!cleanTurnId)return;
+  if(!nativeCompletionSync||nativeCompletionSync.threadId!==cleanThreadId||nativeCompletionSync.turnId!==cleanTurnId){
+    nativeCompletionSync={threadId:cleanThreadId,turnId:cleanTurnId,attempt:0};
+  }
+  if(nativeCompletionTimer)clearTimeout(nativeCompletionTimer);
+  nativeCompletionTimer=setTimeout(reconcileNativeCompletion,delay);
+}
+async function reconcileNativeCompletion(){
+  nativeCompletionTimer=null;
+  const pending=nativeCompletionSync;
+  if(!pending)return;
+  if(currentConversationSource!=='codex'||currentConversationId!==pending.threadId){clearNativeCompletionSync();return}
+  try{
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(pending.threadId));
+    if(res.ok){
+      const data=await res.json();
+      if(nativeCompletionSync!==pending)return;
+      if(nativeTerminalPersisted(data.conversation,pending.turnId)){
+        nativeCompletionSync=null;
+        await loadConversation(pending.threadId,'codex');
+        return;
+      }
+    }
+  }catch(e){}
+  if(nativeCompletionSync!==pending)return;
+  pending.attempt+=1;
+  if(pending.attempt>=60){nativeCompletionSync=null;statusEl.textContent='任务已结束，历史记录仍在同步';return}
+  scheduleNativeCompletionSync(pending.threadId,pending.turnId,Math.min(1500,180+pending.attempt*90));
+}
+function syncNativeAfterPageResume(){
+  if(document.visibilityState==='hidden'||currentConversationSource!=='codex'||!currentConversationId)return;
+  if(nativeCompletionSync){scheduleNativeCompletionSync(nativeCompletionSync.threadId,nativeCompletionSync.turnId,0);return}
+  syncCurrentNativeConversation();
 }
 const MARKDOWN_ALLOWED_TAGS=['p','br','strong','em','del','code','pre','blockquote','ul','ol','li','h1','h2','h3','h4','h5','h6','hr','a','table','thead','tbody','tr','th','td'];
 const MARKDOWN_ALLOWED_ATTRS=['href','title','align','colspan','rowspan','start'];
