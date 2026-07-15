@@ -300,10 +300,16 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
-    assert.match(uiStyles, /\.msg\.assistant\s*\{[^}]*width:\s*min\(780px, 100%\)/s);
+    assert.match(uiStyles, /\.msg\.user::after\s*\{[^}]*width:\s*min\(124px, 100%\);[^}]*height:\s*6px/s);
+    assert.match(uiStyles, /\.msg\.user \.msgActions\s*\{[^}]*top:\s*calc\(100% - 1px\);[^}]*padding:\s*5px 0 0 8px/s);
+    assert.match(uiStyles, /\.completionTimeline > \.activityBatch \+ \.activityBatch/);
+    assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.msg\.assistant > \.msgBody > :not\(\.memoryCitations\)\s*\{[^}]*max-width:\s*min\(780px, 100%\)/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
+    assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
     assert.match(uiStyles, /\.settingsDialog/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
@@ -325,6 +331,12 @@ if (args[0] === 'app-server') {
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
     assert.match(page, /activityBatch/);
+    assert.match(page, /liveProcessPanel/);
+    assert.match(page, /function appendInputImageToUser/);
+    assert.match(page, /latestUserElement/);
+    assert.match(page, /addMsg\('image',attachment\.url,\{kind:'input_image'\}\)/);
+    assert.match(page, /function runningActivityVerb/);
+    assert.match(page, /turnProcessAutoFollow/);
     assert.match(page, /上下文已自动压缩/);
     assert.doesNotMatch(page, /function appendTurnThinking/);
     assert.match(page, /id="sidePanel"/);
@@ -402,6 +414,18 @@ if (args[0] === 'app-server') {
       target: 'server.mjs、ui.css · “menuBtn|toggleMenu”',
       icon: 'search',
     }]);
+    const orchestratedCall = [
+      'exec',
+      'const calls = await Promise.all([',
+      '  tools.view_image({path:"/tmp/reference.png"}),',
+      '  tools.exec_command({cmd:"sed -n \'1,40p\' server.mjs"}),',
+      '  tools.exec_command({cmd:"rg -n \\"composer\\" ui.css"}),',
+      ']);',
+    ].join('\n');
+    assert.deepEqual(parseToolActivity(orchestratedCall), [
+      { verb: '已查看', target: '1 张图像', icon: 'images' },
+      { verb: '已读取文件并运行了多个命令', icon: 'search' },
+    ]);
     const patchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/server.mjs\\n-old\\n+new\\n*** Update File: /workspace/ui.css\\n+added\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
     assert.deepEqual(parseToolActivity(patchCall), [
       { verb: '已编辑', icon: 'pencil', target: 'server.mjs', added: 1, removed: 1, meta: '+1 -1' },
