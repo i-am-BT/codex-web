@@ -229,6 +229,25 @@ This block is automatically supplied ambient UI state, not part of the user's re
         type: 'event_msg',
         payload: { type: 'task_complete', duration_ms: 1250 },
       },
+      {
+        timestamp: '2026-07-11T04:52:33.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-2' },
+      },
+      {
+        timestamp: '2026-07-11T04:52:33.001Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '第二轮消息' }],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:52:33.010Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', duration_ms: 800 },
+      },
     ]));
 
     store = new NativeSessionStore(codexHome, {
@@ -252,6 +271,12 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(conversation.metadata.cliVersion, '0.144.0-alpha.4');
     assert.equal(conversation.status, 'done');
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '用户消息'));
+    const firstTurnMessage = conversation.messages.find((message) => message.role === 'user' && message.content === '用户消息');
+    assert.equal(firstTurnMessage.turnId, 'turn-1');
+    assert.equal(firstTurnMessage.previousTurnId, undefined);
+    const secondTurnMessage = conversation.messages.find((message) => message.role === 'user' && message.content === '第二轮消息');
+    assert.equal(secondTurnMessage.turnId, 'turn-2');
+    assert.equal(secondTurnMessage.previousTurnId, 'turn-1');
     assert.deepEqual(
       conversation.messages.filter((message) => message.role === 'image').map((message) => ({
         content: message.content,

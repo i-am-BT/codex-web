@@ -18,6 +18,9 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
   const webEnv = path.join(temporary, 'web.env');
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
+  const nativeFirstTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa780';
+  const nativeSecondTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa781';
+  const forkedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa797';
   const createdNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa799';
   const archivedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa730';
   const automationNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa731';
@@ -73,6 +76,30 @@ experimental_bearer_token = "test-token"
           },
         }),
         JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.990Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: nativeFirstTurnId },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.995Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'native earlier message' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.998Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: nativeFirstTurnId },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.999Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: nativeSecondTurnId },
+        }),
+        JSON.stringify({
           timestamp: '2026-07-11T04:52:32.000Z',
           type: 'response_item',
           payload: {
@@ -83,6 +110,11 @@ experimental_bearer_token = "test-token"
               { type: 'input_image', image_url: 'data:image/png;base64,c21va2U=' },
             ],
           },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:32.005Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: nativeSecondTurnId },
         }),
         '',
       ].join('\n'),
@@ -192,6 +224,7 @@ if (args.includes('--version')) {
 }
 if (args[0] === 'app-server') {
   const createdThreadId = '${createdNativeSessionId}';
+  const forkedThreadId = '${forkedNativeSessionId}';
   const fixtureThreadId = '${nativeSessionId}';
   const thread = (id) => ({
     id,
@@ -224,6 +257,7 @@ if (args[0] === 'app-server') {
       if (!Object.hasOwn(message, 'id') || !message.method) continue;
       if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake' } });
       else if (message.method === 'thread/start') send({ id: message.id, result: { thread: thread(createdThreadId) } });
+      else if (message.method === 'thread/fork') send({ id: message.id, result: { thread: thread(forkedThreadId) } });
       else if (message.method === 'thread/resume') send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
       else if (message.method === 'turn/start') {
         const turnId = '019f4f84-ea9f-73c2-b997-deba7b4aa798';
@@ -466,11 +500,59 @@ if (args[0] === 'app-server') {
     assert.ok(nativeConversation.messages.some((message) => (
       message.role === 'user' && message.content === 'native fixture message'
     )));
+    const nativeTargetMessage = nativeConversation.messages.find((message) => (
+      message.role === 'user' && message.content === 'native fixture message'
+    ));
+    const nativeFirstMessage = nativeConversation.messages.find((message) => (
+      message.role === 'user' && message.content === 'native earlier message'
+    ));
+    assert.equal(nativeFirstMessage.turnId, nativeFirstTurnId);
+    assert.equal(nativeFirstMessage.previousTurnId, undefined);
+    assert.equal(nativeTargetMessage.turnId, nativeSecondTurnId);
+    assert.equal(nativeTargetMessage.previousTurnId, nativeFirstTurnId);
     assert.ok(nativeConversation.messages.some((message) => (
       message.role === 'image'
       && message.kind === 'input_image'
       && message.content === 'data:image/png;base64,c21va2U='
     )));
+
+    const restartedFromFirst = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messageSeq: nativeFirstMessage.seq,
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'untrusted',
+      }),
+    });
+    assert.equal(restartedFromFirst.status, 201);
+    const restartedFromFirstPayload = await restartedFromFirst.json();
+    assert.equal(restartedFromFirstPayload.threadId, createdNativeSessionId);
+    assert.equal(restartedFromFirstPayload.forkedThroughTurnId, '');
+    assert.equal(restartedFromFirstPayload.draft, 'native earlier message');
+
+    const forked = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messageSeq: nativeTargetMessage.seq,
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'workspace-write',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(forked.status, 201);
+    const forkedPayload = await forked.json();
+    assert.equal(forkedPayload.threadId, forkedNativeSessionId);
+    assert.equal(forkedPayload.sourceThreadId, nativeSessionId);
+    assert.equal(forkedPayload.forkedThroughTurnId, nativeFirstTurnId);
+    assert.equal(forkedPayload.draft, 'native fixture message');
+    assert.equal(forkedPayload.conversation.status, 'done');
 
     const archivedNativeSession = await fetch(`${baseUrl}/api/native-sessions/${archivedNativeSessionId}`, {
       headers: { Cookie: cookie },
@@ -593,6 +675,17 @@ if (args[0] === 'app-server') {
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/resume'));
+    const restartFromFirstMessage = protocolMessages.find((message) => (
+      message.method === 'thread/start'
+      && message.params.sandbox === 'read-only'
+      && message.params.approvalPolicy === 'untrusted'
+    ));
+    assert.ok(restartFromFirstMessage);
+    const forkMessage = protocolMessages.find((message) => message.method === 'thread/fork');
+    assert.equal(forkMessage.params.threadId, nativeSessionId);
+    assert.equal(forkMessage.params.lastTurnId, nativeFirstTurnId);
+    assert.equal(forkMessage.params.sandbox, 'workspace-write');
+    assert.equal(forkMessage.params.approvalPolicy, 'on-request');
     const turnStartMessages = protocolMessages.filter((message) => message.method === 'turn/start');
     assert.equal(turnStartMessages[0].params.sandboxPolicy.type, 'workspaceWrite');
     assert.deepEqual(turnStartMessages[0].params.sandboxPolicy.writableRoots, [temporary]);

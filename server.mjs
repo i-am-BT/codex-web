@@ -321,6 +321,72 @@ app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
   }
 });
 
+app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+  if (activeNativeTurns.get(threadId)?.status === 'running') {
+    return res.status(409).json({ error: '会话任务正在运行，不能创建历史分支' });
+  }
+
+  const messageSeq = Number(req.body?.messageSeq);
+  if (!Number.isInteger(messageSeq) || messageSeq < 1) {
+    return res.status(400).json({ error: '消息序号无效' });
+  }
+
+  try {
+    const source = nativeSessions.get(threadId);
+    if (!source) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    const target = source.messages.find((message) => (
+      message.seq === messageSeq
+      && message.role === 'user'
+      && message.turnId
+    ));
+    if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户消息创建分支' });
+    if (!target.previousTurnId && source.truncated) {
+      return res.status(409).json({ error: '会话历史已截断，无法确定这条消息之前的 turn' });
+    }
+
+    const settings = parseNativeThreadSettings(req.body || {});
+    const result = target.previousTurnId
+      ? await appServerClient.request('thread/fork', compactObject({
+        threadId,
+        lastTurnId: target.previousTurnId,
+        cwd: settings.cwd,
+        model: settings.model,
+        modelProvider: settings.provider,
+        sandbox: settings.sandbox,
+        approvalPolicy: settings.approval,
+        threadSource: 'user',
+      }))
+      : await appServerClient.request('thread/start', compactObject({
+        cwd: settings.cwd,
+        model: settings.model,
+        modelProvider: settings.provider,
+        sandbox: settings.sandbox,
+        approvalPolicy: settings.approval,
+        threadSource: 'user',
+      }));
+    const forkedThreadId = cleanNativeThreadId(result?.thread?.id);
+    if (!forkedThreadId) throw new Error('Codex app-server 未返回有效分支 thread id');
+
+    nativeSessions.refresh();
+    const persisted = nativeSessions.get(forkedThreadId);
+    const conversation = persisted
+      ? decorateNativeConversation(persisted)
+      : nativeConversationFromThread(result.thread, '');
+    res.status(201).json({
+      ok: true,
+      threadId: forkedThreadId,
+      sourceThreadId: threadId,
+      forkedThroughTurnId: target.previousTurnId || '',
+      draft: extractUserDraft(target.content),
+      conversation,
+    });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `创建 Codex App 历史分支失败: ${err.message}` });
+  }
+});
+
 app.post('/api/native-sessions', requireAuth, async (req, res) => {
   try {
     const turn = parseNativeTurnPayload(req.body || {});
@@ -1587,6 +1653,16 @@ function parseNativeTurnPayload(body) {
   const message = String(body.message || '').trim();
   const attachments = normalizeUploadedAttachments(body.attachments, body.images);
   if (!message && !attachments.length) throw new Error('message is required');
+  const settings = parseNativeThreadSettings(body);
+  return {
+    message,
+    attachments,
+    ...settings,
+    input: buildNativeTurnInput(message, attachments),
+  };
+}
+
+function parseNativeThreadSettings(body) {
   const cwd = normalizeCwd(body.cwd || DEFAULT_CWD);
   if (!cwd) throw new Error('工作目录不存在');
   const model = cleanValue(body.model) || DEFAULT_MODEL;
@@ -1595,15 +1671,12 @@ function parseNativeTurnPayload(body) {
   const approval = cleanApproval(body.approval || DEFAULT_APPROVAL);
   const reasoningEffort = cleanReasoningEffort(body.reasoningEffort);
   return {
-    message,
-    attachments,
     cwd,
     model,
     provider,
     sandbox,
     approval,
     reasoningEffort,
-    input: buildNativeTurnInput(message, attachments),
   };
 }
 
@@ -1637,7 +1710,7 @@ function nativeConversationFromThread(thread, activeTurnId) {
     title: String(thread?.name || thread?.preview || '新会话').trim().slice(0, 80),
     createdAt,
     updatedAt,
-    status: 'running',
+    status: activeTurnId ? 'running' : 'done',
     readOnly: false,
     activeTurnId,
     messages: [],
@@ -3183,7 +3256,7 @@ function applyConversationMode(){
 function newChat(){closeComposerPopovers();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
 async function loadConversation(id,source='web'){
-  if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return}
+  if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   const seq=++conversationLoadSeq;
   nativeOptimisticElements=[];
   nativeRunningElement=null;
@@ -3202,10 +3275,10 @@ async function loadConversation(id,source='web'){
   statusEl.textContent='Loading...';
   const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
   const res=await fetch(endpoint+encodeURIComponent(id));
-  if(seq!==conversationLoadSeq)return;
-  if(!res.ok){statusEl.textContent='加载失败';return}
+  if(seq!==conversationLoadSeq)return false;
+  if(!res.ok){statusEl.textContent='加载失败';return false}
   const data=await res.json();
-  if(seq!==conversationLoadSeq)return;
+  if(seq!==conversationLoadSeq)return false;
   const conversation=data.conversation;
   if(titleEl)titleEl.textContent=conversation.title||'Chat';
   currentConversationId=conversation.id;
@@ -3219,13 +3292,14 @@ async function loadConversation(id,source='web'){
   updateActiveHistory();
   chat.innerHTML='';
   beginTurnProcessCollection();
-  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,autoScroll:false,kind:msg.kind,at:msg.at}));
+  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoScroll:false,kind:msg.kind,at:msg.at}));
   if(!(conversation.messages||[]).length)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   updateConversationStatus(conversation);
   renderPromptQueue();
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
   closeMenu();
   scrollChatToLatest();
+  return true;
 }
 function updateConversationStatus(conversation){
   const time=new Date(conversation.updatedAt||conversation.createdAt);
@@ -3240,6 +3314,39 @@ function updateConversationStatus(conversation){
 }
 function applyNativeConversationMetadata(metadata){if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
+async function forkNativeConversation(messageSeq){
+  if(!currentConversationId||currentConversationSource!=='codex')return;
+  if(webRunActive){statusEl.textContent='任务运行中，不能创建历史分支';return}
+  if(!confirm('从这条消息重新开始？原会话会保留，新分支不会撤销已经产生的本地文件修改，原消息中的附件需要重新添加。'))return;
+  const sourceThreadId=currentConversationId;
+  statusEl.textContent='正在创建历史分支...';
+  try{
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,sandbox:sandbox.value,approval:approval.value})});
+    const data=await res.json();
+    if(!res.ok)throw new Error(data.error||'创建历史分支失败');
+    clearPendingAttachments();
+    const loaded=await loadConversation(data.threadId,'codex');
+    if(!loaded){
+      newChat();
+      currentConversationId=data.threadId;
+      currentConversationSource='codex';
+      if(titleEl)titleEl.textContent=data.conversation?.title||'新分支';
+      nativeNotice.textContent='Codex App 会话 · 历史分支';
+      statusEl.textContent='Codex App · 新分支';
+      applyNativeConversationMetadata(data.conversation?.metadata||{});
+      applyConversationMode();
+      updateActiveHistory();
+    }
+    input.value=data.draft||'';
+    input.style.height='auto';
+    input.style.height=Math.min(input.scrollHeight,180)+'px';
+    await refreshHistory();
+    statusEl.textContent='已创建分支，可修改后发送；原会话保持不变';
+    input.focus();
+  }catch(e){
+    statusEl.textContent=e.message;
+  }
+}
 function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
@@ -3302,7 +3409,7 @@ async function syncCurrentNativeConversation(){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
   }
-  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if(webRunActive&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{autoScroll:false,kind:msg.kind,at:msg.at})}
+  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if(webRunActive&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoScroll:false,kind:msg.kind,at:msg.at})}
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
   activeNativeTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
@@ -3942,7 +4049,16 @@ function addMsg(role,text,options={}){
       tag.textContent=role==='process'?'过程':'日志';
       actions.appendChild(tag);
     }
-    if(role==='user'&&Number.isInteger(options.messageIndex)){
+    if(role==='user'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId){
+      const fork=document.createElement('button');
+      fork.type='button';
+      fork.className='rollbackMsg';
+      fork.title='从这里重新开始';
+      fork.setAttribute('aria-label','从这里重新开始');
+      setIconLabel(fork,'git-branch','从这里重新开始',false);
+      fork.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq)});
+      actions.appendChild(fork);
+    }else if(role==='user'&&Number.isInteger(options.messageIndex)){
       const rollback=document.createElement('button');
       rollback.type='button';
       rollback.className='rollbackMsg';

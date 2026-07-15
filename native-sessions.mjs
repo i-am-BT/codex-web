@@ -402,6 +402,8 @@ function createDetailCache(entry, options) {
     messagesTruncated: startOffset > 0,
     calls: new Map(),
     metadata: {},
+    currentTurnId: '',
+    previousTurnId: '',
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
     lastTimestamp: '',
   };
@@ -497,6 +499,7 @@ function applyNativeRecord(cache, record, maxMessages) {
   if (record.timestamp) cache.lastTimestamp = String(record.timestamp);
 
   if (record.type === 'session_meta' || record.type === 'turn_context') {
+    if (record.type === 'turn_context') updateNativeTurnId(cache, record.payload?.turn_id);
     applyMetadataRecord(cache, record);
     return;
   }
@@ -580,6 +583,7 @@ function applyMetadataRecord(cache, record) {
 }
 
 function applyEventRecord(cache, record, payload, maxMessages) {
+  if (payload.type === 'task_started') updateNativeTurnId(cache, payload.turn_id);
   switch (payload.type) {
     case 'task_started':
       cache.status = 'running';
@@ -757,11 +761,20 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind) {
     content: clean,
     at: record.timestamp || '',
     kind,
+    turnId: cache.currentTurnId || undefined,
+    previousTurnId: cache.previousTurnId || undefined,
   });
   if (cache.messages.length > maxMessages) {
     cache.messages.splice(0, cache.messages.length - maxMessages);
     cache.messagesTruncated = true;
   }
+}
+
+function updateNativeTurnId(cache, value) {
+  const turnId = String(value || '').trim();
+  if (!turnId || turnId === cache.currentTurnId) return;
+  cache.previousTurnId = cache.currentTurnId || '';
+  cache.currentTurnId = turnId;
 }
 
 function contentText(content) {
