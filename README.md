@@ -82,6 +82,12 @@ cp .env.example .env
 
 本仓库已默认忽略 `.env`、`runtime/` 和 `node_modules/`。请勿手动移除忽略规则或强制提交这些本地敏感/运行时文件。
 
+仓库提供以下安全示例，不包含真实凭据或运行数据：
+
+- `.env.example`：完整环境变量模板，所有敏感字段均为占位符
+- `runtime.example/`：运行目录结构和脱敏 JSON 示例
+- `node_modules.example/`：依赖目录重建说明；真实依赖请通过 `npm ci` 安装
+
 ## 启动
 
 ```bash
