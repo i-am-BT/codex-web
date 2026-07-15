@@ -71,6 +71,14 @@ const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
 const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
 const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
 const NATIVE_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DESKTOP_PENDING_PREFIX = 'desktop:';
+const DESKTOP_INTERACTIVE_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+  'item/tool/requestUserInput',
+  'mcpServer/elicitation/request',
+]);
 
 if (!webPassword) {
   console.error(`CODEX_WEB_PASSWORD is required in ${ENV_FILE}`);
@@ -109,6 +117,10 @@ const desktopIpcClient = new CodexDesktopIpcClient({
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
 const pendingNativeRequests = new Map();
+const desktopThreadStates = new Map();
+const desktopResolvedRequestKeys = new Map();
+const desktopSnapshotRequestTimes = new Map();
+const desktopSnapshotRequests = new Map();
 let activeProcess = null;
 let activeConversationId = '';
 let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
@@ -123,14 +135,16 @@ appServerClient.on('stderr', (content) => {
 });
 appServerClient.on('protocolError', (error) => console.error(error.message));
 appServerClient.on('exit', (error) => {
-  activeNativeTurns.clear();
-  clearPendingNativeRequests(error.message);
+  clearAppServerNativeTurns();
+  clearAppServerPendingRequests(error.message);
   broadcastNativeRuntime({ type: 'disconnected', error: error.message });
 });
 desktopIpcClient.on('disconnect', (error) => {
+  clearDesktopThreadStates(error?.message || 'Codex Desktop IPC 已断开');
   const text = String(error?.message || '').trim();
   if (text) console.warn(`Codex Desktop IPC: ${text}`);
 });
+desktopIpcClient.on('broadcast', handleDesktopIpcBroadcast);
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '25mb' }));
@@ -323,6 +337,7 @@ app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
       generation: req.query.generation,
     });
     if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    requestDesktopThreadSnapshot(conversation.id);
     res.json({ conversation: decorateNativeConversation(conversation) });
   } catch (err) {
     res.status(500).json({ error: `读取 Codex App 会话失败: ${err.message}` });
@@ -393,9 +408,17 @@ app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
 app.post('/api/native-sessions/:id/interrupt', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+  const requestedTurnId = String(req.body?.turnId || '').trim();
+  const currentTurnId = currentNativeTurnId(threadId);
+  if (!requestedTurnId || !currentTurnId) {
+    return res.status(409).json({ error: '当前任务状态已变化，请刷新后重试' });
+  }
+  if (requestedTurnId !== currentTurnId) {
+    return res.status(409).json({ error: '页面中的任务已过期，未取消当前新任务' });
+  }
 
   try {
-    let turnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
+    let turnId = requestedTurnId;
     const result = await interruptNativeTurn(threadId, turnId);
     turnId = String(result?.interruptedTurnId || turnId);
     if (!turnId) return res.status(409).json({ error: '该会话没有可取消的任务' });
@@ -448,10 +471,14 @@ app.post('/api/native-requests/:id/respond', requireAuth, async (req, res) => {
 
   try {
     const result = buildNativeRequestResponse(pending, req.body || {});
-    pending.respond(result);
+    await respondToNativeRequest(pending, result);
     pendingNativeRequests.delete(key);
+    if (pending.transport === 'desktop-ipc') {
+      desktopResolvedRequestKeys.set(key, Date.now() + 30000);
+      removeDesktopRequestFromState(pending.threadId, pending.requestId);
+    }
     broadcastNativeRequest({ type: 'resolved', id: key, threadId: pending.threadId });
-    if (req.body?.decision === 'cancel' && pending.threadId && pending.turnId) {
+    if (pending.transport !== 'desktop-ipc' && req.body?.decision === 'cancel' && pending.threadId && pending.turnId) {
       appServerClient.request('turn/interrupt', {
         threadId: pending.threadId,
         turnId: pending.turnId,
@@ -459,7 +486,7 @@ app.post('/api/native-requests/:id/respond', requireAuth, async (req, res) => {
     }
     res.json({ ok: true, id: key });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(pending.transport === 'desktop-ipc' ? 502 : 400).json({ error: err.message });
   }
 });
 
@@ -1313,6 +1340,212 @@ function broadcastNativeRequest(event) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'native-request', event);
 }
 
+function handleDesktopIpcBroadcast(message) {
+  if (message?.method !== 'thread-stream-state-changed') return;
+  const params = message.params || {};
+  const change = params.change || {};
+  const threadId = cleanNativeThreadId(params.conversationId);
+  const ownerClientId = String(message.sourceClientId || '');
+  if (!threadId || !ownerClientId) return;
+
+  if (change.type === 'snapshot') {
+    const state = {
+      ownerClientId,
+      revision: Number(change.revision) || 0,
+      requests: normalizeDesktopRequests(change.conversationState?.requests),
+    };
+    desktopThreadStates.set(threadId, state);
+    syncDesktopPendingRequests(threadId, state);
+    return;
+  }
+
+  if (change.type !== 'patches') return;
+  const state = desktopThreadStates.get(threadId);
+  if (
+    !state
+    || state.ownerClientId !== ownerClientId
+    || state.revision !== Number(change.baseRevision)
+  ) {
+    requestDesktopThreadSnapshot(threadId, { force: true });
+    return;
+  }
+  const requests = applyDesktopRequestPatches(state.requests, change.patches);
+  if (requests === null) {
+    requestDesktopThreadSnapshot(threadId, { force: true });
+    return;
+  }
+  state.requests = requests;
+  state.revision = Number(change.revision) || state.revision;
+  syncDesktopPendingRequests(threadId, state);
+}
+
+function normalizeDesktopRequests(requests) {
+  return Array.isArray(requests)
+    ? requests.filter((request) => request && typeof request === 'object').slice(0, 100)
+    : [];
+}
+
+function applyDesktopRequestPatches(requests, patches) {
+  if (!Array.isArray(patches)) return null;
+  const state = { requests: normalizeDesktopRequests(requests) };
+  let requestPatchCount = 0;
+  for (const patch of patches) {
+    const patchPath = Array.isArray(patch?.path) ? patch.path : [];
+    if (!patchPath.length) {
+      if (patch?.op === 'remove') state.requests = [];
+      else if (patch?.value && typeof patch.value === 'object') {
+        state.requests = normalizeDesktopRequests(patch.value.requests);
+      }
+      continue;
+    }
+    if (patchPath[0] !== 'requests' || patchPath.length > 32) continue;
+    requestPatchCount += 1;
+    if (requestPatchCount > 2000) return null;
+    applyDesktopRequestPatch(state, patch, patchPath);
+  }
+  return normalizeDesktopRequests(state.requests);
+}
+
+function applyDesktopRequestPatch(root, patch, patchPath) {
+  let target = root;
+  for (const segment of patchPath.slice(0, -1)) {
+    if (!target || typeof target !== 'object') return;
+    target = target[segment];
+  }
+  if (!target || typeof target !== 'object') return;
+  const key = patchPath.at(-1);
+  if (Array.isArray(target)) {
+    const index = key === '-' ? target.length : Number(key);
+    if (!Number.isInteger(index) || index < 0 || index > target.length) return;
+    if (patch.op === 'remove') target.splice(index, 1);
+    else if (patch.op === 'add') target.splice(index, 0, patch.value);
+    else if (patch.op === 'replace' && index < target.length) target[index] = patch.value;
+    return;
+  }
+  if (patch.op === 'remove') delete target[key];
+  else if (patch.op === 'add' || patch.op === 'replace') target[key] = patch.value;
+}
+
+function desktopPendingKey(threadId, requestId) {
+  return `${DESKTOP_PENDING_PREFIX}${threadId}:${encodeURIComponent(requestId)}`;
+}
+
+function syncDesktopPendingRequests(threadId, state) {
+  const now = Date.now();
+  for (const [key, expiresAt] of desktopResolvedRequestKeys) {
+    if (expiresAt <= now) desktopResolvedRequestKeys.delete(key);
+  }
+
+  const seen = new Set();
+  for (const request of state.requests) {
+    const requestId = String(request.id ?? '');
+    const method = String(request.method || '');
+    if (!requestId || !DESKTOP_INTERACTIVE_METHODS.has(method)) continue;
+    const key = desktopPendingKey(threadId, requestId);
+    seen.add(key);
+    if (desktopResolvedRequestKeys.get(key) > now) continue;
+    const existing = pendingNativeRequests.get(key);
+    const pending = {
+      key,
+      requestId,
+      method,
+      params: request.params || {},
+      threadId,
+      turnId: String(request.params?.turnId || ''),
+      createdAt: existing?.createdAt || new Date().toISOString(),
+      transport: 'desktop-ipc',
+      ownerClientId: state.ownerClientId,
+    };
+    pendingNativeRequests.set(key, pending);
+    if (!existing) broadcastNativeRequest({ type: 'pending', request: publicNativeRequest(pending) });
+  }
+
+  for (const [key, pending] of pendingNativeRequests) {
+    if (pending.transport !== 'desktop-ipc' || pending.threadId !== threadId || seen.has(key)) continue;
+    pendingNativeRequests.delete(key);
+    broadcastNativeRequest({ type: 'resolved', id: key, threadId });
+  }
+}
+
+function removeDesktopRequestFromState(threadId, requestId) {
+  const state = desktopThreadStates.get(threadId);
+  if (!state) return;
+  state.requests = state.requests.filter((request) => String(request.id ?? '') !== String(requestId));
+}
+
+function clearDesktopThreadStates(reason = '') {
+  desktopThreadStates.clear();
+  desktopResolvedRequestKeys.clear();
+  desktopSnapshotRequestTimes.clear();
+  desktopSnapshotRequests.clear();
+  for (const [key, pending] of pendingNativeRequests) {
+    if (pending.transport !== 'desktop-ipc') continue;
+    pendingNativeRequests.delete(key);
+    broadcastNativeRequest({ type: 'resolved', id: key, threadId: pending.threadId, error: reason });
+  }
+}
+
+function requestDesktopThreadSnapshot(threadId, { force = false } = {}) {
+  if (desktopSnapshotRequests.has(threadId)) return desktopSnapshotRequests.get(threadId);
+  const now = Date.now();
+  if (!force && now - (desktopSnapshotRequestTimes.get(threadId) || 0) < 15000) return null;
+  desktopSnapshotRequestTimes.set(threadId, now);
+  const request = desktopIpcClient.loadCompleteHistory(threadId)
+    .catch(() => {})
+    .finally(() => {
+      if (desktopSnapshotRequests.get(threadId) === request) desktopSnapshotRequests.delete(threadId);
+    });
+  desktopSnapshotRequests.set(threadId, request);
+  return request;
+}
+
+async function respondToNativeRequest(pending, response) {
+  if (pending.transport !== 'desktop-ipc') {
+    pending.respond(response);
+    return;
+  }
+  const options = { targetClientId: pending.ownerClientId };
+  switch (pending.method) {
+    case 'item/commandExecution/requestApproval':
+      await desktopIpcClient.commandApprovalDecision(
+        pending.threadId,
+        pending.requestId,
+        response.decision,
+        options,
+      );
+      return;
+    case 'item/fileChange/requestApproval':
+      await desktopIpcClient.fileApprovalDecision(
+        pending.threadId,
+        pending.requestId,
+        response.decision,
+        options,
+      );
+      return;
+    case 'item/permissions/requestApproval':
+      await desktopIpcClient.permissionsApprovalResponse(
+        pending.threadId,
+        pending.requestId,
+        response,
+        options,
+      );
+      return;
+    case 'item/tool/requestUserInput':
+      await desktopIpcClient.submitUserInput(pending.threadId, pending.requestId, response, options);
+      return;
+    case 'mcpServer/elicitation/request':
+      await desktopIpcClient.submitMcpElicitationResponse(
+        pending.threadId,
+        pending.requestId,
+        response,
+        options,
+      );
+      return;
+    default:
+      throw new Error(`Codex Desktop 不支持处理 ${pending.method}`);
+  }
+}
+
 function handleAppServerNotification(event) {
   const method = event.method;
   const params = event.params || {};
@@ -1425,17 +1658,23 @@ function handleAppServerRequest(request) {
   broadcastNativeRequest({ type: 'pending', request: publicNativeRequest(entry) });
 }
 
-function clearPendingNativeRequests(reason = '') {
-  if (!pendingNativeRequests.size) return;
-  const requests = [...pendingNativeRequests.values()];
-  pendingNativeRequests.clear();
-  for (const request of requests) {
+function clearAppServerPendingRequests(reason = '') {
+  for (const [key, request] of pendingNativeRequests) {
+    if (request.transport === 'desktop-ipc') continue;
+    pendingNativeRequests.delete(key);
     broadcastNativeRequest({
       type: 'resolved',
       id: request.key,
       threadId: request.threadId,
       error: reason,
     });
+  }
+}
+
+function clearAppServerNativeTurns() {
+  for (const [threadId, active] of activeNativeTurns) {
+    if (active.transport === 'desktop-ipc') continue;
+    activeNativeTurns.delete(threadId);
   }
 }
 
@@ -1540,8 +1779,20 @@ function setNativeTurnState(threadId, state) {
     updatedAt: new Date().toISOString(),
   };
   activeNativeTurns.set(cleanId, next);
+  if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
   broadcastNativeRuntime({ type: 'turn', threadId: cleanId, ...next });
   nativeSessions.scheduleRefresh();
+}
+
+function currentNativeTurnId(threadId) {
+  const active = activeNativeTurns.get(threadId);
+  if (active?.status === 'running' && active.turnId) return String(active.turnId);
+  try {
+    const conversation = nativeSessions.get(threadId);
+    return conversation?.status === 'running' ? String(conversation.latestTurnId || '') : '';
+  } catch {
+    return '';
+  }
 }
 
 function nativeTurnStatus(status) {
@@ -1566,11 +1817,16 @@ function nativeSessionSummaries() {
 
 function decorateNativeConversation(conversation) {
   const active = activeNativeTurns.get(conversation.id);
+  const activeTurnId = active?.status === 'running' && active.turnId
+    ? active.turnId
+    : conversation.status === 'running'
+      ? conversation.latestTurnId || ''
+      : '';
   return {
     ...conversation,
     status: active?.status === 'running' ? 'running' : conversation.status,
     readOnly: false,
-    activeTurnId: active?.turnId || '',
+    activeTurnId,
   };
 }
 

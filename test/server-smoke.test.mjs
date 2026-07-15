@@ -593,6 +593,143 @@ if (args[0] === 'app-server') {
     assert.ok(Date.now() - echoStartedAt < 3000);
     assert.equal(echoedContinuationPayload.turnId, 'desktop-echo-turn');
 
+    const interruptCountBeforeStaleRequest = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-follower-interrupt-turn',
+    ).length;
+    const staleInterrupt = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: desktopContinuedPayload.turnId }),
+    });
+    assert.equal(staleInterrupt.status, 409);
+    assert.match((await staleInterrupt.json()).error, /任务已过期/);
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-interrupt-turn').length,
+      interruptCountBeforeStaleRequest,
+    );
+    const missingTurnInterrupt = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(missingTurnInterrupt.status, 409);
+    assert.match((await missingTurnInterrupt.json()).error, /状态已变化/);
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-interrupt-turn').length,
+      interruptCountBeforeStaleRequest,
+    );
+
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'snapshot',
+          revision: 1,
+          conversationState: {
+            requests: [],
+          },
+        },
+      },
+    });
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'patches',
+          baseRevision: 1,
+          revision: 2,
+          patches: [{
+            op: 'add',
+            path: ['requests', 0],
+            value: {
+              id: 'desktop-approval-1',
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: nativeSessionId,
+                turnId: echoedContinuationPayload.turnId,
+                command: 'printf desktop',
+                cwd: temporary,
+                reason: 'desktop approval test',
+              },
+            },
+          }],
+        },
+      },
+    });
+    const desktopApproval = await waitForPendingRequest(baseUrl, cookie);
+    assert.equal(desktopApproval.method, 'item/commandExecution/requestApproval');
+    assert.equal(desktopApproval.threadId, nativeSessionId);
+    const desktopApproved = await fetch(`${baseUrl}/api/native-requests/${encodeURIComponent(desktopApproval.id)}/respond`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'accept' }),
+    });
+    assert.equal(desktopApproved.status, 200);
+    const desktopApprovalMessage = desktopIpc.messages.find(
+      (message) => message.method === 'thread-follower-command-approval-decision',
+    );
+    assert.equal(desktopApprovalMessage.version, 1);
+    assert.equal(desktopApprovalMessage.targetClientId, 'desktop-owner');
+    assert.deepEqual(desktopApprovalMessage.params, {
+      conversationId: nativeSessionId,
+      requestId: 'desktop-approval-1',
+      decision: 'accept',
+    });
+
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'patches',
+          baseRevision: 2,
+          revision: 3,
+          patches: [{
+            op: 'add',
+            path: ['requests', 0],
+            value: {
+              id: 'desktop-approval-removed',
+              method: 'item/fileChange/requestApproval',
+              params: {
+                threadId: nativeSessionId,
+                turnId: echoedContinuationPayload.turnId,
+                reason: 'desktop removal test',
+              },
+            },
+          }],
+        },
+      },
+    });
+    const removedDesktopApproval = await waitForPendingRequest(baseUrl, cookie);
+    assert.equal(removedDesktopApproval.method, 'item/fileChange/requestApproval');
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'patches',
+          baseRevision: 3,
+          revision: 4,
+          patches: [{ op: 'remove', path: ['requests', 0] }],
+        },
+      },
+    });
+    await waitForPendingRequestGone(baseUrl, cookie, removedDesktopApproval.id);
+
     desktopIpc.startTurnMode = 'respond';
     desktopIpc.onStartTurn = null;
     const echoedInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
@@ -959,6 +1096,9 @@ async function createDesktopIpcFixture(temporary) {
     startTurnMode: 'respond',
     onStartTurn: null,
     lastError: null,
+    broadcast(message) {
+      for (const socket of sockets) writeDesktopFrame(socket, message);
+    },
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
@@ -999,7 +1139,9 @@ async function createDesktopIpcFixture(temporary) {
         ? { turn: { id: 'desktop-turn-1', status: 'inProgress' } }
         : message.method === 'thread-follower-steer-turn'
           ? { turnId: 'desktop-turn-1' }
-          : {};
+          : message.method.includes('approval') || message.method.includes('submit-')
+            ? { ok: true }
+            : {};
       writeDesktopFrame(socket, {
         type: 'response',
         requestId: message.requestId,
@@ -1051,6 +1193,20 @@ async function waitForPendingRequest(baseUrl, cookie) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error('native approval request did not arrive');
+}
+
+async function waitForPendingRequestGone(baseUrl, cookie, requestId) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await fetch(`${baseUrl}/api/native-requests`, {
+      headers: { Cookie: cookie },
+    });
+    if (response.ok) {
+      const requests = (await response.json()).requests || [];
+      if (!requests.some((request) => request.id === requestId)) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('native approval request did not clear');
 }
 
 async function waitForServer(child, runtime) {

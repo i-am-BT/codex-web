@@ -30,11 +30,36 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
         requestId: 'discovery-1',
         request: { method: 'unknown-method', version: 1, params: {} },
       });
+      sendFrame(socket, {
+        type: 'broadcast',
+        method: 'thread-stream-state-changed',
+        sourceClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-1' },
+      });
       return;
     }
 
     if (message.type === 'client-discovery-response') {
       discoveryResponse(message);
+      return;
+    }
+
+    if (message.method === 'thread-follower-command-approval-decision') {
+      assert.equal(message.version, 1);
+      assert.equal(message.targetClientId, 'desktop-owner-id');
+      assert.deepEqual(message.params, {
+        conversationId: 'thread-1',
+        requestId: 'approval-1',
+        decision: 'accept',
+      });
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: { ok: true },
+      });
       return;
     }
 
@@ -57,16 +82,27 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
     socketPath: fixture.socketPath,
     requestTimeoutMs: 1000,
   });
+  const broadcastHandled = new Promise((resolve) => client.once('broadcast', resolve));
 
   try {
     const result = await client.startTurn('thread-1', {
       input: [{ type: 'text', text: '同步测试', text_elements: [] }],
     });
     assert.equal(result.turn.id, 'turn-1');
+    const approval = await client.commandApprovalDecision('thread-1', 'approval-1', 'accept', {
+      targetClientId: 'desktop-owner-id',
+    });
+    assert.deepEqual(approval, { ok: true });
     assert.deepEqual(await discoveryHandled, {
       type: 'client-discovery-response',
       requestId: 'discovery-1',
       response: { canHandle: false },
+    });
+    assert.deepEqual(await broadcastHandled, {
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      sourceClientId: 'desktop-owner-id',
+      params: { conversationId: 'thread-1' },
     });
   } finally {
     client.close();
@@ -105,6 +141,101 @@ test('marks a missing Desktop owner as a safe app-server fallback', async () => 
       client.startTurn('thread-2', { input: [{ type: 'text', text: 'fallback', text_elements: [] }] }),
       (error) => isCodexDesktopIpcUnavailableError(error) && error.reason === 'no-client-found',
     );
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('routes supported Desktop request responses to the selected owner', async () => {
+  const fixture = await createRouterFixture();
+  const received = [];
+  fixture.onMessage = (socket, message) => {
+    if (message.method === 'initialize') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: 'initialize',
+        result: { clientId: 'web-client-id' },
+      });
+      return;
+    }
+    assert.equal(
+      message.timeoutMs,
+      message.method === 'thread-follower-load-complete-history' ? 305000 : 1000,
+    );
+    received.push({
+      method: message.method,
+      version: message.version,
+      targetClientId: message.targetClientId,
+      params: message.params,
+    });
+    sendFrame(socket, {
+      type: 'response',
+      requestId: message.requestId,
+      resultType: 'success',
+      method: message.method,
+      handledByClientId: 'desktop-owner-id',
+      result: { ok: true },
+    });
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    requestTimeoutMs: 1000,
+  });
+  const options = { targetClientId: 'desktop-owner-id' };
+  const userInputResponse = { answers: { choice: { answers: ['yes'] } } };
+  const permissionsResponse = { permissions: { network: true }, scope: 'turn' };
+  const mcpResponse = { action: 'accept', content: { value: 'approved' } };
+
+  try {
+    await client.loadCompleteHistory('thread-3', options);
+    await client.commandApprovalDecision('thread-3', 'command-1', 'accept', options);
+    await client.fileApprovalDecision('thread-3', 'file-1', 'decline', options);
+    await client.permissionsApprovalResponse('thread-3', 'permissions-1', permissionsResponse, options);
+    await client.submitUserInput('thread-3', 'input-1', userInputResponse, options);
+    await client.submitMcpElicitationResponse('thread-3', 'mcp-1', mcpResponse, options);
+
+    assert.deepEqual(received, [
+      {
+        method: 'thread-follower-load-complete-history',
+        version: 1,
+        targetClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-3' },
+      },
+      {
+        method: 'thread-follower-command-approval-decision',
+        version: 1,
+        targetClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-3', requestId: 'command-1', decision: 'accept' },
+      },
+      {
+        method: 'thread-follower-file-approval-decision',
+        version: 1,
+        targetClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-3', requestId: 'file-1', decision: 'decline' },
+      },
+      {
+        method: 'thread-follower-permissions-request-approval-response',
+        version: 1,
+        targetClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-3', requestId: 'permissions-1', response: permissionsResponse },
+      },
+      {
+        method: 'thread-follower-submit-user-input',
+        version: 1,
+        targetClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-3', requestId: 'input-1', response: userInputResponse },
+      },
+      {
+        method: 'thread-follower-submit-mcp-server-elicitation-response',
+        version: 1,
+        targetClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-3', requestId: 'mcp-1', response: mcpResponse },
+      },
+    ]);
   } finally {
     client.close();
     await fixture.close();

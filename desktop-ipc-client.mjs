@@ -8,11 +8,18 @@ const INITIAL_CLIENT_ID = 'initializing-client';
 const MAX_FRAME_BYTES = 256 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_MS = 1500;
 const DEFAULT_REQUEST_TIMEOUT_MS = 20000;
+const DEFAULT_HISTORY_REQUEST_TIMEOUT_MS = 305000;
 const METHOD_VERSIONS = new Map([
   ['initialize', 0],
   ['thread-follower-start-turn', 1],
+  ['thread-follower-load-complete-history', 1],
   ['thread-follower-steer-turn', 1],
   ['thread-follower-interrupt-turn', 2],
+  ['thread-follower-command-approval-decision', 1],
+  ['thread-follower-file-approval-decision', 1],
+  ['thread-follower-permissions-request-approval-response', 1],
+  ['thread-follower-submit-user-input', 1],
+  ['thread-follower-submit-mcp-server-elicitation-response', 1],
 ]);
 const SAFE_FALLBACK_ERRORS = new Set([
   'disabled',
@@ -81,6 +88,7 @@ export class CodexDesktopIpcClient extends EventEmitter {
     return this.sendRequest(method, params, {
       version,
       timeoutMs: positiveTimeout(options.timeoutMs, this.requestTimeoutMs),
+      targetClientId: String(options.targetClientId || ''),
     });
   }
 
@@ -92,6 +100,16 @@ export class CodexDesktopIpcClient extends EventEmitter {
     const result = response?.result;
     if (!result?.turn?.id) throw new Error('Codex Desktop IPC 未返回有效 turn id');
     return result;
+  }
+
+  async loadCompleteHistory(conversationId, options = {}) {
+    return this.request('thread-follower-load-complete-history', { conversationId }, {
+      ...options,
+      timeoutMs: positiveTimeout(
+        options.timeoutMs,
+        Math.max(this.requestTimeoutMs, DEFAULT_HISTORY_REQUEST_TIMEOUT_MS),
+      ),
+    });
   }
 
   async steerTurn(conversationId, params, options = {}) {
@@ -106,6 +124,46 @@ export class CodexDesktopIpcClient extends EventEmitter {
 
   async interruptTurn(conversationId, options = {}) {
     return this.request('thread-follower-interrupt-turn', { conversationId }, options);
+  }
+
+  async commandApprovalDecision(conversationId, requestId, decision, options = {}) {
+    return this.request('thread-follower-command-approval-decision', {
+      conversationId,
+      requestId,
+      decision,
+    }, options);
+  }
+
+  async fileApprovalDecision(conversationId, requestId, decision, options = {}) {
+    return this.request('thread-follower-file-approval-decision', {
+      conversationId,
+      requestId,
+      decision,
+    }, options);
+  }
+
+  async permissionsApprovalResponse(conversationId, requestId, response, options = {}) {
+    return this.request('thread-follower-permissions-request-approval-response', {
+      conversationId,
+      requestId,
+      response,
+    }, options);
+  }
+
+  async submitUserInput(conversationId, requestId, response, options = {}) {
+    return this.request('thread-follower-submit-user-input', {
+      conversationId,
+      requestId,
+      response,
+    }, options);
+  }
+
+  async submitMcpElicitationResponse(conversationId, requestId, response, options = {}) {
+    return this.request('thread-follower-submit-mcp-server-elicitation-response', {
+      conversationId,
+      requestId,
+      response,
+    }, options);
   }
 
   close() {
@@ -147,7 +205,7 @@ export class CodexDesktopIpcClient extends EventEmitter {
     }
   }
 
-  sendRequest(method, params, { version, timeoutMs }) {
+  sendRequest(method, params, { version, timeoutMs, targetClientId = '' }) {
     const socket = this.socket;
     if (!socket?.writable) {
       return Promise.reject(new CodexDesktopIpcUnavailableError('Codex Desktop IPC 未连接', 'not-connected'));
@@ -162,6 +220,7 @@ export class CodexDesktopIpcClient extends EventEmitter {
       method,
       params,
       timeoutMs,
+      ...(targetClientId ? { targetClientId } : {}),
     };
 
     return new Promise((resolve, reject) => {
