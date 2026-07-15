@@ -2416,6 +2416,7 @@ let promptQueues = readPromptQueues();
 let queueDispatchingThreads = new Set();
 let queueGuidingItems = new Set();
 let queueFailures = new Map();
+const syncCurrentNativeConversation = createTrailingSingleFlight(syncCurrentNativeConversationOnce);
 let settingsOverlay = null;
 let settingsDialog = null;
 let settingsClose = null;
@@ -2463,6 +2464,15 @@ function composerModelLabel(value){
   return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
 }
 function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高'})[String(value||'')]||String(value||'默认')}
+function createTrailingSingleFlight(task){
+  let active=null;
+  let rerun=false;
+  return function run(){
+    if(active){rerun=true;return active}
+    active=(async()=>{do{rerun=false;await task()}while(rerun)})().finally(()=>{active=null});
+    return active;
+  }
+}
 function readPromptQueues(){
   try{
     const parsed=JSON.parse(localStorage.getItem('codexWeb.promptQueue.v1')||'{}');
@@ -3144,7 +3154,7 @@ themeToggle?.addEventListener('click',toggleTheme);
 chatBackground?.addEventListener('change',handleChatBackgroundChange);
 chatBackgroundFile?.addEventListener('change',()=>handleCustomBackground(chatBackgroundFile.files?.[0]));
 deleteBackground?.addEventListener('click',deleteSelectedBackground);
-sendBtn?.addEventListener('click', send);input?.addEventListener('keydown',(e)=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});input?.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';applyConversationMode()});
+sendBtn?.addEventListener('click', send);input?.addEventListener('keydown',(e)=>{if(e.key!=='Enter'||e.shiftKey||e.isComposing||e.keyCode===229)return;e.preventDefault();if(!e.repeat)send()});input?.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';applyConversationMode()});
 attachFile?.addEventListener('click',()=>fileInput?.click());
 fileInput?.addEventListener('change',()=>{handleAttachmentFiles(fileInput.files);fileInput.value=''});
 dropZone?.addEventListener('dragover',(e)=>{if(hasFileDrag(e)){e.preventDefault();dropZone.classList.add('drag')}});
@@ -3460,7 +3470,7 @@ function connectSessionEvents(){
   });
   sessionEvents.addEventListener('native-request',()=>refreshNativeRequests());
 }
-async function syncCurrentNativeConversation(){
+async function syncCurrentNativeConversationOnce(){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
   const id=currentConversationId;
   const seq=conversationLoadSeq;

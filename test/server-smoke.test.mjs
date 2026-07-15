@@ -363,6 +363,9 @@ if (args[0] === 'app-server') {
     assert.match(page, /function enqueuePrompt/);
     assert.match(page, /function steerQueuedPrompt/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
+    assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
+    assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
+    assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
     assert.match(page, /function enhanceSettingsModal/);
     assert.match(page, /function openImagePreview/);
@@ -375,6 +378,26 @@ if (args[0] === 'app-server') {
     const inlineScript = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert.ok(inlineScript);
     assert.doesNotThrow(() => new Function(inlineScript));
+    const singleFlightHelper = inlineScript.match(/(function createTrailingSingleFlight[\s\S]*?)(?=function readPromptQueues)/)?.[1];
+    assert.ok(singleFlightHelper);
+    const createTrailingSingleFlight = new Function(
+      singleFlightHelper + '; return createTrailingSingleFlight;',
+    )();
+    let singleFlightRuns = 0;
+    const singleFlightReleases = [];
+    const runSingleFlight = createTrailingSingleFlight(async () => {
+      singleFlightRuns += 1;
+      await new Promise((resolve) => singleFlightReleases.push(resolve));
+    });
+    const firstSingleFlight = runSingleFlight();
+    const joinedSingleFlight = runSingleFlight();
+    assert.equal(firstSingleFlight, joinedSingleFlight);
+    assert.equal(singleFlightRuns, 1);
+    singleFlightReleases.shift()();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(singleFlightRuns, 2);
+    singleFlightReleases.shift()();
+    await firstSingleFlight;
     const composerLabelHelpers = inlineScript.match(/(function composerModelLabel[\s\S]*?)(?=function closeComposerPopovers)/)?.[1];
     assert.ok(composerLabelHelpers);
     const composerLabels = new Function(
