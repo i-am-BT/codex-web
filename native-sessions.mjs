@@ -382,6 +382,7 @@ function createDetailCache(entry, options) {
     calls: new Map(),
     metadata: {},
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
+    latestTurnId: '',
     lastTimestamp: '',
   };
 
@@ -564,6 +565,8 @@ function applyMetadataRecord(cache, record) {
 }
 
 function applyEventRecord(cache, record, payload, maxMessages) {
+  const turnId = String(payload.turn_id || payload.turnId || '');
+  if (turnId) cache.latestTurnId = turnId;
   switch (payload.type) {
     case 'task_started':
       cache.status = 'running';
@@ -849,6 +852,7 @@ function buildConversation(entry, cache, options) {
     createdAt: cache.metadata.createdAt || entry.createdAt,
     updatedAt: cache.lastTimestamp || entry.updatedAt,
     status: cache.status,
+    latestTurnId: cache.latestTurnId,
     readOnly: false,
     truncated: cache.messagesTruncated,
     generation: cache.generation,

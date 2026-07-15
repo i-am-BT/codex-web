@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -527,6 +527,58 @@ if (args[0] === 'app-server') {
     });
     assert.equal(desktopInterrupted.status, 200);
 
+    desktopIpc.startTurnMode = 'echo-only';
+    desktopIpc.onStartTurn = async (message) => {
+      const text = message.params.turnStartParams.input.find((item) => item.type === 'text')?.text || '';
+      assert.equal(text, 'recover from native echo');
+      const records = [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'desktop-echo-turn' },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text }],
+          },
+        },
+      ];
+      await appendFile(nativeSessionFile, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`);
+    };
+    const echoStartedAt = Date.now();
+    const echoedContinuation = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'recover from native echo',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    const echoedContinuationPayload = await echoedContinuation.json();
+    const echoedSessionContent = await readFile(nativeSessionFile, 'utf8');
+    assert.equal(desktopIpc.lastError, null);
+    assert.match(echoedSessionContent, /recover from native echo/);
+    assert.equal(echoedContinuation.status, 202, JSON.stringify(echoedContinuationPayload));
+    assert.ok(Date.now() - echoStartedAt < 3000);
+    assert.equal(echoedContinuationPayload.turnId, 'desktop-echo-turn');
+
+    desktopIpc.startTurnMode = 'respond';
+    desktopIpc.onStartTurn = null;
+    const echoedInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: echoedContinuationPayload.turnId }),
+    });
+    assert.equal(echoedInterrupted.status, 200);
+
     const desktopStart = desktopIpc.messages.find((message) => message.method === 'thread-follower-start-turn');
     assert.equal(desktopStart.params.conversationId, nativeSessionId);
     assert.deepEqual(desktopStart.params.turnStartParams.input, [{
@@ -649,8 +701,8 @@ if (args[0] === 'app-server') {
       .map((line) => JSON.parse(line));
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
-    assert.ok(protocolMessages.some((message) => message.method === 'thread/resume'));
-    assert.ok(protocolMessages.some((message) => message.method === 'turn/start'));
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 1);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 2);
     const steerMessage = protocolMessages.find((message) => message.method === 'turn/steer');
     assert.equal(steerMessage.params.expectedTurnId, continuedPayload.turnId);
     assert.deepEqual(steerMessage.params.input, [{ type: 'text', text: 'change direction while running' }]);
@@ -881,6 +933,9 @@ async function createDesktopIpcFixture(temporary) {
     socketPath,
     messages: [],
     ownerAvailable: true,
+    startTurnMode: 'respond',
+    onStartTurn: null,
+    lastError: null,
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
@@ -908,6 +963,12 @@ async function createDesktopIpcFixture(temporary) {
           requestId: message.requestId,
           resultType: 'error',
           error: 'no-client-found',
+        });
+        return;
+      }
+      if (message.method === 'thread-follower-start-turn' && fixture.startTurnMode === 'echo-only') {
+        Promise.resolve(fixture.onStartTurn?.(message)).catch((error) => {
+          fixture.lastError = error;
         });
         return;
       }

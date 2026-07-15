@@ -1575,14 +1575,36 @@ function decorateNativeConversation(conversation) {
 }
 
 async function continueNativeTurn(threadId, turn) {
-  try {
-    const result = await desktopIpcClient.startTurn(threadId, buildDesktopTurnStartParams(turn));
+  const baseline = nativeSessions.get(threadId);
+  const requestedAt = Date.now();
+  const echoController = new AbortController();
+  const desktopAttempt = desktopIpcClient.startTurn(threadId, buildDesktopTurnStartParams(turn)).then(
+    (result) => ({ type: 'ipc-result', result }),
+    (error) => ({ type: 'ipc-error', error }),
+  );
+  const echoAttempt = waitForNativeTurnEcho(threadId, turn, baseline, requestedAt, echoController.signal).then(
+    (conversation) => ({ type: 'native-echo', conversation }),
+  );
+  const outcome = await Promise.race([desktopAttempt, echoAttempt]);
+  echoController.abort();
+
+  if (outcome.type === 'native-echo' && outcome.conversation) {
+    return recoverDesktopNativeTurn(threadId, outcome.conversation);
+  }
+
+  if (outcome.type === 'ipc-result') {
+    const result = outcome.result;
     const turnId = String(result?.turn?.id || '');
     if (!turnId) throw new Error('Codex Desktop IPC 未返回有效 turn id');
     setNativeTurnState(threadId, { turnId, status: 'running', transport: 'desktop-ipc' });
     return { turnId, result, transport: 'desktop-ipc' };
-  } catch (error) {
-    if (!isCodexDesktopIpcUnavailableError(error)) throw error;
+  }
+
+  const error = outcome.error;
+  if (!isCodexDesktopIpcUnavailableError(error)) {
+    const conversation = findNativeTurnEcho(threadId, turn, baseline, requestedAt);
+    if (conversation) return recoverDesktopNativeTurn(threadId, conversation);
+    throw error;
   }
 
   await appServerClient.request('thread/resume', compactObject({
@@ -1595,6 +1617,51 @@ async function continueNativeTurn(threadId, turn) {
     excludeTurns: true,
   }));
   return startNativeTurn(threadId, turn);
+}
+
+async function waitForNativeTurnEcho(threadId, turn, baseline, requestedAt, signal) {
+  const deadline = Date.now() + CODEX_DESKTOP_IPC_TIMEOUT_MS + 2000;
+  while (!signal.aborted && Date.now() < deadline) {
+    const conversation = findNativeTurnEcho(threadId, turn, baseline, requestedAt);
+    if (conversation) return conversation;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return null;
+}
+
+function findNativeTurnEcho(threadId, turn, baseline, requestedAt) {
+  const conversation = nativeSessions.get(threadId, baseline ? {
+    after: baseline.cursor,
+    generation: baseline.generation,
+  } : {});
+  if (!conversation) return null;
+  const expected = String(turn.input?.find((item) => item?.type === 'text')?.text || turn.message || '').trim();
+  const earliest = requestedAt - 1000;
+  const matched = conversation.messages.some((message) => {
+    if (message.role !== 'user' || Date.parse(message.at || '') < earliest) return false;
+    const content = String(message.content || '').trim();
+    if (!expected) return Boolean(content && turn.attachments?.length);
+    return content === expected || content.startsWith(`${expected}\n`);
+  });
+  return matched ? conversation : null;
+}
+
+function recoverDesktopNativeTurn(threadId, conversation) {
+  const turnId = String(conversation.latestTurnId || `desktop-${randomBytes(8).toString('hex')}`);
+  const status = conversation.status === 'running' ? 'running' : 'done';
+  setNativeTurnState(threadId, { turnId, status, transport: 'desktop-ipc' });
+  if (status !== 'running') {
+    setTimeout(() => {
+      const current = activeNativeTurns.get(threadId);
+      if (current?.turnId === turnId && current.status !== 'running') activeNativeTurns.delete(threadId);
+    }, 1800).unref?.();
+  }
+  return {
+    turnId,
+    result: { turn: { id: turnId, status: status === 'running' ? 'inProgress' : 'completed' } },
+    transport: 'desktop-ipc',
+    recovered: true,
+  };
 }
 
 async function steerNativeTurn(threadId, steer, expectedTurnId) {

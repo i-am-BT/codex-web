@@ -271,6 +271,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(conversation.metadata.model, 'gpt-test');
     assert.equal(conversation.metadata.cliVersion, '0.144.0-alpha.4');
     assert.equal(conversation.status, 'done');
+    assert.equal(conversation.latestTurnId, 'turn-1');
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '用户消息'));
     assert.deepEqual(
       conversation.messages.filter((message) => message.role === 'image').map((message) => ({
