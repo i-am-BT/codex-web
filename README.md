@@ -219,4 +219,6 @@ node_modules/
 npm run check
 ```
 
+提交 Pull Request 前还需要同步最新 `main` 并运行完整检查，具体流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
 如服务已在后台运行，修改后需要重启进程才能生效。
