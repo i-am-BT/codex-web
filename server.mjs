@@ -8,6 +8,10 @@ import path from 'path';
 import net from 'net';
 import { fileURLToPath } from 'url';
 import { CodexAppServerClient } from './app-server-client.mjs';
+import {
+  CodexDesktopIpcClient,
+  isCodexDesktopIpcUnavailableError,
+} from './desktop-ipc-client.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +61,12 @@ const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAG
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
 const NATIVE_SESSION_POLL_MS = Number(process.env.NATIVE_SESSION_POLL_MS || 3000);
 const APP_SERVER_REQUEST_TIMEOUT_MS = Number(process.env.APP_SERVER_REQUEST_TIMEOUT_MS || 30000);
+const CODEX_DESKTOP_IPC_ENABLED = parseBoolean(
+  process.env.CODEX_DESKTOP_IPC_ENABLED,
+  process.platform === 'darwin' || process.platform === 'win32',
+);
+const CODEX_DESKTOP_IPC_SOCKET = String(process.env.CODEX_DESKTOP_IPC_SOCKET || '').trim();
+const CODEX_DESKTOP_IPC_TIMEOUT_MS = Number(process.env.CODEX_DESKTOP_IPC_TIMEOUT_MS || 20000);
 const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
 const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
 const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
@@ -90,6 +100,12 @@ const appServerClient = new CodexAppServerClient({
   clientVersion: '1.0.0',
   requestTimeoutMs: APP_SERVER_REQUEST_TIMEOUT_MS,
 });
+const desktopIpcClient = new CodexDesktopIpcClient({
+  enabled: CODEX_DESKTOP_IPC_ENABLED,
+  socketPath: CODEX_DESKTOP_IPC_SOCKET || undefined,
+  clientType: 'codex-web',
+  requestTimeoutMs: CODEX_DESKTOP_IPC_TIMEOUT_MS,
+});
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
 const pendingNativeRequests = new Map();
@@ -97,7 +113,7 @@ let activeProcess = null;
 let activeConversationId = '';
 let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
 
-nativeSessions.on('change', broadcastNativeSessionChange);
+nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
 appServerClient.on('notification', handleAppServerNotification);
 appServerClient.on('request', handleAppServerRequest);
@@ -110,6 +126,10 @@ appServerClient.on('exit', (error) => {
   activeNativeTurns.clear();
   clearPendingNativeRequests(error.message);
   broadcastNativeRuntime({ type: 'disconnected', error: error.message });
+});
+desktopIpcClient.on('disconnect', (error) => {
+  const text = String(error?.message || '').trim();
+  if (text) console.warn(`Codex Desktop IPC: ${text}`);
 });
 
 app.disable('x-powered-by');
@@ -344,16 +364,7 @@ app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
 
   try {
     const turn = parseNativeTurnPayload(req.body || {});
-    await appServerClient.request('thread/resume', compactObject({
-      threadId,
-      cwd: turn.cwd,
-      model: turn.model,
-      modelProvider: turn.provider,
-      sandbox: turn.sandbox,
-      approvalPolicy: turn.approval,
-      excludeTurns: true,
-    }));
-    const turnStarted = await startNativeTurn(threadId, turn);
+    const turnStarted = await continueNativeTurn(threadId, turn);
     nativeSessions.scheduleRefresh();
     res.status(202).json({ ok: true, threadId, turnId: turnStarted.turnId });
   } catch (err) {
@@ -367,20 +378,11 @@ app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
 
   try {
     const steer = parseNativeSteerPayload(req.body || {});
-    let expectedTurnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
-    if (!expectedTurnId) {
-      const resumed = await appServerClient.request('thread/resume', { threadId });
-      expectedTurnId = findInProgressTurnId(resumed?.thread);
-    }
-    if (!expectedTurnId) return res.status(409).json({ error: '该会话没有可引导的运行中任务' });
-
-    const result = await appServerClient.request('turn/steer', {
-      threadId,
-      expectedTurnId,
-      input: steer.input,
-    });
+    const expectedTurnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
+    const result = await steerNativeTurn(threadId, steer, expectedTurnId);
     const turnId = String(result?.turnId || expectedTurnId);
-    setNativeTurnState(threadId, { turnId, status: 'running' });
+    if (!turnId) return res.status(409).json({ error: '该会话没有可引导的运行中任务' });
+    setNativeTurnState(threadId, { turnId, status: 'running', transport: result.transport });
     nativeSessions.scheduleRefresh();
     res.status(202).json({ ok: true, threadId, turnId });
   } catch (err) {
@@ -394,13 +396,10 @@ app.post('/api/native-sessions/:id/interrupt', requireAuth, async (req, res) => 
 
   try {
     let turnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
-    if (!turnId) {
-      const resumed = await appServerClient.request('thread/resume', { threadId });
-      turnId = findInProgressTurnId(resumed?.thread);
-    }
+    const result = await interruptNativeTurn(threadId, turnId);
+    turnId = String(result?.interruptedTurnId || turnId);
     if (!turnId) return res.status(409).json({ error: '该会话没有可取消的任务' });
-    await appServerClient.request('turn/interrupt', { threadId, turnId });
-    setNativeTurnState(threadId, { turnId, status: 'interrupted' });
+    setNativeTurnState(threadId, { turnId, status: 'interrupted', transport: result.transport });
     res.json({ ok: true, threadId, turnId });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `取消 Codex App 任务失败: ${err.message}` });
@@ -806,6 +805,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 function shutdown(signal) {
   console.log(`${APP_NAME}: stopping on ${signal}`);
   if (activeProcess) terminateProcess(activeProcess);
+  desktopIpcClient.close();
   appServerClient.close();
   nativeSessions.stop();
   for (const client of sessionEventClients) client.end();
@@ -1288,6 +1288,23 @@ function broadcastNativeSessionChange(change) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'sessions', change);
 }
 
+function handleNativeSessionChange(change) {
+  for (const threadId of change.changedIds || []) {
+    const active = activeNativeTurns.get(threadId);
+    if (active?.transport !== 'desktop-ipc' || active.status !== 'running') continue;
+    const conversation = nativeSessions.get(threadId);
+    if (!conversation || conversation.status === 'running') continue;
+    activeNativeTurns.delete(threadId);
+    broadcastNativeRuntime({
+      type: 'turn-cleared',
+      threadId,
+      turnId: active.turnId,
+      status: conversation.status,
+    });
+  }
+  broadcastNativeSessionChange(change);
+}
+
 function broadcastNativeRuntime(event) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'native-runtime', event);
 }
@@ -1515,9 +1532,11 @@ function buildNativeRequestResponse(request, body) {
 function setNativeTurnState(threadId, state) {
   const cleanId = cleanNativeThreadId(threadId);
   if (!cleanId) return;
+  const current = activeNativeTurns.get(cleanId);
   const next = {
     turnId: String(state.turnId || ''),
     status: nativeTurnStatus(state.status),
+    transport: String(state.transport || current?.transport || 'app-server'),
     updatedAt: new Date().toISOString(),
   };
   activeNativeTurns.set(cleanId, next);
@@ -1555,6 +1574,77 @@ function decorateNativeConversation(conversation) {
   };
 }
 
+async function continueNativeTurn(threadId, turn) {
+  try {
+    const result = await desktopIpcClient.startTurn(threadId, buildDesktopTurnStartParams(turn));
+    const turnId = String(result?.turn?.id || '');
+    if (!turnId) throw new Error('Codex Desktop IPC 未返回有效 turn id');
+    setNativeTurnState(threadId, { turnId, status: 'running', transport: 'desktop-ipc' });
+    return { turnId, result, transport: 'desktop-ipc' };
+  } catch (error) {
+    if (!isCodexDesktopIpcUnavailableError(error)) throw error;
+  }
+
+  await appServerClient.request('thread/resume', compactObject({
+    threadId,
+    cwd: turn.cwd,
+    model: turn.model,
+    modelProvider: turn.provider,
+    sandbox: turn.sandbox,
+    approvalPolicy: turn.approval,
+    excludeTurns: true,
+  }));
+  return startNativeTurn(threadId, turn);
+}
+
+async function steerNativeTurn(threadId, steer, expectedTurnId) {
+  const cwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
+  const clientUserMessageId = randomBytes(16).toString('hex');
+  try {
+    const result = await desktopIpcClient.steerTurn(threadId, {
+      input: buildDesktopTurnInput(steer.input),
+      restoreMessage: buildDesktopRestoreMessage(steer, cwd, clientUserMessageId),
+      serviceTier: null,
+      attachments: [],
+      clientUserMessageId,
+    });
+    return { ...result, transport: 'desktop-ipc' };
+  } catch (error) {
+    if (!isCodexDesktopIpcUnavailableError(error)) throw error;
+  }
+
+  let turnId = expectedTurnId;
+  if (!turnId) {
+    const resumed = await appServerClient.request('thread/resume', { threadId });
+    turnId = findInProgressTurnId(resumed?.thread);
+  }
+  if (!turnId) throw new Error('该会话没有可引导的运行中任务');
+  const result = await appServerClient.request('turn/steer', {
+    threadId,
+    expectedTurnId: turnId,
+    input: steer.input,
+  });
+  return { ...result, transport: 'app-server' };
+}
+
+async function interruptNativeTurn(threadId, expectedTurnId) {
+  try {
+    const result = await desktopIpcClient.interruptTurn(threadId);
+    return { ...result, transport: 'desktop-ipc' };
+  } catch (error) {
+    if (!isCodexDesktopIpcUnavailableError(error)) throw error;
+  }
+
+  let turnId = expectedTurnId;
+  if (!turnId) {
+    const resumed = await appServerClient.request('thread/resume', { threadId });
+    turnId = findInProgressTurnId(resumed?.thread);
+  }
+  if (!turnId) throw new Error('该会话没有可取消的任务');
+  await appServerClient.request('turn/interrupt', { threadId, turnId });
+  return { interruptedTurnId: turnId, ok: true, transport: 'app-server' };
+}
+
 async function startNativeTurn(threadId, turn) {
   const result = await appServerClient.request('turn/start', compactObject({
     threadId,
@@ -1568,6 +1658,60 @@ async function startNativeTurn(threadId, turn) {
   if (!turnId) throw new Error('Codex app-server 未返回有效 turn id');
   setNativeTurnState(threadId, { turnId, status: 'running' });
   return { turnId, result };
+}
+
+function buildDesktopTurnStartParams(turn) {
+  const workspaceWrite = turn.sandbox === 'workspace-write';
+  return compactObject({
+    input: buildDesktopTurnInput(turn.input),
+    cwd: turn.cwd,
+    model: turn.model,
+    effort: turn.reasoningEffort,
+    approvalPolicy: turn.approval,
+    sandboxPolicy: desktopSandboxPolicy(turn.sandbox, turn.cwd),
+    runtimeWorkspaceRoots: workspaceWrite ? [turn.cwd] : undefined,
+    attachments: [],
+  });
+}
+
+function buildDesktopTurnInput(input) {
+  return (input || []).map((item) => (
+    item?.type === 'text' ? { ...item, text_elements: [] } : { ...item }
+  ));
+}
+
+function desktopSandboxPolicy(sandbox, cwd) {
+  if (sandbox === 'danger-full-access') return { type: 'dangerFullAccess' };
+  if (sandbox === 'workspace-write') {
+    return {
+      type: 'workspaceWrite',
+      writableRoots: [cwd],
+      networkAccess: true,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+  }
+  return { type: 'readOnly', networkAccess: true };
+}
+
+function buildDesktopRestoreMessage(steer, cwd, id) {
+  const prompt = String(steer.message || '').trim()
+    || String(steer.input?.find((item) => item?.type === 'text')?.text || '').trim()
+    || '请分析上传的附件。';
+  return {
+    id,
+    text: prompt,
+    context: {
+      prompt,
+      addedFiles: [],
+      fileAttachments: [],
+      ideContext: null,
+      imageAttachments: [],
+      workspaceRoots: [cwd],
+    },
+    cwd,
+    createdAt: Date.now(),
+  };
 }
 
 function parseNativeTurnPayload(body) {

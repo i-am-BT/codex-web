@@ -34,6 +34,8 @@ const values = {
   CODEX_BIN: codexBin,
   CODEX_HOME: codexHome,
   CODEX_CONFIG_WRITABLE: 'false',
+  CODEX_DESKTOP_IPC_ENABLED: process.platform === 'darwin' || process.platform === 'win32' ? 'true' : 'false',
+  CODEX_DESKTOP_IPC_TIMEOUT_MS: '20000',
   NATIVE_SESSION_MAX_READ_MB: '32',
   NATIVE_SESSION_MAX_MESSAGES: '700',
   NATIVE_SESSION_MAX_ITEMS: '100',

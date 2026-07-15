@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -22,6 +23,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const archivedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa730';
   const automationNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa731';
   let child;
+  let desktopIpc;
 
   try {
     await mkdir(runtime, { recursive: true });
@@ -269,7 +271,17 @@ if (args[0] === 'app-server') {
 `);
     await chmod(fakeCodex, 0o755);
 
-    child = await startServer({ temporary, runtime, codexHome, fakeCodex, traceFile, appServerTraceFile });
+    desktopIpc = await createDesktopIpcFixture(temporary);
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+      desktopIpcEnabled: 'true',
+      desktopIpcSocket: desktopIpc.socketPath,
+    });
     let port = await waitForServer(child, runtime);
     const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -481,6 +493,52 @@ if (args[0] === 'app-server') {
     });
     assert.equal(automationNativeSession.status, 404);
 
+    const desktopContinued = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'sync through desktop owner',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(desktopContinued.status, 202);
+    const desktopContinuedPayload = await desktopContinued.json();
+    assert.equal(desktopContinuedPayload.turnId, 'desktop-turn-1');
+
+    const desktopSteered = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'steer through desktop owner',
+        turnId: desktopContinuedPayload.turnId,
+      }),
+    });
+    assert.equal(desktopSteered.status, 202);
+    assert.equal((await desktopSteered.json()).turnId, desktopContinuedPayload.turnId);
+
+    const desktopInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: desktopContinuedPayload.turnId }),
+    });
+    assert.equal(desktopInterrupted.status, 200);
+
+    const desktopStart = desktopIpc.messages.find((message) => message.method === 'thread-follower-start-turn');
+    assert.equal(desktopStart.params.conversationId, nativeSessionId);
+    assert.deepEqual(desktopStart.params.turnStartParams.input, [{
+      type: 'text',
+      text: 'sync through desktop owner',
+      text_elements: [],
+    }]);
+    assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
+    assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
+    assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
+    desktopIpc.ownerAvailable = false;
+
     const blockedWrite = await fetch(`${baseUrl}/api/defaults`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -659,6 +717,7 @@ if (args[0] === 'app-server') {
     assert.equal(restored.status, 200);
   } finally {
     if (child) await stopServer(child);
+    if (desktopIpc) await desktopIpc.close();
     await rm(temporary, { recursive: true, force: true });
   }
 });
@@ -782,6 +841,8 @@ function startServer({
   appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl'),
   webEnv = path.join(temporary, 'web.env'),
   configWritable = 'false',
+  desktopIpcEnabled = 'false',
+  desktopIpcSocket = '',
 }) {
   return spawn(process.execPath, [path.join(ROOT, 'server.mjs')], {
     cwd: ROOT,
@@ -800,6 +861,8 @@ function startServer({
       CODEX_WEB_ENV_FILE: webEnv,
       CODEX_WEB_RUNTIME_DIR: runtime,
       CODEX_CONFIG_WRITABLE: configWritable,
+      CODEX_DESKTOP_IPC_ENABLED: desktopIpcEnabled,
+      CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,
       DEFAULT_CWD: temporary,
       DEFAULT_SANDBOX: 'read-only',
       DEFAULT_APPROVAL: 'never',
@@ -808,6 +871,88 @@ function startServer({
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+}
+
+async function createDesktopIpcFixture(temporary) {
+  const socketPath = path.join(tmpdir(), `cwi-${path.basename(temporary)}.sock`);
+  await unlink(socketPath).catch(() => {});
+  const sockets = new Set();
+  const fixture = {
+    socketPath,
+    messages: [],
+    ownerAvailable: true,
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+      await unlink(socketPath).catch(() => {});
+    },
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    attachDesktopFrameReader(socket, (message) => {
+      fixture.messages.push(message);
+      if (message.method === 'initialize') {
+        writeDesktopFrame(socket, {
+          type: 'response',
+          requestId: message.requestId,
+          resultType: 'success',
+          method: message.method,
+          result: { clientId: 'desktop-test-client' },
+        });
+        return;
+      }
+      if (!fixture.ownerAvailable) {
+        writeDesktopFrame(socket, {
+          type: 'response',
+          requestId: message.requestId,
+          resultType: 'error',
+          error: 'no-client-found',
+        });
+        return;
+      }
+      const result = message.method === 'thread-follower-start-turn'
+        ? { turn: { id: 'desktop-turn-1', status: 'inProgress' } }
+        : message.method === 'thread-follower-steer-turn'
+          ? { turnId: 'desktop-turn-1' }
+          : {};
+      writeDesktopFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner',
+        result: { result },
+      });
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  return fixture;
+}
+
+function attachDesktopFrameReader(socket, onMessage) {
+  let buffer = Buffer.alloc(0);
+  socket.on('data', (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length >= 4) {
+      const size = buffer.readUInt32LE(0);
+      if (buffer.length < size + 4) return;
+      const payload = buffer.subarray(4, size + 4);
+      buffer = buffer.subarray(size + 4);
+      onMessage(JSON.parse(payload.toString('utf8')));
+    }
+  });
+}
+
+function writeDesktopFrame(socket, message) {
+  const payload = Buffer.from(JSON.stringify(message));
+  const frame = Buffer.allocUnsafe(payload.length + 4);
+  frame.writeUInt32LE(payload.length, 0);
+  payload.copy(frame, 4);
+  socket.write(frame);
 }
 
 async function waitForPendingRequest(baseUrl, cookie) {

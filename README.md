@@ -73,6 +73,9 @@ cp .env.example .env
 | `CODEX_BIN` | Codex CLI 路径；初始化脚本会优先发现 ChatGPT/Codex App 内置版本 |
 | `CODEX_HOME` | Codex 配置、索引和原生会话目录，默认 `$HOME/.codex` |
 | `APP_SERVER_REQUEST_TIMEOUT_MS` | `codex app-server` 单次协议请求超时，默认 30000 毫秒 |
+| `CODEX_DESKTOP_IPC_ENABLED` | macOS/Windows 默认开启；续聊优先交给当前打开任务的 Codex App 窗口 |
+| `CODEX_DESKTOP_IPC_TIMEOUT_MS` | Codex App 桌面 IPC 请求超时，默认 20000 毫秒 |
+| `CODEX_DESKTOP_IPC_SOCKET` | 可选的桌面 IPC socket/pipe 覆盖路径，通常留空自动发现 |
 | `NATIVE_SESSION_POLL_MS` | 原生会话文件监听的轮询兜底间隔 |
 | `DEFAULT_PROVIDER` | 新会话默认服务商 |
 | `DEFAULT_MODEL` | 新会话默认模型 |
@@ -167,7 +170,8 @@ Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
 
 - Web 新建和续聊都直接使用 Codex App 原生线程，不再创建独立的 Web 会话。
 - 最近会话来自 Codex App 本机索引，只显示未归档的普通用户线程；归档线程、自动化任务和子代理线程不会显示。
-- 新建、续聊、取消、改名、归档与审批通过持久 `codex app-server --stdio` 写回同一原生线程。
+- 已在 Codex App 打开的线程会通过桌面 IPC 由 App 自己启动续聊、引导和取消，因此 App 窗口能立即收到用户消息与流式事件。
+- App 未打开对应线程或桌面 IPC 不可用时，Web 会自动回退到持久 `codex app-server --stdio`；新建、改名、归档与审批仍通过 app-server 写回同一原生线程。
 - 消息历史直接读取 `CODEX_HOME/session_index.jsonl`、`CODEX_HOME/state_5.sqlite` 与 `CODEX_HOME/sessions/`，通过文件监听和轮询兜底增量刷新。
 - 旧版 `runtime/conversations.json` 仅保留兼容读取，不再显示在最近会话中。
 - 浏览器关闭或 SSE 连接中断后，已经启动的 Codex 任务仍会在服务端继续运行；重新打开对应会话可查看结果。
