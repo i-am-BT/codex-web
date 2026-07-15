@@ -336,6 +336,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /latestUserElement/);
     assert.match(page, /addMsg\('image',attachment\.url,\{kind:'input_image'\}\)/);
     assert.match(page, /function runningActivityVerb/);
+    assert.match(page, /sessionEvents\.addEventListener\('open'/);
     assert.match(page, /turnProcessAutoFollow/);
     assert.match(page, /上下文已自动压缩/);
     assert.doesNotMatch(page, /function appendTurnThinking/);
@@ -592,7 +593,10 @@ if (args[0] === 'app-server') {
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/resume'));
-    assert.ok(protocolMessages.some((message) => message.method === 'turn/start'));
+    const turnStartMessages = protocolMessages.filter((message) => message.method === 'turn/start');
+    assert.equal(turnStartMessages[0].params.sandboxPolicy.type, 'workspaceWrite');
+    assert.deepEqual(turnStartMessages[0].params.sandboxPolicy.writableRoots, [temporary]);
+    assert.equal(turnStartMessages[1].params.sandboxPolicy.type, 'readOnly');
     const steerMessage = protocolMessages.find((message) => message.method === 'turn/steer');
     assert.equal(steerMessage.params.expectedTurnId, continuedPayload.turnId);
     assert.deepEqual(steerMessage.params.input, [{ type: 'text', text: 'change direction while running' }]);
@@ -800,9 +804,11 @@ function startServer({
       CODEX_WEB_ENV_FILE: webEnv,
       CODEX_WEB_RUNTIME_DIR: runtime,
       CODEX_CONFIG_WRITABLE: configWritable,
+      HOMEPAGE_API_TOKEN: '',
       DEFAULT_CWD: temporary,
       DEFAULT_SANDBOX: 'read-only',
       DEFAULT_APPROVAL: 'never',
+      FORCE_FULL_ACCESS: 'false',
       FAKE_CODEX_TRACE: traceFile,
       FAKE_APP_SERVER_TRACE: appServerTraceFile,
     },

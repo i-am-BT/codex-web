@@ -52,6 +52,7 @@ const DEFAULT_PROVIDER = process.env.DEFAULT_PROVIDER || '';
 const DEFAULT_CWD = process.env.DEFAULT_CWD || homedir();
 const DEFAULT_SANDBOX = process.env.DEFAULT_SANDBOX || 'read-only';
 const DEFAULT_APPROVAL = process.env.DEFAULT_APPROVAL || 'never';
+const FORCE_FULL_ACCESS = parseBoolean(process.env.FORCE_FULL_ACCESS, false);
 const NATIVE_SESSION_MAX_READ_MB = Number(process.env.NATIVE_SESSION_MAX_READ_MB || 32);
 const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAGES || 700);
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
@@ -107,9 +108,19 @@ appServerClient.on('stderr', (content) => {
 });
 appServerClient.on('protocolError', (error) => console.error(error.message));
 appServerClient.on('exit', (error) => {
+  for (const [threadId, turn] of activeNativeTurns) {
+    broadcastNativeRuntime({
+      type: 'turn',
+      threadId,
+      turnId: turn.turnId || '',
+      status: 'interrupted',
+      updatedAt: new Date().toISOString(),
+    });
+  }
   activeNativeTurns.clear();
   clearPendingNativeRequests(error.message);
   broadcastNativeRuntime({ type: 'disconnected', error: error.message });
+  nativeSessions.scheduleRefresh();
 });
 
 app.disable('x-powered-by');
@@ -280,14 +291,15 @@ app.get('/api/config', requireAuth, (req, res) => {
       provider: defaults.provider || DEFAULT_PROVIDER,
       reasoningEffort: defaults.reasoningEffort || '',
       cwd: DEFAULT_CWD,
-      sandbox: DEFAULT_SANDBOX,
-      approval: DEFAULT_APPROVAL,
+      sandbox: FORCE_FULL_ACCESS ? 'danger-full-access' : DEFAULT_SANDBOX,
+      approval: FORCE_FULL_ACCESS ? 'never' : DEFAULT_APPROVAL,
     },
     providers: readProviders(),
     conversations: conversationSummaries(),
     appearance: readAppearance(),
     capabilities: {
       manageProviders: CODEX_CONFIG_WRITABLE,
+      forceFullAccess: FORCE_FULL_ACCESS,
     },
   });
 });
@@ -1563,6 +1575,7 @@ async function startNativeTurn(threadId, turn) {
     model: turn.model,
     effort: turn.reasoningEffort,
     approvalPolicy: turn.approval,
+    sandboxPolicy: nativeSandboxPolicy(turn.sandbox, turn.cwd),
   }));
   const turnId = String(result?.turn?.id || '');
   if (!turnId) throw new Error('Codex app-server 未返回有效 turn id');
@@ -1720,11 +1733,28 @@ function isHttpUrl(value) {
 }
 
 function cleanSandbox(value) {
+  if (FORCE_FULL_ACCESS) return 'danger-full-access';
   return ['read-only', 'workspace-write', 'danger-full-access'].includes(value) ? value : DEFAULT_SANDBOX;
 }
 
 function cleanApproval(value) {
+  if (FORCE_FULL_ACCESS) return 'never';
   return ['untrusted', 'on-request', 'never'].includes(value) ? value : DEFAULT_APPROVAL;
+}
+
+function nativeSandboxPolicy(value, cwd) {
+  const sandbox = cleanSandbox(value);
+  if (sandbox === 'danger-full-access') return { type: 'dangerFullAccess' };
+  if (sandbox === 'workspace-write') {
+    return {
+      type: 'workspaceWrite',
+      writableRoots: cwd ? [cwd] : [],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+  }
+  return { type: 'readOnly', networkAccess: false };
 }
 
 function normalizeCwd(value) {
@@ -2167,6 +2197,7 @@ let nativeSyncTimer = null;
 let webRunActive = false;
 let steerSubmitting = false;
 let activeNativeTurnId = '';
+let forceFullAccess = false;
 let nativeRunningElement = null;
 let nativeOptimisticElements = [];
 let nativeLiveItems = new Map();
@@ -2954,7 +2985,7 @@ function updateDeleteBackgroundButton(selected){if(!deleteBackground)return;dele
 async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();cwd.value=data.defaults.cwd;sandbox.value=data.defaults.sandbox;approval.value=data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);cwd.value=data.defaults.cwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
 async function refreshHistory(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
 async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
 async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
@@ -3133,7 +3164,9 @@ function applyConversationMode(){
   attachFile.disabled=legacyLocked||steerSubmitting||queueStarting;
   fileInput.disabled=legacyLocked||steerSubmitting||queueStarting;
   sendBtn.disabled=legacyLocked||steerSubmitting||queueStarting||(!input.value.trim()&&!pendingAttachments.length);
-  for(const control of [provider,model,reasoningEffort,sandbox,approval])control.disabled=webRunActive;
+  for(const control of [provider,model,reasoningEffort])control.disabled=webRunActive;
+  sandbox.disabled=webRunActive||forceFullAccess;
+  approval.disabled=webRunActive||forceFullAccess;
   nativeNotice.classList.toggle('hidden',!native);
   setIconLabel(modeLabel,native?'app-window':'globe-2',native?'Codex App':'Web');
   statusEl.classList.toggle('running',webRunActive);
@@ -3205,11 +3238,15 @@ function updateConversationStatus(conversation){
     statusEl.textContent='Loaded '+stamp;
   }
 }
-function applyNativeConversationMetadata(metadata){if(metadata.cwd)cwd.value=metadata.cwd;if(['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}updateSafetyHint()}
+function applyNativeConversationMetadata(metadata){if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
 function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
+  sessionEvents.addEventListener('open',async()=>{
+    await refreshHistory();
+    if(currentConversationSource==='codex'&&currentConversationId)await syncCurrentNativeConversation();
+  });
   sessionEvents.addEventListener('sessions',(event)=>{
     let changedIds=[];
     try{changedIds=JSON.parse(event.data||'{}').changedIds||[]}catch(e){}
