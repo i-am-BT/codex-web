@@ -172,6 +172,26 @@ This block is automatically supplied ambient UI state, not part of the user's re
         },
       },
       {
+        timestamp: '2026-07-11T04:52:32.004Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '**Current Task**\nInternal handoff summary' }],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:52:32.004Z',
+        type: 'event_msg',
+        payload: { type: 'token_count' },
+      },
+      {
+        timestamp: '2026-07-11T04:52:32.004Z',
+        type: 'compacted',
+        payload: { replacement_history: [] },
+      },
+      {
         timestamp: '2026-07-11T04:52:32.005Z',
         type: 'response_item',
         payload: {
@@ -264,6 +284,14 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '我想 UI 和这个一样\n\n图片附件'));
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content === '助手进度'));
     assert.equal(conversation.messages.some((message) => message.role === 'thinking'), false);
+    assert.equal(conversation.messages.some((message) => message.content.includes('Internal handoff summary')), false);
+    assert.deepEqual(
+      conversation.messages.filter((message) => message.kind === 'context_compacted').map((message) => ({
+        role: message.role,
+        content: message.content,
+      })),
+      [{ role: 'process', content: '上下文已压缩' }],
+    );
     assert.ok(conversation.messages.some((message) => message.role === 'tool' && message.content.includes('exec_command')));
     assert.ok(conversation.messages.some((message) => (
       message.role === 'context'
@@ -306,6 +334,56 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(incremental.reset, false);
     assert.deepEqual(incremental.messages.map((message) => message.content), ['新增回复']);
     assert.ok(incremental.cursor > conversation.cursor);
+
+    const compactedChange = once(store, 'change');
+    await appendFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-11T04:54:00.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '**Current Task**\nLate handoff summary' }],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:54:00.001Z',
+        type: 'compacted',
+        payload: { replacement_history: [] },
+      },
+    ]));
+    await compactedChange;
+
+    const afterCompaction = store.get(id, {
+      after: incremental.cursor,
+      generation: incremental.generation,
+    });
+    assert.equal(afterCompaction.reset, true);
+    assert.equal(afterCompaction.messages.some((message) => message.content.includes('Late handoff summary')), false);
+    assert.equal(afterCompaction.messages.filter((message) => message.kind === 'context_compacted').length, 2);
+
+    const delayedCompactionChange = once(store, 'change');
+    await appendFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-11T04:55:00.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '正常最终回复' }],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:55:10.000Z',
+        type: 'compacted',
+        payload: { replacement_history: [] },
+      },
+    ]));
+    await delayedCompactionChange;
+    const afterDelayedCompaction = store.get(id);
+    assert.ok(afterDelayedCompaction.messages.some((message) => message.content === '正常最终回复'));
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });

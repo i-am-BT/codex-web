@@ -480,6 +480,11 @@ function applyNativeRecord(cache, record, maxMessages) {
     return;
   }
 
+  if (record.type === 'compacted') {
+    applyCompactedRecord(cache, record, maxMessages);
+    return;
+  }
+
   const payload = record.payload || {};
   if (record.type === 'event_msg') {
     applyEventRecord(cache, record, payload, maxMessages);
@@ -583,6 +588,25 @@ function applyEventRecord(cache, record, payload, maxMessages) {
     default:
       break;
   }
+}
+
+function applyCompactedRecord(cache, record, maxMessages) {
+  const previous = cache.messages.at(-1);
+  const previousAt = Date.parse(previous?.at || '');
+  const compactedAt = Date.parse(record.timestamp || '');
+  const followsHandoff = Number.isFinite(previousAt)
+    && Number.isFinite(compactedAt)
+    && compactedAt >= previousAt
+    && compactedAt - previousAt <= 5000;
+  if (previous?.role === 'assistant' && previous.kind === 'final_answer' && followsHandoff) {
+    cache.messages.pop();
+  }
+  if (cache.messages.at(-1)?.kind !== 'context_compacted') {
+    appendNativeMessage(cache, 'process', '上下文已压缩', record, maxMessages, 'context_compacted');
+  }
+  // A browser may have read the internal handoff summary before the compacted
+  // record landed. Changing the generation forces its next poll to reset.
+  cache.generation += 1;
 }
 
 function applyMessageRecord(cache, record, payload, maxMessages) {
