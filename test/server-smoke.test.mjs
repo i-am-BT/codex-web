@@ -263,6 +263,15 @@ if (args[0] === 'app-server') {
         const turnId = '019f4f84-ea9f-73c2-b997-deba7b4aa798';
         send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [] } } });
         send({ method: 'turn/started', params: { threadId: message.params.threadId, turn: { id: turnId, status: 'inProgress', items: [] } } });
+        send({
+          method: 'error',
+          params: {
+            error: { message: 'Reconnecting... 1/5' },
+            willRetry: true,
+            threadId: message.params.threadId,
+            turnId
+          }
+        });
         const text = (message.params.input || []).find((item) => item.type === 'text')?.text || '';
         if (text.includes('needs approval')) {
           send({
@@ -373,6 +382,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
     assert.match(page, /function scheduleNativeCompletionSync/);
     assert.match(page, /function reconcileNativeCompletion/);
+    assert.match(page, /runtime\.type==='connection-error'/);
+    assert.match(page, /上游连接中断，正在重连/);
     assert.match(page, /document\.addEventListener\('visibilitychange',syncNativeAfterPageResume\)/);
     assert.match(page, /window\.addEventListener\('pageshow',syncNativeAfterPageResume\)/);
     assert.doesNotMatch(page, /setTimeout\(\(\)=>\{if\(currentConversationSource==='codex'.*loadConversation\(completedId,'codex'\)/);

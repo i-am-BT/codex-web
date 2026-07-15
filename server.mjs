@@ -102,6 +102,7 @@ nativeSessions.on('change', broadcastNativeSessionChange);
 nativeSessions.start();
 appServerClient.on('notification', handleAppServerNotification);
 appServerClient.on('request', handleAppServerRequest);
+appServerClient.on('appServerError', handleAppServerError);
 appServerClient.on('stderr', (content) => {
   const text = String(content || '').trim();
   if (text) console.error(`codex app-server: ${text}`);
@@ -1372,6 +1373,25 @@ function broadcastNativeRuntime(event) {
 
 function broadcastNativeRequest(event) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'native-request', event);
+}
+
+function handleAppServerError(params = {}) {
+  const threadId = cleanNativeThreadId(params.threadId);
+  const current = threadId ? activeNativeTurns.get(threadId) : null;
+  const turnId = String(params.turnId || current?.turnId || '');
+  const willRetry = params.willRetry === true;
+  const message = String(params.error?.message || 'Codex App 请求异常').trim().slice(0, 180);
+  console.warn(`codex app-server ${willRetry ? 'retrying' : 'error'}: ${message}`);
+  if (!threadId) return;
+  if (willRetry) setNativeTurnState(threadId, { turnId, status: 'running' });
+  broadcastNativeRuntime({
+    type: 'connection-error',
+    threadId,
+    turnId,
+    willRetry,
+    message,
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 function handleAppServerNotification(event) {
@@ -3379,6 +3399,16 @@ function connectSessionEvents(){
       updateNativeLiveDelta(runtime);
     }else if(runtime.type==='item-completed'){
       finishNativeLiveItem(runtime.itemId);
+    }else if(runtime.type==='connection-error'){
+      activeNativeTurnId=runtime.turnId||activeNativeTurnId;
+      if(runtime.willRetry){
+        webRunActive=true;
+        clearNativeCompletionSync();
+        statusEl.textContent='Codex App · 上游连接中断，正在重连';
+      }else{
+        statusEl.textContent='Codex App · 上游请求异常，等待任务状态';
+      }
+      applyConversationMode();
     }else if(runtime.type==='turn'){
       const runtimeTurnId=runtime.turnId||activeNativeTurnId;
       activeNativeTurnId=runtimeTurnId;
