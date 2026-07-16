@@ -989,6 +989,25 @@ body .histDelete:hover {
   color: var(--danger);
 }
 
+@media (hover: hover) and (pointer: fine) {
+  body .histRename,
+  body .histDelete {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(2px);
+    transition: opacity 140ms var(--ease), transform 140ms var(--ease), border-color 160ms var(--ease), background 160ms var(--ease), color 160ms var(--ease);
+  }
+
+  body .hist:hover .histRename,
+  body .hist:hover .histDelete,
+  body .hist:focus-within .histRename,
+  body .hist:focus-within .histDelete {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(0);
+  }
+}
+
 body .logout {
   width: 100%;
   flex: 0 0 auto;

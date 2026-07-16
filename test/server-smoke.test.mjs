@@ -386,6 +386,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.historyProjectMenu\s*\{/);
     assert.match(uiStyles, /\.historyProjectMenu\.openAbove/);
     assert.match(uiStyles, /\.historyProjectMenuAction\.danger/);
+    assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
     assert.match(uiStyles, /\.memoryCitationItem\[open\]/);
     assert.match(uiStyles, /\.composerModelToggle/);
