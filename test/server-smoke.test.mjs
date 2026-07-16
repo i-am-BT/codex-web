@@ -363,6 +363,9 @@ if (args[0] === 'app-server') {
     const uiStyles = await uiAsset.text();
     assert.match(uiStyles, /\.historyProjectHead\[aria-expanded="true"\]/);
     assert.match(uiStyles, /\.historyProjectItems\[hidden\]/);
+    assert.match(uiStyles, /\.historyProjectMenu\s*\{/);
+    assert.match(uiStyles, /\.historyProjectMenu\.openAbove/);
+    assert.match(uiStyles, /\.historyProjectMenuAction\.danger/);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
     assert.match(uiStyles, /\.memoryCitationItem\[open\]/);
     assert.match(uiStyles, /\.composerModelToggle/);
@@ -461,6 +464,12 @@ if (args[0] === 'app-server') {
     assert.match(page, /sideCollapsed/);
     assert.match(page, /function setHistoryProjectExpanded/);
     assert.match(page, /codexWeb\.historyProjectsCollapsed/);
+    assert.match(page, /codexWeb\.historyProjectsHidden/);
+    assert.match(page, /function createHistoryProjectMenu/);
+    assert.match(page, /function archiveHistoryProject/);
+    assert.match(page, /function toggleHistoryProjectHidden/);
+    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\)return/);
+    assert.match(page, /\/api\/native-projects\/archive/);
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);
     assert.match(page, /group\.open=false/);
@@ -1039,6 +1048,29 @@ if (args[0] === 'app-server') {
       body: JSON.stringify({ decision: 'accept' }),
     });
     assert.equal(approved.status, 200);
+
+    const runningProjectArchive = await fetch(`${baseUrl}/api/native-projects/archive`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd: temporary }),
+    });
+    assert.equal(runningProjectArchive.status, 409);
+
+    const stoppedForProjectArchive = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: continuedPayload.turnId }),
+    });
+    assert.equal(stoppedForProjectArchive.status, 200);
+
+    const archivedProject = await fetch(`${baseUrl}/api/native-projects/archive`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd: temporary }),
+    });
+    assert.equal(archivedProject.status, 200);
+    const archivedProjectPayload = await archivedProject.json();
+    assert.deepEqual(archivedProjectPayload.archived, [nativeSessionId]);
 
     const protocolMessages = (await readFile(appServerTraceFile, 'utf8'))
       .trim()

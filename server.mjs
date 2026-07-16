@@ -602,6 +602,48 @@ app.delete('/api/native-sessions/:id', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/api/native-projects/archive', requireAuth, async (req, res) => {
+  const projectPath = normalizeNativeProjectPath(req.body?.cwd);
+  if (!projectPath) return res.status(400).json({ error: '项目路径无效' });
+
+  const targets = nativeSessionSummaries().filter((session) => (
+    normalizeNativeProjectPath(session.cwd) === projectPath
+  ));
+  if (!targets.length) return res.status(404).json({ error: '该项目没有可归档任务' });
+
+  const running = targets.filter((session) => {
+    const active = activeNativeTurns.get(session.id);
+    return active ? active.status === 'running' : session.status === 'running';
+  });
+  if (running.length) {
+    return res.status(409).json({
+      error: `项目中有 ${running.length} 个任务正在运行，请先停止后再归档`,
+      running: running.map((session) => session.id),
+    });
+  }
+
+  const archived = [];
+  const failed = [];
+  for (const session of targets) {
+    try {
+      await appServerClient.request('thread/archive', { threadId: session.id });
+      archived.push(session.id);
+    } catch (err) {
+      failed.push({ id: session.id, error: err.message });
+    }
+  }
+  nativeSessions.scheduleRefresh();
+
+  if (failed.length) {
+    return res.status(502).json({
+      error: `已归档 ${archived.length} 个任务，${failed.length} 个失败`,
+      archived,
+      failed,
+    });
+  }
+  res.json({ ok: true, cwd: projectPath, archived });
+});
+
 app.get('/api/native-requests', requireAuth, (_req, res) => {
   res.json({ requests: listPendingNativeRequests() });
 });
@@ -1984,6 +2026,14 @@ function nativeSessionSummaries() {
   });
 }
 
+function normalizeNativeProjectPath(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const normalized = path.normalize(raw);
+  const root = path.parse(normalized).root;
+  return normalized === root ? root : normalized.replace(/[\\/]+$/, '');
+}
+
 function extractNativeToolImagePaths(message) {
   if (message?.role !== 'tool') return [];
   const source = String(message.content || '');
@@ -2954,8 +3004,11 @@ let appearance = {theme:'light',chatBackground:'default',customBackgrounds:[]};
 const desktopSidebarMedia=window.matchMedia('(min-width: 821px)');
 const SIDEBAR_STORAGE_KEY='codexWeb.sidebarCollapsed';
 const HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsCollapsed';
+const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
+let hiddenHistoryProjects=readHiddenHistoryProjects();
+let activeHistoryProjectMenu=null;
 function refreshIcons(root=document){if(!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
 function setIconLabel(element,name,label,showLabel=true){if(!element)return;element.replaceChildren();const icon=document.createElement('i');icon.setAttribute('data-lucide',name);icon.setAttribute('aria-hidden','true');element.appendChild(icon);if(showLabel){const text=document.createElement('span');text.className='buttonLabel';text.textContent=label;element.appendChild(text)}if(label&&!element.getAttribute('aria-label'))element.setAttribute('aria-label',label);refreshIcons(element)}
 function createComposerMirrorField(panel,labelText,ariaLabel){
@@ -3687,8 +3740,9 @@ document.getElementById('deleteProvider')?.addEventListener('click', deleteSelec
 settingsToggle?.addEventListener('click', toggleSettings);
 menuBtn?.addEventListener('click', toggleMenu);
 document.getElementById('scrim')?.addEventListener('click', closeMenu);
+document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{app.classList.remove('menuOpen');syncMenuButton()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',async()=>{await loadModels(provider.value);syncComposerChrome()});
@@ -3725,7 +3779,7 @@ async function handleChatBackgroundChange(){const value=chatBackground.value;if(
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
 async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);cwd.value=data.defaults.cwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
-async function refreshHistory(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
+async function refreshHistory(){if(activeHistoryProjectMenu)return;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
 async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
 async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
@@ -3733,10 +3787,92 @@ async function deleteSelectedProvider(){const name=provider.value;if(!name){defa
 async function requestModels(payload){try{const res=await fetch('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();return res.ok?data:{error:data.error||'获取模型失败'}}catch(e){return{error:e.message}}}
 function fillSelect(select,items,selected){select.innerHTML='';const list=[...new Set((items||[]).filter(Boolean))];if(!list.length)list.push(selected||'gpt-5.5');for(const item of list){const opt=document.createElement('option');opt.value=item;opt.textContent=item;select.appendChild(opt)}select.value=list.includes(selected)?selected:list[0];syncComposerChrome()}
 function conversationKey(source,id){return (source==='codex'?'codex':'web')+':'+id}
+function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown__'}
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
 function projectNameFromPath(value){const clean=String(value||'').replace(/\\\\/g,'/').replace(/\\/+$/,'');const parts=clean.split('/').filter(Boolean);return parts.length?parts[parts.length-1]:'未指定项目'}
 function readCollapsedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
 function storeCollapsedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...collapsedHistoryProjects].sort()))}catch{}}
+function readHiddenHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
+function storeHiddenHistoryProjects(){try{localStorage.setItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...hiddenHistoryProjects].sort()))}catch{}}
+function closeHistoryProjectMenu(restoreFocus=false){
+  const active=activeHistoryProjectMenu;
+  if(!active)return;
+  active.menu.hidden=true;
+  active.menu.classList.remove('openAbove');
+  active.button.setAttribute('aria-expanded','false');
+  activeHistoryProjectMenu=null;
+  if(restoreFocus&&active.button.isConnected)active.button.focus();
+}
+function toggleHistoryProjectMenu(button,menu){
+  const shouldOpen=menu.hidden;
+  closeHistoryProjectMenu();
+  if(!shouldOpen)return;
+  menu.hidden=false;
+  button.setAttribute('aria-expanded','true');
+  activeHistoryProjectMenu={button,menu};
+  requestAnimationFrame(()=>{
+    const bounds=history.getBoundingClientRect();
+    const anchor=button.getBoundingClientRect();
+    menu.classList.toggle('openAbove',anchor.bottom+menu.offsetHeight+8>bounds.bottom&&anchor.top-menu.offsetHeight>bounds.top);
+    menu.querySelector('button:not(:disabled)')?.focus();
+  });
+}
+function addHistoryProjectMenuAction(menu,iconName,label,handler,{danger=false,disabled=false}={}){
+  const action=document.createElement('button');
+  action.type='button';
+  action.className='historyProjectMenuAction'+(danger?' danger':'');
+  action.setAttribute('role','menuitem');
+  action.disabled=disabled;
+  setIconLabel(action,iconName,label);
+  action.addEventListener('click',(event)=>{event.stopPropagation();closeHistoryProjectMenu();handler()});
+  menu.appendChild(action);
+  return action;
+}
+function createHistoryProjectMenu(groupKey,groupData,projectName){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='historyProjectMenuButton';
+  button.title='项目操作';
+  button.setAttribute('aria-label','项目 '+projectName+' 的操作');
+  button.setAttribute('aria-haspopup','menu');
+  button.setAttribute('aria-expanded','false');
+  setIconLabel(button,'ellipsis','项目操作',false);
+  const menu=document.createElement('div');
+  menu.className='historyProjectMenu';
+  menu.setAttribute('role','menu');
+  menu.setAttribute('aria-label','项目 '+projectName+' 的操作');
+  menu.hidden=true;
+  addHistoryProjectMenuAction(menu,'archive','归档项目任务',()=>archiveHistoryProject(groupData.path,projectName,groupData.items),{disabled:!groupData.path});
+  const hidden=hiddenHistoryProjects.has(groupKey);
+  addHistoryProjectMenuAction(menu,hidden?'undo-2':'x',hidden?'恢复项目':'移除项目',()=>toggleHistoryProjectHidden(groupKey,projectName,groupData.items.length),{danger:!hidden});
+  button.addEventListener('click',(event)=>{event.stopPropagation();toggleHistoryProjectMenu(button,menu)});
+  menu.addEventListener('click',(event)=>event.stopPropagation());
+  return{button,menu};
+}
+async function archiveHistoryProject(projectPath,projectName,items){
+  if(!projectPath)return;
+  if(!confirm('归档项目「'+projectName+'」下的 '+items.length+' 个任务？归档后可在 Codex App 中恢复。'))return;
+  statusEl.textContent='正在归档项目任务...';
+  try{
+    const res=await fetch('/api/native-projects/archive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cwd:projectPath})});
+    const data=await res.json().catch(()=>({}));
+    if((data.archived||[]).includes(currentConversationId))newChat();
+    await refreshHistory();
+    if(!res.ok)throw new Error(data.error||'归档项目任务失败');
+    statusEl.textContent='已归档 '+data.archived.length+' 个项目任务';
+  }catch(error){
+    await refreshHistory();
+    statusEl.textContent=error.message;
+  }
+}
+function toggleHistoryProjectHidden(groupKey,projectName,itemCount){
+  const hidden=hiddenHistoryProjects.has(groupKey);
+  if(!hidden&&!confirm('从侧栏移除项目「'+projectName+'」？不会删除目录或 '+itemCount+' 个任务，可通过搜索恢复。'))return;
+  if(hidden)hiddenHistoryProjects.delete(groupKey);else hiddenHistoryProjects.add(groupKey);
+  storeHiddenHistoryProjects();
+  renderHistory();
+  statusEl.textContent=hidden?'项目已恢复':'项目已从侧栏移除';
+}
 function setHistoryProjectExpanded(group,expanded){
   const head=group?.querySelector('.historyProjectHead');
   const rows=group?.querySelector('.historyProjectItems');
@@ -3752,22 +3888,24 @@ function setHistoryProjectExpanded(group,expanded){
 function renderHistory(items){
   if(Array.isArray(items))historyItems=items;
   const query=String(historyFilter?.value||'').trim().toLocaleLowerCase();
-  const visibleItems=query?historyItems.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')).toLocaleLowerCase().includes(query)):historyItems;
+  const candidates=query?historyItems:historyItems.filter((item)=>!hiddenHistoryProjects.has(historyProjectKey(item.cwd)));
+  const visibleItems=query?candidates.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')).toLocaleLowerCase().includes(query)):candidates;
   const scrollTop=history.scrollTop;
+  closeHistoryProjectMenu();
   history.innerHTML='';
   const historyCount=document.getElementById('historyTitleCount');
-  if(historyCount)historyCount.textContent=query?visibleItems.length+'/'+historyItems.length:String(historyItems.length);
+  if(historyCount)historyCount.textContent=(query||visibleItems.length!==historyItems.length)?visibleItems.length+'/'+historyItems.length:String(historyItems.length);
   if(!visibleItems.length){
     const empty=document.createElement('div');
     empty.className='historyEmpty';
-    empty.textContent=query?'没有匹配的任务':'暂无任务';
+    empty.textContent=query?'没有匹配的任务':hiddenHistoryProjects.size?'项目已从侧栏移除，可通过搜索恢复':'暂无任务';
     history.appendChild(empty);
     return;
   }
   const groups=new Map();
   for(const item of visibleItems){
     const projectPath=normalizeProjectPath(item.cwd);
-    const groupKey=projectPath||'__unknown__';
+    const groupKey=historyProjectKey(projectPath);
     if(!groups.has(groupKey))groups.set(groupKey,{path:projectPath,items:[]});
     groups.get(groupKey).items.push(item);
   }
@@ -3779,6 +3917,8 @@ function renderHistory(items){
     const projectName=projectNameFromPath(groupData.path);
     group.dataset.projectName=projectName;
     group.setAttribute('aria-label','项目 '+projectName+'，路径 '+(groupData.path||'未知'));
+    const header=document.createElement('div');
+    header.className='historyProjectHeader';
     const head=document.createElement('button');
     head.type='button';
     head.className='historyProjectHead';
@@ -3806,11 +3946,15 @@ function renderHistory(items){
     headText.appendChild(projectPath);
     head.appendChild(chevron);
     head.appendChild(headText);
+    const projectMenu=createHistoryProjectMenu(groupKey,groupData,projectName);
+    header.appendChild(head);
+    header.appendChild(projectMenu.button);
+    header.appendChild(projectMenu.menu);
     const rows=document.createElement('div');
     rows.className='historyProjectItems';
     rows.id=rowsId;
     for(const item of groupData.items)rows.appendChild(createHistoryRow(item,groupData.path));
-    group.appendChild(head);
+    group.appendChild(header);
     group.appendChild(rows);
     history.appendChild(group);
     const currentKey=conversationKey(currentConversationSource,currentConversationId);

@@ -726,6 +726,14 @@ body .history {
   gap: 5px;
 }
 
+.historyProjectHeader {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  min-width: 0;
+}
+
 .historyProjectHead {
   display: grid;
   grid-template-columns: 15px minmax(0, 1fr);
@@ -741,6 +749,91 @@ body .history {
   text-align: left;
   cursor: pointer;
   transition: background 140ms var(--ease), color 140ms var(--ease);
+}
+
+.historyProjectMenuButton {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-subtle);
+  padding: 0;
+  opacity: 0.62;
+}
+
+.historyProjectMenuButton:hover,
+.historyProjectMenuButton:focus-visible,
+.historyProjectMenuButton[aria-expanded="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+  opacity: 1;
+}
+
+.historyProjectMenuButton .lucide {
+  width: 15px;
+  height: 15px;
+}
+
+.historyProjectMenu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  right: 2px;
+  display: grid;
+  width: 184px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  padding: 5px;
+  box-shadow: var(--shadow-lg);
+}
+
+.historyProjectMenu[hidden] {
+  display: none;
+}
+
+.historyProjectMenu.openAbove {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+
+.historyProjectMenuAction {
+  display: grid;
+  width: 100%;
+  min-height: 34px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  padding: 7px 9px;
+  text-align: left;
+  font-size: 12px;
+}
+
+.historyProjectMenuAction:hover,
+.historyProjectMenuAction:focus-visible {
+  background: var(--surface-hover);
+}
+
+.historyProjectMenuAction.danger {
+  color: var(--danger);
+}
+
+.historyProjectMenuAction:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.historyProjectMenuAction .lucide {
+  width: 15px;
+  height: 15px;
 }
 
 .historyProjectHead:hover {
