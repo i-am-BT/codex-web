@@ -20,6 +20,11 @@ const MARKED_BROWSER_FILE = path.join(ROOT, 'node_modules', 'marked', 'lib', 'ma
 const DOMPURIFY_BROWSER_FILE = path.join(ROOT, 'node_modules', 'dompurify', 'dist', 'purify.min.js');
 const LUCIDE_BROWSER_FILE = path.join(ROOT, 'node_modules', 'lucide', 'dist', 'umd', 'lucide.min.js');
 const UI_CSS_FILE = path.join(ROOT, 'ui.css');
+const IMAGE_PROMPT_CSS_FILE = path.join(ROOT, 'image-prompt.css');
+const IMAGE_PROMPT_JS_FILE = path.join(ROOT, 'image-prompt.js');
+const IMAGE_PROMPT_CASES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-cases.json');
+const IMAGE_PROMPT_STYLES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-style-library.json');
+const IMAGE_PROMPT_IMAGE_BASE = 'https://raw.githubusercontent.com/freestylefly/awesome-gpt-image-2/60b6e1d3ddaf1c982426d6c8181827764c6b2012/data';
 
 loadEnv(DEFAULT_ENV_FILE, false);
 
@@ -124,6 +129,7 @@ const desktopSnapshotRequests = new Map();
 let activeProcess = null;
 let activeConversationId = '';
 let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
+let imagePromptLibraryCache = null;
 
 nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
@@ -199,6 +205,14 @@ app.get('/vendor/lucide.js', (_req, res) => {
 
 app.get('/ui.css', (_req, res) => {
   res.type('text/css').sendFile(UI_CSS_FILE);
+});
+
+app.get('/image-prompt.css', (_req, res) => {
+  res.type('text/css').sendFile(IMAGE_PROMPT_CSS_FILE);
+});
+
+app.get('/image-prompt.js', (_req, res) => {
+  res.type('text/javascript').sendFile(IMAGE_PROMPT_JS_FILE);
 });
 
 app.post('/api/login', (req, res) => {
@@ -324,6 +338,15 @@ app.get('/api/config', requireAuth, (req, res) => {
       manageProviders: CODEX_CONFIG_WRITABLE,
     },
   });
+});
+
+app.get('/api/image-prompts', requireAuth, (_req, res) => {
+  try {
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.json(readImagePromptLibrary());
+  } catch (err) {
+    res.status(500).json({ error: `读取提示词库失败: ${err.message}` });
+  }
 });
 
 app.get('/api/native-sessions', requireAuth, (_req, res) => {
@@ -2576,6 +2599,41 @@ function conversationSummaries() {
     .slice(0, 160);
 }
 
+function readImagePromptLibrary() {
+  if (imagePromptLibraryCache) return imagePromptLibraryCache;
+  const caseData = JSON.parse(readFileSync(IMAGE_PROMPT_CASES_FILE, 'utf8'));
+  const styleData = JSON.parse(readFileSync(IMAGE_PROMPT_STYLES_FILE, 'utf8'));
+  const cases = Array.isArray(caseData?.cases) ? caseData.cases : [];
+  const templates = Array.isArray(styleData?.templates) ? styleData.templates : [];
+  if (!cases.length || !templates.length) throw new Error('提示词数据为空');
+  imagePromptLibraryCache = {
+    version: `${styleData.version || 1}:${cases.length}:${templates.length}`,
+    imageBaseUrl: IMAGE_PROMPT_IMAGE_BASE,
+    totalCases: cases.length,
+    totalTemplates: templates.length,
+    categories: Array.isArray(styleData.categories) ? styleData.categories : [],
+    styles: Array.isArray(styleData.styles) ? styleData.styles : [],
+    scenes: Array.isArray(styleData.scenes) ? styleData.scenes : [],
+    cases,
+    templates,
+    sources: [
+      {
+        name: 'awesome-gpt-image-2',
+        url: 'https://github.com/freestylefly/awesome-gpt-image-2',
+        license: 'MIT',
+        role: '提示词案例与工业模板',
+      },
+      {
+        name: 'gpt_image_playground',
+        url: 'https://github.com/CookSleep/gpt_image_playground',
+        license: 'MIT',
+        role: '参数、参考图与收藏工作流',
+      },
+    ],
+  };
+  return imagePromptLibraryCache;
+}
+
 function pageHtml(authenticated) {
   const appName = escapeHtml(APP_NAME);
   return `<!DOCTYPE html>
@@ -2604,6 +2662,7 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
 <link rel="stylesheet" href="/ui.css">
+<link rel="stylesheet" href="/image-prompt.css">
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
@@ -4721,6 +4780,7 @@ async function send(){
   }
 }
 </script>
+<script src="/image-prompt.js"></script>
 </body>
 </html>`;
 }

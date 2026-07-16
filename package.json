@@ -7,7 +7,7 @@
   "scripts": {
     "setup": "node scripts/setup-local.mjs",
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check app-server-client.mjs && node --check desktop-ipc-client.mjs && node --check native-sessions.mjs && node --check scripts/setup-local.mjs && node --check test/desktop-ipc-client.test.mjs && node --check test/server-smoke.test.mjs && node --check test/native-sessions.test.mjs",
+    "check": "node --check server.mjs && node --check image-prompt.js && node --check app-server-client.mjs && node --check desktop-ipc-client.mjs && node --check native-sessions.mjs && node --check scripts/setup-local.mjs && node --check test/desktop-ipc-client.test.mjs && node --check test/server-smoke.test.mjs && node --check test/native-sessions.test.mjs",
     "test": "node --test"
   },
   "dependencies": {

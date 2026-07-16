@@ -330,8 +330,26 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.msg\.user\.hasInputImage > \.msgBody:empty/);
     assert.match(uiStyles, /\.settingsDialog/);
 
+    const imagePromptStylesResponse = await fetch(`${baseUrl}/image-prompt.css`);
+    assert.equal(imagePromptStylesResponse.status, 200);
+    const imagePromptStyles = await imagePromptStylesResponse.text();
+    assert.match(imagePromptStyles, /\.workspaceNavButton\.active/);
+    assert.match(imagePromptStyles, /\.imagePromptGrid/);
+    assert.match(imagePromptStyles, /\.imagePromptDetailDialog/);
+    assert.match(imagePromptStyles, /\.imagePromptPreviewFrame\.imageLoading img/);
+
+    const imagePromptScriptResponse = await fetch(`${baseUrl}/image-prompt.js`);
+    assert.equal(imagePromptScriptResponse.status, 200);
+    const imagePromptScript = await imagePromptScriptResponse.text();
+    assert.doesNotThrow(() => new Function(imagePromptScript));
+    assert.match(imagePromptScript, /function composeCodexImagePrompt/);
+    assert.match(imagePromptScript, /function loadDetailImage/);
+    assert.match(imagePromptScript, /发送到 Codex App/);
+
     const unauthorized = await fetch(`${baseUrl}/api/config`);
     assert.equal(unauthorized.status, 401);
+    const unauthorizedImagePrompts = await fetch(`${baseUrl}/api/image-prompts`);
+    assert.equal(unauthorizedImagePrompts.status, 401);
 
     const login = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
@@ -346,6 +364,8 @@ if (args[0] === 'app-server') {
     const page = await pageResponse.text();
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
+    assert.match(page, /href="\/image-prompt\.css"/);
+    assert.match(page, /src="\/image-prompt\.js"/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
     assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
@@ -502,6 +522,19 @@ if (args[0] === 'app-server') {
     )));
     assert.equal(config.conversations.some((conversation) => conversation.id === archivedNativeSessionId), false);
     assert.equal(config.conversations.some((conversation) => conversation.id === automationNativeSessionId), false);
+
+    const imagePromptsResponse = await fetch(`${baseUrl}/api/image-prompts`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(imagePromptsResponse.status, 200);
+    const imagePrompts = await imagePromptsResponse.json();
+    assert.equal(imagePrompts.totalCases, 517);
+    assert.equal(imagePrompts.totalTemplates, 22);
+    assert.equal(imagePrompts.cases.length, 517);
+    assert.equal(imagePrompts.templates.length, 22);
+    assert.match(imagePrompts.imageBaseUrl, /awesome-gpt-image-2\/60b6e1d3/);
+    assert.ok(imagePrompts.sources.some((source) => source.name === 'gpt_image_playground'));
+    assert.ok(imagePrompts.cases.some((item) => item.id === 520 && item.prompt));
 
     const nativeSessions = await fetch(`${baseUrl}/api/native-sessions`, {
       headers: { Cookie: cookie },
