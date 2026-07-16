@@ -408,6 +408,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.activityImagePreview img\s*\{[^}]*width:\s*100%;[^}]*object-fit:\s*contain/s);
     assert.match(uiStyles, /\.activityImagePreview\.loaded img\s*\{[^}]*height:\s*auto/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary:last-child \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming:last-child > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgBody > :not\(\.memoryCitations\)\s*\{[^}]*max-width:\s*min\(780px, 100%\)/s);

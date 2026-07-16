@@ -1940,6 +1940,22 @@ body[data-theme] .activityBatch {
   gap: 14px;
 }
 
+body .liveProcessTimeline > .progressCommentary:last-child .markdownBody > :last-child,
+body .liveProcessTimeline > .activityCluster.streaming:last-child > summary .activityClusterText {
+  background: linear-gradient(90deg, var(--text-muted) 0%, var(--text-muted) 36%, var(--text) 50%, var(--text-muted) 64%, var(--text-muted) 100%);
+  background-position: 100% 50%;
+  background-size: 240% 100%;
+  background-clip: text;
+  color: transparent;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: liveProcessFlow 2.1s linear infinite;
+}
+
+body .liveProcessTimeline > .progressCommentary:last-child.streaming .markdownBody > :last-child::after {
+  display: none;
+}
+
 .completionTimeline > .msg.user.steeringUser {
   width: fit-content;
   max-width: min(680px, 78%);
@@ -3005,6 +3021,15 @@ body[data-chat-bg="custom"] .chat {
   }
 }
 
+@keyframes liveProcessFlow {
+  from {
+    background-position: 100% 50%;
+  }
+  to {
+    background-position: -100% 50%;
+  }
+}
+
 @media (min-width: 821px) {
   body .app {
     display: grid;
@@ -3285,6 +3310,13 @@ body[data-chat-bg="custom"] .chat {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+
+  body .liveProcessTimeline > .progressCommentary:last-child .markdownBody > :last-child,
+  body .liveProcessTimeline > .activityCluster.streaming:last-child > summary .activityClusterText {
+    background: none;
+    color: var(--text-muted);
+    -webkit-text-fill-color: currentColor;
   }
 }
 
