@@ -61,6 +61,7 @@ const DEFAULT_PROVIDER = process.env.DEFAULT_PROVIDER || '';
 const DEFAULT_CWD = process.env.DEFAULT_CWD || homedir();
 const DEFAULT_SANDBOX = process.env.DEFAULT_SANDBOX || 'read-only';
 const DEFAULT_APPROVAL = process.env.DEFAULT_APPROVAL || 'never';
+const FORCE_FULL_ACCESS = parseBoolean(process.env.FORCE_FULL_ACCESS, false);
 const NATIVE_SESSION_MAX_READ_MB = Number(process.env.NATIVE_SESSION_MAX_READ_MB || 32);
 const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAGES || 700);
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
@@ -135,15 +136,17 @@ nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
 appServerClient.on('notification', handleAppServerNotification);
 appServerClient.on('request', handleAppServerRequest);
+appServerClient.on('appServerError', handleAppServerError);
 appServerClient.on('stderr', (content) => {
   const text = String(content || '').trim();
   if (text) console.error(`codex app-server: ${text}`);
 });
 appServerClient.on('protocolError', (error) => console.error(error.message));
 appServerClient.on('exit', (error) => {
-  clearAppServerNativeTurns();
+  clearAppServerNativeTurns(error.message);
   clearAppServerPendingRequests(error.message);
   broadcastNativeRuntime({ type: 'disconnected', error: error.message });
+  nativeSessions.scheduleRefresh();
 });
 desktopIpcClient.on('disconnect', (error) => {
   clearDesktopThreadStates(error?.message || 'Codex Desktop IPC 已断开');
@@ -328,14 +331,15 @@ app.get('/api/config', requireAuth, (req, res) => {
       provider: defaults.provider || DEFAULT_PROVIDER,
       reasoningEffort: defaults.reasoningEffort || '',
       cwd: DEFAULT_CWD,
-      sandbox: DEFAULT_SANDBOX,
-      approval: DEFAULT_APPROVAL,
+      sandbox: FORCE_FULL_ACCESS ? 'danger-full-access' : DEFAULT_SANDBOX,
+      approval: FORCE_FULL_ACCESS ? 'never' : DEFAULT_APPROVAL,
     },
     providers: readProviders(),
     conversations: conversationSummaries(),
     appearance: readAppearance(),
     capabilities: {
       manageProviders: CODEX_CONFIG_WRITABLE,
+      forceFullAccess: FORCE_FULL_ACCESS,
     },
   });
 });
@@ -364,6 +368,72 @@ app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
     res.json({ conversation: decorateNativeConversation(conversation) });
   } catch (err) {
     res.status(500).json({ error: `读取 Codex App 会话失败: ${err.message}` });
+  }
+});
+
+app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+  if (activeNativeTurns.get(threadId)?.status === 'running') {
+    return res.status(409).json({ error: '会话任务正在运行，不能创建历史分支' });
+  }
+
+  const messageSeq = Number(req.body?.messageSeq);
+  if (!Number.isInteger(messageSeq) || messageSeq < 1) {
+    return res.status(400).json({ error: '消息序号无效' });
+  }
+
+  try {
+    const source = nativeSessions.get(threadId);
+    if (!source) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    const target = source.messages.find((message) => (
+      message.seq === messageSeq
+      && message.role === 'user'
+      && message.turnId
+    ));
+    if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户消息创建分支' });
+    if (!target.previousTurnId && source.truncated) {
+      return res.status(409).json({ error: '会话历史已截断，无法确定这条消息之前的 turn' });
+    }
+
+    const settings = parseNativeThreadSettings(req.body || {});
+    const result = target.previousTurnId
+      ? await appServerClient.request('thread/fork', compactObject({
+        threadId,
+        lastTurnId: target.previousTurnId,
+        cwd: settings.cwd,
+        model: settings.model,
+        modelProvider: settings.provider,
+        sandbox: settings.sandbox,
+        approvalPolicy: settings.approval,
+        threadSource: 'user',
+      }))
+      : await appServerClient.request('thread/start', compactObject({
+        cwd: settings.cwd,
+        model: settings.model,
+        modelProvider: settings.provider,
+        sandbox: settings.sandbox,
+        approvalPolicy: settings.approval,
+        threadSource: 'user',
+      }));
+    const forkedThreadId = cleanNativeThreadId(result?.thread?.id);
+    if (!forkedThreadId) throw new Error('Codex app-server 未返回有效分支 thread id');
+
+    nativeSessions.refresh();
+    const persisted = nativeSessions.get(forkedThreadId);
+    const conversation = persisted
+      ? decorateNativeConversation(persisted)
+      : nativeConversationFromThread(result.thread, '');
+    res.status(201).json({
+      ok: true,
+      threadId: forkedThreadId,
+      sourceThreadId: threadId,
+      forkedThroughTurnId: target.previousTurnId || '',
+      draft: extractUserDraft(target.content),
+      conversation,
+    });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `创建 Codex App 历史分支失败: ${err.message}` });
   }
 });
 
@@ -1569,6 +1639,25 @@ async function respondToNativeRequest(pending, response) {
   }
 }
 
+function handleAppServerError(params = {}) {
+  const threadId = cleanNativeThreadId(params.threadId);
+  const current = threadId ? activeNativeTurns.get(threadId) : null;
+  const turnId = String(params.turnId || current?.turnId || '');
+  const willRetry = params.willRetry === true;
+  const message = String(params.error?.message || 'Codex App 请求异常').trim().slice(0, 180);
+  console.warn(`codex app-server ${willRetry ? 'retrying' : 'error'}: ${message}`);
+  if (!threadId) return;
+  if (willRetry) setNativeTurnState(threadId, { turnId, status: 'running' });
+  broadcastNativeRuntime({
+    type: 'connection-error',
+    threadId,
+    turnId,
+    willRetry,
+    message,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
 function handleAppServerNotification(event) {
   const method = event.method;
   const params = event.params || {};
@@ -1694,10 +1783,18 @@ function clearAppServerPendingRequests(reason = '') {
   }
 }
 
-function clearAppServerNativeTurns() {
+function clearAppServerNativeTurns(reason = '') {
   for (const [threadId, active] of activeNativeTurns) {
     if (active.transport === 'desktop-ipc') continue;
     activeNativeTurns.delete(threadId);
+    broadcastNativeRuntime({
+      type: 'turn',
+      threadId,
+      turnId: active.turnId || '',
+      status: 'interrupted',
+      error: reason,
+      updatedAt: new Date().toISOString(),
+    });
   }
 }
 
@@ -1999,6 +2096,7 @@ async function startNativeTurn(threadId, turn) {
     model: turn.model,
     effort: turn.reasoningEffort,
     approvalPolicy: turn.approval,
+    sandboxPolicy: nativeSandboxPolicy(turn.sandbox, turn.cwd),
   }));
   const turnId = String(result?.turn?.id || '');
   if (!turnId) throw new Error('Codex app-server 未返回有效 turn id');
@@ -2064,6 +2162,16 @@ function parseNativeTurnPayload(body) {
   const message = String(body.message || '').trim();
   const attachments = normalizeUploadedAttachments(body.attachments, body.images);
   if (!message && !attachments.length) throw new Error('message is required');
+  const settings = parseNativeThreadSettings(body);
+  return {
+    message,
+    attachments,
+    ...settings,
+    input: buildNativeTurnInput(message, attachments),
+  };
+}
+
+function parseNativeThreadSettings(body) {
   const cwd = normalizeCwd(body.cwd || DEFAULT_CWD);
   if (!cwd) throw new Error('工作目录不存在');
   const model = cleanValue(body.model) || DEFAULT_MODEL;
@@ -2072,15 +2180,12 @@ function parseNativeTurnPayload(body) {
   const approval = cleanApproval(body.approval || DEFAULT_APPROVAL);
   const reasoningEffort = cleanReasoningEffort(body.reasoningEffort);
   return {
-    message,
-    attachments,
     cwd,
     model,
     provider,
     sandbox,
     approval,
     reasoningEffort,
-    input: buildNativeTurnInput(message, attachments),
   };
 }
 
@@ -2114,7 +2219,7 @@ function nativeConversationFromThread(thread, activeTurnId) {
     title: String(thread?.name || thread?.preview || '新会话').trim().slice(0, 80),
     createdAt,
     updatedAt,
-    status: 'running',
+    status: activeTurnId ? 'running' : 'done',
     readOnly: false,
     activeTurnId,
     messages: [],
@@ -2210,11 +2315,28 @@ function isHttpUrl(value) {
 }
 
 function cleanSandbox(value) {
+  if (FORCE_FULL_ACCESS) return 'danger-full-access';
   return ['read-only', 'workspace-write', 'danger-full-access'].includes(value) ? value : DEFAULT_SANDBOX;
 }
 
 function cleanApproval(value) {
+  if (FORCE_FULL_ACCESS) return 'never';
   return ['untrusted', 'on-request', 'never'].includes(value) ? value : DEFAULT_APPROVAL;
+}
+
+function nativeSandboxPolicy(value, cwd) {
+  const sandbox = cleanSandbox(value);
+  if (sandbox === 'danger-full-access') return { type: 'dangerFullAccess' };
+  if (sandbox === 'workspace-write') {
+    return {
+      type: 'workspaceWrite',
+      writableRoots: cwd ? [cwd] : [],
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+  }
+  return { type: 'readOnly', networkAccess: false };
 }
 
 function normalizeCwd(value) {
@@ -2690,9 +2812,12 @@ let nativeCursor = 0;
 let nativeGeneration = 0;
 let sessionEvents = null;
 let nativeSyncTimer = null;
+let nativeCompletionSync = null;
+let nativeCompletionTimer = null;
 let webRunActive = false;
 let steerSubmitting = false;
 let activeNativeTurnId = '';
+let forceFullAccess = false;
 let nativeRunningElement = null;
 let nativeOptimisticElements = [];
 let nativeOptimisticSteering = new Map();
@@ -3497,6 +3622,9 @@ dropZone?.addEventListener('paste',handleAttachmentPaste);
 input?.addEventListener('paste',handleAttachmentPaste);
 cancelBtn?.addEventListener('click', cancelRun);
 nativeRequestForm?.addEventListener('submit',(e)=>e.preventDefault());
+document.addEventListener('visibilitychange',syncNativeAfterPageResume);
+window.addEventListener('pageshow',syncNativeAfterPageResume);
+window.addEventListener('online',syncNativeAfterPageResume);
 if (${authenticated ? 'true' : 'false'}) boot(true);
 async function toggleTheme(){const next=appearance.theme==='dark'?'light':'dark';await saveAppearance({theme:next})}
 function applyAppearance(){const theme=appearance.theme==='dark'?'dark':'light';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const bg=custom?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.chatBg=bg;document.body.style.setProperty('--custom-chat-bg',custom?'url("'+custom.url+'")':'none');if(themeToggle){setIconLabel(themeToggle,theme==='dark'?'sun':'moon','',false);themeToggle.title=theme==='dark'?'切换明亮模式':'切换黑暗模式';themeToggle.setAttribute('aria-label',themeToggle.title)}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
@@ -3508,7 +3636,7 @@ function updateDeleteBackgroundButton(selected){if(!deleteBackground)return;dele
 async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();cwd.value=data.defaults.cwd;sandbox.value=data.defaults.sandbox;approval.value=data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);cwd.value=data.defaults.cwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
 async function refreshHistory(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
 async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
 async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
@@ -3687,7 +3815,9 @@ function applyConversationMode(){
   attachFile.disabled=legacyLocked||steerSubmitting||queueStarting;
   fileInput.disabled=legacyLocked||steerSubmitting||queueStarting;
   sendBtn.disabled=legacyLocked||steerSubmitting||queueStarting||(!input.value.trim()&&!pendingAttachments.length);
-  for(const control of [provider,model,reasoningEffort,sandbox,approval])control.disabled=webRunActive;
+  for(const control of [provider,model,reasoningEffort])control.disabled=webRunActive;
+  sandbox.disabled=webRunActive||forceFullAccess;
+  approval.disabled=webRunActive||forceFullAccess;
   nativeNotice.classList.toggle('hidden',!native);
   setIconLabel(modeLabel,native?'app-window':'globe-2',native?'Codex App':'Web');
   statusEl.classList.toggle('running',webRunActive);
@@ -3701,10 +3831,11 @@ function applyConversationMode(){
   syncComposerChrome();
   renderPromptQueue();
 }
-function newChat(){closeComposerPopovers();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
+function newChat(){closeComposerPopovers();clearNativeCompletionSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
 async function loadConversation(id,source='web'){
-  if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return}
+  if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
+  clearNativeCompletionSync();
   const seq=++conversationLoadSeq;
   nativeOptimisticElements=[];
   nativeOptimisticSteering=new Map();
@@ -3724,10 +3855,10 @@ async function loadConversation(id,source='web'){
   statusEl.textContent='Loading...';
   const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
   const res=await fetch(endpoint+encodeURIComponent(id));
-  if(seq!==conversationLoadSeq)return;
-  if(!res.ok){statusEl.textContent='加载失败';return}
+  if(seq!==conversationLoadSeq)return false;
+  if(!res.ok){statusEl.textContent='加载失败';return false}
   const data=await res.json();
-  if(seq!==conversationLoadSeq)return;
+  if(seq!==conversationLoadSeq)return false;
   const conversation=data.conversation;
   if(titleEl)titleEl.textContent=conversation.title||'Chat';
   currentConversationId=conversation.id;
@@ -3741,13 +3872,14 @@ async function loadConversation(id,source='web'){
   updateActiveHistory();
   chat.innerHTML='';
   beginTurnProcessCollection();
-  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,autoScroll:false,kind:msg.kind,at:msg.at}));
+  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoScroll:false,kind:msg.kind,at:msg.at}));
   if(!(conversation.messages||[]).length)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   updateConversationStatus(conversation);
   renderPromptQueue();
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
   closeMenu();
   scrollChatToLatest();
+  return true;
 }
 function updateConversationStatus(conversation){
   const time=new Date(conversation.updatedAt||conversation.createdAt);
@@ -3760,11 +3892,48 @@ function updateConversationStatus(conversation){
     statusEl.textContent='Loaded '+stamp;
   }
 }
-function applyNativeConversationMetadata(metadata){if(metadata.cwd)cwd.value=metadata.cwd;if(['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}updateSafetyHint()}
+function applyNativeConversationMetadata(metadata){if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
+async function forkNativeConversation(messageSeq){
+  if(!currentConversationId||currentConversationSource!=='codex')return;
+  if(webRunActive){statusEl.textContent='任务运行中，不能创建历史分支';return}
+  if(!confirm('从这条消息重新开始？原会话会保留，新分支不会撤销已经产生的本地文件修改，原消息中的附件需要重新添加。'))return;
+  const sourceThreadId=currentConversationId;
+  statusEl.textContent='正在创建历史分支...';
+  try{
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,sandbox:sandbox.value,approval:approval.value})});
+    const data=await res.json();
+    if(!res.ok)throw new Error(data.error||'创建历史分支失败');
+    clearPendingAttachments();
+    const loaded=await loadConversation(data.threadId,'codex');
+    if(!loaded){
+      newChat();
+      currentConversationId=data.threadId;
+      currentConversationSource='codex';
+      if(titleEl)titleEl.textContent=data.conversation?.title||'新分支';
+      nativeNotice.textContent='Codex App 会话 · 历史分支';
+      statusEl.textContent='Codex App · 新分支';
+      applyNativeConversationMetadata(data.conversation?.metadata||{});
+      applyConversationMode();
+      updateActiveHistory();
+    }
+    input.value=data.draft||'';
+    input.style.height='auto';
+    input.style.height=Math.min(input.scrollHeight,180)+'px';
+    await refreshHistory();
+    statusEl.textContent='已创建分支，可修改后发送；原会话保持不变';
+    input.focus();
+  }catch(e){
+    statusEl.textContent=e.message;
+  }
+}
 function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
+  sessionEvents.addEventListener('open',async()=>{
+    await refreshHistory();
+    syncNativeAfterPageResume();
+  });
   sessionEvents.addEventListener('sessions',(event)=>{
     let changedIds=[];
     try{changedIds=JSON.parse(event.data||'{}').changedIds||[]}catch(e){}
@@ -3784,8 +3953,19 @@ function connectSessionEvents(){
       updateNativeLiveDelta(runtime);
     }else if(runtime.type==='item-completed'){
       finishNativeLiveItem(runtime.itemId);
-    }else if(runtime.type==='turn'){
+    }else if(runtime.type==='connection-error'){
       activeNativeTurnId=runtime.turnId||activeNativeTurnId;
+      if(runtime.willRetry){
+        webRunActive=true;
+        clearNativeCompletionSync();
+        statusEl.textContent='Codex App · 上游连接中断，正在重连';
+      }else{
+        statusEl.textContent='Codex App · 上游请求异常，等待任务状态';
+      }
+      applyConversationMode();
+    }else if(runtime.type==='turn'){
+      const runtimeTurnId=runtime.turnId||activeNativeTurnId;
+      activeNativeTurnId=runtimeTurnId;
       webRunActive=runtime.status==='running';
       if(!webRunActive){
         activeNativeTurnId='';
@@ -3794,9 +3974,10 @@ function connectSessionEvents(){
         statusEl.textContent=runtime.status==='error'?'Codex App 任务失败':runtime.status==='interrupted'?'Codex App 任务已取消':'Codex App 任务完成';
         playTaskCompleteSound();
         const completedId=currentConversationId;
-        setTimeout(()=>{if(currentConversationSource==='codex'&&currentConversationId===completedId)loadConversation(completedId,'codex')},220);
+        scheduleNativeCompletionSync(completedId,runtimeTurnId,220);
         schedulePromptQueueDispatch(completedId,320);
       }else{
+        clearNativeCompletionSync();
         statusEl.textContent='Codex App · 运行中';
       }
       applyConversationMode();
@@ -3815,20 +3996,91 @@ async function syncCurrentNativeConversationOnce(){
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
   const data=await res.json();
   const conversation=data.conversation;
-  if(conversation.reset){await loadConversation(id,'codex');return}
+  if(conversation.reset){
+    if(webRunActive||nativeLiveItems.size){
+      nativeCursor=Number(conversation.cursor||nativeCursor);
+      nativeGeneration=Number(conversation.generation||nativeGeneration);
+      if(conversation.status!=='running')scheduleNativeCompletionSync(id,nativeCompletionSync?.turnId||activeNativeTurnId,120);
+      return;
+    }
+    await loadConversation(id,'codex');return;
+  }
+  const wasRunning=webRunActive;
+  const completingTurnId=activeNativeTurnId;
   if((conversation.messages||[]).length){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
   }
-  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if(webRunActive&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{autoScroll:false,kind:msg.kind,at:msg.at})}
+  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoScroll:false,kind:msg.kind,at:msg.at})}
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
   activeNativeTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
   webRunActive=conversation.status==='running';
+  if(wasRunning&&!webRunActive){
+    activeNativeTurnId='';
+    finishAllNativeLiveItems();
+    if(nativeTerminalPersisted(conversation,completingTurnId)&&nativeLiveItems.size){
+      clearNativeCompletionSync();
+      await loadConversation(id,'codex');
+      return;
+    }
+    scheduleNativeCompletionSync(id,completingTurnId,120);
+  }
   updateConversationStatus(conversation);
   applyConversationMode();
   if(!webRunActive)schedulePromptQueueDispatch(id,180);
   if(nearBottom&&(conversation.messages||[]).length)scrollChatToLatest();
+}
+function nativeTerminalPersisted(conversation,turnId){
+  const id=String(turnId||'');
+  if(!id)return false;
+  return (conversation.messages||[]).some((message)=>(
+    message.turnId===id
+    && message.role==='process'
+    && ['task_complete','task_error','turn_aborted','error'].includes(message.kind)
+  ));
+}
+function clearNativeCompletionSync(){
+  if(nativeCompletionTimer)clearTimeout(nativeCompletionTimer);
+  nativeCompletionTimer=null;
+  nativeCompletionSync=null;
+}
+function scheduleNativeCompletionSync(threadId,turnId,delay=180){
+  const cleanThreadId=String(threadId||'');
+  const cleanTurnId=String(turnId||'');
+  if(!cleanThreadId||!cleanTurnId)return;
+  if(!nativeCompletionSync||nativeCompletionSync.threadId!==cleanThreadId||nativeCompletionSync.turnId!==cleanTurnId){
+    nativeCompletionSync={threadId:cleanThreadId,turnId:cleanTurnId,attempt:0};
+  }
+  if(nativeCompletionTimer)clearTimeout(nativeCompletionTimer);
+  nativeCompletionTimer=setTimeout(reconcileNativeCompletion,delay);
+}
+async function reconcileNativeCompletion(){
+  nativeCompletionTimer=null;
+  const pending=nativeCompletionSync;
+  if(!pending)return;
+  if(currentConversationSource!=='codex'||currentConversationId!==pending.threadId){clearNativeCompletionSync();return}
+  try{
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(pending.threadId));
+    if(res.ok){
+      const data=await res.json();
+      if(nativeCompletionSync!==pending)return;
+      if(nativeTerminalPersisted(data.conversation,pending.turnId)){
+        nativeCompletionSync=null;
+        await loadConversation(pending.threadId,'codex');
+        return;
+      }
+    }
+  }catch(e){}
+  if(nativeCompletionSync!==pending)return;
+  pending.attempt+=1;
+  if(pending.attempt>=60){nativeCompletionSync=null;statusEl.textContent='任务已结束，历史记录仍在同步';return}
+  scheduleNativeCompletionSync(pending.threadId,pending.turnId,Math.min(1500,180+pending.attempt*90));
+}
+function syncNativeAfterPageResume(){
+  if(document.visibilityState==='hidden'||currentConversationSource!=='codex'||!currentConversationId)return;
+  if(nativeCompletionSync){scheduleNativeCompletionSync(nativeCompletionSync.threadId,nativeCompletionSync.turnId,0);return}
+  syncCurrentNativeConversation();
 }
 const MARKDOWN_ALLOWED_TAGS=['p','br','strong','em','del','code','pre','blockquote','ul','ol','li','h1','h2','h3','h4','h5','h6','hr','a','table','thead','tbody','tr','th','td'];
 const MARKDOWN_ALLOWED_ATTRS=['href','title','align','colspan','rowspan','start'];
@@ -4546,7 +4798,16 @@ function addMsg(role,text,options={}){
       tag.textContent=role==='process'?'过程':'日志';
       actions.appendChild(tag);
     }
-    if(role==='user'&&Number.isInteger(options.messageIndex)){
+    if(role==='user'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId){
+      const fork=document.createElement('button');
+      fork.type='button';
+      fork.className='rollbackMsg';
+      fork.title='从这里重新开始';
+      fork.setAttribute('aria-label','从这里重新开始');
+      setIconLabel(fork,'git-branch','从这里重新开始',false);
+      fork.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq)});
+      actions.appendChild(fork);
+    }else if(role==='user'&&Number.isInteger(options.messageIndex)){
       const rollback=document.createElement('button');
       rollback.type='button';
       rollback.className='rollbackMsg';

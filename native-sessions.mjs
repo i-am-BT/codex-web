@@ -24,21 +24,6 @@ const MESSAGE_TEXT_LIMIT = 80000;
 const DETAIL_TEXT_LIMIT = 8000;
 const IMAGE_URL_LIMIT = 16 * 1024 * 1024;
 const APP_THREAD_SOURCES = new Set(['vscode', 'appServer', 'app_server']);
-const APP_THREAD_QUERY = `
-  SELECT id, rollout_path, source, cwd, title, created_at_ms, updated_at_ms, recency_at_ms
-  FROM threads
-  WHERE archived = 0
-    AND preview <> ''
-    AND cli_version <> ''
-    AND NOT (
-      COALESCE(thread_source, '') = 'automation'
-      OR (
-        preview LIKE 'Automation:%'
-        AND preview LIKE '%Automation ID:%'
-        AND preview LIKE '%Automation memory:%'
-      )
-    )
-`;
 
 export class NativeSessionStore extends EventEmitter {
   constructor(codexHome, options = {}) {
@@ -151,7 +136,7 @@ export class NativeSessionStore extends EventEmitter {
         this.closeStateDb();
         this.stateDb = new DatabaseSync(this.stateDbFile, { readOnly: true, timeout: 500 });
         this.stateDbIno = stat.ino;
-        this.stateThreadQuery = this.stateDb.prepare(APP_THREAD_QUERY);
+        this.stateThreadQuery = prepareAppThreadQuery(this.stateDb);
       }
 
       const next = new Map();
@@ -205,7 +190,7 @@ export class NativeSessionStore extends EventEmitter {
       .map((entry) => {
         const cached = this.details.get(entry.id);
         const status = cached && cached.filePath === entry.filePath && cached.size === entry.size
-          ? cached.status
+          ? effectiveSessionStatus(cached.status, entry.mtimeMs, this.runningWindowMs, now)
           : now - entry.mtimeMs <= this.runningWindowMs
             ? 'running'
             : 'done';
@@ -251,8 +236,44 @@ export class NativeSessionStore extends EventEmitter {
     }
 
     readSessionUpdates(cache, entry, this.maxMessages);
-    return buildConversation(entry, cache, options);
+    return buildConversation(entry, cache, options, this.runningWindowMs);
   }
+}
+
+function prepareAppThreadQuery(db) {
+  const columns = new Set(db.prepare('PRAGMA table_info(threads)').all().map((column) => String(column.name || '')));
+  const requiredColumns = [
+    'id',
+    'rollout_path',
+    'source',
+    'cwd',
+    'title',
+    'archived',
+    'preview',
+    'cli_version',
+    'created_at_ms',
+    'updated_at_ms',
+  ];
+  const missingColumns = requiredColumns.filter((column) => !columns.has(column));
+  if (missingColumns.length) throw new Error(`threads table is missing columns: ${missingColumns.join(', ')}`);
+
+  const recencyColumn = columns.has('recency_at_ms') ? 'recency_at_ms' : 'updated_at_ms';
+  const threadSource = columns.has('thread_source') ? "COALESCE(thread_source, '')" : "''";
+  return db.prepare(`
+    SELECT id, rollout_path, source, cwd, title, created_at_ms, updated_at_ms, ${recencyColumn} AS recency_at_ms
+    FROM threads
+    WHERE archived = 0
+      AND preview <> ''
+      AND cli_version <> ''
+      AND NOT (
+        ${threadSource} = 'automation'
+        OR (
+          preview LIKE 'Automation:%'
+          AND preview LIKE '%Automation ID:%'
+          AND preview LIKE '%Automation memory:%'
+        )
+      )
+  `);
 }
 
 export function readSessionIndex(file) {
@@ -381,9 +402,10 @@ function createDetailCache(entry, options) {
     messagesTruncated: startOffset > 0,
     calls: new Map(),
     metadata: {},
+    currentTurnId: '',
+    previousTurnId: '',
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
     latestTurnId: '',
-    currentTurnId: '',
     displayUserMessagesInTurn: 0,
     lastTimestamp: '',
   };
@@ -479,6 +501,7 @@ function applyNativeRecord(cache, record, maxMessages) {
   if (record.timestamp) cache.lastTimestamp = String(record.timestamp);
 
   if (record.type === 'session_meta' || record.type === 'turn_context') {
+    if (record.type === 'turn_context') updateNativeTurnId(cache, record.payload?.turn_id);
     applyMetadataRecord(cache, record);
     return;
   }
@@ -554,11 +577,7 @@ function applyMetadataRecord(cache, record) {
       createdAt: payload.timestamp || record.timestamp || cache.metadata.createdAt || '',
     };
   } else if (record?.type === 'turn_context') {
-    const turnId = String(payload.turn_id || payload.turnId || '');
-    if (turnId && turnId !== cache.currentTurnId) {
-      cache.currentTurnId = turnId;
-      cache.displayUserMessagesInTurn = 0;
-    }
+    updateNativeTurnId(cache, payload.turn_id || payload.turnId);
     cache.metadata = {
       ...cache.metadata,
       cwd: payload.cwd || cache.metadata.cwd || '',
@@ -574,6 +593,7 @@ function applyMetadataRecord(cache, record) {
 function applyEventRecord(cache, record, payload, maxMessages) {
   const turnId = String(payload.turn_id || payload.turnId || '');
   if (turnId) cache.latestTurnId = turnId;
+  if (payload.type === 'task_started') updateNativeTurnId(cache, turnId);
   switch (payload.type) {
     case 'task_started':
       cache.status = 'running';
@@ -781,11 +801,23 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind) {
     content: clean,
     at: record.timestamp || '',
     kind,
+    turnId: cache.currentTurnId || undefined,
+    previousTurnId: cache.previousTurnId || undefined,
   });
   if (cache.messages.length > maxMessages) {
     cache.messages.splice(0, cache.messages.length - maxMessages);
     cache.messagesTruncated = true;
   }
+}
+
+function updateNativeTurnId(cache, value) {
+  const turnId = String(value || '').trim();
+  if (!turnId) return;
+  cache.latestTurnId = turnId;
+  if (turnId === cache.currentTurnId) return;
+  cache.previousTurnId = cache.currentTurnId || '';
+  cache.currentTurnId = turnId;
+  cache.displayUserMessagesInTurn = 0;
 }
 
 function contentText(content) {
@@ -854,7 +886,7 @@ function normalizeSandboxPolicy(value) {
   return '';
 }
 
-function buildConversation(entry, cache, options) {
+function buildConversation(entry, cache, options, runningWindowMs) {
   const after = Number(options.after);
   const requestedGeneration = Number(options.generation);
   const hasAfter = Number.isInteger(after) && after >= 0;
@@ -869,7 +901,7 @@ function buildConversation(entry, cache, options) {
     title: entry.title,
     createdAt: cache.metadata.createdAt || entry.createdAt,
     updatedAt: cache.lastTimestamp || entry.updatedAt,
-    status: cache.status,
+    status: effectiveSessionStatus(cache.status, entry.mtimeMs, runningWindowMs),
     latestTurnId: cache.latestTurnId,
     readOnly: false,
     truncated: cache.messagesTruncated,
@@ -880,6 +912,11 @@ function buildConversation(entry, cache, options) {
     metadata: { ...cache.metadata },
     messages: messages.map((message) => ({ ...message })),
   };
+}
+
+function effectiveSessionStatus(status, mtimeMs, runningWindowMs, now = Date.now()) {
+  if (status !== 'running') return status;
+  return now - mtimeMs <= runningWindowMs ? 'running' : 'interrupted';
 }
 
 function cleanTitle(value) {

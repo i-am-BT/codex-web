@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -267,6 +267,25 @@ This block is automatically supplied ambient UI state, not part of the user's re
         type: 'event_msg',
         payload: { type: 'task_complete', duration_ms: 1250 },
       },
+      {
+        timestamp: '2026-07-11T04:52:33.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-2' },
+      },
+      {
+        timestamp: '2026-07-11T04:52:33.001Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '第二轮消息' }],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:52:33.010Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', duration_ms: 800 },
+      },
     ]));
 
     store = new NativeSessionStore(codexHome, {
@@ -289,13 +308,19 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(conversation.metadata.model, 'gpt-test');
     assert.equal(conversation.metadata.cliVersion, '0.144.0-alpha.4');
     assert.equal(conversation.status, 'done');
-    assert.equal(conversation.latestTurnId, 'turn-1');
+    assert.equal(conversation.latestTurnId, 'turn-2');
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '用户消息'));
     assert.ok(conversation.messages.some((message) => (
       message.role === 'user'
       && message.kind === 'steering_user'
       && message.content === '中途引导'
     )));
+    const firstTurnMessage = conversation.messages.find((message) => message.role === 'user' && message.content === '用户消息');
+    assert.equal(firstTurnMessage.turnId, 'turn-1');
+    assert.equal(firstTurnMessage.previousTurnId, undefined);
+    const secondTurnMessage = conversation.messages.find((message) => message.role === 'user' && message.content === '第二轮消息');
+    assert.equal(secondTurnMessage.turnId, 'turn-2');
+    assert.equal(secondTurnMessage.previousTurnId, 'turn-1');
     assert.deepEqual(
       conversation.messages.filter((message) => message.role === 'image').map((message) => ({
         content: message.content,
@@ -348,6 +373,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
         content: [{ type: 'output_text', text: '新增回复' }],
       },
     }]));
+    store.refresh();
     const [change] = await changed;
     assert.deepEqual(change.changedIds, [id]);
 
@@ -408,6 +434,57 @@ This block is automatically supplied ambient UI state, not part of the user's re
     await delayedCompactionChange;
     const afterDelayedCompaction = store.get(id);
     assert.ok(afterDelayedCompaction.messages.some((message) => message.content === '正常最终回复'));
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store clears orphaned running state after the recovery window', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-orphan-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f638d-488c-7520-b72a-9c0be60aacb5';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '15');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-15T10-13-51-${id}.jsonl`);
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-15T02:13:51.440Z',
+        type: 'session_meta',
+        payload: {
+          id,
+          cwd: '/root',
+          originator: 'codex-web',
+          source: 'vscode',
+          cli_version: '0.141.0',
+        },
+      },
+      {
+        timestamp: '2026-07-15T02:13:51.441Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-orphaned' },
+      },
+      {
+        timestamp: '2026-07-15T02:13:52.000Z',
+        type: 'response_item',
+        payload: { type: 'function_call', call_id: 'call-restart', name: 'exec_command', arguments: '{}' },
+      },
+    ]));
+    const staleTime = new Date(Date.now() - 120000);
+    await utimes(sessionFile, staleTime, staleTime);
+
+    store = new NativeSessionStore(codexHome, {
+      pollIntervalMs: 25,
+      runningWindowMs: 60000,
+      watchChanges: false,
+    });
+
+    const conversation = store.get(id);
+    assert.equal(conversation.status, 'interrupted');
+    assert.equal(store.list()[0].status, 'interrupted');
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });
@@ -534,6 +611,55 @@ test('native session store only exposes visible, non-archived Codex App threads'
     const [change] = await changed;
     assert.ok(change.changedIds.includes(visibleNewer));
     assert.deepEqual(store.list().map((session) => session.id), [visibleOlder]);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store supports Codex state databases without recency_at_ms', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-legacy-schema-'));
+  const codexHome = path.join(temporary, '.codex');
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '15');
+  const id = '019f4f84-ea9f-73c2-b997-deba7b4aa710';
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-15T10-00-00-${id}.jsonl`);
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([{
+      timestamp: '2026-07-15T02:00:00.000Z',
+      type: 'session_meta',
+      payload: { id, cwd: '/workspace', source: 'vscode' },
+    }]));
+
+    const db = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL,
+        source TEXT NOT NULL,
+        cwd TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        archived INTEGER NOT NULL DEFAULT 0,
+        preview TEXT NOT NULL DEFAULT '',
+        cli_version TEXT NOT NULL DEFAULT '',
+        thread_source TEXT,
+        created_at_ms INTEGER,
+        updated_at_ms INTEGER
+      )
+    `);
+    db.prepare(`
+      INSERT INTO threads (
+        id, rollout_path, source, cwd, title, archived, preview, cli_version, thread_source,
+        created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, sessionFile, 'vscode', '/workspace', '兼容会话', 0, 'preview', '0.141.0', 'user', 1784080800000, 1784080860000);
+    db.close();
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.deepEqual(store.list().map((session) => session.id), [id]);
+    assert.equal(store.get(id)?.metadata.cwd, '/workspace');
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });
