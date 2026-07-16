@@ -18,6 +18,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const traceFile = path.join(temporary, 'codex-trace.json');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
   const webEnv = path.join(temporary, 'web.env');
+  const toolImagePath = path.join(temporary, 'tool-preview.png');
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
   const nativeFirstTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa780';
   const nativeSecondTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa781';
@@ -31,6 +32,10 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   try {
     await mkdir(runtime, { recursive: true });
     await mkdir(codexHome, { recursive: true });
+    await writeFile(
+      toolImagePath,
+      Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
+    );
     await writeFile(path.join(codexHome, 'config.toml'), `model_provider = "fake"
 model = "test-model"
 model_reasoning_effort = "max"
@@ -111,6 +116,16 @@ experimental_bearer_token = "test-token"
               { type: 'input_text', text: 'native fixture message' },
               { type: 'input_image', image_url: 'data:image/png;base64,c21va2U=' },
             ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:32.004Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'tool-image-preview',
+            input: `const result = await tools.view_image({path:${JSON.stringify(toolImagePath)},detail:"original"});\nimage(result.image_url);`,
           },
         }),
         JSON.stringify({
@@ -361,6 +376,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.activityClusterText\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /\.activityCluster\[open\] > summary \.activityClusterChevron/);
+    assert.match(uiStyles, /\.activityImageGallery\s*\{/);
+    assert.match(uiStyles, /\.activityImagePreview img\s*\{[^}]*object-fit:\s*contain/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
@@ -419,6 +436,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /function createActivityCluster/);
     assert.match(page, /function isImageViewActivityPresentation/);
     assert.match(page, /image_view_activity/);
+    assert.match(page, /function nativeToolImageUrls/);
+    assert.match(page, /function createActivityImageGallery/);
     assert.match(page, /className='completionTimeline liveProcessTimeline'/);
     assert.doesNotMatch(page, /function updateTurnProcessLatest/);
     assert.match(page, /function appendInputImageToUser/);
@@ -622,6 +641,17 @@ if (args[0] === 'app-server') {
       && message.kind === 'input_image'
       && message.content === 'data:image/png;base64,c21va2U='
     )));
+    const nativeToolImageMessage = nativeConversation.messages.find((message) => (
+      message.role === 'tool' && message.content.includes('tools.view_image')
+    ));
+    assert.ok(nativeToolImageMessage);
+    const toolImageUrl = `/api/native-sessions/${nativeSessionId}/tool-images/${nativeToolImageMessage.seq}/1?generation=${nativeConversation.generation}`;
+    const unauthorizedToolImage = await fetch(`${baseUrl}${toolImageUrl}`);
+    assert.equal(unauthorizedToolImage.status, 401);
+    const toolImage = await fetch(`${baseUrl}${toolImageUrl}`, { headers: { Cookie: cookie } });
+    assert.equal(toolImage.status, 200);
+    assert.equal(toolImage.headers.get('content-type'), 'image/png');
+    assert.deepEqual(Buffer.from(await toolImage.arrayBuffer()), await readFile(toolImagePath));
 
     const restartedFromFirst = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
       method: 'POST',

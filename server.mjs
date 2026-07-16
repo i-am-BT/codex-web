@@ -1,7 +1,16 @@
 import express from 'express';
 import { spawn } from 'child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
 import { createServer } from 'http';
 import { homedir, networkInterfaces } from 'os';
 import path from 'path';
@@ -77,6 +86,15 @@ const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
 const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
 const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
 const NATIVE_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TOOL_IMAGE_MAX_BYTES = 25 * 1024 * 1024;
+const TOOL_IMAGE_TYPES = new Map([
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.webp', 'image/webp'],
+  ['.gif', 'image/gif'],
+  ['.avif', 'image/avif'],
+]);
 const DESKTOP_PENDING_PREFIX = 'desktop:';
 const DESKTOP_INTERACTIVE_METHODS = new Set([
   'item/commandExecution/requestApproval',
@@ -368,6 +386,37 @@ app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
     res.json({ conversation: decorateNativeConversation(conversation) });
   } catch (err) {
     res.status(500).json({ error: `读取 Codex App 会话失败: ${err.message}` });
+  }
+});
+
+app.get('/api/native-sessions/:id/tool-images/:seq/:index', requireAuth, (req, res) => {
+  try {
+    const threadId = cleanNativeThreadId(req.params.id);
+    const sequence = Number(req.params.seq);
+    const imageIndex = Number(req.params.index);
+    if (!threadId || !Number.isInteger(sequence) || sequence < 1 || !Number.isInteger(imageIndex) || imageIndex < 1) {
+      return res.status(400).json({ error: '工具图片参数无效' });
+    }
+
+    const conversation = nativeSessions.get(threadId);
+    if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    const requestedGeneration = Number(req.query.generation);
+    if (
+      Number.isInteger(requestedGeneration)
+      && requestedGeneration > 0
+      && requestedGeneration !== conversation.generation
+    ) {
+      return res.status(404).json({ error: '工具图片记录已更新' });
+    }
+
+    const message = conversation.messages.find((item) => item.seq === sequence);
+    const imagePath = extractNativeToolImagePaths(message)[imageIndex - 1];
+    const image = readNativeToolImage(imagePath, conversation.metadata?.cwd);
+    if (!image) return res.status(404).json({ error: '工具图片不存在或不受支持' });
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.type(image.type).send(image.data);
+  } catch (err) {
+    res.status(500).json({ error: `读取工具图片失败: ${err.message}` });
   }
 });
 
@@ -1933,6 +1982,45 @@ function nativeSessionSummaries() {
       activeTurnId: active?.turnId || '',
     };
   });
+}
+
+function extractNativeToolImagePaths(message) {
+  if (message?.role !== 'tool') return [];
+  const source = String(message.content || '');
+  const paths = [];
+  const orchestratedPattern = /tools\.view_image\s*\(\s*\{\s*path\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  for (const match of source.matchAll(orchestratedPattern)) {
+    try {
+      paths.push(JSON.parse(`"${match[1]}"`));
+    } catch {
+      // Ignore malformed tool arguments rather than exposing an arbitrary path.
+    }
+  }
+  if (paths.length) return paths;
+  if (!source.startsWith('view_image\n')) return [];
+  try {
+    const input = JSON.parse(source.slice(source.indexOf('\n') + 1));
+    return typeof input?.path === 'string' && input.path.trim() ? [input.path.trim()] : [];
+  } catch {
+    return [];
+  }
+}
+
+function readNativeToolImage(filePath, cwd) {
+  if (!filePath) return null;
+  try {
+    const candidate = path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(String(cwd || DEFAULT_CWD), filePath);
+    const resolved = realpathSync(candidate);
+    const type = TOOL_IMAGE_TYPES.get(path.extname(resolved).toLowerCase());
+    if (!type) return null;
+    const stats = statSync(resolved);
+    if (!stats.isFile() || stats.size < 1 || stats.size > TOOL_IMAGE_MAX_BYTES) return null;
+    return { type, data: readFileSync(resolved) };
+  } catch {
+    return null;
+  }
 }
 
 function decorateNativeConversation(conversation) {
@@ -4356,10 +4444,52 @@ function patchActivityPresentations(patch){const items=[];let current=null;for(c
 function commandActivityPresentation(command){const source=String(command||'');const clean=shortActivityText(source,120);const files=extractActivityFiles(source);if(/(?:^|\\s)(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files.join('、')||clean,icon:'book-open'};if(/\\brg\\b/.test(source)){const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';return{verb:'已搜索',target:(files.join('、')||'内容')+(query?' · “'+shortActivityText(query,48)+'”':''),icon:'search'}}if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files.join('、')||shortActivityText(source.split('\\n')[0],84),icon:'circle-check'};if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};return{verb:'已运行',target:files.join('、')||clean||'工具调用',icon:'terminal'}}
 function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
 function isImageViewActivityPresentation(presentation){return presentation?.verb==='已查看'&&/\\d+ 张图像$/.test(String(presentation.target||''))&&['image','images'].includes(presentation.icon)}
+function nativeToolImageUrls(presentations,messageSeq){
+  const sequence=Number(messageSeq);
+  if(currentConversationSource!=='codex'||!currentConversationId||!Number.isInteger(sequence)||sequence<1)return[];
+  const count=presentations.reduce((total,presentation)=>total+(Number(String(presentation.target||'').match(/^(\\d+) 张图像$/)?.[1])||0),0);
+  if(!count)return[];
+  const generation=nativeGeneration>0?'?generation='+encodeURIComponent(nativeGeneration):'';
+  const base='/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/tool-images/'+sequence+'/';
+  return Array.from({length:count},(_,index)=>base+(index+1)+generation);
+}
+function createActivityImageGallery(urls){
+  const gallery=document.createElement('div');
+  gallery.className='activityImageGallery'+(urls.length===1?' single':'');
+  urls.forEach((url,index)=>{
+    const preview=document.createElement('button');
+    preview.type='button';
+    preview.className='activityImagePreview';
+    preview.title='放大查看第 '+(index+1)+' 张图片';
+    preview.setAttribute('aria-label',preview.title);
+    const img=document.createElement('img');
+    img.src=url;
+    img.alt='查看的图像 '+(index+1);
+    img.loading='lazy';
+    img.decoding='async';
+    const unavailable=document.createElement('span');
+    unavailable.className='activityImageUnavailable';
+    unavailable.hidden=true;
+    const unavailableIcon=document.createElement('i');
+    unavailableIcon.setAttribute('data-lucide','image-off');
+    unavailableIcon.setAttribute('aria-hidden','true');
+    const unavailableText=document.createElement('span');
+    unavailableText.textContent='图片已不可用';
+    unavailable.appendChild(unavailableIcon);
+    unavailable.appendChild(unavailableText);
+    img.addEventListener('error',()=>{img.remove();unavailable.hidden=false;preview.classList.add('unavailable');preview.disabled=true;refreshIcons(unavailable)});
+    preview.appendChild(img);
+    preview.appendChild(unavailable);
+    preview.addEventListener('click',()=>openImagePreview(url,img.alt,preview));
+    gallery.appendChild(preview);
+  });
+  return gallery;
+}
 function createToolActivityItem(presentation,rawText,running=false){
   const expandable=presentation.expandable!==false;
+  const imageUrls=Array.isArray(presentation.imageUrls)?presentation.imageUrls.filter(Boolean):[];
   const item=document.createElement(expandable?'details':'div');
-  item.className='activityItem'+(expandable?'':' static');
+  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'');
   item.dataset.messageText=String(rawText||'');
   const summary=document.createElement(expandable?'summary':'div');
   summary.className='activityItemSummary'+(presentation.target?'':' standalone');
@@ -4389,6 +4519,7 @@ function createToolActivityItem(presentation,rawText,running=false){
     summary.appendChild(meta);
   }
   item.appendChild(summary);
+  if(imageUrls.length)item.appendChild(createActivityImageGallery(imageUrls));
   if(expandable){
     const content=document.createElement('div');
     content.className='activityItemContent';
@@ -4498,13 +4629,14 @@ function settleActivityCluster(cluster){
   cluster?.classList.remove('streaming');
   updateActivityCluster(cluster);
 }
-function appendTurnTool(text){
+function appendTurnTool(text,options={}){
   const presentations=toolActivityPresentations(text);
   const imageViews=presentations.filter(isImageViewActivityPresentation);
   const folded=presentations.filter((presentation)=>!isImageViewActivityPresentation(presentation));
+  const imageUrls=nativeToolImageUrls(imageViews,options.nativeMessageSeq);
   let visibleBatch=null;
   if(imageViews.length){
-    visibleBatch=createActivityBatch(imageViews.map((presentation)=>({...presentation,expandable:false})),text,'image_view_activity',true);
+    visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:false,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true);
     activateTurnProcessElement(visibleBatch);
     refreshIcons(visibleBatch);
   }
@@ -4765,7 +4897,7 @@ function addMsg(role,text,options={}){
     return completion;
   }
   if(collectingTurnProcess&&role==='tool'){
-    const activity=appendTurnTool(text);
+    const activity=appendTurnTool(text,options);
     latestToolElement=activity;
     if(options.autoScroll!==false)scrollChatToLatest();
     return activity;

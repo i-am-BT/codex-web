@@ -1857,6 +1857,72 @@ body[data-theme] .activityCluster {
   color: var(--text-muted);
 }
 
+.activityImageGallery {
+  display: grid;
+  width: min(560px, calc(100% - 25px));
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 8px;
+  margin: 5px 0 9px 25px;
+}
+
+.activityImageGallery.single {
+  width: min(240px, calc(100% - 25px));
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.activityImagePreview {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  padding: 0;
+  cursor: zoom-in;
+}
+
+.activityImagePreview:hover {
+  border-color: color-mix(in srgb, var(--text-muted) 48%, var(--border));
+  background: var(--surface-active);
+}
+
+.activityImagePreview:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.activityImagePreview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.activityImagePreview.unavailable {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.activityImageUnavailable {
+  display: grid;
+  place-items: center;
+  gap: 7px;
+  color: var(--text-subtle);
+  font-size: 12px;
+}
+
+.activityImageUnavailable[hidden] {
+  display: none;
+}
+
+.activityImageUnavailable .lucide {
+  width: 18px;
+  height: 18px;
+}
+
 .activityItemIcon {
   display: grid;
   width: 18px;
