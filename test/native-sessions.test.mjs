@@ -403,6 +403,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
         payload: { replacement_history: [] },
       },
     ]));
+    store.refresh();
     await compactedChange;
 
     const afterCompaction = store.get(id, {
@@ -431,6 +432,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
         payload: { replacement_history: [] },
       },
     ]));
+    store.refresh();
     await delayedCompactionChange;
     const afterDelayedCompaction = store.get(id);
     assert.ok(afterDelayedCompaction.messages.some((message) => message.content === '正常最终回复'));
