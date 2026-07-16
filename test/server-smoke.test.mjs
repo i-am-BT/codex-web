@@ -386,6 +386,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.historyProjectMenu\s*\{/);
     assert.match(uiStyles, /\.historyProjectMenu\.openAbove/);
     assert.match(uiStyles, /\.historyProjectMenuAction\.danger/);
+    assert.match(uiStyles, /body\[data-theme\] \.requestAction\s*\{[^}]*background:\s*var\(--surface-raised\);[^}]*color:\s*var\(--text\)/s);
+    assert.match(uiStyles, /body\[data-theme\] \.requestAction\.danger\s*\{[^}]*background:\s*var\(--danger-soft\);[^}]*color:\s*var\(--danger\)/s);
     assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
     assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
