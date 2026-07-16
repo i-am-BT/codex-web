@@ -4038,13 +4038,15 @@ function createHistoryRow(item,projectPath){
   open.textContent=item.title;
   open.title=row.title;
   open.addEventListener('click',(e)=>{e.stopPropagation();loadConversation(item.id,source)});
-  row.appendChild(open);
   if(source==='codex'){
     const badge=document.createElement('span');
     badge.className='histSource';
     badge.textContent='App';
     badge.title='Codex App 原生会话';
     row.appendChild(badge);
+  }
+  row.appendChild(open);
+  if(source==='codex'){
     const rename=document.createElement('button');
     rename.type='button';
     rename.className='histRename';

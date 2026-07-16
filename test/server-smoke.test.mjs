@@ -387,6 +387,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.historyProjectMenu\.openAbove/);
     assert.match(uiStyles, /\.historyProjectMenuAction\.danger/);
     assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
+    assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
     assert.match(uiStyles, /\.memoryCitationItem\[open\]/);
     assert.match(uiStyles, /\.composerModelToggle/);
@@ -472,6 +473,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /image_view_activity/);
     assert.match(page, /function nativeToolImageUrls/);
     assert.match(page, /function createActivityImageGallery/);
+    assert.match(page, /row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(source==='codex'\)/s);
     assert.match(page, /galleryOnly:true/);
     assert.doesNotMatch(page, /base\+\(index\+1\)\+generation/);
     assert.match(page, /continueMsg messageAction/);
