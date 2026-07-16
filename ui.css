@@ -2993,6 +2993,64 @@ body[data-theme="light"][data-chat-bg="plain"] .chat {
   background: #ffffff;
 }
 
+body[data-theme="light"][data-chat-bg="dream-skin"] {
+  --canvas: #f7f4f5;
+  --surface: #ffffff;
+  --surface-raised: #fff7f8;
+  --surface-hover: #ffedef;
+  --surface-active: #ffe3e7;
+  --border: rgba(196, 120, 128, 0.24);
+  --border-strong: rgba(196, 120, 128, 0.42);
+  --text: #2b2224;
+  --text-muted: #8a7a7d;
+  --text-subtle: #a38f93;
+  --primary: #e25563;
+  --primary-hover: #c93d4c;
+  --primary-soft: rgba(226, 85, 99, 0.12);
+  --primary-line: rgba(226, 85, 99, 0.42);
+  --user-bg: #d94c5b;
+  --code-bg: rgba(255, 247, 248, 0.94);
+}
+
+body[data-theme="dark"][data-chat-bg="dream-skin"] {
+  --canvas: #071116;
+  --surface: #0b1a20;
+  --surface-raised: #10272c;
+  --surface-hover: #163238;
+  --surface-active: #1a3a40;
+  --border: rgba(54, 215, 232, 0.2);
+  --border-strong: rgba(124, 255, 70, 0.34);
+  --text: #e9fff1;
+  --text-muted: #9ebdb3;
+  --text-subtle: #6f9087;
+  --primary: #7cff46;
+  --primary-hover: #b8ff3d;
+  --primary-soft: rgba(124, 255, 70, 0.13);
+  --primary-line: rgba(124, 255, 70, 0.42);
+  --user-bg: #642a8c;
+  --code-bg: rgba(5, 10, 16, 0.94);
+}
+
+body[data-theme="light"][data-chat-bg="dream-skin"] .chat {
+  background-color: #f7f4f5;
+  background-image:
+    linear-gradient(90deg, rgba(247, 244, 245, 0.98) 0%, rgba(247, 244, 245, 0.88) 42%, rgba(247, 244, 245, 0.46) 100%),
+    url("/assets/dream-skin/portal-hero.png");
+  background-position: center, right center;
+  background-repeat: no-repeat;
+  background-size: cover;
+}
+
+body[data-theme="dark"][data-chat-bg="dream-skin"] .chat {
+  background-color: #071116;
+  background-image:
+    linear-gradient(90deg, rgba(7, 17, 22, 0.98) 0%, rgba(7, 17, 22, 0.86) 46%, rgba(7, 17, 22, 0.62) 100%),
+    url("/assets/dream-skin/portal-hero.png");
+  background-position: center, right center;
+  background-repeat: no-repeat;
+  background-size: cover;
+}
+
 body[data-chat-bg="grid"] .chat {
   background-color: var(--canvas);
   background-image:

@@ -388,6 +388,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.historyProjectMenuAction\.danger/);
     assert.match(uiStyles, /body\[data-theme\] \.requestAction\s*\{[^}]*background:\s*var\(--surface-raised\);[^}]*color:\s*var\(--text\)/s);
     assert.match(uiStyles, /body\[data-theme\] \.requestAction\.danger\s*\{[^}]*background:\s*var\(--danger-soft\);[^}]*color:\s*var\(--danger\)/s);
+    assert.match(uiStyles, /body\[data-theme="light"\]\[data-chat-bg="dream-skin"\]/);
+    assert.match(uiStyles, /url\("\/assets\/dream-skin\/portal-hero\.png"\)/);
     assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
     assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
@@ -449,6 +451,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorized.status, 401);
     const unauthorizedImagePrompts = await fetch(`${baseUrl}/api/image-prompts`);
     assert.equal(unauthorizedImagePrompts.status, 401);
+    const unauthorizedDreamSkin = await fetch(`${baseUrl}/assets/dream-skin/portal-hero.png`);
+    assert.equal(unauthorizedDreamSkin.status, 401);
 
     const login = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
@@ -458,6 +462,21 @@ if (args[0] === 'app-server') {
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
 
+    const dreamSkinAsset = await fetch(`${baseUrl}/assets/dream-skin/portal-hero.png`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(dreamSkinAsset.status, 200);
+    assert.equal(dreamSkinAsset.headers.get('content-type'), 'image/png');
+    assert.ok(Number(dreamSkinAsset.headers.get('content-length')) > 1_000_000);
+
+    const dreamSkinAppearanceResponse = await fetch(`${baseUrl}/api/appearance`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatBackground: 'dream-skin' }),
+    });
+    assert.equal(dreamSkinAppearanceResponse.status, 200);
+    assert.equal((await dreamSkinAppearanceResponse.json()).appearance.chatBackground, 'dream-skin');
+
     const pageResponse = await fetch(baseUrl, { headers: { Cookie: cookie } });
     assert.equal(pageResponse.status, 200);
     const page = await pageResponse.text();
@@ -465,6 +484,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /href="\/image-prompt\.css"/);
     assert.match(page, /src="\/image-prompt\.js"/);
+    assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
     assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
@@ -698,6 +718,7 @@ if (args[0] === 'app-server') {
     assert.equal(config.defaults.model, 'test-model');
     assert.equal(config.defaults.reasoningEffort, 'max');
     assert.equal(config.capabilities.manageProviders, false);
+    assert.equal(config.appearance.chatBackground, 'dream-skin');
     assert.ok(config.conversations.some((conversation) => (
       conversation.id === nativeSessionId
       && conversation.source === 'codex'

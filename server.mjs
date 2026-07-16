@@ -31,6 +31,7 @@ const LUCIDE_BROWSER_FILE = path.join(ROOT, 'node_modules', 'lucide', 'dist', 'u
 const UI_CSS_FILE = path.join(ROOT, 'ui.css');
 const IMAGE_PROMPT_CSS_FILE = path.join(ROOT, 'image-prompt.css');
 const IMAGE_PROMPT_JS_FILE = path.join(ROOT, 'image-prompt.js');
+const DREAM_SKIN_DIR = path.join(ROOT, 'vendor', 'codex-dream-skin');
 const IMAGE_PROMPT_CASES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-cases.json');
 const IMAGE_PROMPT_STYLES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-style-library.json');
 const IMAGE_PROMPT_IMAGE_BASE = 'https://raw.githubusercontent.com/freestylefly/awesome-gpt-image-2/60b6e1d3ddaf1c982426d6c8181827764c6b2012/data';
@@ -292,6 +293,7 @@ app.get('/api/session', (req, res) => {
 app.use('/assets/images', requireAuth, express.static(IMAGE_DIR, { fallthrough: false }));
 app.use('/assets/files', requireAuth, express.static(FILE_DIR, { fallthrough: false }));
 app.use('/assets/backgrounds', requireAuth, express.static(BACKGROUND_DIR, { fallthrough: false }));
+app.use('/assets/dream-skin', requireAuth, express.static(DREAM_SKIN_DIR, { fallthrough: false }));
 
 app.post('/api/uploads/image', requireAuth, (req, res) => {
   try {
@@ -1254,7 +1256,7 @@ function deleteCustomBackground(value) {
 
 function cleanChatBackground(value, customBackgrounds = []) {
   const text = String(value || '');
-  if (['default', 'plain', 'paper', 'grid'].includes(text)) return text;
+  if (['default', 'plain', 'paper', 'grid', 'dream-skin'].includes(text)) return text;
   if (customBackgrounds.some((item) => item.value === text)) return text;
   return 'default';
 }
@@ -3826,8 +3828,8 @@ if (${authenticated ? 'true' : 'false'}) boot(true);
 async function toggleTheme(){const next=appearance.theme==='dark'?'light':'dark';await saveAppearance({theme:next})}
 function applyAppearance(){const theme=appearance.theme==='dark'?'dark':'light';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const bg=custom?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.chatBg=bg;document.body.style.setProperty('--custom-chat-bg',custom?'url("'+custom.url+'")':'none');if(themeToggle){setIconLabel(themeToggle,theme==='dark'?'sun':'moon','',false);themeToggle.title=theme==='dark'?'切换明亮模式':'切换黑暗模式';themeToggle.setAttribute('aria-label',themeToggle.title)}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
 async function saveAppearance(patch){const res=await fetch('/api/appearance',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'外观保存失败';applyAppearance();return null}appearance=data.appearance;applyAppearance();return appearance}
-function renderBackgroundOptions(selected){if(!chatBackground)return;const options=[['default','默认'],['plain','纯净'],['paper','纸张'],['grid','网格']];for(const item of appearance.customBackgrounds||[])options.push([item.value,item.name]);options.push(['custom','自定义']);chatBackground.innerHTML='';for(const [value,label] of options){const opt=document.createElement('option');opt.value=value;opt.textContent=label;chatBackground.appendChild(opt)}chatBackground.value=options.some(([value])=>value===selected)?selected:'default'}
-function cleanBackgroundValue(value){const text=String(value||'');if(['default','plain','paper','grid'].includes(text))return text;return findCustomBackground(text)?text:'default'}
+function renderBackgroundOptions(selected){if(!chatBackground)return;const options=[['default','默认'],['plain','纯净'],['paper','纸张'],['grid','网格'],['dream-skin','Dream Skin']];for(const item of appearance.customBackgrounds||[])options.push([item.value,item.name]);options.push(['custom','自定义']);chatBackground.innerHTML='';for(const [value,label] of options){const opt=document.createElement('option');opt.value=value;opt.textContent=label;chatBackground.appendChild(opt)}chatBackground.value=options.some(([value])=>value===selected)?selected:'default'}
+function cleanBackgroundValue(value){const text=String(value||'');if(['default','plain','paper','grid','dream-skin'].includes(text))return text;return findCustomBackground(text)?text:'default'}
 function findCustomBackground(value){return (appearance.customBackgrounds||[]).find((item)=>item.value===value&&item.url)}
 function updateDeleteBackgroundButton(selected){if(!deleteBackground)return;deleteBackground.classList.toggle('hidden',!findCustomBackground(selected));deleteBackground.disabled=!findCustomBackground(selected)}
 async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
