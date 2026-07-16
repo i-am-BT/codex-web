@@ -27,6 +27,8 @@
   --code-bg: #080a0d;
   --sidebar-width: 316px;
   --header-height: 60px;
+  --conversation-width: 760px;
+  --conversation-gutter: clamp(16px, 4vw, 48px);
   --radius: 8px;
   --radius-sm: 6px;
   --shadow-lg: 0 22px 70px rgba(0, 0, 0, 0.34);
@@ -1063,7 +1065,7 @@ body .chat {
   min-height: 0;
   gap: 13px;
   background: var(--canvas);
-  padding: 22px clamp(22px, 4vw, 50px) 30px;
+  padding: 22px var(--conversation-gutter) 30px;
   scroll-padding-block: 24px;
 }
 
@@ -2351,15 +2353,29 @@ body .msg.thinking.streaming .toolSummaryRow::after {
   animation: streamDot 1s ease-in-out infinite;
 }
 
+body .chat > :is(
+  .msg:not(.user):not(.inputImage),
+  .activityCluster,
+  .liveProcessPanel
+) {
+  width: min(var(--conversation-width), 100%);
+  max-width: var(--conversation-width);
+  align-self: center;
+}
+
+body .chat > :is(.msg.user, .msg.image.inputImage) {
+  margin-right: max(0px, calc((100% - var(--conversation-width)) / 2));
+}
+
 body .composer {
   flex: 0 0 auto;
   border-top: 0;
   background: var(--surface);
-  padding: 10px clamp(14px, 3vw, 34px) 14px;
+  padding: 10px var(--conversation-gutter) 14px;
 }
 
 .composer > * {
-  width: min(920px, 100%);
+  width: min(var(--conversation-width), 100%);
   margin-inline: auto;
 }
 
