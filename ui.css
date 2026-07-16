@@ -1025,16 +1025,26 @@ body .msg.user::after {
 }
 
 body .msg.user.hasInputImage {
-  width: min(420px, 92%);
+  display: flex;
+  width: fit-content;
   max-width: min(420px, 92%);
-  padding: 7px;
+  flex-direction: column;
+  align-items: flex-end;
+  background: transparent;
+  padding: 0;
 }
 
 .userAttachmentStack {
   display: grid;
+  width: min(240px, 100%);
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 5px;
-  margin-bottom: 8px;
+  margin: 0 0 8px auto;
+}
+
+.userAttachmentStack.single {
+  width: 144px;
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .userAttachment {
@@ -1042,9 +1052,9 @@ body .msg.user.hasInputImage {
   min-width: 0;
   width: 100%;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.22);
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--surface-raised);
   padding: 0;
   cursor: zoom-in;
 }
@@ -1056,12 +1066,21 @@ body .msg.user.hasInputImage {
 .userAttachment img {
   display: block;
   width: 100%;
-  max-height: 300px;
+  max-height: 180px;
   object-fit: contain;
 }
 
 body .msg.user.hasInputImage > .msgBody {
-  padding: 1px 5px 3px;
+  width: fit-content;
+  max-width: 100%;
+  border-radius: var(--radius);
+  background: var(--surface-active);
+  color: var(--text);
+  padding: 9px 12px;
+}
+
+body .msg.user.hasInputImage > .msgBody:empty {
+  display: none;
 }
 
 .userAttachment:focus-visible {
@@ -1645,13 +1664,13 @@ body .msg.process.completionSummary {
   content: "";
 }
 
-.completionSummary > summary .lucide {
+.completionSummary > summary .completionChevron {
   width: 13px;
   height: 13px;
   transition: transform 160ms var(--ease);
 }
 
-.completionSummary[open] > summary .lucide {
+.completionSummary[open] > summary .completionChevron {
   transform: rotate(90deg);
 }
 
@@ -1705,12 +1724,26 @@ body[data-theme] .activityBatch {
 }
 
 .liveProcessPanel {
-  margin-bottom: 0;
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
 }
 
-.liveProcessPanel .completionContent {
-  margin-bottom: 0;
-  padding-bottom: 10px;
+.liveProcessTimeline {
+  width: 100%;
+  gap: 14px;
+}
+
+.completionTimeline > .msg.user.steeringUser {
+  width: fit-content;
+  max-width: min(680px, 78%);
+  margin: 2px 0 10px auto;
+  padding: 9px 12px;
+  font-size: 13px;
+}
+
+.completionTimeline > .msg.user.steeringUser.optimistic {
+  opacity: 0.88;
 }
 
 .activityItem > summary::marker,
@@ -1722,6 +1755,75 @@ body[data-theme] .activityBatch {
 .activityBatch {
   display: grid;
   gap: 3px;
+}
+
+body[data-theme] .activityCluster {
+  width: min(780px, 100%);
+  max-width: min(780px, 100%);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+
+.activityCluster > summary::marker,
+.activityCluster > summary::-webkit-details-marker {
+  display: none;
+  content: "";
+}
+
+.activityClusterSummary {
+  display: grid;
+  min-height: 30px;
+  width: 100%;
+  grid-template-columns: 18px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.activityClusterSummary:hover {
+  color: var(--text);
+}
+
+.activityClusterText {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activityClusterChevron {
+  width: 13px;
+  height: 13px;
+  color: var(--text-subtle);
+  transition: transform 160ms var(--ease);
+}
+
+.activityCluster[open] > summary .activityClusterChevron {
+  transform: rotate(90deg);
+}
+
+.activityCluster.streaming:not([open]) .activityClusterIcon {
+  animation: streamDot 1.1s ease-in-out infinite;
+}
+
+.activityClusterItems {
+  display: grid;
+  gap: 3px;
+  margin: 3px 0 5px 21px;
+  border-left: 1px solid var(--border);
+  padding: 2px 0 2px 10px;
+}
+
+.activityClusterItems > .activityBatch {
+  width: 100%;
+  max-width: 100%;
 }
 
 .activityItem {

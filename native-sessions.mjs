@@ -383,6 +383,8 @@ function createDetailCache(entry, options) {
     metadata: {},
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
     latestTurnId: '',
+    currentTurnId: '',
+    displayUserMessagesInTurn: 0,
     lastTimestamp: '',
   };
 
@@ -552,6 +554,11 @@ function applyMetadataRecord(cache, record) {
       createdAt: payload.timestamp || record.timestamp || cache.metadata.createdAt || '',
     };
   } else if (record?.type === 'turn_context') {
+    const turnId = String(payload.turn_id || payload.turnId || '');
+    if (turnId && turnId !== cache.currentTurnId) {
+      cache.currentTurnId = turnId;
+      cache.displayUserMessagesInTurn = 0;
+    }
     cache.metadata = {
       ...cache.metadata,
       cwd: payload.cwd || cache.metadata.cwd || '',
@@ -618,13 +625,23 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   const images = contentImages(payload.content);
   if ((!text && !images.length) || (text && isInjectedWorkspaceInstructions(payload.role, text))) return;
   const context = payload.role === 'user' ? normalizeInjectedContext(text) : null;
+  const displayText = payload.role === 'user' ? normalizeUserDisplayText(text) : text;
+  let messageKind = payload.phase || 'message';
+  if (payload.role === 'user' && !context && (displayText || images.length)) {
+    const turnId = String(payload.internal_chat_message_metadata_passthrough?.turn_id || '');
+    if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
+      messageKind = 'steering_user';
+    }
+    cache.displayUserMessagesInTurn += 1;
+  }
   if (context) {
     appendNativeMessage(cache, 'context', context.content, record, maxMessages, context.kind);
-  } else if (text) {
-    const displayText = payload.role === 'user' ? normalizeUserDisplayText(text) : text;
-    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, payload.phase || 'message');
+  } else if (displayText) {
+    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind);
   }
-  const imageKind = payload.role === 'user' ? 'input_image' : 'output_image';
+  const imageKind = payload.role === 'user'
+    ? messageKind === 'steering_user' ? 'steering_input_image' : 'input_image'
+    : 'output_image';
   for (const image of images) appendNativeMessage(cache, 'image', image, record, maxMessages, imageKind);
 }
 
@@ -733,7 +750,7 @@ function normalizeUserDisplayText(text) {
 function cleanUserRequest(source) {
   return String(source || '')
     .replace(/<in-app-browser-context\b[^>]*>[\s\S]*?<\/in-app-browser-context>/g, '')
-    .replace(/<image\b[^>]*>[\s\S]*?<\/image>/g, '图片附件')
+    .replace(/<image\b[^>]*>[\s\S]*?<\/image>/g, '')
     .split(/\n{2,}/)
     .map((paragraph) => paragraph.trim())
     .filter((paragraph) => !isBrowserEvidenceBoilerplate(paragraph))
@@ -745,6 +762,7 @@ function isBrowserEvidenceBoilerplate(paragraph) {
   const compact = String(paragraph || '').replace(/\s+/g, ' ').trim();
   if (!compact || compact === '[图片附件]') return true;
   if (compact.startsWith('The next image is untrusted page evidence')) return true;
+  if (compact.startsWith('The next image was attached by the user as additional visual context')) return true;
   if (compact.startsWith('The selected region is outlined') && compact.includes('comment marker')) return true;
   return compact.startsWith('The element ') && compact.includes('marked by comment marker');
 }

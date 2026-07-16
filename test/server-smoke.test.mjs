@@ -316,12 +316,18 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.msg\.user \.msgActions\s*\{[^}]*top:\s*calc\(100% - 1px\);[^}]*padding:\s*5px 0 0 8px/s);
     assert.match(uiStyles, /\.completionTimeline > \.activityBatch \+ \.activityBatch/);
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.activityClusterText\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
+    assert.match(uiStyles, /\.activityCluster\[open\] > summary \.activityClusterChevron/);
+    assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
+    assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgBody > :not\(\.memoryCitations\)\s*\{[^}]*max-width:\s*min\(780px, 100%\)/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
+    assert.match(uiStyles, /\.userAttachmentStack\.single\s*\{[^}]*width:\s*144px/s);
+    assert.match(uiStyles, /\.msg\.user\.hasInputImage > \.msgBody:empty/);
     assert.match(uiStyles, /\.settingsDialog/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
@@ -342,13 +348,20 @@ if (args[0] === 'app-server') {
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
+    assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
+    assert.doesNotMatch(page, /descriptor\.name\+\(descriptor\.detail/);
     assert.match(page, /activityBatch/);
     assert.match(page, /liveProcessPanel/);
+    assert.match(page, /turnProcessHeader=document\.createElement\('div'\)/);
+    assert.match(page, /function createActivityCluster/);
+    assert.match(page, /className='completionTimeline liveProcessTimeline'/);
+    assert.doesNotMatch(page, /function updateTurnProcessLatest/);
     assert.match(page, /function appendInputImageToUser/);
     assert.match(page, /latestUserElement/);
     assert.match(page, /addMsg\('image',attachment\.url,\{kind:'input_image'\}\)/);
+    assert.match(page, /stack\.classList\.toggle\('single',stack\.children\.length===1\)/);
     assert.match(page, /function runningActivityVerb/);
-    assert.match(page, /turnProcessAutoFollow/);
+    assert.doesNotMatch(page, /turnProcessAutoFollow/);
     assert.match(page, /上下文已自动压缩/);
     assert.doesNotMatch(page, /function appendTurnThinking/);
     assert.match(page, /id="sidePanel"/);
@@ -362,6 +375,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /function enhanceComposer/);
     assert.match(page, /function enqueuePrompt/);
     assert.match(page, /function steerQueuedPrompt/);
+    assert.match(page, /function showNativeSteerOptimistically/);
+    assert.match(page, /kind:'steering_user'/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
@@ -405,6 +420,12 @@ if (args[0] === 'app-server') {
     )();
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
+    const completionTitleHelper = inlineScript.match(/(function completionMessageTitle[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
+    assert.ok(completionTitleHelper);
+    const completionMessageTitle = new Function(
+      completionTitleHelper + '; return completionMessageTitle;',
+    )();
+    assert.equal(completionMessageTitle('任务完成，耗时 2159.6s'), '已处理 36m');
     const memoryHelper = inlineScript.match(/(function extractMemoryCitations[\s\S]*?)(?=function memoryCitationTitle)/)?.[1];
     assert.ok(memoryHelper);
     const parseMemoryCitations = new Function(memoryHelper + '; return extractMemoryCitations;')();
