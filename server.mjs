@@ -32,6 +32,7 @@ const UI_CSS_FILE = path.join(ROOT, 'ui.css');
 const IMAGE_PROMPT_CSS_FILE = path.join(ROOT, 'image-prompt.css');
 const IMAGE_PROMPT_JS_FILE = path.join(ROOT, 'image-prompt.js');
 const DREAM_SKIN_DIR = path.join(ROOT, 'vendor', 'codex-dream-skin');
+const GPT_IMAGE_PLAYGROUND_DIR = path.join(ROOT, 'vendor', 'gpt-image-playground', 'app');
 const IMAGE_PROMPT_CASES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-cases.json');
 const IMAGE_PROMPT_STYLES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-style-library.json');
 const IMAGE_PROMPT_IMAGE_BASE = 'https://raw.githubusercontent.com/freestylefly/awesome-gpt-image-2/60b6e1d3ddaf1c982426d6c8181827764c6b2012/data';
@@ -294,6 +295,15 @@ app.use('/assets/images', requireAuth, express.static(IMAGE_DIR, { fallthrough: 
 app.use('/assets/files', requireAuth, express.static(FILE_DIR, { fallthrough: false }));
 app.use('/assets/backgrounds', requireAuth, express.static(BACKGROUND_DIR, { fallthrough: false }));
 app.use('/assets/dream-skin', requireAuth, express.static(DREAM_SKIN_DIR, { fallthrough: false }));
+app.use('/playground', requireAuth, express.static(GPT_IMAGE_PLAYGROUND_DIR, {
+  fallthrough: false,
+  setHeaders: (res, filePath) => {
+    const immutable = filePath.includes(`${path.sep}assets${path.sep}`);
+    res.setHeader('Cache-Control', immutable
+      ? 'private, max-age=31536000, immutable'
+      : 'private, no-store');
+  },
+}));
 
 app.post('/api/uploads/image', requireAuth, (req, res) => {
   try {
@@ -2942,7 +2952,7 @@ function readImagePromptLibrary() {
         name: 'gpt_image_playground',
         url: 'https://github.com/CookSleep/gpt_image_playground',
         license: 'MIT',
-        role: '参数、参考图与收藏工作流',
+        role: '完整生图工作台',
       },
     ],
   };

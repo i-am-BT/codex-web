@@ -9,10 +9,13 @@ This directory contains or adapts MIT-licensed material from:
   - License: `LICENSE.awesome-gpt-image-2`
 - `CookSleep/gpt_image_playground` at commit
   `a10477581b3d43ac98d39777e4445625a9db113d`
-  - Interaction patterns adapted for prompt parameters, reference images,
-    favorites, and Codex App handoff.
+  - Complete production application vendored at
+    `../gpt-image-playground/app/` and mounted at `/playground/`.
+  - Interaction patterns are also adapted for prompt parameters, reference
+    images, favorites, and Codex App handoff in the prompt library.
   - Original repository: https://github.com/CookSleep/gpt_image_playground
   - License: `LICENSE.gpt-image-playground`
 
-The integrated Codex Web workflow does not call the playground's image API.
-It prepares a prompt and sends it through the existing Codex App task path.
+The prompt library can continue to prepare tasks for Codex App. The separate
+Playground view calls user-configured image APIs directly from the browser and
+keeps its profiles and API keys in browser-local storage.

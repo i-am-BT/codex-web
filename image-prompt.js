@@ -2,6 +2,7 @@
   'use strict';
 
   const VIEW_KEY = 'codexWeb.workspaceView';
+  const PROMPT_VIEW_KEY = 'codexWeb.imagePromptView';
   const FAVORITES_KEY = 'codexWeb.imagePromptFavorites';
   const PARAMS_KEY = 'codexWeb.imagePromptParams';
   const PAGE_SIZE = 24;
@@ -30,6 +31,7 @@
 
   const state = {
     activeView: 'codex',
+    activePromptView: localStorage.getItem(PROMPT_VIEW_KEY) === 'playground' ? 'playground' : 'library',
     library: null,
     mode: 'cases',
     query: '',
@@ -100,9 +102,20 @@
     const workspace = document.createElement('section');
     workspace.id = 'imagePromptWorkspace';
     workspace.className = 'imagePromptWorkspace hidden';
-    workspace.setAttribute('aria-label', 'Image Prompt 提示词库');
+    workspace.setAttribute('aria-label', 'Image Prompt');
     workspace.innerHTML = `
-      <div class="imagePromptShell">
+      <div class="imagePromptViewBar">
+        <div class="imagePromptViewTabs" role="tablist" aria-label="Image Prompt 视图">
+          <button id="imagePromptLibraryView" class="imagePromptViewTab active" type="button" role="tab" aria-selected="true" aria-controls="imagePromptLibraryPanel">
+            <i data-lucide="library" aria-hidden="true"></i><span>提示词库</span>
+          </button>
+          <button id="imagePromptPlaygroundView" class="imagePromptViewTab" type="button" role="tab" aria-selected="false" aria-controls="imagePromptPlaygroundPanel" tabindex="-1">
+            <i data-lucide="wand-sparkles" aria-hidden="true"></i><span>生图工作台</span>
+          </button>
+        </div>
+      </div>
+      <div id="imagePromptLibraryPanel" class="imagePromptLibraryPanel" role="tabpanel" aria-labelledby="imagePromptLibraryView">
+        <div class="imagePromptShell">
         <header class="imagePromptHeader">
           <div>
             <h1>Codex Image Prompt</h1>
@@ -140,11 +153,22 @@
           <span>MIT licensed sources</span>
           <span>生成任务通过 Codex App 执行</span>
         </footer>
+        </div>
+      </div>
+      <div id="imagePromptPlaygroundPanel" class="imagePromptPlaygroundPanel hidden" role="tabpanel" aria-labelledby="imagePromptPlaygroundView">
+        <div id="imagePromptPlaygroundLoading" class="imagePromptPlaygroundLoading"><span class="spinner"></span> 正在载入生图工作台</div>
+        <iframe id="imagePromptPlaygroundFrame" class="imagePromptPlaygroundFrame" data-src="/playground/" title="GPT Image Playground 生图工作台" allow="clipboard-read; clipboard-write"></iframe>
       </div>
       <div id="imagePromptToast" class="imagePromptToast" role="status" aria-live="polite"></div>
     `;
     elements.main.insertBefore(workspace, elements.composer);
     elements.workspace = workspace;
+    elements.libraryView = workspace.querySelector('#imagePromptLibraryView');
+    elements.playgroundView = workspace.querySelector('#imagePromptPlaygroundView');
+    elements.libraryPanel = workspace.querySelector('#imagePromptLibraryPanel');
+    elements.playgroundPanel = workspace.querySelector('#imagePromptPlaygroundPanel');
+    elements.playgroundLoading = workspace.querySelector('#imagePromptPlaygroundLoading');
+    elements.playgroundFrame = workspace.querySelector('#imagePromptPlaygroundFrame');
     elements.stats = workspace.querySelector('#imagePromptStats');
     elements.sources = workspace.querySelector('.imagePromptSources');
     elements.casesMode = workspace.querySelector('#imagePromptCasesMode');
@@ -241,6 +265,12 @@
   }
 
   function bindWorkspaceEvents() {
+    elements.libraryView.addEventListener('click', () => setImagePromptView('library'));
+    elements.playgroundView.addEventListener('click', () => setImagePromptView('playground'));
+    elements.playgroundFrame.addEventListener('load', () => {
+      elements.playgroundLoading.classList.add('hidden');
+      elements.playgroundFrame.classList.add('loaded');
+    });
     elements.casesMode.addEventListener('click', () => setLibraryMode('cases'));
     elements.templatesMode.addEventListener('click', () => setLibraryMode('templates'));
     elements.search.addEventListener('input', () => {
@@ -310,9 +340,31 @@
     if (options.persist !== false) localStorage.setItem(VIEW_KEY, state.activeView);
     if (promptActive) {
       if (typeof closeMenu === 'function') closeMenu();
-      loadLibrary();
+      setImagePromptView(state.activePromptView, { persist: false });
     } else {
       document.getElementById('input')?.focus();
+    }
+  }
+
+  function setImagePromptView(view, options = {}) {
+    state.activePromptView = view === 'playground' ? 'playground' : 'library';
+    const playgroundActive = state.activePromptView === 'playground';
+    elements.libraryPanel.classList.toggle('hidden', playgroundActive);
+    elements.playgroundPanel.classList.toggle('hidden', !playgroundActive);
+    elements.libraryView.classList.toggle('active', !playgroundActive);
+    elements.playgroundView.classList.toggle('active', playgroundActive);
+    elements.libraryView.setAttribute('aria-selected', String(!playgroundActive));
+    elements.playgroundView.setAttribute('aria-selected', String(playgroundActive));
+    elements.libraryView.tabIndex = playgroundActive ? -1 : 0;
+    elements.playgroundView.tabIndex = playgroundActive ? 0 : -1;
+    if (options.persist !== false) localStorage.setItem(PROMPT_VIEW_KEY, state.activePromptView);
+    if (!playgroundActive) {
+      loadLibrary();
+      return;
+    }
+    if (elements.playgroundFrame.dataset.loaded !== 'true') {
+      elements.playgroundFrame.dataset.loaded = 'true';
+      elements.playgroundFrame.src = elements.playgroundFrame.dataset.src;
     }
   }
 

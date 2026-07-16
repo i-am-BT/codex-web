@@ -438,6 +438,8 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptStyles, /\.imagePromptGrid/);
     assert.match(imagePromptStyles, /\.imagePromptDetailDialog/);
     assert.match(imagePromptStyles, /\.imagePromptPreviewFrame\.imageLoading img/);
+    assert.match(imagePromptStyles, /\.imagePromptPlaygroundFrame/);
+    assert.match(imagePromptStyles, /\.imagePromptViewTab\.active/);
 
     const imagePromptScriptResponse = await fetch(`${baseUrl}/image-prompt.js`);
     assert.equal(imagePromptScriptResponse.status, 200);
@@ -446,6 +448,8 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptScript, /function composeCodexImagePrompt/);
     assert.match(imagePromptScript, /function loadDetailImage/);
     assert.match(imagePromptScript, /发送到 Codex App/);
+    assert.match(imagePromptScript, /function setImagePromptView/);
+    assert.match(imagePromptScript, /data-src="\/playground\/"/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
     assert.equal(unauthorized.status, 401);
@@ -453,6 +457,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedImagePrompts.status, 401);
     const unauthorizedDreamSkin = await fetch(`${baseUrl}/assets/dream-skin/portal-hero.png`);
     assert.equal(unauthorizedDreamSkin.status, 401);
+    const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
+    assert.equal(unauthorizedPlayground.status, 401);
 
     const login = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
@@ -461,6 +467,28 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    const playgroundResponse = await fetch(`${baseUrl}/playground/`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundResponse.status, 200);
+    assert.match(playgroundResponse.headers.get('cache-control'), /private, no-store/);
+    const playgroundPage = await playgroundResponse.text();
+    assert.match(playgroundPage, /<title>GPT Image Playground<\/title>/);
+    const playgroundAssetPath = playgroundPage.match(/src="\.\/(assets\/[^\"]+\.js)"/)?.[1];
+    assert.ok(playgroundAssetPath);
+    const playgroundAsset = await fetch(`${baseUrl}/playground/${playgroundAssetPath}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundAsset.status, 200);
+    assert.match(playgroundAsset.headers.get('content-type'), /javascript/);
+    assert.match(playgroundAsset.headers.get('cache-control'), /private, max-age=31536000, immutable/);
+    const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundServiceWorker.status, 200);
+    assert.match(playgroundServiceWorker.headers.get('content-type'), /javascript/);
+    assert.match(await playgroundServiceWorker.text(), /registration\.unregister/);
 
     const dreamSkinAsset = await fetch(`${baseUrl}/assets/dream-skin/portal-hero.png`, {
       headers: { Cookie: cookie },
