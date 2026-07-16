@@ -613,7 +613,9 @@ function applyEventRecord(cache, record, payload, maxMessages) {
       appendNativeMessage(cache, 'process', payload.message || payload.error || '任务中断', record, maxMessages, payload.type);
       break;
     case 'context_compacted':
-      appendNativeMessage(cache, 'process', '上下文已压缩', record, maxMessages, payload.type);
+      if (cache.messages.at(-1)?.kind !== 'context_compacted') {
+        appendNativeMessage(cache, 'process', '上下文已自动压缩', record, maxMessages, payload.type);
+      }
       break;
     default:
       break;
@@ -624,19 +626,28 @@ function applyCompactedRecord(cache, record, maxMessages) {
   const previous = cache.messages.at(-1);
   const previousAt = Date.parse(previous?.at || '');
   const compactedAt = Date.parse(record.timestamp || '');
-  const followsHandoff = Number.isFinite(previousAt)
+  const followsHandoffQuickly = Number.isFinite(previousAt)
     && Number.isFinite(compactedAt)
     && compactedAt >= previousAt
     && compactedAt - previousAt <= 5000;
-  if (previous?.role === 'assistant' && previous.kind === 'final_answer' && followsHandoff) {
+  const embeddedHandoff = compactedRecordContainsHandoff(record, previous);
+  if (previous?.role === 'assistant' && previous.kind === 'final_answer' && (followsHandoffQuickly || embeddedHandoff)) {
     cache.messages.pop();
   }
   if (cache.messages.at(-1)?.kind !== 'context_compacted') {
-    appendNativeMessage(cache, 'process', '上下文已压缩', record, maxMessages, 'context_compacted');
+    appendNativeMessage(cache, 'process', '上下文已自动压缩', record, maxMessages, 'context_compacted');
   }
   // A browser may have read the internal handoff summary before the compacted
   // record landed. Changing the generation forces its next poll to reset.
   cache.generation += 1;
+}
+
+function compactedRecordContainsHandoff(record, message) {
+  const content = String(message?.content || '').trim();
+  const compactedMessage = String(record?.payload?.message || '');
+  const envelope = 'Another language model started to solve this problem';
+  if (content.length < 24 || !compactedMessage.startsWith(envelope)) return false;
+  return compactedMessage.includes(content.slice(0, Math.min(240, content.length)));
 }
 
 function applyMessageRecord(cache, record, payload, maxMessages) {

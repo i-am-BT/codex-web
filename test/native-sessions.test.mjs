@@ -339,7 +339,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
         role: message.role,
         content: message.content,
       })),
-      [{ role: 'process', content: '上下文已压缩' }],
+      [{ role: 'process', content: '上下文已自动压缩' }],
     );
     assert.ok(conversation.messages.some((message) => message.role === 'tool' && message.content.includes('exec_command')));
     assert.ok(conversation.messages.some((message) => (
@@ -398,9 +398,17 @@ This block is automatically supplied ambient UI state, not part of the user's re
         },
       },
       {
-        timestamp: '2026-07-11T04:54:00.001Z',
+        timestamp: '2026-07-11T04:55:27.000Z',
         type: 'compacted',
-        payload: { replacement_history: [] },
+        payload: {
+          message: 'Another language model started to solve this problem.\n**Current Task**\nLate handoff summary',
+          replacement_history: [],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:55:27.001Z',
+        type: 'event_msg',
+        payload: { type: 'context_compacted' },
       },
     ]));
     store.refresh();
@@ -417,7 +425,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
     const delayedCompactionChange = once(store, 'change');
     await appendFile(sessionFile, jsonl([
       {
-        timestamp: '2026-07-11T04:55:00.000Z',
+        timestamp: '2026-07-11T04:56:00.000Z',
         type: 'response_item',
         payload: {
           type: 'message',
@@ -427,7 +435,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
         },
       },
       {
-        timestamp: '2026-07-11T04:55:10.000Z',
+        timestamp: '2026-07-11T04:56:10.000Z',
         type: 'compacted',
         payload: { replacement_history: [] },
       },
