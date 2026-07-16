@@ -437,19 +437,20 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
     if (!source) return res.status(404).json({ error: 'Codex App 会话不存在' });
     const target = source.messages.find((message) => (
       message.seq === messageSeq
-      && message.role === 'user'
+      && ['user', 'assistant'].includes(message.role)
       && message.turnId
     ));
-    if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户消息创建分支' });
-    if (!target.previousTurnId && source.truncated) {
+    if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户或助手消息创建分支' });
+    const forkedThroughTurnId = target.role === 'assistant' ? target.turnId : target.previousTurnId;
+    if (target.role === 'user' && !forkedThroughTurnId && source.truncated) {
       return res.status(409).json({ error: '会话历史已截断，无法确定这条消息之前的 turn' });
     }
 
     const settings = parseNativeThreadSettings(req.body || {});
-    const result = target.previousTurnId
+    const result = forkedThroughTurnId
       ? await appServerClient.request('thread/fork', compactObject({
         threadId,
-        lastTurnId: target.previousTurnId,
+        lastTurnId: forkedThroughTurnId,
         cwd: settings.cwd,
         model: settings.model,
         modelProvider: settings.provider,
@@ -477,8 +478,8 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       ok: true,
       threadId: forkedThreadId,
       sourceThreadId: threadId,
-      forkedThroughTurnId: target.previousTurnId || '',
-      draft: extractUserDraft(target.content),
+      forkedThroughTurnId: forkedThroughTurnId || '',
+      draft: target.role === 'user' ? extractUserDraft(target.content) : '',
       conversation,
     });
   } catch (err) {
@@ -2034,12 +2035,64 @@ function normalizeNativeProjectPath(value) {
   return normalized === root ? root : normalized.replace(/[\\/]+$/, '');
 }
 
+function executableOrchestratedToolCallOffsets(source, toolName) {
+  const text = String(source || '');
+  const needle = `tools.${toolName}`;
+  const offsets = [];
+  let quote = '';
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = '';
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (!text.startsWith(needle, index)) continue;
+    let cursor = index + needle.length;
+    while (/\s/.test(text[cursor] || '')) cursor += 1;
+    if (text[cursor] === '(') offsets.push(index);
+  }
+  return offsets;
+}
+
 function extractNativeToolImagePaths(message) {
   if (message?.role !== 'tool') return [];
   const source = String(message.content || '');
   const paths = [];
-  const orchestratedPattern = /tools\.view_image\s*\(\s*\{\s*path\s*:\s*"((?:\\.|[^"\\])*)"/g;
-  for (const match of source.matchAll(orchestratedPattern)) {
+  const orchestratedPattern = /^tools\.view_image\s*\(\s*\{\s*path\s*:\s*"((?:\\.|[^"\\])*)"/;
+  for (const offset of executableOrchestratedToolCallOffsets(source, 'view_image')) {
+    const match = source.slice(offset).match(orchestratedPattern);
+    if (!match) continue;
     try {
       paths.push(JSON.parse(`"${match[1]}"`));
     } catch {
@@ -4126,10 +4179,13 @@ function updateConversationStatus(conversation){
 }
 function applyNativeConversationMetadata(metadata){if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
-async function forkNativeConversation(messageSeq){
+async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
   if(!currentConversationId||currentConversationSource!=='codex')return;
   if(webRunActive){statusEl.textContent='任务运行中，不能创建历史分支';return}
-  if(!confirm('从这条消息重新开始？原会话会保留，新分支不会撤销已经产生的本地文件修改，原消息中的附件需要重新添加。'))return;
+  const prompt=continueAfter
+    ?'在新任务中从这条回答之后继续？原任务会保留，已经产生的本地文件修改不会撤销。'
+    :'从这条消息重新开始？原会话会保留，新分支不会撤销已经产生的本地文件修改，原消息中的附件需要重新添加。';
+  if(!confirm(prompt))return;
   const sourceThreadId=currentConversationId;
   statusEl.textContent='正在创建历史分支...';
   try{
@@ -4153,7 +4209,7 @@ async function forkNativeConversation(messageSeq){
     input.style.height='auto';
     input.style.height=Math.min(input.scrollHeight,180)+'px';
     await refreshHistory();
-    statusEl.textContent='已创建分支，可修改后发送；原会话保持不变';
+    statusEl.textContent=continueAfter?'已在新任务中继续；原任务保持不变':'已创建分支，可修改后发送；原会话保持不变';
     input.focus();
   }catch(e){
     statusEl.textContent=e.message;
@@ -4553,7 +4609,31 @@ function renderReviewComments(body,comments){
 }
 function decodeEmbeddedToolString(value){try{return JSON.parse('"'+value+'"')}catch(e){return String(value||'')}}
 function readEmbeddedToolString(source,marker){const start=String(source||'').indexOf(marker);if(start<0)return null;let value='';let escaped=false;for(let index=start+marker.length;index<source.length;index++){const char=source[index];if(char==='"'&&!escaped)return decodeEmbeddedToolString(value);value+=char;if(char==='\\\\'&&!escaped)escaped=true;else escaped=false}return null}
-function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim();let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};const imagePath=readEmbeddedToolString(detail,'tools.view_image({path:"');if(imagePath!==null)return{name:'view_image',detail:imagePath};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail};if(detail.includes('view_image'))return{name:'view_image',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
+function executableOrchestratedToolCallOffsets(source,toolName){
+  const text=String(source||'');
+  const needle='tools.'+toolName;
+  const offsets=[];
+  let quote='';
+  let escaped=false;
+  let lineComment=false;
+  let blockComment=false;
+  for(let index=0;index<text.length;index++){
+    const char=text[index];
+    const next=text[index+1];
+    if(lineComment){if(char==='\\n')lineComment=false;continue}
+    if(blockComment){if(char==='*'&&next==='/'){blockComment=false;index++}continue}
+    if(quote){if(escaped)escaped=false;else if(char==='\\\\')escaped=true;else if(char===quote)quote='';continue}
+    if(char==='/'&&next==='/'){lineComment=true;index++;continue}
+    if(char==='/'&&next==='*'){blockComment=true;index++;continue}
+    if(char==='"'||char==="'"||char.charCodeAt(0)===96){quote=char;continue}
+    if(!text.startsWith(needle,index))continue;
+    let cursor=index+needle.length;
+    while(/\\s/.test(text[cursor]||''))cursor++;
+    if(text[cursor]==='(')offsets.push(index);
+  }
+  return offsets;
+}
+function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim();let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
 function activityFileLabel(file){const clean=String(file||'').trim().replace(/^["']|["',;)]$/g,'');const parts=clean.split('/').filter(Boolean);return parts[parts.length-1]||clean||'文件'}
 function extractActivityFiles(source){const matches=String(source||'').match(/[A-Za-z0-9_@.+-]+\\.(?:mjs|cjs|js|css|jsonl?|md|toml|ya?ml|py|sh|html|tsx?|jsx?|go|rs|java|cpp|hpp|c|h)/g)||[];return[...new Set(matches.map(activityFileLabel))].slice(0,4)}
 function shortActivityText(value,max=100){const clean=String(value||'').replace(/\\s+/g,' ').trim();return clean.length>max?clean.slice(0,max-3)+'...':clean}
@@ -4561,8 +4641,8 @@ function orchestratedActivityPresentations(text){
   const source=String(text||'');
   if(!source.startsWith('exec\\n'))return[];
   const detail=source.slice(source.indexOf('\\n')+1);
-  const imageCount=(detail.match(/tools\\.view_image\\s*\\(/g)||[]).length;
-  const commandCount=(detail.match(/tools\\.exec_command\\s*\\(/g)||[]).length;
+  const imageCount=executableOrchestratedToolCallOffsets(detail,'view_image').length;
+  const commandCount=executableOrchestratedToolCallOffsets(detail,'exec_command').length;
   const items=[];
   if(imageCount)items.push({verb:'已查看',target:imageCount+' 张图像',icon:'images'});
   if(commandCount>1)items.push({verb:'已读取文件并运行了多个命令',icon:'search'});
@@ -4593,9 +4673,8 @@ function nativeToolImageUrls(presentations,messageSeq){
   if(currentConversationSource!=='codex'||!currentConversationId||!Number.isInteger(sequence)||sequence<1)return[];
   const count=presentations.reduce((total,presentation)=>total+(Number(String(presentation.target||'').match(/^(\\d+) 张图像$/)?.[1])||0),0);
   if(!count)return[];
-  const generation=nativeGeneration>0?'?generation='+encodeURIComponent(nativeGeneration):'';
   const base='/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/tool-images/'+sequence+'/';
-  return Array.from({length:count},(_,index)=>base+(index+1)+generation);
+  return Array.from({length:count},(_,index)=>base+(index+1));
 }
 function createActivityImageGallery(urls){
   const gallery=document.createElement('div');
@@ -4631,9 +4710,11 @@ function createActivityImageGallery(urls){
 }
 function createToolActivityItem(presentation,rawText,running=false){
   const expandable=presentation.expandable!==false;
+  const galleryOnly=Boolean(presentation.galleryOnly);
   const imageUrls=Array.isArray(presentation.imageUrls)?presentation.imageUrls.filter(Boolean):[];
   const item=document.createElement(expandable?'details':'div');
   item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'');
+  if(expandable)item.open=false;
   item.dataset.messageText=String(rawText||'');
   const summary=document.createElement(expandable?'summary':'div');
   summary.className='activityItemSummary'+(presentation.target?'':' standalone');
@@ -4662,9 +4743,16 @@ function createToolActivityItem(presentation,rawText,running=false){
     meta.textContent=presentation.meta;
     summary.appendChild(meta);
   }
+  if(expandable){
+    const chevron=document.createElement('i');
+    chevron.className='activityItemChevron';
+    chevron.setAttribute('data-lucide','chevron-right');
+    chevron.setAttribute('aria-hidden','true');
+    summary.appendChild(chevron);
+  }
   item.appendChild(summary);
   if(imageUrls.length)item.appendChild(createActivityImageGallery(imageUrls));
-  if(expandable){
+  if(expandable&&!galleryOnly){
     const content=document.createElement('div');
     content.className='activityItemContent';
     const raw=document.createElement('pre');
@@ -4780,7 +4868,7 @@ function appendTurnTool(text,options={}){
   const imageUrls=nativeToolImageUrls(imageViews,options.nativeMessageSeq);
   let visibleBatch=null;
   if(imageViews.length){
-    visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:false,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true);
+    visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true);
     activateTurnProcessElement(visibleBatch);
     refreshIcons(visibleBatch);
   }
@@ -5098,11 +5186,21 @@ function addMsg(role,text,options={}){
       tag.textContent=role==='process'?'过程':'日志';
       actions.appendChild(tag);
     }
+    const copy=document.createElement('button');
+    copy.type='button';
+    copy.className='copyMsg messageAction';
+    copy.title='复制此消息';
+    copy.dataset.tooltip='复制';
+    copy.setAttribute('aria-label','复制此消息');
+    setIconLabel(copy,'copy','复制此消息',false);
+    copy.addEventListener('click',(e)=>{e.stopPropagation();copyText(el.dataset.messageText||'',copy)});
+    actions.appendChild(copy);
     if(role==='user'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId){
       const fork=document.createElement('button');
       fork.type='button';
-      fork.className='rollbackMsg';
+      fork.className='rollbackMsg messageAction';
       fork.title='从这里重新开始';
+      fork.dataset.tooltip='从这里重新开始';
       fork.setAttribute('aria-label','从这里重新开始');
       setIconLabel(fork,'git-branch','从这里重新开始',false);
       fork.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq)});
@@ -5110,28 +5208,32 @@ function addMsg(role,text,options={}){
     }else if(role==='user'&&Number.isInteger(options.messageIndex)){
       const rollback=document.createElement('button');
       rollback.type='button';
-      rollback.className='rollbackMsg';
+      rollback.className='rollbackMsg messageAction';
       rollback.title='回退到这条消息';
+      rollback.dataset.tooltip='回退到这条消息';
       rollback.setAttribute('aria-label','回退到这条消息');
       setIconLabel(rollback,'rotate-ccw','回退到这条消息',false);
       rollback.addEventListener('click',(e)=>{e.stopPropagation();rollbackConversation(options.messageIndex)});
       actions.appendChild(rollback);
     }
-    if(role==='user'){
+    if(role==='assistant'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId&&['','message','final_answer'].includes(kind)){
+      const continueTask=document.createElement('button');
+      continueTask.type='button';
+      continueTask.className='continueMsg messageAction';
+      continueTask.title='在新任务中继续';
+      continueTask.dataset.tooltip='在新任务中继续';
+      continueTask.setAttribute('aria-label','在新任务中继续');
+      setIconLabel(continueTask,'corner-up-right','在新任务中继续',false);
+      continueTask.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true})});
+      actions.appendChild(continueTask);
+    }
+    if(['user','assistant'].includes(role)){
       const time=document.createElement('time');
       time.className='messageTime';
       time.dateTime=String(options.at||new Date().toISOString());
       time.textContent=formatMessageTime(time.dateTime);
       actions.appendChild(time);
     }
-    const copy=document.createElement('button');
-    copy.type='button';
-    copy.className='copyMsg';
-    copy.title='复制此消息';
-    copy.setAttribute('aria-label','复制此消息');
-    setIconLabel(copy,'copy','复制此消息',false);
-    copy.addEventListener('click',(e)=>{e.stopPropagation();copyText(el.dataset.messageText||'',copy)});
-    actions.appendChild(copy);
     if(collapsible){
       const summary=document.createElement('summary');
       const row=document.createElement('span');

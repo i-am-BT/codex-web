@@ -97,6 +97,26 @@ experimental_bearer_token = "test-token"
           },
         }),
         JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.997Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: 'native assistant answer' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.997Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'false-tool-image-patch',
+            input: 'const patch = "*** Begin Patch\\n*** Update File: /tmp/fake-ui.js\\n+tools.view_image({path:\\"/tmp/not-a-real-image.png\\"})\\n*** End Patch";\ntext(await tools.apply_patch(patch));',
+          },
+        }),
+        JSON.stringify({
           timestamp: '2026-07-11T04:52:31.998Z',
           type: 'event_msg',
           payload: { type: 'task_complete', turn_id: nativeFirstTurnId },
@@ -379,13 +399,16 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.activityClusterText\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /\.activityCluster\[open\] > summary \.activityClusterChevron/);
+    assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
     assert.match(uiStyles, /\.activityImageGallery\s*\{/);
     assert.match(uiStyles, /\.activityImagePreview img\s*\{[^}]*object-fit:\s*contain/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgBody > :not\(\.memoryCitations\)\s*\{[^}]*max-width:\s*min\(780px, 100%\)/s);
-    assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*100%/s);
+    assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*fit-content;[^}]*opacity:\s*0/s);
+    assert.match(uiStyles, /\.messageAction::after\s*\{[^}]*content:\s*attr\(data-tooltip\)/s);
+    assert.match(uiStyles, /\.msg\.assistant \.continueMsg\s*\{[^}]*background:\s*var\(--surface-active\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
@@ -441,6 +464,9 @@ if (args[0] === 'app-server') {
     assert.match(page, /image_view_activity/);
     assert.match(page, /function nativeToolImageUrls/);
     assert.match(page, /function createActivityImageGallery/);
+    assert.match(page, /galleryOnly:true/);
+    assert.doesNotMatch(page, /base\+\(index\+1\)\+generation/);
+    assert.match(page, /continueMsg messageAction/);
     assert.match(page, /className='completionTimeline liveProcessTimeline'/);
     assert.doesNotMatch(page, /function updateTurnProcessLatest/);
     assert.match(page, /function appendInputImageToUser/);
@@ -588,6 +614,65 @@ if (args[0] === 'app-server') {
       { verb: '已编辑', icon: 'pencil', target: 'server.mjs', added: 1, removed: 1, meta: '+1 -1' },
       { verb: '已编辑', icon: 'pencil', target: 'ui.css', added: 1, removed: 0, meta: '+1 -0' },
     ]);
+    const falseImagePatchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/fake-ui.js\\n+tools.view_image({path:\\"/tmp/not-a-real-image.png\\"})\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
+    assert.deepEqual(parseToolActivity(falseImagePatchCall), [
+      { verb: '已编辑', icon: 'pencil', target: 'fake-ui.js', added: 1, removed: 0, meta: '+1 -0' },
+    ]);
+
+    class FixtureElement {
+      constructor(tagName) {
+        this.tagName = String(tagName).toUpperCase();
+        this.children = [];
+        this.dataset = {};
+        this.attributes = new Map();
+        this.className = '';
+        this.open = false;
+      }
+
+      appendChild(child) {
+        this.children.push(child);
+        child.parentNode = this;
+        return child;
+      }
+
+      setAttribute(name, value) {
+        this.attributes.set(name, String(value));
+      }
+
+      addEventListener() {}
+    }
+    const activityDomHelpers = inlineScript.match(
+      /(function createActivityImageGallery[\s\S]*?)(?=function createActivityBatch)/,
+    )?.[1];
+    assert.ok(activityDomHelpers);
+    const createToolActivityItem = new Function(
+      'document',
+      'openImagePreview',
+      'refreshIcons',
+      'setIconLabel',
+      `${activityDomHelpers}; return createToolActivityItem;`,
+    )(
+      { createElement: (tagName) => new FixtureElement(tagName) },
+      () => {},
+      () => {},
+      () => {},
+    );
+    const imageActivity = createToolActivityItem({
+      verb: '已查看',
+      target: '1 张图像',
+      icon: 'image',
+      expandable: true,
+      galleryOnly: true,
+      imageUrls: ['/api/native-sessions/thread/tool-images/7/1'],
+    }, 'exec\nreal image call');
+    const activityNodes = (node) => [node, ...node.children.flatMap(activityNodes)];
+    const renderedActivityNodes = activityNodes(imageActivity);
+    assert.equal(imageActivity.tagName, 'DETAILS');
+    assert.equal(imageActivity.open, false);
+    assert.equal(renderedActivityNodes.filter((node) => node.className.includes('activityImageGallery')).length, 1);
+    assert.equal(renderedActivityNodes.filter((node) => node.className === 'activityRaw').length, 0);
+    assert.equal(renderedActivityNodes.filter((node) => node.className === 'activityItemChevron').length, 1);
+    assert.equal(renderedActivityNodes.find((node) => node.tagName === 'IMG').src, '/api/native-sessions/thread/tool-images/7/1');
 
     const configResponse = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
     assert.equal(configResponse.status, 200);
@@ -641,8 +726,12 @@ if (args[0] === 'app-server') {
     const nativeFirstMessage = nativeConversation.messages.find((message) => (
       message.role === 'user' && message.content === 'native earlier message'
     ));
+    const nativeAssistantMessage = nativeConversation.messages.find((message) => (
+      message.role === 'assistant' && message.content === 'native assistant answer'
+    ));
     assert.equal(nativeFirstMessage.turnId, nativeFirstTurnId);
     assert.equal(nativeFirstMessage.previousTurnId, undefined);
+    assert.equal(nativeAssistantMessage.turnId, nativeFirstTurnId);
     assert.equal(nativeTargetMessage.turnId, nativeSecondTurnId);
     assert.equal(nativeTargetMessage.previousTurnId, nativeFirstTurnId);
     assert.ok(nativeConversation.messages.some((message) => (
@@ -651,16 +740,26 @@ if (args[0] === 'app-server') {
       && message.content === 'data:image/png;base64,c21va2U='
     )));
     const nativeToolImageMessage = nativeConversation.messages.find((message) => (
-      message.role === 'tool' && message.content.includes('tools.view_image')
+      message.role === 'tool' && message.content.includes(toolImagePath)
     ));
     assert.ok(nativeToolImageMessage);
-    const toolImageUrl = `/api/native-sessions/${nativeSessionId}/tool-images/${nativeToolImageMessage.seq}/1?generation=${nativeConversation.generation}`;
+    const toolImageUrl = `/api/native-sessions/${nativeSessionId}/tool-images/${nativeToolImageMessage.seq}/1`;
     const unauthorizedToolImage = await fetch(`${baseUrl}${toolImageUrl}`);
     assert.equal(unauthorizedToolImage.status, 401);
     const toolImage = await fetch(`${baseUrl}${toolImageUrl}`, { headers: { Cookie: cookie } });
     assert.equal(toolImage.status, 200);
     assert.equal(toolImage.headers.get('content-type'), 'image/png');
     assert.deepEqual(Buffer.from(await toolImage.arrayBuffer()), await readFile(toolImagePath));
+
+    const falseToolImageMessage = nativeConversation.messages.find((message) => (
+      message.role === 'tool' && message.content.includes('not-a-real-image.png')
+    ));
+    assert.ok(falseToolImageMessage);
+    const falseToolImage = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/tool-images/${falseToolImageMessage.seq}/1`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(falseToolImage.status, 404);
 
     const restartedFromFirst = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
       method: 'POST',
@@ -699,6 +798,24 @@ if (args[0] === 'app-server') {
     assert.equal(forkedPayload.forkedThroughTurnId, nativeFirstTurnId);
     assert.equal(forkedPayload.draft, 'native fixture message');
     assert.equal(forkedPayload.conversation.status, 'done');
+
+    const continuedFromAssistant = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messageSeq: nativeAssistantMessage.seq,
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'workspace-write',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(continuedFromAssistant.status, 201);
+    const continuedFromAssistantPayload = await continuedFromAssistant.json();
+    assert.equal(continuedFromAssistantPayload.threadId, forkedNativeSessionId);
+    assert.equal(continuedFromAssistantPayload.forkedThroughTurnId, nativeFirstTurnId);
+    assert.equal(continuedFromAssistantPayload.draft, '');
 
     const archivedNativeSession = await fetch(`${baseUrl}/api/native-sessions/${archivedNativeSessionId}`, {
       headers: { Cookie: cookie },
@@ -1086,7 +1203,9 @@ if (args[0] === 'app-server') {
       && message.params.approvalPolicy === 'untrusted'
     ));
     assert.ok(restartFromFirstMessage);
-    const forkMessage = protocolMessages.find((message) => message.method === 'thread/fork');
+    const forkMessages = protocolMessages.filter((message) => message.method === 'thread/fork');
+    assert.equal(forkMessages.length, 2);
+    const forkMessage = forkMessages[0];
     assert.equal(forkMessage.params.threadId, nativeSessionId);
     assert.equal(forkMessage.params.lastTurnId, nativeFirstTurnId);
     assert.equal(forkMessage.params.sandbox, 'workspace-write');
