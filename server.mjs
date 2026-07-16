@@ -4355,6 +4355,7 @@ function runningActivityVerb(verb){
 function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){current={verb:match[1],icon:match[2],target:activityFileLabel(line.slice(match[0].length)),added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
 function commandActivityPresentation(command){const source=String(command||'');const clean=shortActivityText(source,120);const files=extractActivityFiles(source);if(/(?:^|\\s)(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files.join('、')||clean,icon:'book-open'};if(/\\brg\\b/.test(source)){const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';return{verb:'已搜索',target:(files.join('、')||'内容')+(query?' · “'+shortActivityText(query,48)+'”':''),icon:'search'}}if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files.join('、')||shortActivityText(source.split('\\n')[0],84),icon:'circle-check'};if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};return{verb:'已运行',target:files.join('、')||clean||'工具调用',icon:'terminal'}}
 function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
+function isImageViewActivityPresentation(presentation){return presentation?.verb==='已查看'&&/\\d+ 张图像$/.test(String(presentation.target||''))&&['image','images'].includes(presentation.icon)}
 function createToolActivityItem(presentation,rawText,running=false){
   const expandable=presentation.expandable!==false;
   const item=document.createElement(expandable?'details':'div');
@@ -4498,17 +4499,30 @@ function settleActivityCluster(cluster){
   updateActivityCluster(cluster);
 }
 function appendTurnTool(text){
-  const batch=createActivityBatch(toolActivityPresentations(text),text,'tool_activity',true);
+  const presentations=toolActivityPresentations(text);
+  const imageViews=presentations.filter(isImageViewActivityPresentation);
+  const folded=presentations.filter((presentation)=>!isImageViewActivityPresentation(presentation));
+  let visibleBatch=null;
+  if(imageViews.length){
+    visibleBatch=createActivityBatch(imageViews.map((presentation)=>({...presentation,expandable:false})),text,'image_view_activity',true);
+    activateTurnProcessElement(visibleBatch);
+    refreshIcons(visibleBatch);
+  }
+  if(!folded.length)return visibleBatch;
+  const batch=createActivityBatch(folded,text,'tool_activity',true);
+  if(visibleBatch)batch._relatedActivityBatches=[visibleBatch];
   activateTurnProcessElement(batch);
   refreshIcons(batch);
   return batch;
 }
 function settleTurnTool(batch){
   if(!batch)return;
-  batch.classList.remove('streaming');
-  for(const verb of batch.querySelectorAll('.activityVerb[data-completed-verb]'))verb.textContent=verb.dataset.completedVerb;
-  const cluster=batch.closest('.activityCluster');
-  if(cluster)updateActivityCluster(cluster);
+  for(const item of [batch,...(batch._relatedActivityBatches||[])]){
+    item.classList.remove('streaming');
+    for(const verb of item.querySelectorAll('.activityVerb[data-completed-verb]'))verb.textContent=verb.dataset.completedVerb;
+    const cluster=item.closest('.activityCluster');
+    if(cluster)updateActivityCluster(cluster);
+  }
 }
 function appendTurnProcessActivity(text,kind){
   const presentation=kind==='context_compacted'
@@ -4733,10 +4747,20 @@ function addMsg(role,text,options={}){
   }
   if(role==='process'&&kind==='task_complete'){
     const anchor=latestFinalAssistantElement?.parentNode===chat?latestFinalAssistantElement:null;
-    const completion=createCompletionMessage(text,collectTurnArtifactsFromDom(anchor,takeTurnProcessElements()));
-    if(anchor)chat.insertBefore(completion,anchor);else chat.appendChild(completion);
+    const artifacts=collectTurnArtifactsFromDom(anchor,takeTurnProcessElements());
+    const visibleActivities=artifacts.filter((item)=>item.dataset?.messageKind==='image_view_activity');
+    const foldedActivities=artifacts.filter((item)=>item.dataset?.messageKind!=='image_view_activity');
+    for(const item of visibleActivities)settleTurnTool(item);
+    const completion=createCompletionMessage(text,foldedActivities);
+    if(anchor){
+      chat.insertBefore(completion,anchor);
+      for(const item of visibleActivities)chat.insertBefore(item,anchor);
+    }else{
+      chat.appendChild(completion);
+      for(const item of visibleActivities)chat.appendChild(item);
+    }
     latestToolElement=null;
-    refreshIcons(completion);
+    refreshIcons(chat);
     if(options.autoScroll!==false)scrollChatToLatest();
     return completion;
   }

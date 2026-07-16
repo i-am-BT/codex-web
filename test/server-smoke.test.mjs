@@ -417,6 +417,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /liveProcessPanel/);
     assert.match(page, /turnProcessHeader=document\.createElement\('div'\)/);
     assert.match(page, /function createActivityCluster/);
+    assert.match(page, /function isImageViewActivityPresentation/);
+    assert.match(page, /image_view_activity/);
     assert.match(page, /className='completionTimeline liveProcessTimeline'/);
     assert.doesNotMatch(page, /function updateTurnProcessLatest/);
     assert.match(page, /function appendInputImageToUser/);
