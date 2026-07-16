@@ -2084,17 +2084,20 @@ body[data-theme] .activityCluster {
   min-width: 0;
   aspect-ratio: 4 / 3;
   overflow: hidden;
-  place-items: center;
-  border: 1px solid var(--border);
+  border: 0;
   border-radius: 6px;
-  background: var(--surface-raised);
+  background: transparent;
   padding: 0;
   cursor: zoom-in;
 }
 
+.activityImagePreview.loaded {
+  aspect-ratio: auto;
+}
+
 .activityImagePreview:hover {
-  border-color: color-mix(in srgb, var(--text-muted) 48%, var(--border));
-  background: var(--surface-active);
+  border-color: transparent;
+  background: transparent;
 }
 
 .activityImagePreview:focus-visible {
@@ -2107,6 +2110,10 @@ body[data-theme] .activityCluster {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+.activityImagePreview.loaded img {
+  height: auto;
 }
 
 .activityImagePreview.unavailable {

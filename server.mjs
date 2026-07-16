@@ -4686,10 +4686,11 @@ function createActivityImageGallery(urls){
     preview.title='放大查看第 '+(index+1)+' 张图片';
     preview.setAttribute('aria-label',preview.title);
     const img=document.createElement('img');
-    img.src=url;
     img.alt='查看的图像 '+(index+1);
     img.loading='lazy';
     img.decoding='async';
+    img.addEventListener('load',()=>preview.classList.add('loaded'),{once:true});
+    img.src=url;
     const unavailable=document.createElement('span');
     unavailable.className='activityImageUnavailable';
     unavailable.hidden=true;
