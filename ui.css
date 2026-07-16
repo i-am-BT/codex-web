@@ -1373,7 +1373,7 @@ body .msg.assistant .continueMsg {
 }
 
 body .msg.assistant .continueMsg {
-  background: var(--surface-active);
+  background: transparent;
   color: var(--text-muted);
 }
 
@@ -1387,7 +1387,7 @@ body .msg.assistant .continueMsg:focus-visible {
 
 body .msg.assistant .continueMsg:hover,
 body .msg.assistant .continueMsg:focus-visible {
-  background: color-mix(in srgb, var(--surface-active) 78%, var(--text) 8%);
+  background: transparent;
 }
 
 body .msg.assistant .messageAction .lucide {
