@@ -3058,9 +3058,11 @@ const desktopSidebarMedia=window.matchMedia('(min-width: 821px)');
 const SIDEBAR_STORAGE_KEY='codexWeb.sidebarCollapsed';
 const HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsCollapsed';
 const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
+const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
 let hiddenHistoryProjects=readHiddenHistoryProjects();
+let renamedHistoryProjects=readRenamedHistoryProjects();
 let activeHistoryProjectMenu=null;
 function refreshIcons(root=document){if(!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
 function setIconLabel(element,name,label,showLabel=true){if(!element)return;element.replaceChildren();const icon=document.createElement('i');icon.setAttribute('data-lucide',name);icon.setAttribute('aria-hidden','true');element.appendChild(icon);if(showLabel){const text=document.createElement('span');text.className='buttonLabel';text.textContent=label;element.appendChild(text)}if(label&&!element.getAttribute('aria-label'))element.setAttribute('aria-label',label);refreshIcons(element)}
@@ -3843,6 +3845,9 @@ function conversationKey(source,id){return (source==='codex'?'codex':'web')+':'+
 function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown__'}
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
 function projectNameFromPath(value){const clean=String(value||'').replace(/\\\\/g,'/').replace(/\\/+$/,'');const parts=clean.split('/').filter(Boolean);return parts.length?parts[parts.length-1]:'未指定项目'}
+function readRenamedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECT_NAMES_STORAGE_KEY)||'{}');if(!saved||Array.isArray(saved)||typeof saved!=='object')return new Map();return new Map(Object.entries(saved).filter(([key,value])=>key&&typeof value==='string'&&value.trim()).map(([key,value])=>[key,value.trim().replace(/\s+/g,' ').slice(0,80)]))}catch{return new Map()}}
+function storeRenamedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECT_NAMES_STORAGE_KEY,JSON.stringify(Object.fromEntries([...renamedHistoryProjects.entries()].sort(([left],[right])=>left.localeCompare(right)))))}catch{}}
+function historyProjectName(value){return renamedHistoryProjects.get(historyProjectKey(value))||projectNameFromPath(value)}
 function readCollapsedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
 function storeCollapsedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...collapsedHistoryProjects].sort()))}catch{}}
 function readHiddenHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
@@ -3895,12 +3900,24 @@ function createHistoryProjectMenu(groupKey,groupData,projectName){
   menu.setAttribute('role','menu');
   menu.setAttribute('aria-label','项目 '+projectName+' 的操作');
   menu.hidden=true;
+  addHistoryProjectMenuAction(menu,'pencil','重命名项目',()=>renameHistoryProject(groupKey,groupData.path,projectName));
   addHistoryProjectMenuAction(menu,'archive','归档项目任务',()=>archiveHistoryProject(groupData.path,projectName,groupData.items),{disabled:!groupData.path});
   const hidden=hiddenHistoryProjects.has(groupKey);
   addHistoryProjectMenuAction(menu,hidden?'undo-2':'x',hidden?'恢复项目':'移除项目',()=>toggleHistoryProjectHidden(groupKey,projectName,groupData.items.length),{danger:!hidden});
   button.addEventListener('click',(event)=>{event.stopPropagation();toggleHistoryProjectMenu(button,menu)});
   menu.addEventListener('click',(event)=>event.stopPropagation());
   return{button,menu};
+}
+function renameHistoryProject(groupKey,projectPath,projectName){
+  const next=prompt('重命名项目（留空恢复默认名称）',projectName);
+  if(next===null)return;
+  const clean=next.trim().replace(/\s+/g,' ').slice(0,80);
+  const defaultName=projectNameFromPath(projectPath);
+  if(!clean||clean===defaultName)renamedHistoryProjects.delete(groupKey);
+  else renamedHistoryProjects.set(groupKey,clean);
+  storeRenamedHistoryProjects();
+  renderHistory();
+  statusEl.textContent=clean&&clean!==defaultName?'项目已重命名':'项目名称已恢复默认';
 }
 async function archiveHistoryProject(projectPath,projectName,items){
   if(!projectPath)return;
@@ -3942,7 +3959,7 @@ function renderHistory(items){
   if(Array.isArray(items))historyItems=items;
   const query=String(historyFilter?.value||'').trim().toLocaleLowerCase();
   const candidates=query?historyItems:historyItems.filter((item)=>!hiddenHistoryProjects.has(historyProjectKey(item.cwd)));
-  const visibleItems=query?candidates.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')).toLocaleLowerCase().includes(query)):candidates;
+  const visibleItems=query?candidates.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')+' '+historyProjectName(item.cwd)).toLocaleLowerCase().includes(query)):candidates;
   const scrollTop=history.scrollTop;
   closeHistoryProjectMenu();
   history.innerHTML='';
@@ -3967,7 +3984,7 @@ function renderHistory(items){
     const group=document.createElement('section');
     group.className='historyProject';
     group.dataset.projectPath=groupData.path;
-    const projectName=projectNameFromPath(groupData.path);
+    const projectName=historyProjectName(groupData.path);
     group.dataset.projectName=projectName;
     group.setAttribute('aria-label','项目 '+projectName+'，路径 '+(groupData.path||'未知'));
     const header=document.createElement('div');

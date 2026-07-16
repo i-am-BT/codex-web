@@ -506,6 +506,10 @@ if (args[0] === 'app-server') {
     assert.match(page, /function createHistoryProjectMenu/);
     assert.match(page, /function archiveHistoryProject/);
     assert.match(page, /function toggleHistoryProjectHidden/);
+    assert.match(page, /codexWeb\.historyProjectNames\.v1/);
+    assert.match(page, /function renameHistoryProject/);
+    assert.match(page, /'pencil','重命名项目'/);
+    assert.match(page, /historyProjectName\(item\.cwd\)/);
     assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\)return/);
     assert.match(page, /\/api\/native-projects\/archive/);
     assert.match(page, /function extractMemoryCitations/);
