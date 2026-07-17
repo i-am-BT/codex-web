@@ -188,8 +188,23 @@ export class NativeSessionStore extends EventEmitter {
       .sort((left, right) => right.recencyMs - left.recencyMs)
       .slice(0, positiveNumber(limit, this.maxSessions))
       .map((entry) => {
-        const cached = this.details.get(entry.id);
-        const status = cached && cached.filePath === entry.filePath && cached.size === entry.size
+        let cached = this.details.get(entry.id);
+        let cacheIsCurrent = cached
+          && cached.filePath === entry.filePath
+          && cached.size === entry.size;
+
+        // A recent mtime only means the session changed, not that its turn is
+        // still running. Parse changed recent sessions so a task_complete at
+        // the end of the JSONL is reflected in the sidebar immediately.
+        if (!cacheIsCurrent && now - entry.mtimeMs <= this.runningWindowMs) {
+          this.get(entry.id);
+          cached = this.details.get(entry.id);
+          cacheIsCurrent = cached
+            && cached.filePath === entry.filePath
+            && cached.size === entry.size;
+        }
+
+        const status = cacheIsCurrent
           ? effectiveSessionStatus(cached.status, entry.mtimeMs, this.runningWindowMs, now)
           : now - entry.mtimeMs <= this.runningWindowMs
             ? 'running'
