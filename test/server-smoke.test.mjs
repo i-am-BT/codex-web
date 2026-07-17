@@ -524,7 +524,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /href="\/image-prompt\.css"/);
     assert.match(page, /src="\/image-prompt\.js"/);
-    assert.match(page, /\['dream-skin','Dream Skin'\]/);
+    assert.match(page, /\['dream-skin','Skin'\]/);
+    assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
     assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
