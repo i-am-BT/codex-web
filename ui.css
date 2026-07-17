@@ -847,9 +847,19 @@ body[data-theme] .providerBox {
 }
 
 .historyTitleCount {
-  color: var(--text-subtle);
+  display: inline-grid;
+  min-width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  padding: 0 5px;
+  font-size: 9px;
   font-variant-numeric: tabular-nums;
-  font-weight: 600;
+  font-weight: 720;
+  line-height: 1;
 }
 
 .historySearch {
@@ -1061,8 +1071,28 @@ body .history {
 }
 
 .historyProjectCount {
-  color: var(--text-subtle);
-  font-size: 10px;
+  display: inline-grid;
+  min-width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--border) 86%, transparent);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  padding: 0 5px;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 720;
+  line-height: 1;
+  transition: border-color 140ms var(--ease), background 140ms var(--ease), color 140ms var(--ease);
+}
+
+.historyProjectHead:hover .historyProjectCount,
+.historyProjectHead[aria-expanded="true"] .historyProjectCount {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
 }
 
 .historyProjectPath {

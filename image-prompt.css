@@ -193,10 +193,100 @@ body[data-theme="light"] .imagePromptPlaygroundPanel {
   letter-spacing: 0;
 }
 
+.imagePromptHeaderLead {
+  min-width: 0;
+}
+
+.imagePromptStatsRow {
+  display: flex;
+  min-height: 24px;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 3px;
+}
+
 .imagePromptHeader p {
-  margin: 3px 0 0;
+  margin: 0;
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.imagePromptStatsDivider {
+  width: 1px;
+  height: 11px;
+  background: var(--border-strong);
+}
+
+.imagePromptSyncStatus {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.imagePromptSyncStatus::before {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--success);
+  content: "";
+}
+
+.imagePromptSyncStatus[data-status="checking"]::before {
+  background: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.imagePromptSyncStatus[data-status="error"] {
+  color: var(--danger);
+}
+
+.imagePromptSyncStatus[data-status="error"]::before {
+  background: var(--danger);
+}
+
+.imagePromptSyncButton {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-subtle);
+  padding: 0;
+}
+
+.imagePromptSyncButton:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.imagePromptSyncButton:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.imagePromptSyncButton .lucide {
+  width: 13px;
+  height: 13px;
+}
+
+.imagePromptSyncButton.syncing .lucide {
+  animation: imagePromptSyncSpin 900ms linear infinite;
+}
+
+@keyframes imagePromptSyncSpin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .imagePromptSources {

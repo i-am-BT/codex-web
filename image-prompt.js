@@ -52,6 +52,10 @@
     pendingPlaygroundPrompt: null,
     selected: null,
     loading: false,
+    syncing: false,
+    checkingStatus: false,
+    syncStatus: null,
+    statusTimer: null,
   };
 
   const elements = {};
@@ -71,6 +75,7 @@
     createPromptWorkspace();
     createPromptDetail();
     bindWorkspaceEvents();
+    startLibraryStatusChecks();
 
     const savedView = localStorage.getItem(VIEW_KEY);
     setWorkspaceView(savedView === 'image-prompts' ? 'image-prompts' : 'codex', { persist: false });
@@ -127,9 +132,16 @@
       <div id="imagePromptLibraryPanel" class="imagePromptLibraryPanel" role="tabpanel" aria-labelledby="imagePromptLibraryView">
         <div class="imagePromptShell">
         <header class="imagePromptHeader">
-          <div>
+          <div class="imagePromptHeaderLead">
             <h1>Codex Image Prompt</h1>
-            <p id="imagePromptStats">提示词库</p>
+            <div class="imagePromptStatsRow">
+              <p id="imagePromptStats">提示词库</p>
+              <span class="imagePromptStatsDivider" aria-hidden="true"></span>
+              <span id="imagePromptSyncStatus" class="imagePromptSyncStatus" data-status="ready" role="status">内置版本</span>
+              <button id="imagePromptSync" class="imagePromptSyncButton" type="button" aria-label="检查提示词库更新" title="检查提示词库更新" disabled>
+                <i data-lucide="refresh-cw" aria-hidden="true"></i>
+              </button>
+            </div>
           </div>
           <div class="imagePromptSources" aria-label="提示词来源"></div>
         </header>
@@ -180,6 +192,8 @@
     elements.playgroundLoading = workspace.querySelector('#imagePromptPlaygroundLoading');
     elements.playgroundFrame = workspace.querySelector('#imagePromptPlaygroundFrame');
     elements.stats = workspace.querySelector('#imagePromptStats');
+    elements.syncStatus = workspace.querySelector('#imagePromptSyncStatus');
+    elements.sync = workspace.querySelector('#imagePromptSync');
     elements.sources = workspace.querySelector('.imagePromptSources');
     elements.casesMode = workspace.querySelector('#imagePromptCasesMode');
     elements.templatesMode = workspace.querySelector('#imagePromptTemplatesMode');
@@ -280,6 +294,7 @@
       elements.playgroundFrame.classList.add('loaded');
     });
     window.addEventListener('message', handlePlaygroundBridgeMessage);
+    elements.sync.addEventListener('click', syncPromptLibrary);
     elements.casesMode.addEventListener('click', () => setLibraryMode('cases'));
     elements.templatesMode.addEventListener('click', () => setLibraryMode('templates'));
     elements.search.addEventListener('input', () => {
@@ -349,6 +364,7 @@
     if (promptActive) {
       if (typeof closeMenu === 'function') closeMenu();
       setImagePromptView(state.activePromptView, { persist: false });
+      void checkLibraryStatus();
     } else {
       document.getElementById('input')?.focus();
     }
@@ -378,36 +394,48 @@
     flushPlaygroundPrompt();
   }
 
-  async function loadLibrary() {
-    if (state.library || state.loading) return;
+  async function loadLibrary({ force = false, quiet = false } = {}) {
+    if ((!force && state.library) || state.loading) return false;
+    const previousVersion = state.library?.version || '';
     state.loading = true;
-    elements.loading.classList.remove('hidden');
+    if (!quiet && !state.library) {
+      elements.loading.innerHTML = '<span class="spinner"></span> 载入提示词';
+      elements.loading.classList.remove('hidden');
+    }
     try {
-      const response = await fetch('/api/image-prompts');
+      const response = await fetch('/api/image-prompts', { cache: 'no-store' });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '提示词库载入失败');
       state.library = data;
       populateLibraryChrome();
       renderLibrary();
+      return Boolean(previousVersion && previousVersion !== data.version);
     } catch (error) {
-      elements.loading.innerHTML = '';
-      const retry = document.createElement('button');
-      retry.type = 'button';
-      retry.className = 'imagePromptSecondary';
-      retry.textContent = '重新载入';
-      retry.addEventListener('click', () => {
-        state.loading = false;
-        loadLibrary();
-      });
-      elements.loading.append(String(error.message || error), retry);
+      if (!state.library) {
+        elements.loading.innerHTML = '';
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'imagePromptSecondary';
+        retry.textContent = '重新载入';
+        retry.addEventListener('click', () => {
+          state.loading = false;
+          void loadLibrary();
+        });
+        elements.loading.append(String(error.message || error), retry);
+      } else if (!quiet) {
+        showToast(String(error.message || error), 'error');
+      }
+      return false;
     } finally {
       state.loading = false;
+      renderSyncStatus(state.syncStatus || state.library?.sync || {});
     }
   }
 
   function populateLibraryChrome() {
     const library = state.library;
     elements.stats.textContent = `${library.totalCases} 个案例 · ${library.totalTemplates} 套模板`;
+    renderSyncStatus(library.sync);
     elements.sources.replaceChildren();
     for (const source of library.sources || []) {
       const link = document.createElement('a');
@@ -419,12 +447,108 @@
       elements.sources.appendChild(link);
     }
     const labels = categoryLabels();
+    elements.category.replaceChildren();
+    const allCategories = document.createElement('option');
+    allCategories.value = '';
+    allCategories.textContent = '全部分类';
+    elements.category.appendChild(allCategories);
     for (const category of library.categories || []) {
       const option = document.createElement('option');
       option.value = category.value;
       option.textContent = labels.get(category.value) || category.value;
       elements.category.appendChild(option);
     }
+    const hasSelectedCategory = [...elements.category.options].some((option) => option.value === state.category);
+    if (!hasSelectedCategory) state.category = '';
+    elements.category.value = state.category;
+  }
+
+  function renderSyncStatus(status = {}) {
+    state.syncStatus = status;
+    const currentStatus = state.syncing ? 'checking' : (status.status || 'ready');
+    let label = '内置版本';
+    if (currentStatus === 'checking') label = '正在检查更新';
+    else if (currentStatus === 'error') label = '更新失败，使用当前版本';
+    else if (status.source === 'github') label = 'GitHub 已同步';
+    else if (status.checkedAt) label = '内置版本 · 已检查';
+    elements.syncStatus.textContent = label;
+    elements.syncStatus.dataset.status = currentStatus;
+
+    const details = [];
+    if (status.revision) details.push(`版本 ${String(status.revision).slice(0, 12)}`);
+    if (status.checkedAt) details.push(`检查于 ${formatSyncTime(status.checkedAt)}`);
+    if (status.updatedAt) details.push(`更新于 ${formatSyncTime(status.updatedAt)}`);
+    if (status.error) details.push(status.error);
+    elements.syncStatus.title = details.join(' · ');
+    elements.sync.disabled = state.loading || state.syncing || currentStatus === 'checking';
+    elements.sync.classList.toggle('syncing', currentStatus === 'checking');
+  }
+
+  async function syncPromptLibrary() {
+    if (state.syncing || state.loading) return;
+    state.syncing = true;
+    const previousVersion = state.library?.version || '';
+    renderSyncStatus({ ...(state.syncStatus || state.library?.sync), status: 'checking', error: '' });
+    try {
+      const response = await fetch('/api/image-prompts/sync', {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+      });
+      const data = await response.json();
+      if (data.status) renderSyncStatus(data.status);
+      if (!response.ok) throw new Error(data.error || '检查更新失败');
+      const changed = Boolean(data.changed) || Boolean(previousVersion && data.status?.version !== previousVersion);
+      await loadLibrary({ force: true, quiet: true });
+      showToast(changed ? '提示词库已更新' : '提示词库已是最新版本');
+    } catch (error) {
+      showToast(String(error.message || error), 'error');
+    } finally {
+      state.syncing = false;
+      renderSyncStatus(state.syncStatus || state.library?.sync || {});
+    }
+  }
+
+  async function checkLibraryStatus() {
+    if (state.checkingStatus || state.syncing || state.activeView !== 'image-prompts') return;
+    state.checkingStatus = true;
+    let checkAgain = false;
+    try {
+      const response = await fetch('/api/image-prompts/status', { cache: 'no-store' });
+      if (!response.ok) return;
+      const status = await response.json();
+      renderSyncStatus(status);
+      checkAgain = status.status === 'checking';
+      if (state.library && status.version && status.version !== state.library.version) {
+        const changed = await loadLibrary({ force: true, quiet: true });
+        if (changed) showToast('提示词库已自动更新');
+      }
+    } catch {
+      // Status checks are best-effort; the current library remains usable.
+    } finally {
+      state.checkingStatus = false;
+      if (checkAgain) window.setTimeout(() => void checkLibraryStatus(), 1500);
+    }
+  }
+
+  function startLibraryStatusChecks() {
+    if (state.statusTimer) return;
+    state.statusTimer = window.setInterval(() => {
+      if (!document.hidden) void checkLibraryStatus();
+    }, 60_000);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) void checkLibraryStatus();
+    });
+  }
+
+  function formatSyncTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
   }
 
   function setLibraryMode(mode) {

@@ -21,6 +21,10 @@ import {
   CodexDesktopIpcClient,
   isCodexDesktopIpcUnavailableError,
 } from './desktop-ipc-client.mjs';
+import {
+  AWESOME_GPT_IMAGE_BUILTIN_REVISION,
+  ImagePromptLibrary,
+} from './image-prompt-library.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -34,9 +38,7 @@ const IMAGE_PROMPT_JS_FILE = path.join(ROOT, 'image-prompt.js');
 const DREAM_SKIN_DIR = path.join(ROOT, 'vendor', 'codex-dream-skin');
 const DREAM_SKIN_SKILL_FILE = path.join(DREAM_SKIN_DIR, 'SKILL.md');
 const GPT_IMAGE_PLAYGROUND_DIR = path.join(ROOT, 'vendor', 'gpt-image-playground', 'app');
-const IMAGE_PROMPT_CASES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-cases.json');
-const IMAGE_PROMPT_STYLES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-style-library.json');
-const IMAGE_PROMPT_IMAGE_BASE = 'https://raw.githubusercontent.com/freestylefly/awesome-gpt-image-2/60b6e1d3ddaf1c982426d6c8181827764c6b2012/data';
+const IMAGE_PROMPT_VENDOR_DIR = path.join(ROOT, 'vendor', 'image-prompts');
 
 loadEnv(DEFAULT_ENV_FILE, false);
 
@@ -50,6 +52,7 @@ const PID_FILE = path.join(RUNTIME_DIR, 'server.pid');
 const IMAGE_DIR = path.join(RUNTIME_DIR, 'images');
 const FILE_DIR = path.join(RUNTIME_DIR, 'files');
 const BACKGROUND_DIR = path.join(RUNTIME_DIR, 'backgrounds');
+const IMAGE_PROMPT_CACHE_DIR = path.join(RUNTIME_DIR, 'image-prompts');
 const CODEX_HOME = resolveLocalPath(process.env.CODEX_HOME || path.join(homedir(), '.codex'), homedir());
 const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path.join(CODEX_HOME, 'config.toml'), CODEX_HOME);
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
@@ -88,6 +91,17 @@ const CODEX_DESKTOP_IPC_TIMEOUT_MS = Number(process.env.CODEX_DESKTOP_IPC_TIMEOU
 const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
 const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
 const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
+const IMAGE_PROMPT_AUTO_SYNC = parseBoolean(process.env.IMAGE_PROMPT_AUTO_SYNC, true);
+const imagePromptSyncIntervalMinutes = Number(process.env.IMAGE_PROMPT_SYNC_INTERVAL_MINUTES || 360);
+const IMAGE_PROMPT_SYNC_INTERVAL_MS = (
+  Number.isFinite(imagePromptSyncIntervalMinutes) && imagePromptSyncIntervalMinutes > 0
+    ? imagePromptSyncIntervalMinutes
+    : 360
+) * 60 * 1000;
+const imagePromptSyncTimeoutMs = Number(process.env.IMAGE_PROMPT_SYNC_TIMEOUT_MS || 20000);
+const IMAGE_PROMPT_SYNC_TIMEOUT_MS = Number.isFinite(imagePromptSyncTimeoutMs) && imagePromptSyncTimeoutMs > 0
+  ? imagePromptSyncTimeoutMs
+  : 20000;
 const NATIVE_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TOOL_IMAGE_MAX_BYTES = 25 * 1024 * 1024;
 const TOOL_IMAGE_TYPES = new Map([
@@ -116,6 +130,17 @@ mkdirSync(RUNTIME_DIR, { recursive: true });
 mkdirSync(IMAGE_DIR, { recursive: true });
 mkdirSync(FILE_DIR, { recursive: true });
 mkdirSync(BACKGROUND_DIR, { recursive: true });
+
+const imagePromptLibrary = new ImagePromptLibrary({
+  cacheDir: IMAGE_PROMPT_CACHE_DIR,
+  casesFile: path.join(IMAGE_PROMPT_VENDOR_DIR, 'awesome-gpt-image-2-cases.json'),
+  stylesFile: path.join(IMAGE_PROMPT_VENDOR_DIR, 'awesome-gpt-image-2-style-library.json'),
+  builtInRevision: AWESOME_GPT_IMAGE_BUILTIN_REVISION,
+  githubToken: process.env.IMAGE_PROMPT_GITHUB_TOKEN || '',
+  autoSync: IMAGE_PROMPT_AUTO_SYNC,
+  intervalMs: IMAGE_PROMPT_SYNC_INTERVAL_MS,
+  requestTimeoutMs: IMAGE_PROMPT_SYNC_TIMEOUT_MS,
+});
 
 const app = express();
 const sessions = loadSessions();
@@ -151,7 +176,6 @@ const desktopSnapshotRequests = new Map();
 let activeProcess = null;
 let activeConversationId = '';
 let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
-let imagePromptLibraryCache = null;
 
 nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
@@ -424,10 +448,30 @@ app.get('/api/playground-config', requireAuth, (_req, res) => {
   });
 });
 
+app.get('/api/image-prompts/status', requireAuth, (_req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json(imagePromptLibrary.getStatus());
+});
+
+app.post('/api/image-prompts/sync', requireAuth, async (_req, res) => {
+  const previousVersion = imagePromptLibrary.getStatus().version;
+  try {
+    const status = await imagePromptLibrary.sync({ reason: 'manual' });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ ok: true, changed: status.version !== previousVersion, status });
+  } catch (err) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(502).json({
+      error: `提示词库更新失败: ${err.message}`,
+      status: imagePromptLibrary.getStatus(),
+    });
+  }
+});
+
 app.get('/api/image-prompts', requireAuth, (_req, res) => {
   try {
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-    res.json(readImagePromptLibrary());
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(imagePromptLibrary.getLibrary());
   } catch (err) {
     res.status(500).json({ error: `读取提示词库失败: ${err.message}` });
   }
@@ -1070,6 +1114,7 @@ server.listen(listenPort, HOST, () => {
   writeFileSync(path.join(RUNTIME_DIR, 'port'), String(actual));
   writeFileSync(PID_FILE, String(process.pid));
   console.log(`${APP_NAME}: http://${getLanAddress()}:${actual}`);
+  imagePromptLibrary.start();
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -1082,6 +1127,7 @@ function shutdown(signal) {
   desktopIpcClient.close();
   appServerClient.close();
   nativeSessions.stop();
+  imagePromptLibrary.stop();
   for (const client of sessionEventClients) client.end();
   sessionEventClients.clear();
   server.close(() => {
@@ -3009,41 +3055,6 @@ function conversationSummaries() {
   return nativeSessionSummaries()
     .sort((left, right) => Date.parse(right.updatedAt || right.createdAt || 0) - Date.parse(left.updatedAt || left.createdAt || 0))
     .slice(0, 160);
-}
-
-function readImagePromptLibrary() {
-  if (imagePromptLibraryCache) return imagePromptLibraryCache;
-  const caseData = JSON.parse(readFileSync(IMAGE_PROMPT_CASES_FILE, 'utf8'));
-  const styleData = JSON.parse(readFileSync(IMAGE_PROMPT_STYLES_FILE, 'utf8'));
-  const cases = Array.isArray(caseData?.cases) ? caseData.cases : [];
-  const templates = Array.isArray(styleData?.templates) ? styleData.templates : [];
-  if (!cases.length || !templates.length) throw new Error('提示词数据为空');
-  imagePromptLibraryCache = {
-    version: `${styleData.version || 1}:${cases.length}:${templates.length}`,
-    imageBaseUrl: IMAGE_PROMPT_IMAGE_BASE,
-    totalCases: cases.length,
-    totalTemplates: templates.length,
-    categories: Array.isArray(styleData.categories) ? styleData.categories : [],
-    styles: Array.isArray(styleData.styles) ? styleData.styles : [],
-    scenes: Array.isArray(styleData.scenes) ? styleData.scenes : [],
-    cases,
-    templates,
-    sources: [
-      {
-        name: 'awesome-gpt-image-2',
-        url: 'https://github.com/freestylefly/awesome-gpt-image-2',
-        license: 'MIT',
-        role: '提示词案例与工业模板',
-      },
-      {
-        name: 'gpt_image_playground',
-        url: 'https://github.com/CookSleep/gpt_image_playground',
-        license: 'MIT',
-        role: '完整生图工作台',
-      },
-    ],
-  };
-  return imagePromptLibraryCache;
 }
 
 function pageHtml(authenticated) {

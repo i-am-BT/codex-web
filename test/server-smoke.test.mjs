@@ -443,6 +443,8 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptStyles, /\.imagePromptPreviewFrame\.imageLoading img/);
     assert.match(imagePromptStyles, /\.imagePromptPlaygroundFrame/);
     assert.match(imagePromptStyles, /\.imagePromptViewTab\.active/);
+    assert.match(imagePromptStyles, /\.imagePromptSyncStatus\[data-status="error"\]/);
+    assert.match(imagePromptStyles, /\.imagePromptSyncButton\.syncing \.lucide/);
 
     const imagePromptScriptResponse = await fetch(`${baseUrl}/image-prompt.js`);
     assert.equal(imagePromptScriptResponse.status, 200);
@@ -456,6 +458,8 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptScript, /transparent_output/);
     assert.doesNotMatch(imagePromptScript, /发送到 Codex App|function composeCodexImagePrompt/);
     assert.match(imagePromptScript, /function setImagePromptView/);
+    assert.match(imagePromptScript, /function syncPromptLibrary/);
+    assert.match(imagePromptScript, /function checkLibraryStatus/);
     assert.match(imagePromptScript, /data-src="\/playground\/"/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
@@ -464,6 +468,10 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedPlaygroundConfig.status, 401);
     const unauthorizedImagePrompts = await fetch(`${baseUrl}/api/image-prompts`);
     assert.equal(unauthorizedImagePrompts.status, 401);
+    const unauthorizedImagePromptStatus = await fetch(`${baseUrl}/api/image-prompts/status`);
+    assert.equal(unauthorizedImagePromptStatus.status, 401);
+    const unauthorizedImagePromptSync = await fetch(`${baseUrl}/api/image-prompts/sync`, { method: 'POST' });
+    assert.equal(unauthorizedImagePromptSync.status, 401);
     const unauthorizedDreamSkin = await fetch(`${baseUrl}/api/dream-skin/prompt`, { method: 'POST' });
     assert.equal(unauthorizedDreamSkin.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
@@ -851,14 +859,28 @@ if (args[0] === 'app-server') {
       headers: { Cookie: cookie },
     });
     assert.equal(imagePromptsResponse.status, 200);
+    assert.match(imagePromptsResponse.headers.get('cache-control'), /private, no-store/);
     const imagePrompts = await imagePromptsResponse.json();
     assert.equal(imagePrompts.totalCases, 517);
     assert.equal(imagePrompts.totalTemplates, 22);
     assert.equal(imagePrompts.cases.length, 517);
     assert.equal(imagePrompts.templates.length, 22);
     assert.match(imagePrompts.imageBaseUrl, /awesome-gpt-image-2\/60b6e1d3/);
+    assert.equal(imagePrompts.revision, '60b6e1d3ddaf1c982426d6c8181827764c6b2012');
+    assert.equal(imagePrompts.sync.source, 'bundled');
+    assert.equal(imagePrompts.sync.status, 'ready');
+    assert.equal(imagePrompts.sync.autoSync, false);
     assert.ok(imagePrompts.sources.some((source) => source.name === 'gpt_image_playground'));
     assert.ok(imagePrompts.cases.some((item) => item.id === 520 && item.prompt));
+
+    const imagePromptStatusResponse = await fetch(`${baseUrl}/api/image-prompts/status`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(imagePromptStatusResponse.status, 200);
+    assert.match(imagePromptStatusResponse.headers.get('cache-control'), /private, no-store/);
+    const imagePromptStatus = await imagePromptStatusResponse.json();
+    assert.equal(imagePromptStatus.version, imagePrompts.version);
+    assert.equal(imagePromptStatus.totalCases, 517);
 
     const nativeSessions = await fetch(`${baseUrl}/api/native-sessions`, {
       headers: { Cookie: cookie },
@@ -1585,6 +1607,7 @@ function startServer({
       CODEX_DESKTOP_IPC_ENABLED: desktopIpcEnabled,
       CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,
       HOMEPAGE_API_TOKEN: '',
+      IMAGE_PROMPT_AUTO_SYNC: 'false',
       DEFAULT_CWD: temporary,
       DEFAULT_SANDBOX: 'read-only',
       DEFAULT_APPROVAL: 'never',
