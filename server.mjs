@@ -390,6 +390,7 @@ app.get('/api/playground-config', requireAuth, (_req, res) => {
       apiKey: providerCredential(provider),
       model: 'gpt-image-2',
       apiMode: 'images',
+      codexCli: true,
     },
   });
 });

@@ -29,7 +29,9 @@ When embedded in Codex Web, the build also imports the active Codex provider
 from the authenticated `/api/playground-config` endpoint. It refreshes the
 provider URL and credential on each load, while preserving a previously chosen
 image model. The initial image model is `gpt-image-2`; the Codex text model is
-not reused for image requests.
+not reused for image requests. Codex CLI compatibility mode is enabled so
+multi-image requests are split into concurrent single-image calls instead of
+sending an unsupported `n` parameter to Codex-compatible image gateways.
 
 Codex Web serves this build at `/playground/` behind its existing Web login.
 The upstream caching service worker is replaced with a non-caching shim that

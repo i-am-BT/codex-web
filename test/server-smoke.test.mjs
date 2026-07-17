@@ -772,6 +772,7 @@ if (args[0] === 'app-server') {
         apiKey: 'test-token',
         model: 'gpt-image-2',
         apiMode: 'images',
+        codexCli: true,
       },
     });
     assert.ok(config.conversations.some((conversation) => (
