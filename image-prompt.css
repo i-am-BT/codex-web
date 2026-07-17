@@ -1120,13 +1120,7 @@ body[data-theme="light"] .imagePromptToolbar {
     display: none;
   }
 
-  #imagePromptCopy {
-    grid-row: 1 / 3;
-    height: 100%;
-  }
-
-  #imagePromptUse,
-  #imagePromptSend {
+  #imagePromptUse {
     width: 100%;
   }
 

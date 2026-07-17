@@ -445,9 +445,13 @@ if (args[0] === 'app-server') {
     assert.equal(imagePromptScriptResponse.status, 200);
     const imagePromptScript = await imagePromptScriptResponse.text();
     assert.doesNotThrow(() => new Function(imagePromptScript));
-    assert.match(imagePromptScript, /function composeCodexImagePrompt/);
     assert.match(imagePromptScript, /function loadDetailImage/);
-    assert.match(imagePromptScript, /发送到 Codex App/);
+    assert.match(imagePromptScript, /function useSelectedPromptInPlayground/);
+    assert.match(imagePromptScript, /function handlePlaygroundBridgeMessage/);
+    assert.match(imagePromptScript, /codex-web:image-prompt/);
+    assert.match(imagePromptScript, /在生图工作台使用/);
+    assert.match(imagePromptScript, /transparent_output/);
+    assert.doesNotMatch(imagePromptScript, /发送到 Codex App|function composeCodexImagePrompt/);
     assert.match(imagePromptScript, /function setImagePromptView/);
     assert.match(imagePromptScript, /data-src="\/playground\/"/);
 
@@ -483,6 +487,9 @@ if (args[0] === 'app-server') {
     assert.equal(playgroundAsset.status, 200);
     assert.match(playgroundAsset.headers.get('content-type'), /javascript/);
     assert.match(playgroundAsset.headers.get('cache-control'), /private, max-age=31536000, immutable/);
+    const playgroundAssetScript = await playgroundAsset.text();
+    assert.match(playgroundAssetScript, /codex-web:playground-ready/);
+    assert.match(playgroundAssetScript, /codex-web:image-prompt-applied/);
     const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
       headers: { Cookie: cookie },
     });

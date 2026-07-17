@@ -11,7 +11,15 @@
     quality: 'auto',
     format: 'png',
     count: 1,
-    preserve: true,
+    transparent: false,
+  };
+  const PLAYGROUND_SIZE_BY_RATIO = {
+    auto: 'auto',
+    '1:1': '1024x1024',
+    '4:3': '1024x768',
+    '3:4': '768x1024',
+    '16:9': '1280x720',
+    '9:16': '720x1280',
   };
   const CATEGORY_FALLBACKS = {
     'UI & Interfaces': 'UI 与界面',
@@ -40,6 +48,8 @@
     visible: PAGE_SIZE,
     favorites: readStringSet(FAVORITES_KEY),
     params: readParams(),
+    references: [],
+    pendingPlaygroundPrompt: null,
     selected: null,
     loading: false,
   };
@@ -151,7 +161,7 @@
         </div>
         <footer class="imagePromptFooter">
           <span>MIT licensed sources</span>
-          <span>生成任务通过 Codex App 执行</span>
+          <span>提示词可直接填入生图工作台</span>
         </footer>
         </div>
       </div>
@@ -220,7 +230,7 @@
               <label><span>格式</span><select id="imagePromptFormat"><option value="png">PNG</option><option value="jpeg">JPEG</option><option value="webp">WebP</option></select></label>
               <label><span>数量</span><input id="imagePromptCount" type="number" min="1" max="4" step="1"></label>
             </div>
-            <label class="imagePromptToggle"><input id="imagePromptPreserve" type="checkbox"><span>保持提示词结构</span></label>
+            <label class="imagePromptToggle"><input id="imagePromptTransparent" type="checkbox"><span>透明背景</span></label>
             <div class="imagePromptReferencesHead">
               <span>参考附件 <b id="imagePromptReferenceCount">0</b></span>
               <button id="imagePromptAddReference" class="imagePromptSecondary" type="button"><i data-lucide="paperclip"></i><span>添加参考图</span></button>
@@ -232,8 +242,7 @@
         <footer class="imagePromptDetailActions">
           <button id="imagePromptCopy" class="imagePromptSecondary" type="button"><i data-lucide="copy"></i><span>复制</span></button>
           <span class="imagePromptActionSpacer"></span>
-          <button id="imagePromptUse" class="imagePromptSecondary" type="button"><i data-lucide="message-square"></i><span>填入对话</span></button>
-          <button id="imagePromptSend" class="imagePromptPrimary" type="button"><i data-lucide="sparkles"></i><span>发送到 Codex App</span></button>
+          <button id="imagePromptUse" class="imagePromptPrimary" type="button"><i data-lucide="wand-sparkles"></i><span>在生图工作台使用</span></button>
         </footer>
       </section>
     `;
@@ -254,14 +263,13 @@
     elements.quality = overlay.querySelector('#imagePromptQuality');
     elements.format = overlay.querySelector('#imagePromptFormat');
     elements.count = overlay.querySelector('#imagePromptCount');
-    elements.preserve = overlay.querySelector('#imagePromptPreserve');
+    elements.transparent = overlay.querySelector('#imagePromptTransparent');
     elements.referenceCount = overlay.querySelector('#imagePromptReferenceCount');
     elements.addReference = overlay.querySelector('#imagePromptAddReference');
     elements.referenceInput = overlay.querySelector('#imagePromptReferenceInput');
     elements.references = overlay.querySelector('#imagePromptReferences');
     elements.copy = overlay.querySelector('#imagePromptCopy');
     elements.use = overlay.querySelector('#imagePromptUse');
-    elements.send = overlay.querySelector('#imagePromptSend');
   }
 
   function bindWorkspaceEvents() {
@@ -271,6 +279,7 @@
       elements.playgroundLoading.classList.add('hidden');
       elements.playgroundFrame.classList.add('loaded');
     });
+    window.addEventListener('message', handlePlaygroundBridgeMessage);
     elements.casesMode.addEventListener('click', () => setLibraryMode('cases'));
     elements.templatesMode.addEventListener('click', () => setLibraryMode('templates'));
     elements.search.addEventListener('input', () => {
@@ -308,11 +317,10 @@
       updateDetailFavorite();
     });
     elements.copy.addEventListener('click', () => copyText(elements.detailEditor.value));
-    elements.use.addEventListener('click', () => useSelectedPrompt(false));
-    elements.send.addEventListener('click', () => useSelectedPrompt(true));
+    elements.use.addEventListener('click', useSelectedPromptInPlayground);
     elements.addReference.addEventListener('click', () => elements.referenceInput.click());
     elements.referenceInput.addEventListener('change', addReferenceFiles);
-    for (const control of [elements.ratio, elements.quality, elements.format, elements.count, elements.preserve]) {
+    for (const control of [elements.ratio, elements.quality, elements.format, elements.count, elements.transparent]) {
       control.addEventListener('change', saveCurrentParams);
     }
 
@@ -364,8 +372,10 @@
     }
     if (elements.playgroundFrame.dataset.loaded !== 'true') {
       elements.playgroundFrame.dataset.loaded = 'true';
+      elements.playgroundFrame.dataset.bridgeReady = 'false';
       elements.playgroundFrame.src = elements.playgroundFrame.dataset.src;
     }
+    flushPlaygroundPrompt();
   }
 
   async function loadLibrary() {
@@ -553,7 +563,7 @@
     elements.quality.value = state.params.quality;
     elements.format.value = state.params.format;
     elements.count.value = String(state.params.count);
-    elements.preserve.checked = state.params.preserve;
+    elements.transparent.checked = state.params.transparent;
     renderDetailTags(item);
     renderTemplateExamples(type, item);
     elements.detailSource.href = type === 'case'
@@ -643,8 +653,20 @@
     if (!files?.length) return;
     elements.addReference.disabled = true;
     try {
-      if (typeof handleAttachmentFiles !== 'function') throw new Error('附件上传功能不可用');
-      await handleAttachmentFiles(files);
+      if (typeof readFileDataUrl !== 'function') throw new Error('图片读取功能不可用');
+      for (const file of [...files]) {
+        if (!file.type.startsWith('image/')) continue;
+        if (file.size > 20 * 1024 * 1024) throw new Error(`${file.name} 超过 20 MB`);
+        if (state.references.length >= 12) throw new Error('最多添加 12 张参考图');
+        const key = `${file.name}:${file.size}:${file.lastModified}`;
+        if (state.references.some((reference) => reference.key === key)) continue;
+        state.references.push({
+          key,
+          name: file.name || `参考图 ${state.references.length + 1}`,
+          type: file.type,
+          dataUrl: await readFileDataUrl(file),
+        });
+      }
       syncPromptReferences();
     } catch (error) {
       showToast(error.message || '添加参考图失败', 'error');
@@ -655,31 +677,21 @@
   }
 
   function syncPromptReferences() {
-    const tray = document.getElementById('attachmentTray');
-    const chips = [...(tray?.querySelectorAll('.attachmentChip') || [])];
-    elements.referenceCount.textContent = String(chips.length);
+    elements.referenceCount.textContent = String(state.references.length);
     elements.references.replaceChildren();
-    chips.forEach((chip, index) => {
+    state.references.forEach((reference, index) => {
       const item = document.createElement('div');
       item.className = 'imagePromptReference';
-      const sourceImage = chip.querySelector('img');
-      if (sourceImage) {
-        const image = document.createElement('img');
-        image.src = sourceImage.src;
-        image.alt = sourceImage.alt || '参考图';
-        item.appendChild(image);
-      } else {
-        const icon = document.createElement('span');
-        icon.className = 'imagePromptReferenceIcon';
-        icon.appendChild(createIcon('file'));
-        item.appendChild(icon);
-      }
+      const image = document.createElement('img');
+      image.src = reference.dataUrl;
+      image.alt = reference.name || '参考图';
+      item.appendChild(image);
       const name = document.createElement('span');
-      name.textContent = chip.querySelector('.attachmentText span')?.textContent || `附件 ${index + 1}`;
+      name.textContent = reference.name || `参考图 ${index + 1}`;
       const remove = createIconButton('x', `移除 ${name.textContent}`);
       remove.addEventListener('click', () => {
-        chip.querySelector('button')?.click();
-        requestAnimationFrame(syncPromptReferences);
+        state.references.splice(index, 1);
+        syncPromptReferences();
       });
       item.appendChild(name);
       item.appendChild(remove);
@@ -694,13 +706,13 @@
       quality: elements.quality.value,
       format: elements.format.value,
       count: clamp(Number(elements.count.value) || 1, 1, 4),
-      preserve: elements.preserve.checked,
+      transparent: elements.transparent.checked,
     };
     elements.count.value = String(state.params.count);
     localStorage.setItem(PARAMS_KEY, JSON.stringify(state.params));
   }
 
-  function useSelectedPrompt(sendNow) {
+  function useSelectedPromptInPlayground() {
     if (!state.selected) return;
     saveCurrentParams();
     const prompt = elements.detailEditor.value.trim();
@@ -714,45 +726,50 @@
       elements.detailEditor.focus();
       return;
     }
-    const composed = composeCodexImagePrompt(prompt);
-    const chatInput = document.getElementById('input');
-    chatInput.value = composed;
-    chatInput.dispatchEvent(new Event('input', { bubbles: true }));
-    chatInput.style.height = 'auto';
-    chatInput.style.height = `${Math.min(chatInput.scrollHeight, 180)}px`;
+    state.pendingPlaygroundPrompt = {
+      type: 'codex-web:image-prompt',
+      requestId: `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      prompt,
+      params: {
+        size: PLAYGROUND_SIZE_BY_RATIO[state.params.ratio] || 'auto',
+        quality: state.params.quality,
+        output_format: state.params.format,
+        n: state.params.count,
+        transparent_output: state.params.transparent,
+      },
+      images: state.references.map((reference) => ({
+        name: reference.name,
+        type: reference.type,
+        dataUrl: reference.dataUrl,
+      })),
+    };
     closePromptDetail();
-    setWorkspaceView('codex');
-    if (!sendNow) {
-      chatInput.focus();
-      return;
-    }
-    requestAnimationFrame(() => {
-      const button = document.getElementById('send');
-      if (!button || button.disabled) {
-        if (typeof statusEl !== 'undefined') statusEl.textContent = '当前暂不可发送';
-        return;
-      }
-      button.click();
-    });
+    setImagePromptView('playground');
+    flushPlaygroundPrompt();
   }
 
-  function composeCodexImagePrompt(prompt) {
-    const count = state.params.count;
-    const qualityLabels = { auto: '自动', high: '高', medium: '中', low: '低' };
-    const attachmentCount = document.querySelectorAll('#attachmentTray .attachmentChip').length;
-    return [
-      `请使用 Codex App 的图像生成能力生成 ${count} 张图片。`,
-      state.params.ratio === 'auto' ? '' : `画面比例：${state.params.ratio}。`,
-      state.params.quality === 'auto' ? '' : `质量：${qualityLabels[state.params.quality]}。`,
-      `输出格式：${state.params.format.toUpperCase()}。`,
-      state.params.preserve ? '保持提示词的主体、构图、文字与风格约束，不要擅自改成其他主题。' : '',
-      attachmentCount ? `将已附加的 ${attachmentCount} 个文件作为参考素材，并保持其中需要延续的主体特征。` : '',
-      '',
-      '提示词：',
-      prompt,
-      '',
-      '请直接调用图像生成能力并返回图片结果，不要只描述画面。',
-    ].filter((line, index, lines) => line || (index > 0 && lines[index - 1])).join('\n').trim();
+  function handlePlaygroundBridgeMessage(event) {
+    if (event.origin !== window.location.origin || event.source !== elements.playgroundFrame.contentWindow) return;
+    const message = event.data;
+    if (!message || typeof message !== 'object') return;
+    if (message.type === 'codex-web:playground-ready') {
+      elements.playgroundFrame.dataset.bridgeReady = 'true';
+      flushPlaygroundPrompt();
+      return;
+    }
+    if (!state.pendingPlaygroundPrompt || message.requestId !== state.pendingPlaygroundPrompt.requestId) return;
+    if (message.type === 'codex-web:image-prompt-applied') {
+      state.pendingPlaygroundPrompt = null;
+      showToast('已填入生图工作台');
+    } else if (message.type === 'codex-web:image-prompt-error') {
+      state.pendingPlaygroundPrompt = null;
+      showToast(message.error || '填入生图工作台失败', 'error');
+    }
+  }
+
+  function flushPlaygroundPrompt() {
+    if (!state.pendingPlaygroundPrompt || elements.playgroundFrame.dataset.bridgeReady !== 'true') return;
+    elements.playgroundFrame.contentWindow?.postMessage(state.pendingPlaygroundPrompt, window.location.origin);
   }
 
   function itemPrompt(type, item) {
@@ -822,7 +839,7 @@
         quality: ['auto', 'high', 'medium', 'low'].includes(value.quality) ? value.quality : DEFAULT_PARAMS.quality,
         format: ['png', 'jpeg', 'webp'].includes(value.format) ? value.format : DEFAULT_PARAMS.format,
         count: clamp(Number(value.count) || DEFAULT_PARAMS.count, 1, 4),
-        preserve: value.preserve !== false,
+        transparent: value.transparent === true,
       };
     } catch {
       return { ...DEFAULT_PARAMS };
