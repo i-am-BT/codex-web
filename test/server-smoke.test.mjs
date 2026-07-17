@@ -396,6 +396,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.memoryCitationItem\[open\]/);
     assert.match(uiStyles, /\.composerModelToggle/);
     assert.match(uiStyles, /\.composerPermissionToggle/);
+    assert.match(uiStyles, /\.composerProjectToggle/);
+    assert.match(uiStyles, /\.composerProjectPanel/);
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
@@ -576,6 +578,9 @@ if (args[0] === 'app-server') {
     assert.match(page, /function renderMemoryCitations/);
     assert.match(page, /group\.open=false/);
     assert.match(page, /function enhanceComposer/);
+    assert.match(page, /function renderComposerProjectOptions/);
+    assert.match(page, /function selectComposerProjectPath/);
+    assert.match(page, /composerProjectToggle/);
     assert.match(page, /function enqueuePrompt/);
     assert.match(page, /function steerQueuedPrompt/);
     assert.match(page, /function showNativeSteerOptimistically/);

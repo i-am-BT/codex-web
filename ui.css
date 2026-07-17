@@ -2425,6 +2425,172 @@ body .nativeNotice {
   display: none;
 }
 
+.composerProjectPicker {
+  position: relative;
+  z-index: 4;
+  margin-bottom: -1px;
+}
+
+.composerProjectToggle {
+  display: flex;
+  width: 100%;
+  height: 38px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-bottom: 0;
+  border-radius: 14px 14px 0 0;
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  padding: 0 14px;
+  font-size: 12px;
+  text-align: left;
+}
+
+.composerProjectToggle:hover,
+.composerProjectToggle[aria-expanded="true"] {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.composerProjectToggle:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.composerProjectToggle .lucide {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+}
+
+.composerProjectName {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composerProjectChevron {
+  margin-left: auto;
+  color: var(--text-subtle);
+}
+
+.composerProjectToggle:disabled .composerProjectChevron {
+  display: none;
+}
+
+.composerProjectPanel {
+  position: absolute;
+  z-index: 40;
+  left: 0;
+  bottom: calc(100% + 8px);
+  display: grid;
+  width: min(460px, 100%);
+  max-height: min(440px, 62vh);
+  gap: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 12px;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.18);
+}
+
+.composerProjectOptions {
+  display: grid;
+  max-height: 290px;
+  gap: 3px;
+  overflow-y: auto;
+}
+
+.composerProjectOption {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 8px 9px;
+  text-align: left;
+}
+
+.composerProjectOption:hover,
+.composerProjectOption.active {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.composerProjectOption.active {
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+
+.composerProjectOption .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.composerProjectOption > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.composerProjectOption strong,
+.composerProjectOption small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composerProjectOption strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.composerProjectOption small {
+  color: var(--text-subtle);
+  font-size: 10px;
+}
+
+.composerProjectCustom {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+body[data-theme] .composerProjectCustom input {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 6px 9px;
+  font-size: 11px;
+}
+
+.composerProjectApply {
+  min-width: 54px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--text);
+  color: var(--canvas);
+  padding: 0 12px;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.composerProjectPicker + .box {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
 body .box {
   position: relative;
   display: grid;

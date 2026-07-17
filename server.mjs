@@ -3062,6 +3062,12 @@ let historyFilter = null;
 let historyItems = [];
 let composerPermissionToggle = null;
 let composerModelToggle = null;
+let composerProjectPicker = null;
+let composerProjectToggle = null;
+let composerProjectPanel = null;
+let composerProjectName = null;
+let composerProjectPathInput = null;
+let composerProjectOptions = null;
 let composerPermissionPanel = null;
 let composerModelPanel = null;
 let composerProviderSelect = null;
@@ -3199,6 +3205,54 @@ function queuedPromptLabel(item){
   if(text)return text;
   const count=item.attachments?.length||0;
   return count+' 个附件';
+}
+function composerProjectPaths(){
+  const paths=[];
+  const seen=new Set();
+  for(const value of [cwd.value,...historyItems.map((item)=>item.cwd)]){
+    const path=normalizeProjectPath(value);
+    const key=historyProjectKey(path);
+    if(!path||seen.has(key))continue;
+    seen.add(key);
+    paths.push(path);
+  }
+  return paths;
+}
+function selectComposerProjectPath(value){
+  const path=normalizeProjectPath(value);
+  if(!path)return;
+  cwd.value=path;
+  syncComposerChrome();
+  closeComposerPopovers();
+  statusEl.textContent='新任务项目 · '+historyProjectName(path);
+  input.focus();
+}
+function renderComposerProjectOptions(){
+  if(!composerProjectOptions)return;
+  composerProjectOptions.replaceChildren();
+  const paths=composerProjectPaths();
+  for(const path of paths){
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='composerProjectOption';
+    button.classList.toggle('active',normalizeProjectPath(cwd.value)===path);
+    button.setAttribute('aria-label','使用项目 '+historyProjectName(path));
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide','folder');
+    icon.setAttribute('aria-hidden','true');
+    const text=document.createElement('span');
+    const name=document.createElement('strong');
+    name.textContent=historyProjectName(path);
+    const detail=document.createElement('small');
+    detail.textContent=path;
+    text.appendChild(name);
+    text.appendChild(detail);
+    button.appendChild(icon);
+    button.appendChild(text);
+    button.addEventListener('click',()=>selectComposerProjectPath(path));
+    composerProjectOptions.appendChild(button);
+  }
+  refreshIcons(composerProjectOptions);
 }
 function queueActionButton(icon,label,handler,showLabel=false){
   const button=document.createElement('button');
@@ -3439,7 +3493,7 @@ async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
   }
 }
 function closeComposerPopovers(){
-  for(const [panel,button] of [[composerPermissionPanel,composerPermissionToggle],[composerModelPanel,composerModelToggle]]){
+  for(const [panel,button] of [[composerProjectPanel,composerProjectToggle],[composerPermissionPanel,composerPermissionToggle],[composerModelPanel,composerModelToggle]]){
     panel?.classList.add('hidden');
     button?.setAttribute('aria-expanded','false');
   }
@@ -3449,9 +3503,10 @@ function toggleComposerPopover(panel,button){
   const open=panel.classList.contains('hidden');
   closeComposerPopovers();
   if(!open)return;
+  if(panel===composerProjectPanel)renderComposerProjectOptions();
   panel.classList.remove('hidden');
   button.setAttribute('aria-expanded','true');
-  panel.querySelector('select')?.focus();
+  panel.querySelector('select,input')?.focus();
 }
 function syncComposerChrome(){
   syncComposerSelect(provider,composerProviderSelect);
@@ -3459,6 +3514,14 @@ function syncComposerChrome(){
   syncComposerSelect(reasoningEffort,composerReasoningSelect);
   if(composerModelName)composerModelName.textContent=composerModelLabel(model.value);
   if(composerEffortName)composerEffortName.textContent=composerEffortLabel(reasoningEffort.value);
+  const projectPath=normalizeProjectPath(cwd.value);
+  if(composerProjectName)composerProjectName.textContent=historyProjectName(projectPath);
+  if(composerProjectPathInput&&document.activeElement!==composerProjectPathInput)composerProjectPathInput.value=projectPath;
+  if(composerProjectToggle){
+    composerProjectToggle.title=projectPath+(currentConversationId?'\\n当前任务的项目路径不可更改':'');
+    composerProjectToggle.setAttribute('aria-label','项目 '+historyProjectName(projectPath)+(currentConversationId?'，当前任务不可更改':'，点击选择'));
+    composerProjectToggle.disabled=webRunActive||Boolean(currentConversationId);
+  }
   composerModelToggle?.classList.toggle('running',webRunActive);
   if(composerModelToggle)composerModelToggle.disabled=webRunActive;
   for(const control of [composerProviderSelect,composerModelSelect,composerReasoningSelect])if(control)control.disabled=webRunActive;
@@ -3476,6 +3539,54 @@ function syncComposerChrome(){
 function enhanceComposer(){
   if(!dropZone||!attachFile||!sendBtn)return;
   const composer=dropZone.parentElement;
+  composerProjectPicker=document.createElement('div');
+  composerProjectPicker.className='composerProjectPicker';
+  composerProjectToggle=document.createElement('button');
+  composerProjectToggle.type='button';
+  composerProjectToggle.className='composerProjectToggle';
+  composerProjectToggle.setAttribute('aria-expanded','false');
+  composerProjectToggle.setAttribute('aria-controls','composerProjectPanel');
+  const projectIcon=document.createElement('i');
+  projectIcon.setAttribute('data-lucide','folder');
+  projectIcon.setAttribute('aria-hidden','true');
+  composerProjectName=document.createElement('span');
+  composerProjectName.className='composerProjectName';
+  const projectChevron=document.createElement('i');
+  projectChevron.className='composerProjectChevron';
+  projectChevron.setAttribute('data-lucide','chevron-down');
+  projectChevron.setAttribute('aria-hidden','true');
+  composerProjectToggle.appendChild(projectIcon);
+  composerProjectToggle.appendChild(composerProjectName);
+  composerProjectToggle.appendChild(projectChevron);
+  composerProjectPanel=document.createElement('div');
+  composerProjectPanel.id='composerProjectPanel';
+  composerProjectPanel.className='composerProjectPanel hidden';
+  const projectTitle=document.createElement('div');
+  projectTitle.className='composerPopoverTitle';
+  projectTitle.textContent='选择项目路径';
+  composerProjectOptions=document.createElement('div');
+  composerProjectOptions.className='composerProjectOptions';
+  const customProject=document.createElement('div');
+  customProject.className='composerProjectCustom';
+  composerProjectPathInput=document.createElement('input');
+  composerProjectPathInput.type='text';
+  composerProjectPathInput.placeholder='/path/to/project';
+  composerProjectPathInput.setAttribute('aria-label','自定义项目路径');
+  const useProjectPath=document.createElement('button');
+  useProjectPath.type='button';
+  useProjectPath.className='composerProjectApply';
+  useProjectPath.textContent='使用';
+  const applyProjectPath=()=>selectComposerProjectPath(composerProjectPathInput.value);
+  useProjectPath.addEventListener('click',applyProjectPath);
+  composerProjectPathInput.addEventListener('keydown',(event)=>{if(event.key==='Enter'){event.preventDefault();applyProjectPath()}});
+  customProject.appendChild(composerProjectPathInput);
+  customProject.appendChild(useProjectPath);
+  composerProjectPanel.appendChild(projectTitle);
+  composerProjectPanel.appendChild(composerProjectOptions);
+  composerProjectPanel.appendChild(customProject);
+  composerProjectPicker.appendChild(composerProjectToggle);
+  composerProjectPicker.appendChild(composerProjectPanel);
+  composer.insertBefore(composerProjectPicker,composer.firstChild);
   if(attachmentTray&&composer&&attachmentTray.parentElement===composer)composer.insertBefore(attachmentTray,dropZone);
   promptQueuePanel=document.createElement('section');
   promptQueuePanel.className='promptQueue hidden';
@@ -3545,13 +3656,14 @@ function enhanceComposer(){
   composerModelSelect=createComposerMirrorField(composerModelPanel,'模型','模型');
   composerReasoningSelect=createComposerMirrorField(composerModelPanel,'思考档位','思考档位');
   dropZone.appendChild(composerModelPanel);
+  composerProjectToggle.addEventListener('click',()=>toggleComposerPopover(composerProjectPanel,composerProjectToggle));
   composerPermissionToggle.addEventListener('click',()=>toggleComposerPopover(composerPermissionPanel,composerPermissionToggle));
   composerModelToggle.addEventListener('click',()=>toggleComposerPopover(composerModelPanel,composerModelToggle));
   composerProviderSelect.addEventListener('change',async()=>{provider.value=composerProviderSelect.value;await loadModels(provider.value);syncComposerChrome()});
   composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;syncComposerChrome()});
   composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;syncComposerChrome()});
   input.addEventListener('focus',closeComposerPopovers);
-  document.addEventListener('click',(event)=>{if(!dropZone.contains(event.target))closeComposerPopovers()});
+  document.addEventListener('click',(event)=>{if(!dropZone.contains(event.target)&&!composerProjectPicker.contains(event.target))closeComposerPopovers()});
   syncComposerChrome();
   refreshIcons(dropZone);
 }
@@ -3990,6 +4102,7 @@ function setHistoryProjectExpanded(group,expanded){
 }
 function renderHistory(items){
   if(Array.isArray(items))historyItems=items;
+  renderComposerProjectOptions();
   const query=String(historyFilter?.value||'').trim().toLocaleLowerCase();
   const candidates=query?historyItems:historyItems.filter((item)=>!hiddenHistoryProjects.has(historyProjectKey(item.cwd)));
   const visibleItems=query?candidates.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')+' '+historyProjectName(item.cwd)).toLocaleLowerCase().includes(query)):candidates;
