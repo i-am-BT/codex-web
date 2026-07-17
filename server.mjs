@@ -32,6 +32,7 @@ const UI_CSS_FILE = path.join(ROOT, 'ui.css');
 const IMAGE_PROMPT_CSS_FILE = path.join(ROOT, 'image-prompt.css');
 const IMAGE_PROMPT_JS_FILE = path.join(ROOT, 'image-prompt.js');
 const DREAM_SKIN_DIR = path.join(ROOT, 'vendor', 'codex-dream-skin');
+const DREAM_SKIN_SKILL_FILE = path.join(DREAM_SKIN_DIR, 'SKILL.md');
 const GPT_IMAGE_PLAYGROUND_DIR = path.join(ROOT, 'vendor', 'gpt-image-playground', 'app');
 const IMAGE_PROMPT_CASES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-cases.json');
 const IMAGE_PROMPT_STYLES_FILE = path.join(ROOT, 'vendor', 'image-prompts', 'awesome-gpt-image-2-style-library.json');
@@ -339,6 +340,14 @@ app.post('/api/appearance/background', requireAuth, (req, res) => {
     const customBackgrounds = [...current.customBackgrounds.filter((item) => item.value !== background.value), background];
     const appearance = saveAppearance({ chatBackground: background.value, customBackgrounds });
     res.json({ ok: true, appearance, background });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/dream-skin/prompt', requireAuth, (req, res) => {
+  try {
+    res.json({ ok: true, ...buildDreamSkinTask(req.body || {}) });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -1285,9 +1294,46 @@ function deleteCustomBackground(value) {
   return saveAppearance({ chatBackground, customBackgrounds });
 }
 
+function buildDreamSkinTask(body) {
+  if (!existsSync(DREAM_SKIN_SKILL_FILE)) throw new Error('Dream Skin 技能文件不存在');
+  const description = String(body.description || '')
+    .trim()
+    .replace(/\r\n?/g, '\n')
+    .slice(0, 2000) || '生成一张安静、高级、适合长时间使用的 Codex Web 背景。';
+  const mode = ['no-person', 'fictional-adult', 'reference'].includes(body.mode)
+    ? body.mode
+    : 'no-person';
+  const referenceCount = Math.min(3, Math.max(0, Number(body.referenceCount) || 0));
+  if (mode === 'reference' && !referenceCount) throw new Error('参考图模式至少需要添加 1 张图片');
+  const skill = path.relative(ROOT, DREAM_SKIN_SKILL_FILE).split(path.sep).join('/');
+  const modeInstruction = {
+    'no-person': '无人物：只生成连续环境、抽象艺术、建筑、自然或材质背景。',
+    'fictional-adult': '原创人物：最多一位明确成年的原创虚构人物，不模仿任何真实人物或受版权保护角色。',
+    reference: '参考图：严格按技能中的 Image 1/2/3 合约使用附件；参考图不是擦除 UI 的修图底稿。',
+  }[mode];
+  const attachmentInstruction = referenceCount
+    ? `本任务附带 ${referenceCount} 张参考图，编号按实际附件顺序排列。`
+    : '本任务没有参考图，不要自行推断或寻找人物身份。';
+  const prompt = [
+    'Dream Skin 背景生成任务',
+    '',
+    `先完整读取并遵循项目内置技能：${skill}`,
+    modeInstruction,
+    attachmentInstruction,
+    '',
+    '用户视觉需求：',
+    description,
+    '',
+    '必须实际调用 $imagegen 生成最终位图，不要只返回提示词或教程。',
+    '返回一张 2560x1440、16:9、无 UI、无文字、可直接作为 Codex Web 背景的最终图片。',
+    '不要修改项目代码、配置或现有图片。',
+  ].join('\n');
+  return { prompt, cwd: ROOT, skill, mode };
+}
+
 function cleanChatBackground(value, customBackgrounds = []) {
   const text = String(value || '');
-  if (['default', 'dream-skin'].includes(text)) return text;
+  if (text === 'default') return text;
   if (customBackgrounds.some((item) => item.value === text)) return text;
   return 'default';
 }
@@ -3012,7 +3058,7 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
 <div id="nativeRequestModal" class="requestOverlay hidden" role="presentation"><div class="requestPanel" role="dialog" aria-modal="true" aria-labelledby="nativeRequestTitle"><div class="requestHead"><div><div id="nativeRequestTitle" class="requestTitle">Codex 请求确认</div><div id="nativeRequestMeta" class="requestMeta"></div></div></div><pre id="nativeRequestDetail" class="requestDetail"></pre><form id="nativeRequestForm"><div id="nativeRequestFields" class="requestFields"></div><div id="nativeRequestActions" class="requestActions"></div></form></div></div>
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
@@ -3088,6 +3134,14 @@ let settingsDialog = null;
 let settingsClose = null;
 let passwordForm = null;
 let passwordStatus = null;
+let dreamSkinPanel = null;
+let dreamSkinIdea = null;
+let dreamSkinMode = null;
+let dreamSkinReferenceInput = null;
+let dreamSkinReferenceList = null;
+let dreamSkinGenerateButton = null;
+let dreamSkinStatus = null;
+let dreamSkinReferenceFiles = [];
 let imagePreview = null;
 let imagePreviewImage = null;
 let imagePreviewClose = null;
@@ -3673,6 +3727,132 @@ function settingsSectionTitle(text){
   title.textContent=text;
   return title;
 }
+function createDreamSkinGenerator(general){
+  const backgroundControls=general?.querySelector('.backgroundControls');
+  if(!backgroundControls||dreamSkinPanel)return;
+  dreamSkinPanel=document.createElement('section');
+  dreamSkinPanel.className='dreamSkinGenerator hidden';
+  dreamSkinPanel.setAttribute('aria-label','Dream Skin 背景生成');
+  const head=document.createElement('div');
+  head.className='dreamSkinGeneratorHead';
+  const identity=document.createElement('div');
+  identity.className='dreamSkinIdentity';
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','sparkles');
+  icon.setAttribute('aria-hidden','true');
+  const title=document.createElement('span');
+  title.textContent='Dream Skin';
+  identity.appendChild(icon);
+  identity.appendChild(title);
+  const close=document.createElement('button');
+  close.type='button';
+  close.className='dreamSkinClose';
+  close.title='关闭背景生成';
+  close.setAttribute('aria-label','关闭背景生成');
+  setIconLabel(close,'x','关闭背景生成',false);
+  close.addEventListener('click',closeDreamSkinGenerator);
+  head.appendChild(identity);
+  head.appendChild(close);
+  const ideaField=document.createElement('label');
+  ideaField.className='field dreamSkinIdeaField';
+  const ideaLabel=document.createElement('span');
+  ideaLabel.textContent='背景需求';
+  dreamSkinIdea=document.createElement('textarea');
+  dreamSkinIdea.rows=3;
+  dreamSkinIdea.maxLength=2000;
+  dreamSkinIdea.placeholder='例如：雨夜东京工作室，青绿色霓虹，右侧有窗景，左侧安静留白';
+  ideaField.appendChild(ideaLabel);
+  ideaField.appendChild(dreamSkinIdea);
+  const options=document.createElement('div');
+  options.className='dreamSkinOptions';
+  const modeField=document.createElement('label');
+  modeField.className='field';
+  const modeLabel=document.createElement('span');
+  modeLabel.textContent='生成模式';
+  dreamSkinMode=document.createElement('select');
+  [['no-person','无人物'],['fictional-adult','原创人物'],['reference','参考图重绘']].forEach(([value,label])=>{
+    const option=document.createElement('option');
+    option.value=value;
+    option.textContent=label;
+    dreamSkinMode.appendChild(option);
+  });
+  modeField.appendChild(modeLabel);
+  modeField.appendChild(dreamSkinMode);
+  const referenceField=document.createElement('div');
+  referenceField.className='field dreamSkinReferenceField';
+  const referenceLabel=document.createElement('span');
+  referenceLabel.textContent='参考图';
+  const referenceButton=document.createElement('button');
+  referenceButton.type='button';
+  referenceButton.className='miniSecondary dreamSkinReferenceButton';
+  setIconLabel(referenceButton,'image-plus','添加参考图');
+  dreamSkinReferenceInput=document.createElement('input');
+  dreamSkinReferenceInput.type='file';
+  dreamSkinReferenceInput.accept='image/png,image/jpeg,image/webp,image/gif';
+  dreamSkinReferenceInput.multiple=true;
+  dreamSkinReferenceInput.className='hidden';
+  referenceButton.addEventListener('click',()=>dreamSkinReferenceInput.click());
+  dreamSkinReferenceInput.addEventListener('change',()=>{
+    const candidates=[...(dreamSkinReferenceInput.files||[])].filter((file)=>file.type.startsWith('image/'));
+    dreamSkinReferenceFiles=[...dreamSkinReferenceFiles,...candidates].slice(0,3);
+    dreamSkinReferenceInput.value='';
+    renderDreamSkinReferences();
+  });
+  referenceField.appendChild(referenceLabel);
+  referenceField.appendChild(referenceButton);
+  referenceField.appendChild(dreamSkinReferenceInput);
+  options.appendChild(modeField);
+  options.appendChild(referenceField);
+  dreamSkinReferenceList=document.createElement('div');
+  dreamSkinReferenceList.className='dreamSkinReferenceList hidden';
+  const guide=document.createElement('details');
+  guide.className='dreamSkinGuide';
+  const guideSummary=document.createElement('summary');
+  const guideIcon=document.createElement('i');
+  guideIcon.setAttribute('data-lucide','book-open');
+  guideIcon.setAttribute('aria-hidden','true');
+  const guideLabel=document.createElement('span');
+  guideLabel.textContent='背景生成规范';
+  guideSummary.appendChild(guideIcon);
+  guideSummary.appendChild(guideLabel);
+  const guideBody=document.createElement('div');
+  guideBody.className='dreamSkinGuideBody';
+  const guideList=document.createElement('ul');
+  ['2560 x 1440、16:9 纯背景','左侧低信息，主体和细节集中在右侧','不生成窗口、控件、文字、Logo 或水印'].forEach((text)=>{
+    const item=document.createElement('li');
+    item.textContent=text;
+    guideList.appendChild(item);
+  });
+  const guideLink=document.createElement('a');
+  guideLink.href='/assets/dream-skin/SKILL.md';
+  guideLink.target='_blank';
+  guideLink.rel='noopener noreferrer';
+  guideLink.textContent='查看完整 Markdown skill';
+  guideBody.appendChild(guideList);
+  guideBody.appendChild(guideLink);
+  guide.appendChild(guideSummary);
+  guide.appendChild(guideBody);
+  const actions=document.createElement('div');
+  actions.className='dreamSkinActions';
+  dreamSkinStatus=document.createElement('div');
+  dreamSkinStatus.className='dreamSkinStatus';
+  dreamSkinStatus.setAttribute('role','status');
+  dreamSkinGenerateButton=document.createElement('button');
+  dreamSkinGenerateButton.type='button';
+  dreamSkinGenerateButton.className='miniPrimary dreamSkinGenerate';
+  setIconLabel(dreamSkinGenerateButton,'sparkles','一键生成背景');
+  dreamSkinGenerateButton.addEventListener('click',generateDreamSkinBackground);
+  actions.appendChild(dreamSkinStatus);
+  actions.appendChild(dreamSkinGenerateButton);
+  dreamSkinPanel.appendChild(head);
+  dreamSkinPanel.appendChild(ideaField);
+  dreamSkinPanel.appendChild(options);
+  dreamSkinPanel.appendChild(dreamSkinReferenceList);
+  dreamSkinPanel.appendChild(guide);
+  dreamSkinPanel.appendChild(actions);
+  backgroundControls.insertAdjacentElement('afterend',dreamSkinPanel);
+  refreshIcons(dreamSkinPanel);
+}
 function enhanceSettingsModal(){
   if(!settingsPanel||settingsOverlay)return;
   settingsOverlay=document.createElement('div');
@@ -3971,12 +4151,18 @@ if (${authenticated ? 'true' : 'false'}) boot(true);
 async function toggleTheme(){const next=appearance.theme==='dark'?'light':'dark';await saveAppearance({theme:next})}
 function applyAppearance(){const theme=appearance.theme==='dark'?'dark':'light';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const bg=custom?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.chatBg=bg;document.body.style.setProperty('--custom-chat-bg',custom?'url("'+custom.url+'")':'none');if(themeToggle){setIconLabel(themeToggle,theme==='dark'?'sun':'moon','',false);themeToggle.title=theme==='dark'?'切换明亮模式':'切换黑暗模式';themeToggle.setAttribute('aria-label',themeToggle.title)}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
 async function saveAppearance(patch){const res=await fetch('/api/appearance',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'外观保存失败';applyAppearance();return null}appearance=data.appearance;applyAppearance();return appearance}
-function renderBackgroundOptions(selected){if(!chatBackground)return;const options=[['default','默认'],['dream-skin','Skin']];for(const item of appearance.customBackgrounds||[])options.push([item.value,item.name]);options.push(['custom','自定义']);chatBackground.innerHTML='';for(const [value,label] of options){const opt=document.createElement('option');opt.value=value;opt.textContent=label;chatBackground.appendChild(opt)}chatBackground.value=options.some(([value])=>value===selected)?selected:'default'}
-function cleanBackgroundValue(value){const text=String(value||'');if(['default','dream-skin'].includes(text))return text;return findCustomBackground(text)?text:'default'}
+function renderBackgroundOptions(selected){if(!chatBackground)return;const options=[['default','默认'],['dream-skin','Dream Skin']];for(const item of appearance.customBackgrounds||[])options.push([item.value,item.name]);options.push(['custom','自定义']);chatBackground.innerHTML='';for(const [value,label] of options){const opt=document.createElement('option');opt.value=value;opt.textContent=label;chatBackground.appendChild(opt)}chatBackground.value=options.some(([value])=>value===selected)?selected:'default'}
+function cleanBackgroundValue(value){const text=String(value||'');if(text==='default')return text;return findCustomBackground(text)?text:'default'}
 function findCustomBackground(value){return (appearance.customBackgrounds||[]).find((item)=>item.value===value&&item.url)}
 function updateDeleteBackgroundButton(selected){if(!deleteBackground)return;deleteBackground.classList.toggle('hidden',!findCustomBackground(selected));deleteBackground.disabled=!findCustomBackground(selected)}
-async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
+function openDreamSkinGenerator(){if(!dreamSkinPanel)return;dreamSkinPanel.classList.remove('hidden');renderDreamSkinReferences();chatBackground.value='dream-skin';requestAnimationFrame(()=>{dreamSkinPanel.scrollIntoView({block:'nearest'});dreamSkinIdea?.focus()})}
+function closeDreamSkinGenerator(){dreamSkinPanel?.classList.add('hidden');if(chatBackground)chatBackground.value=cleanBackgroundValue(appearance.chatBackground)}
+function renderDreamSkinReferences(){if(!dreamSkinReferenceList)return;dreamSkinReferenceList.replaceChildren();dreamSkinReferenceList.classList.toggle('hidden',!dreamSkinReferenceFiles.length);dreamSkinReferenceFiles.forEach((file,index)=>{const chip=document.createElement('div');chip.className='dreamSkinReferenceChip';const image=document.createElement('img');image.alt='参考图 '+(index+1);const url=URL.createObjectURL(file);image.src=url;image.addEventListener('load',()=>URL.revokeObjectURL(url),{once:true});const name=document.createElement('span');name.textContent=file.name;name.title=file.name;const remove=document.createElement('button');remove.type='button';remove.title='移除参考图';remove.setAttribute('aria-label','移除参考图 '+(index+1));setIconLabel(remove,'x','移除参考图',false);remove.addEventListener('click',()=>{dreamSkinReferenceFiles.splice(index,1);renderDreamSkinReferences()});chip.appendChild(image);chip.appendChild(name);chip.appendChild(remove);dreamSkinReferenceList.appendChild(chip)});refreshIcons(dreamSkinReferenceList)}
+async function uploadDreamSkinReference(file){const data=await readFileDataUrl(file);const res=await fetch('/api/uploads/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'参考图上传失败');return body.attachment}
+async function generateDreamSkinBackground(){if(!dreamSkinGenerateButton||dreamSkinGenerateButton.disabled)return;const mode=dreamSkinMode?.value||'no-person';if(mode==='reference'&&!dreamSkinReferenceFiles.length){dreamSkinStatus.textContent='参考图模式至少需要添加 1 张图片';dreamSkinReferenceInput?.focus();return}dreamSkinGenerateButton.disabled=true;dreamSkinStatus.textContent='准备生成任务...';try{const attachments=[];for(let index=0;index<dreamSkinReferenceFiles.length;index++){dreamSkinStatus.textContent='上传参考图 '+(index+1)+' / '+dreamSkinReferenceFiles.length;attachments.push(await uploadDreamSkinReference(dreamSkinReferenceFiles[index]))}const res=await fetch('/api/dream-skin/prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({description:dreamSkinIdea?.value||'',mode,referenceCount:attachments.length})});const body=await res.json();if(!res.ok)throw new Error(body.error||'生成任务创建失败');dreamSkinStatus.textContent='正在启动 Codex App...';closeSettings();newChat();cwd.value=body.cwd||cwd.value;syncComposerChrome();input.value=body.prompt;input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';pendingAttachments=attachments;renderAttachmentTray();dreamSkinReferenceFiles=[];if(dreamSkinIdea)dreamSkinIdea.value='';renderDreamSkinReferences();closeDreamSkinGenerator();dreamSkinGenerateButton.disabled=false;dreamSkinStatus.textContent='';await send()}catch(error){dreamSkinStatus.textContent=error.message;dreamSkinGenerateButton.disabled=false}}
+async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='dream-skin'){openDreamSkinGenerator();return}closeDreamSkinGenerator();if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
+async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'Dream Skin.'+extension,type:blob.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','背景已应用',false);button.title='背景已应用';button.setAttribute('aria-label','背景已应用');statusEl.textContent='Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
 async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);cwd.value=data.defaults.cwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
 async function refreshHistory(){if(activeHistoryProjectMenu)return;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
@@ -5340,6 +5526,19 @@ function addMsg(role,text,options={}){
       openImagePreview(text,img.alt,img);
     });
     el.appendChild(img);
+    if(!inputImage){
+      const imageActions=document.createElement('div');
+      imageActions.className='generatedImageActions';
+      const applyBackground=document.createElement('button');
+      applyBackground.type='button';
+      applyBackground.className='generatedBackgroundApply';
+      applyBackground.title='设为会话背景';
+      applyBackground.setAttribute('aria-label','设为会话背景');
+      setIconLabel(applyBackground,'paintbrush','设为会话背景',false);
+      applyBackground.addEventListener('click',(event)=>{event.stopPropagation();applyGeneratedImageBackground(text,applyBackground)});
+      imageActions.appendChild(applyBackground);
+      el.appendChild(imageActions);
+    }
   }else{
     const body=document.createElement('div');
     body.className='msgBody';

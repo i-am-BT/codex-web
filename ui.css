@@ -532,6 +532,189 @@ body.modalOpen {
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
+.settingsDialog .dreamSkinGenerator {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.dreamSkinGeneratorHead,
+.dreamSkinIdentity,
+.dreamSkinActions {
+  display: flex;
+  align-items: center;
+}
+
+.dreamSkinGeneratorHead {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dreamSkinIdentity {
+  gap: 7px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 740;
+}
+
+.dreamSkinIdentity .lucide {
+  width: 16px;
+  height: 16px;
+  color: var(--primary);
+}
+
+.dreamSkinClose {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.dreamSkinClose:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.dreamSkinIdeaField,
+.dreamSkinOptions .field {
+  min-width: 0;
+  margin: 0;
+}
+
+.dreamSkinIdeaField textarea {
+  min-height: 78px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 9px 10px;
+  line-height: 1.5;
+}
+
+.dreamSkinOptions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.dreamSkinReferenceButton {
+  width: 100%;
+}
+
+.dreamSkinReferenceList {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.dreamSkinReferenceChip {
+  display: grid;
+  min-width: 0;
+  max-width: 220px;
+  grid-template-columns: 30px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  padding: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.dreamSkinReferenceChip img {
+  width: 30px;
+  height: 30px;
+  border-radius: 5px;
+  object-fit: cover;
+}
+
+.dreamSkinReferenceChip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dreamSkinReferenceChip button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-subtle);
+}
+
+.dreamSkinReferenceChip button:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.dreamSkinGuide {
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  padding-top: 8px;
+  font-size: 11px;
+}
+
+.dreamSkinGuide summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-weight: 680;
+}
+
+.dreamSkinGuide summary::marker {
+  content: '';
+}
+
+.dreamSkinGuide summary .lucide {
+  width: 14px;
+  height: 14px;
+}
+
+.dreamSkinGuideBody {
+  padding: 7px 0 0 20px;
+  line-height: 1.55;
+}
+
+.dreamSkinGuideBody ul {
+  margin: 0 0 5px;
+  padding-left: 14px;
+}
+
+.dreamSkinGuideBody a {
+  color: var(--primary);
+  text-underline-offset: 2px;
+}
+
+.dreamSkinActions {
+  min-height: 38px;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.dreamSkinStatus {
+  min-width: 0;
+  flex: 1;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: right;
+}
+
+.dreamSkinGenerate {
+  width: auto;
+  min-width: 148px;
+}
+
 .settingsDialog .providerBox {
   margin: 0;
   border-top: 0;
@@ -1222,6 +1405,7 @@ body .msg.assistant > .msgBody > :not(.memoryCitations) {
 }
 
 body[data-theme] .msg.image {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
@@ -1242,6 +1426,54 @@ body[data-theme] .msg.image.inputImage {
 .msg.image img:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 3px;
+}
+
+.generatedImageActions {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 140ms var(--ease);
+}
+
+.msg.image:hover .generatedImageActions,
+.msg.image:focus-within .generatedImageActions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.generatedBackgroundApply {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: var(--radius-sm);
+  background: rgba(12, 15, 20, 0.78);
+  color: #ffffff;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(10px);
+}
+
+.generatedBackgroundApply:hover {
+  background: rgba(12, 15, 20, 0.94);
+}
+
+.generatedBackgroundApply:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.generatedBackgroundApply.loading .lucide {
+  animation: spin 900ms linear infinite;
+}
+
+@media (hover: none) {
+  .generatedImageActions {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 .msg.image.inputImage img {
@@ -3159,64 +3391,6 @@ body[data-theme="light"][data-chat-bg="plain"] .chat {
   background: #ffffff;
 }
 
-body[data-theme="light"][data-chat-bg="dream-skin"] {
-  --canvas: #f7f4f5;
-  --surface: #ffffff;
-  --surface-raised: #fff7f8;
-  --surface-hover: #ffedef;
-  --surface-active: #ffe3e7;
-  --border: rgba(196, 120, 128, 0.24);
-  --border-strong: rgba(196, 120, 128, 0.42);
-  --text: #2b2224;
-  --text-muted: #8a7a7d;
-  --text-subtle: #a38f93;
-  --primary: #e25563;
-  --primary-hover: #c93d4c;
-  --primary-soft: rgba(226, 85, 99, 0.12);
-  --primary-line: rgba(226, 85, 99, 0.42);
-  --user-bg: #d94c5b;
-  --code-bg: rgba(255, 247, 248, 0.94);
-}
-
-body[data-theme="dark"][data-chat-bg="dream-skin"] {
-  --canvas: #071116;
-  --surface: #0b1a20;
-  --surface-raised: #10272c;
-  --surface-hover: #163238;
-  --surface-active: #1a3a40;
-  --border: rgba(54, 215, 232, 0.2);
-  --border-strong: rgba(124, 255, 70, 0.34);
-  --text: #e9fff1;
-  --text-muted: #9ebdb3;
-  --text-subtle: #6f9087;
-  --primary: #7cff46;
-  --primary-hover: #b8ff3d;
-  --primary-soft: rgba(124, 255, 70, 0.13);
-  --primary-line: rgba(124, 255, 70, 0.42);
-  --user-bg: #642a8c;
-  --code-bg: rgba(5, 10, 16, 0.94);
-}
-
-body[data-theme="light"][data-chat-bg="dream-skin"] .chat {
-  background-color: #f7f4f5;
-  background-image:
-    linear-gradient(90deg, rgba(247, 244, 245, 0.98) 0%, rgba(247, 244, 245, 0.88) 42%, rgba(247, 244, 245, 0.46) 100%),
-    url("/assets/dream-skin/portal-hero.png");
-  background-position: center, right center;
-  background-repeat: no-repeat;
-  background-size: cover;
-}
-
-body[data-theme="dark"][data-chat-bg="dream-skin"] .chat {
-  background-color: #071116;
-  background-image:
-    linear-gradient(90deg, rgba(7, 17, 22, 0.98) 0%, rgba(7, 17, 22, 0.86) 46%, rgba(7, 17, 22, 0.62) 100%),
-    url("/assets/dream-skin/portal-hero.png");
-  background-position: center, right center;
-  background-repeat: no-repeat;
-  background-size: cover;
-}
-
 body[data-chat-bg="grid"] .chat {
   background-color: var(--canvas);
   background-image:
@@ -3442,6 +3616,23 @@ body[data-chat-bg="custom"] .chat {
   .settingsDialog .settings > *,
   .passwordForm > * {
     grid-column: 1;
+  }
+
+  .dreamSkinOptions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dreamSkinActions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .dreamSkinStatus {
+    text-align: left;
+  }
+
+  .dreamSkinGenerate {
+    width: 100%;
   }
 
   .passwordSubmit {

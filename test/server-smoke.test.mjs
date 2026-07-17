@@ -388,8 +388,9 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.historyProjectMenuAction\.danger/);
     assert.match(uiStyles, /body\[data-theme\] \.requestAction\s*\{[^}]*background:\s*var\(--surface-raised\);[^}]*color:\s*var\(--text\)/s);
     assert.match(uiStyles, /body\[data-theme\] \.requestAction\.danger\s*\{[^}]*background:\s*var\(--danger-soft\);[^}]*color:\s*var\(--danger\)/s);
-    assert.match(uiStyles, /body\[data-theme="light"\]\[data-chat-bg="dream-skin"\]/);
-    assert.match(uiStyles, /url\("\/assets\/dream-skin\/portal-hero\.png"\)/);
+    assert.match(uiStyles, /\.settingsDialog \.dreamSkinGenerator/);
+    assert.match(uiStyles, /\.generatedBackgroundApply/);
+    assert.doesNotMatch(uiStyles, /data-chat-bg="dream-skin"|portal-hero\.png/);
     assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
     assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
@@ -463,7 +464,7 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedPlaygroundConfig.status, 401);
     const unauthorizedImagePrompts = await fetch(`${baseUrl}/api/image-prompts`);
     assert.equal(unauthorizedImagePrompts.status, 401);
-    const unauthorizedDreamSkin = await fetch(`${baseUrl}/assets/dream-skin/portal-hero.png`);
+    const unauthorizedDreamSkin = await fetch(`${baseUrl}/api/dream-skin/prompt`, { method: 'POST' });
     assert.equal(unauthorizedDreamSkin.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
@@ -502,12 +503,12 @@ if (args[0] === 'app-server') {
     assert.match(playgroundServiceWorker.headers.get('content-type'), /javascript/);
     assert.match(await playgroundServiceWorker.text(), /registration\.unregister/);
 
-    const dreamSkinAsset = await fetch(`${baseUrl}/assets/dream-skin/portal-hero.png`, {
+    const dreamSkinSkill = await fetch(`${baseUrl}/assets/dream-skin/SKILL.md`, {
       headers: { Cookie: cookie },
     });
-    assert.equal(dreamSkinAsset.status, 200);
-    assert.equal(dreamSkinAsset.headers.get('content-type'), 'image/png');
-    assert.ok(Number(dreamSkinAsset.headers.get('content-length')) > 1_000_000);
+    assert.equal(dreamSkinSkill.status, 200);
+    assert.match(dreamSkinSkill.headers.get('content-type'), /markdown|text\/plain/);
+    assert.match(await dreamSkinSkill.text(), /Required Workflow[\s\S]*imagegen/);
 
     const dreamSkinAppearanceResponse = await fetch(`${baseUrl}/api/appearance`, {
       method: 'PATCH',
@@ -515,7 +516,32 @@ if (args[0] === 'app-server') {
       body: JSON.stringify({ chatBackground: 'dream-skin' }),
     });
     assert.equal(dreamSkinAppearanceResponse.status, 200);
-    assert.equal((await dreamSkinAppearanceResponse.json()).appearance.chatBackground, 'dream-skin');
+    assert.equal((await dreamSkinAppearanceResponse.json()).appearance.chatBackground, 'default');
+
+    const dreamSkinPromptResponse = await fetch(`${baseUrl}/api/dream-skin/prompt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: '雨夜东京工作室，右侧霓虹窗景',
+        mode: 'no-person',
+        referenceCount: 0,
+      }),
+    });
+    assert.equal(dreamSkinPromptResponse.status, 200);
+    const dreamSkinTask = await dreamSkinPromptResponse.json();
+    assert.equal(dreamSkinTask.mode, 'no-person');
+    assert.equal(dreamSkinTask.skill, 'vendor/codex-dream-skin/SKILL.md');
+    assert.match(dreamSkinTask.prompt, /完整读取并遵循项目内置技能/);
+    assert.match(dreamSkinTask.prompt, /必须实际调用 \$imagegen/);
+    assert.match(dreamSkinTask.prompt, /雨夜东京工作室/);
+    assert.ok(dreamSkinTask.cwd.endsWith('codex-web'));
+
+    const dreamSkinReferenceError = await fetch(`${baseUrl}/api/dream-skin/prompt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'reference', referenceCount: 0 }),
+    });
+    assert.equal(dreamSkinReferenceError.status, 400);
 
     const pageResponse = await fetch(baseUrl, { headers: { Cookie: cookie } });
     assert.equal(pageResponse.status, 200);
@@ -524,8 +550,12 @@ if (args[0] === 'app-server') {
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /href="\/image-prompt\.css"/);
     assert.match(page, /src="\/image-prompt\.js"/);
-    assert.match(page, /\['dream-skin','Skin'\]/);
+    assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
+    assert.match(page, /function createDreamSkinGenerator/);
+    assert.match(page, /function generateDreamSkinBackground/);
+    assert.match(page, /function applyGeneratedImageBackground/);
+    assert.match(page, /generatedBackgroundApply/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
     assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
@@ -762,7 +792,7 @@ if (args[0] === 'app-server') {
     assert.equal(config.defaults.model, 'test-model');
     assert.equal(config.defaults.reasoningEffort, 'max');
     assert.equal(config.capabilities.manageProviders, false);
-    assert.equal(config.appearance.chatBackground, 'dream-skin');
+    assert.equal(config.appearance.chatBackground, 'default');
 
     const playgroundConfigResponse = await fetch(`${baseUrl}/api/playground-config`, {
       headers: { Cookie: cookie },
