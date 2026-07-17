@@ -8,11 +8,15 @@ The production files in `app/` were built from:
 - Version: `0.7.0`
 - License: MIT, reproduced in `LICENSE`
 
-Build commands:
+Rebuild from a clean checkout of the pinned commit:
 
 ```text
+cp vendor/gpt-image-playground/package-lock.json <upstream-checkout>/package-lock.json
+git -C <upstream-checkout> apply <codex-web-checkout>/vendor/gpt-image-playground/patches/codex-web.patch
+cd <upstream-checkout>
 npm ci
 npm run build
+rsync -a --delete --exclude sw.js dist/ <codex-web-checkout>/vendor/gpt-image-playground/app/
 ```
 
 The included `package-lock.json` is the upstream lock refreshed with
@@ -24,6 +28,11 @@ It accepts prompt text, image parameters, and reference images from the Codex
 Web prompt library, then fills the Playground gallery composer. The bridge
 does not submit an image request automatically and does not accept messages
 from other origins.
+
+The patch also completes the gallery composer's `@` reference flow. Typing
+`@` with no current reference images now offers an upload action; after a
+successful upload, the reference picker reopens so the new image can be
+inserted as an explicit mention.
 
 When embedded in Codex Web, the build imports a paired image and Agent profile
 from the authenticated `/api/playground-config` endpoint. Gallery requests and

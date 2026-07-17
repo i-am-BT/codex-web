@@ -506,6 +506,8 @@ if (args[0] === 'app-server') {
     assert.match(playgroundAssetScript, /\/api\/playground-config/);
     assert.match(playgroundAssetScript, /codex-web-agent/);
     assert.match(playgroundAssetScript, /agentApiConfigMode/);
+    assert.match(playgroundAssetScript, /输入 @ 选择或上传参考图/);
+    assert.match(playgroundAssetScript, /上传新的参考图/);
     const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
       headers: { Cookie: cookie },
     });
