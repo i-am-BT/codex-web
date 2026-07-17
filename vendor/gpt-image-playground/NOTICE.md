@@ -25,6 +25,12 @@ Web prompt library, then fills the Playground gallery composer. The bridge
 does not submit an image request automatically and does not accept messages
 from other origins.
 
+When embedded in Codex Web, the build also imports the active Codex provider
+from the authenticated `/api/playground-config` endpoint. It refreshes the
+provider URL and credential on each load, while preserving a previously chosen
+image model. The initial image model is `gpt-image-2`; the Codex text model is
+not reused for image requests.
+
 Codex Web serves this build at `/playground/` behind its existing Web login.
 The upstream caching service worker is replaced with a non-caching shim that
 unregisters itself, so an authenticated page is not kept available offline

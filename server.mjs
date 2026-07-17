@@ -374,6 +374,26 @@ app.get('/api/config', requireAuth, (req, res) => {
   });
 });
 
+app.get('/api/playground-config', requireAuth, (_req, res) => {
+  const defaults = readCodexDefaults();
+  const providers = readProviderDetails();
+  const provider = providers.find((item) => item.name === (defaults.provider || DEFAULT_PROVIDER)) || providers[0];
+  if (!provider) return res.status(404).json({ error: 'Codex 服务商配置不存在' });
+
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({
+    profile: {
+      id: 'codex-web-default',
+      name: `Codex · ${provider.displayName}`,
+      provider: 'openai',
+      baseUrl: provider.baseUrl,
+      apiKey: providerCredential(provider),
+      model: 'gpt-image-2',
+      apiMode: 'images',
+    },
+  });
+});
+
 app.get('/api/image-prompts', requireAuth, (_req, res) => {
   try {
     res.setHeader('Cache-Control', 'private, max-age=3600');

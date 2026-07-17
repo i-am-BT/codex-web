@@ -457,6 +457,8 @@ if (args[0] === 'app-server') {
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
     assert.equal(unauthorized.status, 401);
+    const unauthorizedPlaygroundConfig = await fetch(`${baseUrl}/api/playground-config`);
+    assert.equal(unauthorizedPlaygroundConfig.status, 401);
     const unauthorizedImagePrompts = await fetch(`${baseUrl}/api/image-prompts`);
     assert.equal(unauthorizedImagePrompts.status, 401);
     const unauthorizedDreamSkin = await fetch(`${baseUrl}/assets/dream-skin/portal-hero.png`);
@@ -490,6 +492,7 @@ if (args[0] === 'app-server') {
     const playgroundAssetScript = await playgroundAsset.text();
     assert.match(playgroundAssetScript, /codex-web:playground-ready/);
     assert.match(playgroundAssetScript, /codex-web:image-prompt-applied/);
+    assert.match(playgroundAssetScript, /\/api\/playground-config/);
     const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
       headers: { Cookie: cookie },
     });
@@ -754,6 +757,23 @@ if (args[0] === 'app-server') {
     assert.equal(config.defaults.reasoningEffort, 'max');
     assert.equal(config.capabilities.manageProviders, false);
     assert.equal(config.appearance.chatBackground, 'dream-skin');
+
+    const playgroundConfigResponse = await fetch(`${baseUrl}/api/playground-config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundConfigResponse.status, 200);
+    assert.match(playgroundConfigResponse.headers.get('cache-control'), /private, no-store/);
+    assert.deepEqual(await playgroundConfigResponse.json(), {
+      profile: {
+        id: 'codex-web-default',
+        name: 'Codex · Fake',
+        provider: 'openai',
+        baseUrl: 'http://127.0.0.1:9/v1',
+        apiKey: 'test-token',
+        model: 'gpt-image-2',
+        apiMode: 'images',
+      },
+    });
     assert.ok(config.conversations.some((conversation) => (
       conversation.id === nativeSessionId
       && conversation.source === 'codex'
