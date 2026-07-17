@@ -25,13 +25,16 @@ Web prompt library, then fills the Playground gallery composer. The bridge
 does not submit an image request automatically and does not accept messages
 from other origins.
 
-When embedded in Codex Web, the build also imports the active Codex provider
-from the authenticated `/api/playground-config` endpoint. It refreshes the
-provider URL and credential on each load, while preserving a previously chosen
-image model. The initial image model is `gpt-image-2`; the Codex text model is
-not reused for image requests. Codex CLI compatibility mode is enabled so
-multi-image requests are split into concurrent single-image calls instead of
-sending an unsupported `n` parameter to Codex-compatible image gateways.
+When embedded in Codex Web, the build imports a paired image and Agent profile
+from the authenticated `/api/playground-config` endpoint. Gallery requests and
+Agent image tools use the Images API profile, while Agent conversations use the
+Codex provider's Responses API profile. Both profiles refresh their URL and
+credential on each load. The image profile preserves a previously chosen image
+model and initially uses `gpt-image-2`; the Agent profile follows the current
+Codex text model. Codex CLI compatibility mode remains enabled only on the image
+profile, so multi-image requests are split into concurrent single-image calls
+instead of sending an unsupported `n` parameter to Codex-compatible image
+gateways.
 
 Codex Web serves this build at `/playground/` behind its existing Web login.
 The upstream caching service worker is replaced with a non-caching shim that

@@ -496,6 +496,8 @@ if (args[0] === 'app-server') {
     assert.match(playgroundAssetScript, /codex-web:playground-ready/);
     assert.match(playgroundAssetScript, /codex-web:image-prompt-applied/);
     assert.match(playgroundAssetScript, /\/api\/playground-config/);
+    assert.match(playgroundAssetScript, /codex-web-agent/);
+    assert.match(playgroundAssetScript, /agentApiConfigMode/);
     const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
       headers: { Cookie: cookie },
     });
@@ -802,7 +804,7 @@ if (args[0] === 'app-server') {
     assert.deepEqual(await playgroundConfigResponse.json(), {
       profile: {
         id: 'codex-web-default',
-        name: 'Codex · Fake',
+        name: 'Codex Image · Fake',
         provider: 'openai',
         baseUrl: 'http://127.0.0.1:9/v1',
         apiKey: 'test-token',
@@ -810,6 +812,31 @@ if (args[0] === 'app-server') {
         apiMode: 'images',
         codexCli: true,
       },
+      profiles: [
+        {
+          id: 'codex-web-default',
+          name: 'Codex Image · Fake',
+          provider: 'openai',
+          baseUrl: 'http://127.0.0.1:9/v1',
+          apiKey: 'test-token',
+          model: 'gpt-image-2',
+          apiMode: 'images',
+          codexCli: true,
+        },
+        {
+          id: 'codex-web-agent',
+          name: 'Codex Agent · Fake',
+          provider: 'openai',
+          baseUrl: 'http://127.0.0.1:9/v1',
+          apiKey: 'test-token',
+          model: 'test-model',
+          apiMode: 'responses',
+          codexCli: false,
+        },
+      ],
+      agentApiConfigMode: 'hybrid',
+      agentTextProfileId: 'codex-web-agent',
+      agentImageProfileId: 'codex-web-default',
     });
     assert.ok(config.conversations.some((conversation) => (
       conversation.id === nativeSessionId

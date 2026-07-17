@@ -389,18 +389,38 @@ app.get('/api/playground-config', requireAuth, (_req, res) => {
   const provider = providers.find((item) => item.name === (defaults.provider || DEFAULT_PROVIDER)) || providers[0];
   if (!provider) return res.status(404).json({ error: 'Codex 服务商配置不存在' });
 
-  res.setHeader('Cache-Control', 'private, no-store');
-  res.json({
-    profile: {
-      id: 'codex-web-default',
-      name: `Codex · ${provider.displayName}`,
+  const imageProfile = {
+    id: 'codex-web-default',
+    name: `Codex Image · ${provider.displayName}`,
+    provider: 'openai',
+    baseUrl: provider.baseUrl,
+    apiKey: providerCredential(provider),
+    model: 'gpt-image-2',
+    apiMode: 'images',
+    codexCli: true,
+  };
+  const agentProfile = provider.wireApi === 'responses'
+    ? {
+      id: 'codex-web-agent',
+      name: `Codex Agent · ${provider.displayName}`,
       provider: 'openai',
       baseUrl: provider.baseUrl,
       apiKey: providerCredential(provider),
-      model: 'gpt-image-2',
-      apiMode: 'images',
-      codexCli: true,
-    },
+      model: defaults.model || DEFAULT_MODEL,
+      apiMode: 'responses',
+      codexCli: false,
+    }
+    : null;
+
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({
+    profile: imageProfile,
+    profiles: agentProfile ? [imageProfile, agentProfile] : [imageProfile],
+    ...(agentProfile ? {
+      agentApiConfigMode: 'hybrid',
+      agentTextProfileId: agentProfile.id,
+      agentImageProfileId: imageProfile.id,
+    } : {}),
   });
 });
 
