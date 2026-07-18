@@ -1105,6 +1105,9 @@ if (args[0] === 'app-server') {
     assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
+    assert.match(page, /<option value="ultra">ultra<\/option>/);
+    assert.match(page, /\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -1157,6 +1160,7 @@ if (args[0] === 'app-server') {
     )();
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
+    assert.equal(composerLabels.composerEffortLabel('ultra'), '极高');
     const elapsedTitleHelpers = inlineScript.match(/(function processedMessageTitle[\s\S]*?)(?=function clearTurnReasoningStatus)/)?.[1];
     assert.ok(elapsedTitleHelpers);
     const elapsedTitleApi = new Function(
@@ -2420,6 +2424,7 @@ if (args[0] === 'app-server') {
         message: 'sync through desktop owner',
         provider: 'fake',
         model: 'test-model',
+        reasoningEffort: 'ultra',
         cwd: temporary,
         sandbox: 'read-only',
         approval: 'on-request',
@@ -2650,6 +2655,7 @@ if (args[0] === 'app-server') {
       text: 'sync through desktop owner',
       text_elements: [],
     }]);
+    assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
