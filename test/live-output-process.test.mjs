@@ -84,6 +84,137 @@ test('the real exec-wrapped update_plan call becomes a plan event', () => {
   }]);
 });
 
+test('activity clusters prefer the latest reasoning and mark only the latest row current', () => {
+  const activitySource = sourceBetween('function joinActivityActions', 'function turnPlanProgress');
+  const activityApi = new Function(`${activitySource}; return { activityClusterPresentation, activityClusterMatchesBrowserTarget, markCurrentActivityItem, mergeActivityClusterReasoning, clearActiveActivityReasoning };`)();
+  const item = {
+    classList: { contains: () => false },
+    querySelector(selector) {
+      if (selector === '.activityVerb') return { dataset: { completedVerb: 'Ran' }, textContent: 'Ran' };
+      if (selector === '.activityTarget') return { textContent: 'command' };
+      if (selector === '.activityItemIcon [data-lucide]') {
+        return { getAttribute: (name) => name === 'data-lucide' ? 'square-terminal' : null };
+      }
+      return null;
+    },
+  };
+  const batches = [0, 1].map(() => ({
+    dataset: { activityGroup: 'commands' },
+    classList: { contains: () => false },
+    querySelectorAll: (selector) => selector === '.activityItem' ? [item] : [],
+  }));
+  const cluster = (activityReasoning, activeReasoning = '') => ({
+    dataset: {
+      activityGroup: 'tools',
+      activityReasoning,
+      ...(activeReasoning ? { activeReasoning, reasoningActive: 'true' } : {}),
+    },
+    querySelectorAll(selector) {
+      if (selector === ':scope > .activityClusterItems > .activityBatch') return batches;
+      if (selector === '.activityItem') return batches.flatMap((batch) => batch.querySelectorAll('.activityItem'));
+      return [];
+    },
+  });
+
+  assert.deepEqual(activityApi.activityClusterPresentation(cluster(JSON.stringify([
+    'Planning first step',
+    'Planning latest step',
+  ]))), {
+    icon: 'square-terminal',
+    text: 'Planning latest step',
+  });
+  assert.deepEqual(activityApi.activityClusterPresentation(cluster(JSON.stringify(['   ']))), {
+    icon: 'square-terminal',
+    text: '运行了多个命令',
+  });
+  assert.deepEqual(activityApi.activityClusterPresentation(cluster('{broken')), {
+    icon: 'square-terminal',
+    text: '运行了多个命令',
+  });
+  assert.equal(activityApi.activityClusterMatchesBrowserTarget(cluster(JSON.stringify([
+    'Older planning title',
+    'Latest planning title',
+  ])), 'Older planning title'), true);
+
+  const transientCluster = cluster(JSON.stringify(['Planning owned tool A']), 'Planning unowned tool B');
+  assert.equal(activityApi.activityClusterPresentation(transientCluster).text, 'Planning unowned tool B');
+  assert.equal(activityApi.activityClusterMatchesBrowserTarget(transientCluster, 'Planning unowned tool B'), true);
+  activityApi.clearActiveActivityReasoning(transientCluster, false);
+  assert.equal(activityApi.activityClusterPresentation(transientCluster).text, 'Planning owned tool A');
+  assert.deepEqual(JSON.parse(transientCluster.dataset.activityReasoning), ['Planning owned tool A']);
+  activityApi.mergeActivityClusterReasoning(transientCluster, ['Planning unowned tool B']);
+  assert.equal(activityApi.activityClusterPresentation(transientCluster).text, 'Planning unowned tool B');
+  assert.deepEqual(JSON.parse(transientCluster.dataset.activityReasoning), [
+    'Planning owned tool A',
+    'Planning unowned tool B',
+  ]);
+
+  const rows = [{ dataset: { current: 'true' } }, { dataset: {} }];
+  assert.strictEqual(activityApi.markCurrentActivityItem({ querySelectorAll: () => rows }), rows[1]);
+  assert.equal(rows[0].dataset.current, undefined);
+  assert.equal(rows[1].dataset.current, 'true');
+});
+
+test('active reasoning is temporary and collapse restores the owned cluster title', () => {
+  const clearActiveSource = sourceBetween('function clearActiveActivityReasoning', 'function updateActivityCluster');
+  const reasoningSource = sourceBetween('function clearTurnReasoningStatus', 'function shouldClearTurnReasoningStatus');
+  const collapseSource = sourceBetween('function collapseCurrentActivityCluster', 'function activateTurnProcessElement');
+  const api = new Function(`
+    const cluster = {
+      isConnected: true,
+      open: true,
+      dataset: { activityReasoning: JSON.stringify(['Planning owned tool A']) },
+    };
+    let currentActivityCluster = cluster;
+    let turnReasoningStatus = null;
+    const turnProcessTimeline = { appendChild() {} };
+    let updates = 0;
+    let merges = 0;
+    function updateActivityCluster() { updates += 1; }
+    function mergeActivityClusterReasoning() { merges += 1; }
+    function shortActivityText(value) { return String(value || '').trim(); }
+    function ensureTurnProcessHeader() {}
+    function moveLiveEditedFilesResultToEnd() {}
+    ${clearActiveSource}
+    ${reasoningSource}
+    ${collapseSource}
+    return {
+      update: updateTurnReasoningStatus,
+      clear: clearTurnReasoningStatus,
+      collapse: collapseCurrentActivityCluster,
+      state: () => ({ cluster, currentActivityCluster, turnReasoningStatus, updates, merges }),
+    };
+  `)();
+
+  assert.strictEqual(api.update('Planning unowned tool B'), api.state().cluster);
+  assert.equal(api.state().cluster.dataset.activeReasoning, 'Planning unowned tool B');
+  assert.equal(api.state().cluster.dataset.reasoningActive, 'true');
+  assert.deepEqual(JSON.parse(api.state().cluster.dataset.activityReasoning), ['Planning owned tool A']);
+  assert.equal(api.state().merges, 0);
+  assert.equal(api.state().updates, 1);
+
+  api.clear();
+  assert.equal(api.state().cluster.dataset.activeReasoning, undefined);
+  assert.equal(api.state().cluster.dataset.reasoningActive, undefined);
+  assert.deepEqual(JSON.parse(api.state().cluster.dataset.activityReasoning), ['Planning owned tool A']);
+  assert.strictEqual(api.state().currentActivityCluster, api.state().cluster);
+  assert.equal(api.state().updates, 2);
+
+  api.update('Planning unowned tool B');
+  api.clear(true);
+  assert.equal(api.state().cluster.dataset.activeReasoning, 'Planning unowned tool B');
+  assert.equal(api.state().cluster.dataset.reasoningActive, 'true');
+  assert.equal(api.state().updates, 3);
+
+  api.collapse();
+  assert.equal(api.state().cluster.dataset.activeReasoning, undefined);
+  assert.equal(api.state().cluster.dataset.reasoningActive, undefined);
+  assert.deepEqual(JSON.parse(api.state().cluster.dataset.activityReasoning), ['Planning owned tool A']);
+  assert.equal(api.state().cluster.open, false);
+  assert.equal(api.state().currentActivityCluster, null);
+  assert.equal(api.state().updates, 4);
+});
+
 test('terminal states remove only the ephemeral progress pill', () => {
   const clearSource = sourceBetween('function clearLiveTurnProgress', 'function clearTurnProcessHeader');
   const api = new Function(`
@@ -101,7 +232,8 @@ test('terminal states remove only the ephemeral progress pill', () => {
   `)();
   api.clear();
   assert.deepEqual(api.state(), { removed: 1, liveTurnPlan: [], liveEditedFilesResult: null });
-  assert.match(inlineScript, /\['task_error','turn_aborted','error'\]\.includes\(kind\)\)\{freezeTurnProcessElapsed\([^}]*clearLiveTurnProgress\(\)/);
+  assert.match(inlineScript, /\['task_error','turn_aborted','error'\]\.includes\(kind\)\)\{\s*freezeTurnProcessElapsed\([^}]*clearLiveTurnProgress\(\)/);
+  assert.match(inlineScript, /\['task_error','turn_aborted','error'\]\.includes\(kind\)\)\{[\s\S]*?settleTurnTool\(latestToolElement\);[\s\S]*?collapseCurrentActivityCluster\(\)/);
   assert.match(inlineScript, /async function cancelRun\(\)[\s\S]*?freezeTurnProcessElapsed\('',activeNativeTurnId\);clearLiveTurnProgress\(\)/);
   assert.match(inlineScript, /if\(\['error','interrupted'\]\.includes\(runtime\.status\)\)clearLiveTurnProgress\(\)/);
 });
@@ -274,7 +406,20 @@ test('the live progress pill stays out of completion artifacts', () => {
 test('the compact pill matches the reference sizing and closed tools stay hidden', () => {
   assert.doesNotMatch(inlineScript, /function createTurnPlanElement|turnPlanPanel/);
   assert.doesNotMatch(uiStyles, /\.turnPlanPanel|\.turnPlanList|\.turnPlanStep/);
+  assert.match(inlineScript, /function activityClusterPresentation\(cluster\)\{[\s\S]*?activityClusterReasoning\(cluster\)\.at\(-1\)/);
+  assert.match(inlineScript, /function createActivityCluster[\s\S]*?cluster\.open=true;/);
+  assert.match(inlineScript, /function collapseCurrentActivityCluster[\s\S]*?currentActivityCluster\.open=false/);
+  assert.match(inlineScript, /function markCurrentActivityItem[\s\S]*?current\.dataset\.current='true'/);
+  assert.match(inlineScript, /if\(expandable\)item\.open=false;/);
+  assert.match(inlineScript, /if\(item\.tagName==='DETAILS'\)item\.open=false;/);
   assert.match(uiStyles, /\.activityCluster:not\(\[open\]\) > \.activityClusterItems\s*\{[^}]*display:\s*none/s);
+  assert.match(uiStyles, /\.activityClusterItems::before\s*\{[^}]*background:\s*var\(--activity-rail\)/s);
+  assert.match(uiStyles, /\.activityCluster \.activityItem\[data-current="true"\] > \.activityItemSummary,[^}]*color:\s*var\(--text\)/s);
+  assert.match(uiStyles, /\.activityCluster \.activityItemChevron\s*\{[^}]*opacity:\s*0/s);
+  assert.match(uiStyles, /\.activityCluster \.activityItem\[data-current="true"\] > \.activityItemSummary \.activityItemChevron,[^}]*opacity:\s*1/s);
+  assert.match(uiStyles, /\.activityBatch\.streaming \.activityItem:last-child \.activityItemIcon\s*\{[^}]*animation:\s*streamDot/s);
+  assert.match(uiStyles, /\.activityCluster \.activityBatch\.streaming \.activityItem:last-child \.activityItemIcon\s*\{[^}]*animation:\s*none/s);
+  assert.match(uiStyles, /@media \(hover: none\)[\s\S]*?\.activityCluster \.activityItem:not\(\[data-current="true"\]\):not\(\[open\]\)[^}]*opacity:\s*0\.5/s);
   assert.match(uiStyles, /\.editedFilesResult\.withPlan > \.turnResultHead\s*\{[^}]*min-height:\s*36px/s);
   assert.match(uiStyles, /\.turnPlanProgressRing\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px;[^}]*flex:\s*0 0 12px/s);
   assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);

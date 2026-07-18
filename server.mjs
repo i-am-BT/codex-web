@@ -6887,7 +6887,14 @@ function semanticActivityGroupPresentation(group,running){
   const item=labels[group];
   return item?{icon:item[0],text:running?item[1]:item[2]}:null;
 }
-function activityClusterPresentation(cluster){
+function activityClusterReasoning(cluster){
+  try{
+    const parsed=JSON.parse(cluster?.dataset?.activityReasoning||'[]');
+    if(!Array.isArray(parsed))return[];
+    return parsed.map((item)=>String(item||'').trim()).filter(Boolean);
+  }catch(e){return[]}
+}
+function activityClusterToolPresentation(cluster){
   const batches=[...cluster.querySelectorAll(':scope > .activityClusterItems > .activityBatch')];
   const items=[...cluster.querySelectorAll('.activityItem')];
   const running=batches.some((batch)=>batch.classList.contains('streaming'));
@@ -6935,13 +6942,18 @@ function activityClusterPresentation(cluster){
   const record=records[0];
   return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'工具调用'};
 }
+function activityClusterPresentation(cluster){
+  const fallback=activityClusterToolPresentation(cluster);
+  const latestReasoning=String(cluster?.dataset?.activeReasoning||'').trim()||activityClusterReasoning(cluster).at(-1);
+  return latestReasoning?{...fallback,text:latestReasoning}:fallback;
+}
 function createActivityCluster(group='tools',reasoning=[]){
   const cluster=document.createElement('details');
   cluster.className='msg activityCluster';
   cluster.dataset.messageKind='activity_cluster';
   cluster.dataset.activityGroup=String(group||'tools');
   cluster.dataset.activityReasoning=JSON.stringify((reasoning||[]).map((item)=>String(item||'').trim()).filter(Boolean));
-  cluster.open=false;
+  cluster.open=true;
   const summary=document.createElement('summary');
   summary.className='activityClusterSummary';
   const icon=document.createElement('span');
@@ -6971,7 +6983,23 @@ function mergeActivityClusterReasoning(cluster,reasoning){
 function activityClusterMatchesBrowserTarget(cluster,target){
   const clean=String(target||'').trim().toLowerCase();
   if(!cluster||!clean)return false;
-  try{return (JSON.parse(cluster.dataset.activityReasoning||'[]')||[]).some((label)=>String(label||'').toLowerCase().includes(clean))}catch(e){return false}
+  const active=String(cluster.dataset?.activeReasoning||'').trim();
+  return[...activityClusterReasoning(cluster),active].filter(Boolean).some((label)=>label.toLowerCase().includes(clean));
+}
+function markCurrentActivityItem(cluster){
+  const items=[...(cluster?.querySelectorAll?.('.activityItem')||[])];
+  for(const item of items)delete item.dataset.current;
+  const current=items.at(-1);
+  if(current)current.dataset.current='true';
+  return current||null;
+}
+function clearActiveActivityReasoning(cluster,refresh=true){
+  if(!cluster?.dataset)return false;
+  const changed=cluster.dataset.reasoningActive==='true'||Boolean(String(cluster.dataset.activeReasoning||'').trim());
+  delete cluster.dataset.reasoningActive;
+  delete cluster.dataset.activeReasoning;
+  if(changed&&refresh)updateActivityCluster(cluster);
+  return changed;
 }
 function updateActivityCluster(cluster){
   if(!cluster)return;
@@ -6988,15 +7016,18 @@ function updateActivityCluster(cluster){
   }
   if(label){label.textContent=presentation.text;label.title=presentation.text}
   cluster.dataset.messageText=presentation.text;
-  cluster.classList.toggle('streaming',Boolean(cluster.querySelector('.activityBatch.streaming')));
+  markCurrentActivityItem(cluster);
+  cluster.classList.toggle('streaming',cluster.dataset.reasoningActive==='true'||Boolean(cluster.querySelector('.activityBatch.streaming')));
   refreshIcons(cluster);
 }
 function appendActivityBatchToCluster(cluster,batch){
+  clearActiveActivityReasoning(cluster,false);
   cluster.querySelector(':scope > .activityClusterItems')?.appendChild(batch);
   updateActivityCluster(cluster);
 }
 function settleActivityCluster(cluster){
   for(const batch of cluster?.querySelectorAll('.activityBatch')||[])settleTurnTool(batch);
+  clearActiveActivityReasoning(cluster,false);
   cluster?.classList.remove('streaming');
   updateActivityCluster(cluster);
 }
@@ -7092,14 +7123,24 @@ function turnProcessStartTimestamp(value,now=Date.now()){
   const parsed=new Date(value||now).getTime();
   return Number.isFinite(parsed)?parsed:now;
 }
-function clearTurnReasoningStatus(){
+function clearTurnReasoningStatus(preserveActivity=false){
   if(turnReasoningStatus?.parentNode)turnReasoningStatus.remove();
   turnReasoningStatus=null;
+  if(!preserveActivity)clearActiveActivityReasoning(currentActivityCluster);
 }
 function updateTurnReasoningStatus(text){
   const clean=shortActivityText(text,160);
   if(!clean)return null;
   ensureTurnProcessHeader();
+  if(currentActivityCluster?.isConnected){
+    currentActivityCluster.dataset.activeReasoning=clean;
+    currentActivityCluster.dataset.reasoningActive='true';
+    updateActivityCluster(currentActivityCluster);
+    if(turnReasoningStatus?.parentNode)turnReasoningStatus.remove();
+    turnReasoningStatus=null;
+    moveLiveEditedFilesResultToEnd();
+    return currentActivityCluster;
+  }
   if(!turnReasoningStatus){
     turnReasoningStatus=document.createElement('div');
     turnReasoningStatus.className='msg process reasoningStatus streaming';
@@ -7221,11 +7262,18 @@ function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
   collectingTurnProcess=true;
   if(showElapsed)startTurnProcessElapsed(startedAt,Date.now(),turnId);
 }
+function collapseCurrentActivityCluster(){
+  if(currentActivityCluster?.isConnected){
+    clearActiveActivityReasoning(currentActivityCluster);
+    currentActivityCluster.open=false;
+  }
+  currentActivityCluster=null;
+}
 function activateTurnProcessElement(element){
   if(!collectingTurnProcess||!element)return;
   ensureTurnProcessHeader();
   if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='agent_activity'){
-    currentActivityCluster=null;
+    collapseCurrentActivityCluster();
     if(!currentAgentActivityGroup?.isConnected){
       currentAgentActivityGroup=createAgentActivityGroup();
       turnProcessElements.push(currentAgentActivityGroup);
@@ -7258,13 +7306,13 @@ function activateTurnProcessElement(element){
       const index=turnProcessElements.indexOf(matched);
       if(!turnProcessElements.includes(element))turnProcessElements.splice(index+1,0,element);
       turnProcessTimeline.insertBefore(element,matched.nextSibling);
-      currentActivityCluster=null;
+      collapseCurrentActivityCluster();
       refreshIcons(element);
       moveLiveEditedFilesResultToEnd();
       return element;
     }
   }
-  currentActivityCluster=null;
+  collapseCurrentActivityCluster();
   if(!turnProcessElements.includes(element))turnProcessElements.push(element);
   turnProcessTimeline.appendChild(element);
   moveLiveEditedFilesResultToEnd();
@@ -7665,9 +7713,14 @@ function addMsg(role,text,options={}){
     if(options.autoScroll!==false)scrollChatToLatest();
     return reasoning;
   }
-  if(shouldClearTurnReasoningStatus(role,kind))clearTurnReasoningStatus();
+  if(shouldClearTurnReasoningStatus(role,kind))clearTurnReasoningStatus(browserCommentUser);
   if(shouldClearPendingActivityReasoning(role,kind,steeringUser))pendingActivityReasoning=[];
-  if(role==='process'&&['task_error','turn_aborted','error'].includes(kind)){freezeTurnProcessElapsed(options.at,options.turnId);clearLiveTurnProgress()}
+  if(role==='process'&&['task_error','turn_aborted','error'].includes(kind)){
+    freezeTurnProcessElapsed(options.at,options.turnId);
+    clearLiveTurnProgress();
+    settleTurnTool(latestToolElement);
+    collapseCurrentActivityCluster();
+  }
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
     const batch=isAgentActivityOutput(text)?takePendingAgentActivityBatch():latestToolElement;
     settleTurnTool(batch||latestToolElement);
