@@ -1560,6 +1560,7 @@ if (args[0] === 'app-server') {
       variant: 'agent',
       agentKey: 'ui_trace',
       label: 'Ui trace',
+      agentAction: 'spawn',
       status: '已开始工作',
       icon: 'flower-2',
       expandable: true,
