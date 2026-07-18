@@ -1014,7 +1014,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /freezeTurnProcessElapsed\(options\.at,options\.turnId\)/);
     assert.match(page, /freezeTurnProcessElapsed\(runtime\.updatedAt,runtimeTurnId\)/);
     assert.match(page, /freezeTurnProcessElapsed\(conversation\.updatedAt,completingTurnId\)/);
-    assert.match(page, /freezeTurnProcessElapsed\('',activeNativeTurnId\);webRunActive=false/);
+    assert.match(page, /freezeTurnProcessElapsed\('',activeNativeTurnId\);clearLiveTurnProgress\(\);webRunActive=false/);
     assert.match(page, /function createActivityCluster/);
     assert.match(page, /function updateTurnReasoningStatus/);
     assert.match(page, /if\(!turnReasoningStatus\)\{[\s\S]*turnReasoningStatus\.textContent=clean;[\s\S]*turnProcessTimeline\.appendChild\(turnReasoningStatus\)/);
