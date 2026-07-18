@@ -301,6 +301,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(summaries[0].source, 'codex');
     assert.equal(summaries[0].title, '原生同步测试');
     assert.equal(summaries[0].cwd, '/workspace');
+    assert.equal(summaries[0].status, 'done');
     assert.equal(summaries[0].readOnly, false);
 
     const conversation = store.get(id);
