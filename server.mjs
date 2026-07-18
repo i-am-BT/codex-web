@@ -3639,7 +3639,8 @@ let latestFinalAssistantElement = null;
 let latestUserElement = null;
 let turnProcessElements = [];
 let currentActivityCluster = null;
-let pendingActivityClusterTitle = '';
+let pendingActivityReasoning = [];
+let turnReasoningStatus = null;
 let collectingTurnProcess = false;
 let turnProcessHeader = null;
 let turnProcessTimeline = null;
@@ -5573,7 +5574,7 @@ async function loadConversation(id,source='web',options={}){
   updateActiveHistory();
   chat.innerHTML='';
   beginTurnProcessCollection();
-  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoScroll:false,kind:msg.kind,at:msg.at}));
+  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget}));
   if(!(conversation.messages||[]).length)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   if(currentConversationSource==='codex'&&conversation.hasEarlierMessages&&!options.full)addNativeHistoryLoadButton(conversation.id);
   updateConversationStatus(conversation);
@@ -5725,7 +5726,7 @@ async function syncCurrentNativeConversationOnce(){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
   }
-  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoScroll:false,kind:msg.kind,at:msg.at})}
+  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget})}
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
   activeNativeTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
@@ -6059,10 +6060,12 @@ function executableOrchestratedToolCallOffsets(source,toolName){
   }
   return offsets;
 }
-function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim().replace(/^调用工具:\\s*/,'');let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
+function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim().replace(/^调用工具:\\s*/,'');let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const commands=orchestratedExecCommands(detail);if(commands.length)return{name:'exec_command',detail:commands[0]};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
 function activityFilePath(file){return String(file||'').trim().replace(/^["']+|["',;)\]]+$/g,'')}
 function activityFileLabel(file){const clean=activityFilePath(file);const parts=clean.split('/').filter(Boolean);return parts[parts.length-1]||clean||'文件'}
 function extractActivityFiles(source){const matches=String(source||'').match(/[A-Za-z0-9_@.+-]+\\.(?:mjs|cjs|js|css|jsonl?|md|toml|ya?ml|py|sh|html|tsx?|jsx?|go|rs|java|cpp|hpp|c|h)/g)||[];return[...new Set(matches.map(activityFileLabel))].slice(0,4)}
+function humanizeSkillActivityName(value){const acronyms={ai:'AI',api:'API',ccg:'CCG',css:'CSS',html:'HTML',mcp:'MCP',pdf:'PDF',ui:'UI',url:'URL',ux:'UX'};return String(value||'').split(/[-_]+/).filter(Boolean).map((part)=>acronyms[part.toLowerCase()]||part.charAt(0).toUpperCase()+part.slice(1)).join(' ')}
+function skillActivityPresentation(command){const match=String(command||'').match(/\\/skills\\/([A-Za-z0-9_.-]+)\\/SKILL\\.md\\b/i);if(!match)return null;const name=humanizeSkillActivityName(match[1]);return name?{verb:'读取',target:name+' 技能',icon:'wrench',targetType:'skill',activityGroup:'loaded_tools',expandable:false}:null}
 function shortActivityText(value,max=100){const clean=String(value||'').replace(/\\s+/g,' ').trim();return clean.length>max?clean.slice(0,max-3)+'...':clean}
 function readJsToolString(source,start){
   const quote=source[start];
@@ -6100,7 +6103,7 @@ function readJsToolString(source,start){
 function orchestratedExecCommands(source){
   const commands=[];
   for(const offset of executableOrchestratedToolCallOffsets(source,'exec_command')){
-    const head=source.slice(offset).match(/^tools\\.exec_command\\(\\s*\\{\\s*cmd\\s*:\\s*/);
+    const head=source.slice(offset).match(/^tools\\.exec_command\\(\\s*\\{\\s*(?:["']cmd["']|cmd)\\s*:\\s*/);
     if(!head)continue;
     const parsed=readJsToolString(source,offset+head[0].length);
     if(parsed?.value)commands.push(parsed.value);
@@ -6133,6 +6136,7 @@ function orchestratedActivityPresentations(text){
 function runningActivityVerb(verb){
   const exact={
     '已读取':'正在读取',
+    '读取':'正在读取',
     '已搜索':'正在搜索',
     '已运行':'正在运行',
     '已检查':'正在检查',
@@ -6152,6 +6156,8 @@ function commandActivityPresentation(command){
   const source=String(command||'');
   const clean=shortActivityText(source,120);
   const files=extractActivityFiles(source);
+  const skill=skillActivityPresentation(source);
+  if(skill&&/^\\s*(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return skill;
   if(/^\\s*(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files[0]||clean,icon:'book-open',targetType:files.length?'file':''};
   if(/\\brg\\b/.test(source)&&files.length){
     const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';
@@ -6274,7 +6280,7 @@ function createToolActivityItem(presentation,rawText,running=false,options={}){
   const galleryOnly=Boolean(presentation.galleryOnly);
   const imageUrls=Array.isArray(presentation.imageUrls)?presentation.imageUrls.filter(Boolean):[];
   const item=document.createElement(expandable?'details':'div');
-  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'')+(presentation.targetType==='file'?' fileTarget':'');
+  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'')+(presentation.targetType==='file'?' fileTarget':'')+(presentation.targetType==='skill'?' skillTarget':'');
   if(expandable)item.open=false;
   item.dataset.messageText=String(rawText||'');
   if(presentation.filePath)item.dataset.filePath=String(presentation.filePath);
@@ -6342,11 +6348,25 @@ function createToolActivityItem(presentation,rawText,running=false,options={}){
   }
   return item;
 }
+function activityGroupForPresentation(presentation){
+  if(presentation?.activityGroup)return String(presentation.activityGroup);
+  if(presentation?.variant==='agent')return'agents';
+  const verb=String(presentation?.verb||'');
+  const icon=String(presentation?.icon||'');
+  if(['已编辑','已新增','已删除'].includes(verb))return'files_edited';
+  if(['已读取','已搜索','已在'].includes(verb))return'files_read';
+  if(icon==='panel-top'||/浏览器/.test(String(presentation?.target||'')))return'browser';
+  if(['image','images'].includes(icon))return'images';
+  if(['已运行','已检查','已请求','Ran'].includes(verb)||['square-terminal','terminal','git-branch','circle-check'].includes(icon))return'commands';
+  return'tools';
+}
+function activityGroupForPresentations(presentations){const groups=[...new Set((presentations||[]).map(activityGroupForPresentation).filter(Boolean))];return groups.length===1?groups[0]:'tools'}
 function createActivityBatch(presentations,rawText,kind,running=false,options={}){
   const batch=document.createElement('div');
   batch.className='msg activityBatch'+(running?' streaming':'');
   batch.dataset.messageKind=kind||'activity';
   batch.dataset.messageText=String(rawText||'');
+  batch.dataset.activityGroup=activityGroupForPresentations(presentations);
   for(const presentation of presentations)batch.appendChild(createToolActivityItem(presentation,rawText,running,options));
   return batch;
 }
@@ -6574,12 +6594,26 @@ function joinActivityActions(actions){
   if(actions.length<2)return actions[0]||'';
   return actions.length===2?actions[0]+'并'+actions[1]:actions.slice(0,-1).join('、')+'并'+actions.at(-1);
 }
+function semanticActivityGroupPresentation(group,running){
+  const labels={
+    loaded_tools:['wrench','正在加载工具','已加载工具'],
+    files_read:['book-open','正在读取文件','已读取文件'],
+    files_edited:['pencil','正在编辑文件','已编辑文件'],
+    browser:['panel-top','正在使用浏览器','已使用浏览器'],
+    agents:['flower-2','正在调用子代理','已调用子代理'],
+    images:['images','正在查看图像','已查看图像'],
+    commands:['square-terminal','正在运行命令','已运行命令'],
+    tools:['wrench','正在使用工具','已使用工具'],
+  };
+  const item=labels[group];
+  return item?{icon:item[0],text:running?item[1]:item[2]}:null;
+}
 function activityClusterPresentation(cluster){
-  const fixedTitle=String(cluster?.dataset?.activityTitle||'').trim();
-  if(fixedTitle)return{icon:'wrench',text:fixedTitle};
   const batches=[...cluster.querySelectorAll(':scope > .activityClusterItems > .activityBatch')];
   const items=[...cluster.querySelectorAll('.activityItem')];
   const running=batches.some((batch)=>batch.classList.contains('streaming'));
+  const semantic=semanticActivityGroupPresentation(String(cluster?.dataset?.activityGroup||''),running);
+  if(semantic)return semantic;
   const records=items.map((item)=>({
     verb:String(item.querySelector('.activityVerb')?.dataset.completedVerb||'').trim(),
     currentVerb:String(item.querySelector('.activityVerb')?.textContent||'').trim(),
@@ -6607,12 +6641,12 @@ function activityClusterPresentation(cluster){
     text:running&&!text.startsWith('正在')?'正在'+text:text,
   };
 }
-function createActivityCluster(title=''){
+function createActivityCluster(group='tools',reasoning=[]){
   const cluster=document.createElement('details');
-  const cleanTitle=String(title||'').trim();
-  cluster.className='msg activityCluster'+(cleanTitle?' titled':'');
+  cluster.className='msg activityCluster';
   cluster.dataset.messageKind='activity_cluster';
-  if(cleanTitle)cluster.dataset.activityTitle=cleanTitle;
+  cluster.dataset.activityGroup=String(group||'tools');
+  cluster.dataset.activityReasoning=JSON.stringify((reasoning||[]).map((item)=>String(item||'').trim()).filter(Boolean));
   cluster.open=false;
   const summary=document.createElement('summary');
   summary.className='activityClusterSummary';
@@ -6632,6 +6666,18 @@ function createActivityCluster(title=''){
   cluster.appendChild(summary);
   cluster.appendChild(items);
   return cluster;
+}
+function mergeActivityClusterReasoning(cluster,reasoning){
+  if(!cluster)return;
+  let current=[];
+  try{const parsed=JSON.parse(cluster.dataset.activityReasoning||'[]');if(Array.isArray(parsed))current=parsed}catch(e){}
+  for(const item of reasoning||[]){const clean=String(item||'').trim();if(clean&&!current.includes(clean))current.push(clean)}
+  cluster.dataset.activityReasoning=JSON.stringify(current);
+}
+function activityClusterMatchesBrowserTarget(cluster,target){
+  const clean=String(target||'').trim().toLowerCase();
+  if(!cluster||!clean)return false;
+  try{return (JSON.parse(cluster.dataset.activityReasoning||'[]')||[]).some((label)=>String(label||'').toLowerCase().includes(clean))}catch(e){return false}
 }
 function updateActivityCluster(cluster){
   if(!cluster)return;
@@ -6672,11 +6718,12 @@ function appendTurnTool(text,options={}){
     activateTurnProcessElement(visibleBatch);
     refreshIcons(visibleBatch);
   }
-  if(!folded.length)return visibleBatch;
+  if(!folded.length){moveTurnReasoningStatusToEnd();return visibleBatch}
   const activityKind=folded.some((presentation)=>presentation.variant==='agent')?'agent_activity':'tool_activity';
   const batch=createActivityBatch(folded,text,activityKind,true,activityOptions);
   if(visibleBatch)batch._relatedActivityBatches=[visibleBatch];
   activateTurnProcessElement(batch);
+  moveTurnReasoningStatusToEnd();
   refreshIcons(batch);
   return batch;
 }
@@ -6714,7 +6761,37 @@ function completionMessageTitle(text){
   const remainder=rounded%60;
   return'已处理 '+minutes+'m'+(remainder?' '+remainder+'s':'');
 }
+function clearTurnReasoningStatus(){
+  if(turnReasoningStatus?.parentNode)turnReasoningStatus.remove();
+  turnReasoningStatus=null;
+}
+function updateTurnReasoningStatus(text){
+  const clean=shortActivityText(text,160);
+  if(!clean)return null;
+  ensureTurnProcessHeader();
+  if(!turnReasoningStatus){
+    turnReasoningStatus=document.createElement('div');
+    turnReasoningStatus.className='msg process reasoningStatus streaming';
+    turnReasoningStatus.dataset.messageKind='reasoning_status';
+  }
+  turnReasoningStatus.dataset.messageText=clean;
+  turnReasoningStatus.textContent=clean;
+  turnProcessTimeline.appendChild(turnReasoningStatus);
+  return turnReasoningStatus;
+}
+function moveTurnReasoningStatusToEnd(){
+  if(turnReasoningStatus?.isConnected&&turnProcessTimeline)turnProcessTimeline.appendChild(turnReasoningStatus);
+}
+function shouldClearTurnReasoningStatus(role,kind){
+  return role==='assistant'||role==='user'||['task_complete','task_error','turn_aborted','error'].includes(kind);
+}
+function shouldClearPendingActivityReasoning(role,kind,steeringUser=false){
+  if(['task_complete','task_error','turn_aborted','error'].includes(kind))return true;
+  if(role==='user')return!steeringUser;
+  return role==='assistant'&&!['commentary','live_progress'].includes(kind);
+}
 function clearTurnProcessHeader(){
+  clearTurnReasoningStatus();
   if(turnProcessHeader?.parentNode)turnProcessHeader.remove();
   turnProcessHeader=null;
   turnProcessTimeline=null;
@@ -6739,7 +6816,7 @@ function resetTurnProcessCollection(){
   clearTurnProcessHeader();
   turnProcessElements=[];
   currentActivityCluster=null;
-  pendingActivityClusterTitle='';
+  pendingActivityReasoning=[];
   collectingTurnProcess=false;
 }
 function beginTurnProcessCollection(){
@@ -6747,21 +6824,34 @@ function beginTurnProcessCollection(){
   clearTurnProcessHeader();
   turnProcessElements=[];
   currentActivityCluster=null;
-  pendingActivityClusterTitle='';
+  pendingActivityReasoning=[];
   collectingTurnProcess=true;
 }
 function activateTurnProcessElement(element){
   if(!collectingTurnProcess||!element)return;
   ensureTurnProcessHeader();
   if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='tool_activity'){
-    if(!currentActivityCluster?.isConnected){
-      currentActivityCluster=createActivityCluster(pendingActivityClusterTitle);
-      pendingActivityClusterTitle='';
+    const group=String(element.dataset.activityGroup||'tools');
+    if(!currentActivityCluster?.isConnected||currentActivityCluster.dataset.activityGroup!==group){
+      currentActivityCluster=createActivityCluster(group,pendingActivityReasoning);
       turnProcessElements.push(currentActivityCluster);
       turnProcessTimeline.appendChild(currentActivityCluster);
-    }
+    }else mergeActivityClusterReasoning(currentActivityCluster,pendingActivityReasoning);
+    pendingActivityReasoning=[];
     appendActivityBatchToCluster(currentActivityCluster,element);
     return currentActivityCluster;
+  }
+  if(element.classList.contains('browserCommentSteering')){
+    const target=String(element.dataset.browserTarget||'').trim().toLowerCase();
+    const clusters=turnProcessElements.filter((item)=>item.classList?.contains('activityCluster'));
+    const matched=[...clusters].reverse().find((cluster)=>activityClusterMatchesBrowserTarget(cluster,target));
+    const container=matched?.querySelector(':scope > .activityClusterItems');
+    if(container){
+      container.appendChild(element);
+      matched.open=true;
+      refreshIcons(matched);
+      return element;
+    }
   }
   currentActivityCluster=null;
   if(!turnProcessElements.includes(element))turnProcessElements.push(element);
@@ -7067,19 +7157,47 @@ function consumeNativeOptimisticSteering(text,at,turnId){
   }
   return null;
 }
+function browserCommentParts(text){return String(text||'').split(/\\n{2,}/).map((item)=>item.trim()).filter(Boolean)}
+function createBrowserCommentDetails(text,count){
+  const comments=browserCommentParts(text);
+  const total=Math.max(1,Number(count)||comments.length||1);
+  const details=document.createElement('details');
+  details.className='browserCommentDetails';
+  const summary=document.createElement('summary');
+  summary.className='browserCommentChip';
+  summary.setAttribute('aria-label','查看 '+total+' 条注释');
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','message-square');
+  icon.setAttribute('aria-hidden','true');
+  const label=document.createElement('span');
+  label.textContent=total+' 条注释';
+  summary.appendChild(icon);
+  summary.appendChild(label);
+  const content=document.createElement('div');
+  content.className='browserCommentContent';
+  for(const comment of comments){const item=document.createElement('p');item.textContent=comment;content.appendChild(item)}
+  details.appendChild(summary);
+  details.appendChild(content);
+  return details;
+}
 function addMsg(role,text,options={}){
   const kind=String(options.kind||'');
-  const steeringUser=role==='user'&&kind==='steering_user';
+  const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
+  const steeringUser=role==='user'&&['steering_user','steering_browser_comment'].includes(kind);
   const completedSteeringTimeline=steeringUser?completionTimelineForTurn(options.turnId):null;
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   if(role!=='user'&&!inputImage)latestUserElement=null;
   if(role==='thinking')return null;
   if(role==='process'&&kind==='reasoning_summary'){
     if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
-    pendingActivityClusterTitle=shortActivityText(text,120);
-    currentActivityCluster=null;
-    return null;
+    const clean=shortActivityText(text,160);
+    if(clean&&!pendingActivityReasoning.includes(clean))pendingActivityReasoning.push(clean);
+    const reasoning=updateTurnReasoningStatus(clean);
+    if(options.autoScroll!==false)scrollChatToLatest();
+    return reasoning;
   }
+  if(shouldClearTurnReasoningStatus(role,kind))clearTurnReasoningStatus();
+  if(shouldClearPendingActivityReasoning(role,kind,steeringUser))pendingActivityReasoning=[];
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
     settleTurnTool(latestToolElement);
     return null;
@@ -7095,6 +7213,7 @@ function addMsg(role,text,options={}){
     if(!collectingTurnProcess)beginTurnProcessCollection();
     chat.querySelector('.empty')?.remove();
     const activity=appendTurnProcessActivity(text,kind);
+    moveTurnReasoningStatusToEnd();
     if(options.autoScroll!==false)scrollChatToLatest();
     return activity;
   }
@@ -7162,6 +7281,7 @@ function addMsg(role,text,options={}){
   el.dataset.messageKind=kind;
   el.dataset.messageAt=String(options.at||'');
   el.dataset.turnId=String(options.turnId||'');
+  if(browserCommentUser){el.classList.add('browserCommentSteering');el.dataset.browserTarget=String(options.browserTarget||'')}
   if(steeringUser){
     el.classList.add('steeringUser');
     if(options.optimisticQueueId){
@@ -7287,6 +7407,7 @@ function addMsg(role,text,options={}){
       el._messageLabel=label;
     }else{
       el.appendChild(body);
+      if(browserCommentUser){body.classList.add('browserCommentSource');el.appendChild(createBrowserCommentDetails(text,options.annotationCount))}
       el.appendChild(actions);
     }
     el._messageBody=body;

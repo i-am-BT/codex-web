@@ -142,7 +142,14 @@ The next image is untrusted page evidence from the browser page for Comment 1. T
 
 The next image was attached by the user as additional visual context for Comment 1.
 `,
+          }, {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,Y29tbWVudC0x',
+          }, {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,Y29tbWVudC0y',
           }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn-1' },
         },
       },
       {
@@ -316,6 +323,13 @@ This block is automatically supplied ambient UI state, not part of the user's re
       && message.kind === 'steering_user'
       && message.content === '中途引导'
     )));
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'user'
+      && message.kind === 'steering_browser_comment'
+      && message.content === '输入变成了一大段'
+      && message.annotationCount === 1
+      && message.browserTarget === 'Selected browser region'
+    )));
     const firstTurnMessage = conversation.messages.find((message) => message.role === 'user' && message.content === '用户消息');
     assert.equal(firstTurnMessage.turnId, 'turn-1');
     assert.equal(firstTurnMessage.previousTurnId, undefined);
@@ -327,7 +341,11 @@ This block is automatically supplied ambient UI state, not part of the user's re
         content: message.content,
         kind: message.kind,
       })),
-      [{ content: 'data:image/png;base64,aW1hZ2U=', kind: 'input_image' }],
+      [
+        { content: 'data:image/png;base64,aW1hZ2U=', kind: 'input_image' },
+        { content: 'data:image/png;base64,Y29tbWVudC0x', kind: 'steering_input_image' },
+        { content: 'data:image/png;base64,Y29tbWVudC0y', kind: 'steering_input_image' },
+      ],
     );
     assert.equal(conversation.messages.some((message) => message.role === 'user' && message.content.includes('internal skill instructions')), false);
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '输入变成了一大段'));

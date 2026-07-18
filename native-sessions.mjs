@@ -810,25 +810,43 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   const text = contentText(payload.content);
   const images = contentImages(payload.content);
   if ((!text && !images.length) || (text && isInjectedWorkspaceInstructions(payload.role, text))) return;
+  const browserComments = payload.role === 'user' && isBrowserCommentsMessage(text);
+  const browserCommentMeta = browserComments ? browserCommentsMetadata(text) : null;
   const context = payload.role === 'user' ? normalizeInjectedContext(text) : null;
   const displayText = payload.role === 'user' ? normalizeUserDisplayText(text) : text;
   let messageKind = payload.phase || 'message';
   if (payload.role === 'user' && !context && (displayText || images.length)) {
     const turnId = String(payload.internal_chat_message_metadata_passthrough?.turn_id || '');
     if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
-      messageKind = 'steering_user';
+      messageKind = browserComments ? 'steering_browser_comment' : 'steering_user';
     }
     cache.displayUserMessagesInTurn += 1;
   }
   if (context) {
     appendNativeMessage(cache, 'context', context.content, record, maxMessages, context.kind);
   } else if (displayText) {
-    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind);
+    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind, browserCommentMeta);
   }
   const imageKind = payload.role === 'user'
-    ? messageKind === 'steering_user' ? 'steering_input_image' : 'input_image'
+    ? ['steering_user', 'steering_browser_comment'].includes(messageKind) ? 'steering_input_image' : 'input_image'
     : 'output_image';
   for (const image of images) appendNativeMessage(cache, 'image', image, record, maxMessages, imageKind);
+}
+
+function isBrowserCommentsMessage(text) {
+  return String(text || '').replace(/\r\n/g, '\n').trimStart().startsWith('# Browser comments:');
+}
+
+function browserCommentsMetadata(text) {
+  const source = String(text || '').replace(/\r\n/g, '\n');
+  const headings = source.match(/^## (?:User )?Comment \d+\s*$/gm) || [];
+  const target = source.match(/^Target:\s*"([^"]+)"\s*$/m)?.[1]
+    || source.match(/^File:\s*browser:([^\n]+)$/m)?.[1]
+    || '';
+  return {
+    annotationCount: Math.max(1, headings.length),
+    browserTarget: target.trim().slice(0, 240),
+  };
 }
 
 function isInjectedWorkspaceInstructions(role, text) {
@@ -953,7 +971,7 @@ function isBrowserEvidenceBoilerplate(paragraph) {
   return compact.startsWith('The element ') && compact.includes('marked by comment marker');
 }
 
-function appendNativeMessage(cache, role, content, record, maxMessages, kind) {
+function appendNativeMessage(cache, role, content, record, maxMessages, kind, metadata = null) {
   const limit = role === 'image'
     ? IMAGE_URL_LIMIT
     : role === 'user' || role === 'assistant'
@@ -969,6 +987,7 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind) {
     kind,
     turnId: cache.currentTurnId || undefined,
     previousTurnId: cache.previousTurnId || undefined,
+    ...(metadata && typeof metadata === 'object' ? metadata : {}),
   });
   if (cache.messages.length > maxMessages) {
     cache.messages.splice(0, cache.messages.length - maxMessages);

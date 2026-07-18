@@ -588,7 +588,11 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.activityClusterText\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /\.activityCluster\[open\] > summary \.activityClusterChevron/);
-    assert.match(uiStyles, /\.activityCluster\.titled \.activityClusterText/);
+    assert.match(uiStyles, /body\[data-theme\] \.msg\.process\.reasoningStatus/);
+    assert.match(uiStyles, /--reasoning-flow-muted:\s*#b0b0b1/);
+    assert.match(uiStyles, /\.reasoningStatus\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
+    assert.match(uiStyles, /> \.msg\.process\.reasoningStatus:last-child\s*\{[^}]*var\(--reasoning-flow-muted\)[^}]*var\(--reasoning-flow-strong\)/s);
+    assert.match(uiStyles, /\.browserCommentChip\s*\{/);
     assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
     assert.match(uiStyles, /\.agentActivityItem\[open\] > \.agentActivityRow \.agentActivityChevron/);
@@ -602,6 +606,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.activityImagePreview\.loaded img\s*\{[^}]*height:\s*auto/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
     assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary:last-child \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming:last-child > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus:last-child\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
     assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 36px 36px/s);
@@ -970,6 +975,9 @@ if (args[0] === 'app-server') {
     assert.match(page, /liveProcessPanel/);
     assert.match(page, /turnProcessHeader=document\.createElement\('div'\)/);
     assert.match(page, /function createActivityCluster/);
+    assert.match(page, /function updateTurnReasoningStatus/);
+    assert.match(page, /if\(!turnReasoningStatus\)\{[\s\S]*turnReasoningStatus\.textContent=clean;[\s\S]*turnProcessTimeline\.appendChild\(turnReasoningStatus\)/);
+    assert.doesNotMatch(page, /pendingActivityClusterTitle/);
     assert.match(page, /function isImageViewActivityPresentation/);
     assert.match(page, /image_view_activity/);
     assert.match(page, /function nativeToolImageUrls/);
@@ -1034,6 +1042,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /function steerQueuedPrompt/);
     assert.match(page, /function showNativeSteerOptimistically/);
     assert.match(page, /kind:'steering_user'/);
+    assert.match(page, /steering_browser_comment/);
+    assert.match(page, /function createBrowserCommentDetails/);
     assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><\/div><button id="settingsToggle"/);
     assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
     assert.match(page, /function openArchivedView/);
@@ -1095,6 +1105,76 @@ if (args[0] === 'app-server') {
       completionTitleHelper + '; return completionMessageTitle;',
     )();
     assert.equal(completionMessageTitle('任务完成，耗时 2159.6s'), '已处理 36m');
+    const reasoningStatusHelpers = inlineScript.match(/(function clearTurnReasoningStatus[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
+    assert.ok(reasoningStatusHelpers);
+    const reasoningTimeline = {
+      children: [],
+      appendChild(node) {
+        if (node.parentNode) {
+          const currentIndex = node.parentNode.children.indexOf(node);
+          if (currentIndex >= 0) node.parentNode.children.splice(currentIndex, 1);
+        }
+        node.parentNode = this;
+        node.isConnected = true;
+        this.children.push(node);
+        return node;
+      },
+    };
+    const reasoningDocument = {
+      createElement() {
+        return {
+          className: '',
+          dataset: {},
+          isConnected: false,
+          parentNode: null,
+          remove() {
+            if (!this.parentNode) return;
+            const currentIndex = this.parentNode.children.indexOf(this);
+            if (currentIndex >= 0) this.parentNode.children.splice(currentIndex, 1);
+            this.parentNode = null;
+            this.isConnected = false;
+          },
+        };
+      },
+    };
+    const reasoningApi = new Function('document', 'turnProcessTimeline', `
+      let turnReasoningStatus = null;
+      function shortActivityText(value, max = 100) {
+        const clean = String(value || '').replace(/\\s+/g, ' ').trim();
+        return clean.length > max ? clean.slice(0, max - 3) + '...' : clean;
+      }
+      function ensureTurnProcessHeader() { return turnProcessTimeline; }
+      ${reasoningStatusHelpers}
+      return {
+        clear: clearTurnReasoningStatus,
+        current: () => turnReasoningStatus,
+        move: moveTurnReasoningStatusToEnd,
+        shouldClear: shouldClearTurnReasoningStatus,
+        shouldClearPending: shouldClearPendingActivityReasoning,
+        update: updateTurnReasoningStatus,
+      };
+    `)(reasoningDocument, reasoningTimeline);
+    const firstReasoning = reasoningApi.update('Opening browser skill for execution');
+    const secondReasoning = reasoningApi.update('Refining chat view loading and display logic');
+    assert.strictEqual(secondReasoning, firstReasoning);
+    assert.equal(reasoningTimeline.children.length, 1);
+    assert.equal(secondReasoning.textContent, 'Refining chat view loading and display logic');
+    const laterTool = { isConnected: false, parentNode: null };
+    reasoningTimeline.appendChild(laterTool);
+    reasoningApi.move();
+    assert.strictEqual(reasoningTimeline.children.at(-1), secondReasoning);
+    assert.equal(reasoningApi.shouldClear('assistant', 'commentary'), true);
+    assert.equal(reasoningApi.shouldClear('assistant', 'final_answer'), true);
+    assert.equal(reasoningApi.shouldClear('process', 'turn_aborted'), true);
+    assert.equal(reasoningApi.shouldClear('process', 'task_error'), true);
+    assert.equal(reasoningApi.shouldClear('process', 'context_compacted'), false);
+    assert.equal(reasoningApi.shouldClearPending('assistant', 'commentary'), false);
+    assert.equal(reasoningApi.shouldClearPending('assistant', 'final_answer'), true);
+    assert.equal(reasoningApi.shouldClearPending('user', 'steering_browser_comment', true), false);
+    assert.equal(reasoningApi.shouldClearPending('user', 'message', false), true);
+    reasoningApi.clear();
+    assert.equal(reasoningTimeline.children.length, 1);
+    assert.equal(reasoningApi.current(), null);
     const memoryHelper = inlineScript.match(/(function extractMemoryCitations[\s\S]*?)(?=function memoryCitationTitle)/)?.[1];
     assert.ok(memoryHelper);
     const parseMemoryCitations = new Function(memoryHelper + '; return extractMemoryCitations;')();
@@ -1123,14 +1203,44 @@ if (args[0] === 'app-server') {
     });
     const activityHelpers = inlineScript.match(/(function decodeEmbeddedToolString[\s\S]*?)(?=function toolMessageTitle)/)?.[1];
     assert.ok(activityHelpers);
-    const activityApi = new Function(`${activityHelpers}; return { toolActivityPresentations, activityClusterPresentation };`)();
+    const activityApi = new Function(`${activityHelpers}; return { toolActivityPresentations, activityClusterPresentation, activityClusterMatchesBrowserTarget };`)();
     const parseToolActivity = activityApi.toolActivityPresentations;
-    assert.deepEqual(activityApi.activityClusterPresentation({
-      dataset: { activityTitle: 'Opening browser skill for execution' },
-    }), {
-      icon: 'wrench',
-      text: 'Opening browser skill for execution',
+    const semanticCluster = (activityGroup, streaming = false) => ({
+      dataset: { activityGroup },
+      querySelectorAll(selector) {
+        if (selector === ':scope > .activityClusterItems > .activityBatch') {
+          return streaming ? [{ classList: { contains: (name) => name === 'streaming' } }] : [];
+        }
+        return [];
+      },
     });
+    assert.deepEqual(activityApi.activityClusterPresentation(semanticCluster('loaded_tools')), {
+      icon: 'wrench',
+      text: '已加载工具',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(semanticCluster('files_read')), {
+      icon: 'book-open',
+      text: '已读取文件',
+    });
+    const skillClusterAfterCommentary = {
+      dataset: { activityReasoning: JSON.stringify(['Opening browser skill for execution']) },
+    };
+    assert.equal(
+      activityApi.activityClusterMatchesBrowserTarget(skillClusterAfterCommentary, 'Opening browser skill for execution'),
+      true,
+    );
+    const skillCall = [
+      'exec',
+      'const result = await tools.exec_command({"cmd":"cat /tmp/plugins/browser/skills/control-in-app-browser/SKILL.md"});',
+    ].join('\n');
+    assert.deepEqual(parseToolActivity(skillCall), [{
+      verb: '读取',
+      target: 'Control In App Browser 技能',
+      icon: 'wrench',
+      targetType: 'skill',
+      activityGroup: 'loaded_tools',
+      expandable: false,
+    }]);
     assert.deepEqual(parseToolActivity("exec_command\nsed -n '1,40p' server.mjs\nworkdir=/workspace"), [{
       verb: '已读取',
       target: 'server.mjs',
