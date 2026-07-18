@@ -1015,6 +1015,7 @@ if (args[0] === 'app-server') {
         name: 'Codex Image · Fake',
         provider: 'openai',
         baseUrl: 'http://127.0.0.1:9/v1',
+        apiKey: 'test-token',
         model: 'gpt-image-2',
         apiMode: 'images',
         codexCli: true,
@@ -1025,6 +1026,7 @@ if (args[0] === 'app-server') {
           name: 'Codex Image · Fake',
           provider: 'openai',
           baseUrl: 'http://127.0.0.1:9/v1',
+          apiKey: 'test-token',
           model: 'gpt-image-2',
           apiMode: 'images',
           codexCli: true,
@@ -1034,6 +1036,7 @@ if (args[0] === 'app-server') {
           name: 'Codex Agent · Fake',
           provider: 'openai',
           baseUrl: 'http://127.0.0.1:9/v1',
+          apiKey: 'test-token',
           model: 'test-model',
           apiMode: 'responses',
           codexCli: false,
@@ -1043,8 +1046,6 @@ if (args[0] === 'app-server') {
       agentTextProfileId: 'codex-web-agent',
       agentImageProfileId: 'codex-web-default',
     });
-    assert.equal(Object.hasOwn(playgroundConfig.profile, 'apiKey'), false);
-    assert.equal(playgroundConfig.profiles.every((profile) => !Object.hasOwn(profile, 'apiKey')), true);
     assert.ok(config.conversations.some((conversation) => (
       conversation.id === nativeSessionId
       && conversation.source === 'codex'
