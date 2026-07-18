@@ -646,6 +646,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /--conversation-width:\s*760px/);
     assert.match(uiStyles, /body \.chat > :is\([^}]*\.msg:not\(\.user\):not\(\.inputImage\)[^}]*\.liveProcessPanel[^}]*\)\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\);[^}]*align-self:\s*center/s);
     assert.match(uiStyles, /body \.chat > :is\(\.msg\.user, \.msg\.image\.inputImage\)\s*\{[^}]*margin-right:\s*max\(0px, calc\(\(100% - var\(--conversation-width\)\) \/ 2\)\)/s);
+    assert.match(uiStyles, /body \.composer\s*\{[^}]*border-top:\s*0;[^}]*background:\s*var\(--canvas\)/s);
+    assert.match(uiStyles, /body\[data-theme="light"\] \.composer\s*\{[^}]*background:\s*#ffffff/s);
     assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);

@@ -4337,8 +4337,12 @@ body .chat > :is(.msg.user, .msg.image.inputImage) {
 body .composer {
   flex: 0 0 auto;
   border-top: 0;
-  background: var(--surface);
+  background: var(--canvas);
   padding: 10px var(--conversation-gutter) 14px;
+}
+
+body[data-theme="light"] .composer {
+  background: #ffffff;
 }
 
 .composer > * {
