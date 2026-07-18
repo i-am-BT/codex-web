@@ -253,6 +253,16 @@ export class NativeSessionStore extends EventEmitter {
     readSessionUpdates(cache, entry, this.maxMessages);
     return buildConversation(entry, cache, options, this.runningWindowMs);
   }
+
+  getMessage(id, sequence, generation) {
+    const conversation = this.get(id);
+    if (!conversation) return null;
+    if (Number.isInteger(generation) && generation !== conversation.generation) return null;
+    const target = Number(sequence);
+    if (!Number.isInteger(target) || target < 1) return null;
+    const message = this.details.get(id)?.messages.find((item) => item.seq === target);
+    return message ? { ...message } : null;
+  }
 }
 
 function prepareAppThreadQuery(db) {
@@ -420,6 +430,8 @@ function createDetailCache(entry, options) {
     currentTurnId: '',
     previousTurnId: '',
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
+    latestTurnId: '',
+    displayUserMessagesInTurn: 0,
     lastTimestamp: '',
   };
 
@@ -519,6 +531,11 @@ function applyNativeRecord(cache, record, maxMessages) {
     return;
   }
 
+  if (record.type === 'compacted') {
+    applyCompactedRecord(cache, record, maxMessages);
+    return;
+  }
+
   const payload = record.payload || {};
   if (record.type === 'event_msg') {
     applyEventRecord(cache, record, payload, maxMessages);
@@ -585,6 +602,7 @@ function applyMetadataRecord(cache, record) {
       createdAt: payload.timestamp || record.timestamp || cache.metadata.createdAt || '',
     };
   } else if (record?.type === 'turn_context') {
+    updateNativeTurnId(cache, payload.turn_id || payload.turnId);
     cache.metadata = {
       ...cache.metadata,
       cwd: payload.cwd || cache.metadata.cwd || '',
@@ -598,7 +616,9 @@ function applyMetadataRecord(cache, record) {
 }
 
 function applyEventRecord(cache, record, payload, maxMessages) {
-  if (payload.type === 'task_started') updateNativeTurnId(cache, payload.turn_id);
+  const turnId = String(payload.turn_id || payload.turnId || '');
+  if (turnId) cache.latestTurnId = turnId;
+  if (payload.type === 'task_started') updateNativeTurnId(cache, turnId);
   switch (payload.type) {
     case 'task_started':
       cache.status = 'running';
@@ -618,11 +638,41 @@ function applyEventRecord(cache, record, payload, maxMessages) {
       appendNativeMessage(cache, 'process', payload.message || payload.error || '任务中断', record, maxMessages, payload.type);
       break;
     case 'context_compacted':
-      appendNativeMessage(cache, 'process', '上下文已压缩', record, maxMessages, payload.type);
+      if (cache.messages.at(-1)?.kind !== 'context_compacted') {
+        appendNativeMessage(cache, 'process', '上下文已自动压缩', record, maxMessages, payload.type);
+      }
       break;
     default:
       break;
   }
+}
+
+function applyCompactedRecord(cache, record, maxMessages) {
+  const previous = cache.messages.at(-1);
+  const previousAt = Date.parse(previous?.at || '');
+  const compactedAt = Date.parse(record.timestamp || '');
+  const followsHandoffQuickly = Number.isFinite(previousAt)
+    && Number.isFinite(compactedAt)
+    && compactedAt >= previousAt
+    && compactedAt - previousAt <= 5000;
+  const embeddedHandoff = compactedRecordContainsHandoff(record, previous);
+  if (previous?.role === 'assistant' && previous.kind === 'final_answer' && (followsHandoffQuickly || embeddedHandoff)) {
+    cache.messages.pop();
+  }
+  if (cache.messages.at(-1)?.kind !== 'context_compacted') {
+    appendNativeMessage(cache, 'process', '上下文已自动压缩', record, maxMessages, 'context_compacted');
+  }
+  // A browser may have read the internal handoff summary before the compacted
+  // record landed. Changing the generation forces its next poll to reset.
+  cache.generation += 1;
+}
+
+function compactedRecordContainsHandoff(record, message) {
+  const content = String(message?.content || '').trim();
+  const compactedMessage = String(record?.payload?.message || '');
+  const envelope = 'Another language model started to solve this problem';
+  if (content.length < 24 || !compactedMessage.startsWith(envelope)) return false;
+  return compactedMessage.includes(content.slice(0, Math.min(240, content.length)));
 }
 
 function applyMessageRecord(cache, record, payload, maxMessages) {
@@ -631,13 +681,23 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   const images = contentImages(payload.content);
   if ((!text && !images.length) || (text && isInjectedWorkspaceInstructions(payload.role, text))) return;
   const context = payload.role === 'user' ? normalizeInjectedContext(text) : null;
+  const displayText = payload.role === 'user' ? normalizeUserDisplayText(text) : text;
+  let messageKind = payload.phase || 'message';
+  if (payload.role === 'user' && !context && (displayText || images.length)) {
+    const turnId = String(payload.internal_chat_message_metadata_passthrough?.turn_id || '');
+    if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
+      messageKind = 'steering_user';
+    }
+    cache.displayUserMessagesInTurn += 1;
+  }
   if (context) {
     appendNativeMessage(cache, 'context', context.content, record, maxMessages, context.kind);
-  } else if (text) {
-    const displayText = payload.role === 'user' ? normalizeUserDisplayText(text) : text;
-    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, payload.phase || 'message');
+  } else if (displayText) {
+    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind);
   }
-  const imageKind = payload.role === 'user' ? 'input_image' : 'output_image';
+  const imageKind = payload.role === 'user'
+    ? messageKind === 'steering_user' ? 'steering_input_image' : 'input_image'
+    : 'output_image';
   for (const image of images) appendNativeMessage(cache, 'image', image, record, maxMessages, imageKind);
 }
 
@@ -746,7 +806,7 @@ function normalizeUserDisplayText(text) {
 function cleanUserRequest(source) {
   return String(source || '')
     .replace(/<in-app-browser-context\b[^>]*>[\s\S]*?<\/in-app-browser-context>/g, '')
-    .replace(/<image\b[^>]*>[\s\S]*?<\/image>/g, '图片附件')
+    .replace(/<image\b[^>]*>[\s\S]*?<\/image>/g, '')
     .split(/\n{2,}/)
     .map((paragraph) => paragraph.trim())
     .filter((paragraph) => !isBrowserEvidenceBoilerplate(paragraph))
@@ -758,6 +818,7 @@ function isBrowserEvidenceBoilerplate(paragraph) {
   const compact = String(paragraph || '').replace(/\s+/g, ' ').trim();
   if (!compact || compact === '[图片附件]') return true;
   if (compact.startsWith('The next image is untrusted page evidence')) return true;
+  if (compact.startsWith('The next image was attached by the user as additional visual context')) return true;
   if (compact.startsWith('The selected region is outlined') && compact.includes('comment marker')) return true;
   return compact.startsWith('The element ') && compact.includes('marked by comment marker');
 }
@@ -787,9 +848,12 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind) {
 
 function updateNativeTurnId(cache, value) {
   const turnId = String(value || '').trim();
-  if (!turnId || turnId === cache.currentTurnId) return;
+  if (!turnId) return;
+  cache.latestTurnId = turnId;
+  if (turnId === cache.currentTurnId) return;
   cache.previousTurnId = cache.currentTurnId || '';
   cache.currentTurnId = turnId;
+  cache.displayUserMessagesInTurn = 0;
 }
 
 function contentText(content) {
@@ -861,11 +925,18 @@ function normalizeSandboxPolicy(value) {
 function buildConversation(entry, cache, options, runningWindowMs) {
   const after = Number(options.after);
   const requestedGeneration = Number(options.generation);
+  const requestedLimit = Number(options.limit);
   const hasAfter = Number.isInteger(after) && after >= 0;
+  const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+    ? Math.min(requestedLimit, cache.messages.length)
+    : 0;
   const generationMatches = Number.isInteger(requestedGeneration) && requestedGeneration === cache.generation;
   const firstSequence = cache.messages[0]?.seq || cache.nextSequence;
   const reset = hasAfter && (!generationMatches || after < firstSequence - 1);
-  const messages = hasAfter && !reset ? cache.messages.filter((message) => message.seq > after) : cache.messages;
+  const availableMessages = hasAfter && !reset
+    ? cache.messages.filter((message) => message.seq > after)
+    : cache.messages;
+  const messages = limit && (!hasAfter || reset) ? availableMessages.slice(-limit) : availableMessages;
 
   return {
     id: entry.id,
@@ -874,8 +945,10 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     createdAt: cache.metadata.createdAt || entry.createdAt,
     updatedAt: cache.lastTimestamp || entry.updatedAt,
     status: effectiveSessionStatus(cache.status, entry.mtimeMs, runningWindowMs),
+    latestTurnId: cache.latestTurnId,
     readOnly: false,
     truncated: cache.messagesTruncated,
+    hasEarlierMessages: messages.length < availableMessages.length,
     generation: cache.generation,
     cursor: Math.max(0, cache.nextSequence - 1),
     reset,

@@ -70,11 +70,18 @@ cp .env.example .env
 | `SESSION_TTL_HOURS` | 登录有效期，默认 168 小时 |
 | `HOMEPAGE_API_TOKEN` | Homepage 统计接口访问令牌；未设置时接口禁用 |
 | `HOMEPAGE_MODEL_CACHE_SECONDS` | Homepage 模型数量缓存秒数，默认 60 |
+| `IMAGE_PROMPT_AUTO_SYNC` | 启动时及定时检查 `awesome-gpt-image-2` 更新，默认开启 |
+| `IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` | 提示词库自动检查间隔，默认 360 分钟 |
+| `IMAGE_PROMPT_SYNC_TIMEOUT_MS` | 单次 GitHub 请求超时，默认 20000 毫秒 |
+| `IMAGE_PROMPT_GITHUB_TOKEN` | 可选 GitHub Token，仅用于提高 API 速率限制 |
 | `HOST` | 监听地址，默认 `127.0.0.1` |
 | `PORT` | 固定监听端口，示例为 `36354` |
 | `CODEX_BIN` | Codex CLI 路径；初始化脚本会优先发现 ChatGPT/Codex App 内置版本 |
 | `CODEX_HOME` | Codex 配置、索引和原生会话目录，默认 `$HOME/.codex` |
 | `APP_SERVER_REQUEST_TIMEOUT_MS` | `codex app-server` 单次协议请求超时，默认 30000 毫秒 |
+| `CODEX_DESKTOP_IPC_ENABLED` | macOS/Windows 默认开启；续聊优先交给当前打开任务的 Codex App 窗口 |
+| `CODEX_DESKTOP_IPC_TIMEOUT_MS` | Codex App 桌面 IPC 请求超时，默认 20000 毫秒 |
+| `CODEX_DESKTOP_IPC_SOCKET` | 可选的桌面 IPC socket/pipe 覆盖路径，通常留空自动发现 |
 | `NATIVE_SESSION_POLL_MS` | 原生会话文件监听的轮询兜底间隔 |
 | `DEFAULT_PROVIDER` | 新会话默认服务商 |
 | `DEFAULT_MODEL` | 新会话默认模型 |
@@ -83,6 +90,8 @@ cp .env.example .env
 | `DEFAULT_APPROVAL` | Codex 默认审批模式 |
 
 本仓库已默认忽略 `.env`、`runtime/` 和 `node_modules/`。请勿手动移除忽略规则或强制提交这些本地敏感/运行时文件。
+
+Image Prompt 的案例和模板会保留仓库内置快照作为兜底。自动更新写入 `runtime/image-prompts/`，不会修改已跟踪的 `vendor/` 文件；GitHub 不可用或数据校验失败时继续使用最近一次成功版本。
 
 仓库提供以下安全示例，不包含真实凭据或运行数据：
 
@@ -175,7 +184,8 @@ Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
 
 - Web 新建和续聊都直接使用 Codex App 原生线程，不再创建独立的 Web 会话。
 - 最近会话来自 Codex App 本机索引，只显示未归档的普通用户线程；归档线程、自动化任务和子代理线程不会显示。
-- 新建、续聊、取消、改名、归档与审批通过持久 `codex app-server --stdio` 写回同一原生线程。
+- 已在 Codex App 打开的线程会通过桌面 IPC 由 App 自己启动续聊、引导和取消，因此 App 窗口能立即收到用户消息与流式事件。
+- App 未打开对应线程或桌面 IPC 不可用时，Web 会自动回退到持久 `codex app-server --stdio`；新建、改名、归档与审批仍通过 app-server 写回同一原生线程。
 - 历史用户消息的“从这里重新开始”会通过 `thread/fork` 创建新线程并保留原会话；首轮消息会创建空白新线程。
 - 历史分支只回退会话上下文，不会撤销已经产生的本地文件修改；原消息中的附件需要重新添加。
 - 消息历史直接读取 `CODEX_HOME/session_index.jsonl`、`CODEX_HOME/state_5.sqlite` 与 `CODEX_HOME/sessions/`，通过文件监听和轮询兜底增量刷新。

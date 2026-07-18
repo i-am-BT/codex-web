@@ -1,13 +1,30 @@
 import express from 'express';
 import { spawn } from 'child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
 import { createServer } from 'http';
 import { homedir, networkInterfaces } from 'os';
 import path from 'path';
 import net from 'net';
 import { fileURLToPath } from 'url';
 import { CodexAppServerClient } from './app-server-client.mjs';
+import {
+  CodexDesktopIpcClient,
+  isCodexDesktopIpcUnavailableError,
+} from './desktop-ipc-client.mjs';
+import {
+  AWESOME_GPT_IMAGE_BUILTIN_REVISION,
+  ImagePromptLibrary,
+} from './image-prompt-library.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -16,6 +33,16 @@ const MARKED_BROWSER_FILE = path.join(ROOT, 'node_modules', 'marked', 'lib', 'ma
 const DOMPURIFY_BROWSER_FILE = path.join(ROOT, 'node_modules', 'dompurify', 'dist', 'purify.min.js');
 const LUCIDE_BROWSER_FILE = path.join(ROOT, 'node_modules', 'lucide', 'dist', 'umd', 'lucide.min.js');
 const UI_CSS_FILE = path.join(ROOT, 'ui.css');
+const IMAGE_PROMPT_CSS_FILE = path.join(ROOT, 'image-prompt.css');
+const IMAGE_PROMPT_JS_FILE = path.join(ROOT, 'image-prompt.js');
+const DREAM_SKIN_DIR = path.join(ROOT, 'vendor', 'codex-dream-skin');
+const DREAM_SKIN_SKILL_FILE = path.join(DREAM_SKIN_DIR, 'SKILL.md');
+const DREAM_SKIN_CONCEPT_FILE = path.join(DREAM_SKIN_DIR, 'background-generation-prompts.md');
+const DREAM_SKIN_THEME_FILE = path.join(DREAM_SKIN_DIR, 'concept-themes.json');
+const DREAM_SKIN_THEMES = readDreamSkinThemePresets();
+const DREAM_SKIN_CONCEPTS = readDreamSkinConceptStyles();
+const GPT_IMAGE_PLAYGROUND_DIR = path.join(ROOT, 'vendor', 'gpt-image-playground', 'app');
+const IMAGE_PROMPT_VENDOR_DIR = path.join(ROOT, 'vendor', 'image-prompts');
 
 loadEnv(DEFAULT_ENV_FILE, false);
 
@@ -29,6 +56,7 @@ const PID_FILE = path.join(RUNTIME_DIR, 'server.pid');
 const IMAGE_DIR = path.join(RUNTIME_DIR, 'images');
 const FILE_DIR = path.join(RUNTIME_DIR, 'files');
 const BACKGROUND_DIR = path.join(RUNTIME_DIR, 'backgrounds');
+const IMAGE_PROMPT_CACHE_DIR = path.join(RUNTIME_DIR, 'image-prompts');
 const CODEX_HOME = resolveLocalPath(process.env.CODEX_HOME || path.join(homedir(), '.codex'), homedir());
 const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path.join(CODEX_HOME, 'config.toml'), CODEX_HOME);
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
@@ -58,10 +86,44 @@ const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAG
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
 const NATIVE_SESSION_POLL_MS = Number(process.env.NATIVE_SESSION_POLL_MS || 3000);
 const APP_SERVER_REQUEST_TIMEOUT_MS = Number(process.env.APP_SERVER_REQUEST_TIMEOUT_MS || 30000);
+const CODEX_DESKTOP_IPC_ENABLED = parseBoolean(
+  process.env.CODEX_DESKTOP_IPC_ENABLED,
+  process.platform === 'darwin' || process.platform === 'win32',
+);
+const CODEX_DESKTOP_IPC_SOCKET = String(process.env.CODEX_DESKTOP_IPC_SOCKET || '').trim();
+const CODEX_DESKTOP_IPC_TIMEOUT_MS = Number(process.env.CODEX_DESKTOP_IPC_TIMEOUT_MS || 20000);
 const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
 const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
 const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
+const IMAGE_PROMPT_AUTO_SYNC = parseBoolean(process.env.IMAGE_PROMPT_AUTO_SYNC, true);
+const imagePromptSyncIntervalMinutes = Number(process.env.IMAGE_PROMPT_SYNC_INTERVAL_MINUTES || 360);
+const IMAGE_PROMPT_SYNC_INTERVAL_MS = (
+  Number.isFinite(imagePromptSyncIntervalMinutes) && imagePromptSyncIntervalMinutes > 0
+    ? imagePromptSyncIntervalMinutes
+    : 360
+) * 60 * 1000;
+const imagePromptSyncTimeoutMs = Number(process.env.IMAGE_PROMPT_SYNC_TIMEOUT_MS || 20000);
+const IMAGE_PROMPT_SYNC_TIMEOUT_MS = Number.isFinite(imagePromptSyncTimeoutMs) && imagePromptSyncTimeoutMs > 0
+  ? imagePromptSyncTimeoutMs
+  : 20000;
 const NATIVE_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TOOL_IMAGE_MAX_BYTES = 25 * 1024 * 1024;
+const TOOL_IMAGE_TYPES = new Map([
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.webp', 'image/webp'],
+  ['.gif', 'image/gif'],
+  ['.avif', 'image/avif'],
+]);
+const DESKTOP_PENDING_PREFIX = 'desktop:';
+const DESKTOP_INTERACTIVE_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+  'item/tool/requestUserInput',
+  'mcpServer/elicitation/request',
+]);
 
 if (!webPassword) {
   console.error(`CODEX_WEB_PASSWORD is required in ${ENV_FILE}`);
@@ -72,6 +134,17 @@ mkdirSync(RUNTIME_DIR, { recursive: true });
 mkdirSync(IMAGE_DIR, { recursive: true });
 mkdirSync(FILE_DIR, { recursive: true });
 mkdirSync(BACKGROUND_DIR, { recursive: true });
+
+const imagePromptLibrary = new ImagePromptLibrary({
+  cacheDir: IMAGE_PROMPT_CACHE_DIR,
+  casesFile: path.join(IMAGE_PROMPT_VENDOR_DIR, 'awesome-gpt-image-2-cases.json'),
+  stylesFile: path.join(IMAGE_PROMPT_VENDOR_DIR, 'awesome-gpt-image-2-style-library.json'),
+  builtInRevision: AWESOME_GPT_IMAGE_BUILTIN_REVISION,
+  githubToken: process.env.IMAGE_PROMPT_GITHUB_TOKEN || '',
+  autoSync: IMAGE_PROMPT_AUTO_SYNC,
+  intervalMs: IMAGE_PROMPT_SYNC_INTERVAL_MS,
+  requestTimeoutMs: IMAGE_PROMPT_SYNC_TIMEOUT_MS,
+});
 
 const app = express();
 const sessions = loadSessions();
@@ -91,14 +164,24 @@ const appServerClient = new CodexAppServerClient({
   clientVersion: '1.0.0',
   requestTimeoutMs: APP_SERVER_REQUEST_TIMEOUT_MS,
 });
+const desktopIpcClient = new CodexDesktopIpcClient({
+  enabled: CODEX_DESKTOP_IPC_ENABLED,
+  socketPath: CODEX_DESKTOP_IPC_SOCKET || undefined,
+  clientType: 'codex-web',
+  requestTimeoutMs: CODEX_DESKTOP_IPC_TIMEOUT_MS,
+});
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
 const pendingNativeRequests = new Map();
+const desktopThreadStates = new Map();
+const desktopResolvedRequestKeys = new Map();
+const desktopSnapshotRequestTimes = new Map();
+const desktopSnapshotRequests = new Map();
 let activeProcess = null;
 let activeConversationId = '';
 let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
 
-nativeSessions.on('change', broadcastNativeSessionChange);
+nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
 appServerClient.on('notification', handleAppServerNotification);
 appServerClient.on('request', handleAppServerRequest);
@@ -109,20 +192,17 @@ appServerClient.on('stderr', (content) => {
 });
 appServerClient.on('protocolError', (error) => console.error(error.message));
 appServerClient.on('exit', (error) => {
-  for (const [threadId, turn] of activeNativeTurns) {
-    broadcastNativeRuntime({
-      type: 'turn',
-      threadId,
-      turnId: turn.turnId || '',
-      status: 'interrupted',
-      updatedAt: new Date().toISOString(),
-    });
-  }
-  activeNativeTurns.clear();
-  clearPendingNativeRequests(error.message);
+  clearAppServerNativeTurns(error.message);
+  clearAppServerPendingRequests(error.message);
   broadcastNativeRuntime({ type: 'disconnected', error: error.message });
   nativeSessions.scheduleRefresh();
 });
+desktopIpcClient.on('disconnect', (error) => {
+  clearDesktopThreadStates(error?.message || 'Codex Desktop IPC 已断开');
+  const text = String(error?.message || '').trim();
+  if (text) console.warn(`Codex Desktop IPC: ${text}`);
+});
+desktopIpcClient.on('broadcast', handleDesktopIpcBroadcast);
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '25mb' }));
@@ -177,6 +257,14 @@ app.get('/vendor/lucide.js', (_req, res) => {
 
 app.get('/ui.css', (_req, res) => {
   res.type('text/css').sendFile(UI_CSS_FILE);
+});
+
+app.get('/image-prompt.css', (_req, res) => {
+  res.type('text/css').sendFile(IMAGE_PROMPT_CSS_FILE);
+});
+
+app.get('/image-prompt.js', (_req, res) => {
+  res.type('text/javascript').sendFile(IMAGE_PROMPT_JS_FILE);
 });
 
 app.post('/api/login', (req, res) => {
@@ -235,6 +323,16 @@ app.get('/api/session', (req, res) => {
 app.use('/assets/images', requireAuth, express.static(IMAGE_DIR, { fallthrough: false }));
 app.use('/assets/files', requireAuth, express.static(FILE_DIR, { fallthrough: false }));
 app.use('/assets/backgrounds', requireAuth, express.static(BACKGROUND_DIR, { fallthrough: false }));
+app.use('/assets/dream-skin', requireAuth, express.static(DREAM_SKIN_DIR, { fallthrough: false }));
+app.use('/playground', requireAuth, express.static(GPT_IMAGE_PLAYGROUND_DIR, {
+  fallthrough: false,
+  setHeaders: (res, filePath) => {
+    const immutable = filePath.includes(`${path.sep}assets${path.sep}`);
+    res.setHeader('Cache-Control', immutable
+      ? 'private, max-age=31536000, immutable'
+      : 'private, no-store');
+  },
+}));
 
 app.post('/api/uploads/image', requireAuth, (req, res) => {
   try {
@@ -275,6 +373,14 @@ app.post('/api/appearance/background', requireAuth, (req, res) => {
   }
 });
 
+app.post('/api/dream-skin/prompt', requireAuth, (req, res) => {
+  try {
+    res.json({ ok: true, ...buildDreamSkinTask(req.body || {}) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.delete('/api/appearance/background', requireAuth, (req, res) => {
   try {
     const appearance = deleteCustomBackground(req.body?.value);
@@ -298,11 +404,82 @@ app.get('/api/config', requireAuth, (req, res) => {
     providers: readProviders(),
     conversations: conversationSummaries(),
     appearance: readAppearance(),
+    dreamSkinConcepts: DREAM_SKIN_CONCEPTS.map(({ prompt: _prompt, ...concept }) => concept),
     capabilities: {
       manageProviders: CODEX_CONFIG_WRITABLE,
       forceFullAccess: FORCE_FULL_ACCESS,
     },
   });
+});
+
+app.get('/api/playground-config', requireAuth, (_req, res) => {
+  const defaults = readCodexDefaults();
+  const providers = readProviderDetails();
+  const provider = providers.find((item) => item.name === (defaults.provider || DEFAULT_PROVIDER)) || providers[0];
+  if (!provider) return res.status(404).json({ error: 'Codex 服务商配置不存在' });
+
+  const imageProfile = {
+    id: 'codex-web-default',
+    name: `Codex Image · ${provider.displayName}`,
+    provider: 'openai',
+    baseUrl: provider.baseUrl,
+    apiKey: providerCredential(provider),
+    model: 'gpt-image-2',
+    apiMode: 'images',
+    codexCli: true,
+  };
+  const agentProfile = provider.wireApi === 'responses'
+    ? {
+      id: 'codex-web-agent',
+      name: `Codex Agent · ${provider.displayName}`,
+      provider: 'openai',
+      baseUrl: provider.baseUrl,
+      apiKey: providerCredential(provider),
+      model: defaults.model || DEFAULT_MODEL,
+      apiMode: 'responses',
+      codexCli: false,
+    }
+    : null;
+
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({
+    profile: imageProfile,
+    profiles: agentProfile ? [imageProfile, agentProfile] : [imageProfile],
+    ...(agentProfile ? {
+      agentApiConfigMode: 'hybrid',
+      agentTextProfileId: agentProfile.id,
+      agentImageProfileId: imageProfile.id,
+    } : {}),
+  });
+});
+
+app.get('/api/image-prompts/status', requireAuth, (_req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json(imagePromptLibrary.getStatus());
+});
+
+app.post('/api/image-prompts/sync', requireAuth, async (_req, res) => {
+  const previousVersion = imagePromptLibrary.getStatus().version;
+  try {
+    const status = await imagePromptLibrary.sync({ reason: 'manual' });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ ok: true, changed: status.version !== previousVersion, status });
+  } catch (err) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.status(502).json({
+      error: `提示词库更新失败: ${err.message}`,
+      status: imagePromptLibrary.getStatus(),
+    });
+  }
+});
+
+app.get('/api/image-prompts', requireAuth, (_req, res) => {
+  try {
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(imagePromptLibrary.getLibrary());
+  } catch (err) {
+    res.status(500).json({ error: `读取提示词库失败: ${err.message}` });
+  }
 });
 
 app.get('/api/native-sessions', requireAuth, (_req, res) => {
@@ -311,14 +488,65 @@ app.get('/api/native-sessions', requireAuth, (_req, res) => {
 
 app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
   try {
+    const limit = positiveInteger(req.query.limit);
+    const externalizeImages = Boolean(limit) || req.query.images === 'external';
     const conversation = nativeSessions.get(cleanNativeThreadId(req.params.id), {
       after: req.query.after,
       generation: req.query.generation,
+      limit,
     });
     if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
-    res.json({ conversation: decorateNativeConversation(conversation) });
+    requestDesktopThreadSnapshot(conversation.id);
+    res.json({ conversation: decorateNativeConversation(conversation, { externalizeImages }) });
   } catch (err) {
     res.status(500).json({ error: `读取 Codex App 会话失败: ${err.message}` });
+  }
+});
+
+app.get('/api/native-sessions/:id/images/:seq', requireAuth, (req, res) => {
+  try {
+    const threadId = cleanNativeThreadId(req.params.id);
+    const sequence = positiveInteger(req.params.seq);
+    const generation = positiveInteger(req.query.generation);
+    if (!threadId || !sequence) return res.status(400).json({ error: 'Codex App 图片参数无效' });
+    const message = nativeSessions.getMessage(threadId, sequence, generation || undefined);
+    const image = decodeNativeImage(message);
+    if (!image) return res.status(404).json({ error: 'Codex App 图片不存在' });
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.type(image.type).send(image.data);
+  } catch (err) {
+    res.status(500).json({ error: `读取 Codex App 图片失败: ${err.message}` });
+  }
+});
+
+app.get('/api/native-sessions/:id/tool-images/:seq/:index', requireAuth, (req, res) => {
+  try {
+    const threadId = cleanNativeThreadId(req.params.id);
+    const sequence = Number(req.params.seq);
+    const imageIndex = Number(req.params.index);
+    if (!threadId || !Number.isInteger(sequence) || sequence < 1 || !Number.isInteger(imageIndex) || imageIndex < 1) {
+      return res.status(400).json({ error: '工具图片参数无效' });
+    }
+
+    const conversation = nativeSessions.get(threadId);
+    if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    const requestedGeneration = Number(req.query.generation);
+    if (
+      Number.isInteger(requestedGeneration)
+      && requestedGeneration > 0
+      && requestedGeneration !== conversation.generation
+    ) {
+      return res.status(404).json({ error: '工具图片记录已更新' });
+    }
+
+    const message = conversation.messages.find((item) => item.seq === sequence);
+    const imagePath = extractNativeToolImagePaths(message)[imageIndex - 1];
+    const image = readNativeToolImage(imagePath, conversation.metadata?.cwd);
+    if (!image) return res.status(404).json({ error: '工具图片不存在或不受支持' });
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.type(image.type).send(image.data);
+  } catch (err) {
+    res.status(500).json({ error: `读取工具图片失败: ${err.message}` });
   }
 });
 
@@ -339,19 +567,20 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
     if (!source) return res.status(404).json({ error: 'Codex App 会话不存在' });
     const target = source.messages.find((message) => (
       message.seq === messageSeq
-      && message.role === 'user'
+      && ['user', 'assistant'].includes(message.role)
       && message.turnId
     ));
-    if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户消息创建分支' });
-    if (!target.previousTurnId && source.truncated) {
+    if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户或助手消息创建分支' });
+    const forkedThroughTurnId = target.role === 'assistant' ? target.turnId : target.previousTurnId;
+    if (target.role === 'user' && !forkedThroughTurnId && source.truncated) {
       return res.status(409).json({ error: '会话历史已截断，无法确定这条消息之前的 turn' });
     }
 
     const settings = parseNativeThreadSettings(req.body || {});
-    const result = target.previousTurnId
+    const result = forkedThroughTurnId
       ? await appServerClient.request('thread/fork', compactObject({
         threadId,
-        lastTurnId: target.previousTurnId,
+        lastTurnId: forkedThroughTurnId,
         cwd: settings.cwd,
         model: settings.model,
         modelProvider: settings.provider,
@@ -379,8 +608,8 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       ok: true,
       threadId: forkedThreadId,
       sourceThreadId: threadId,
-      forkedThroughTurnId: target.previousTurnId || '',
-      draft: extractUserDraft(target.content),
+      forkedThroughTurnId: forkedThroughTurnId || '',
+      draft: target.role === 'user' ? extractUserDraft(target.content) : '',
       conversation,
     });
   } catch (err) {
@@ -423,16 +652,7 @@ app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
 
   try {
     const turn = parseNativeTurnPayload(req.body || {});
-    await appServerClient.request('thread/resume', compactObject({
-      threadId,
-      cwd: turn.cwd,
-      model: turn.model,
-      modelProvider: turn.provider,
-      sandbox: turn.sandbox,
-      approvalPolicy: turn.approval,
-      excludeTurns: true,
-    }));
-    const turnStarted = await startNativeTurn(threadId, turn);
+    const turnStarted = await continueNativeTurn(threadId, turn);
     nativeSessions.scheduleRefresh();
     res.status(202).json({ ok: true, threadId, turnId: turnStarted.turnId });
   } catch (err) {
@@ -446,20 +666,11 @@ app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
 
   try {
     const steer = parseNativeSteerPayload(req.body || {});
-    let expectedTurnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
-    if (!expectedTurnId) {
-      const resumed = await appServerClient.request('thread/resume', { threadId });
-      expectedTurnId = findInProgressTurnId(resumed?.thread);
-    }
-    if (!expectedTurnId) return res.status(409).json({ error: '该会话没有可引导的运行中任务' });
-
-    const result = await appServerClient.request('turn/steer', {
-      threadId,
-      expectedTurnId,
-      input: steer.input,
-    });
+    const expectedTurnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
+    const result = await steerNativeTurn(threadId, steer, expectedTurnId);
     const turnId = String(result?.turnId || expectedTurnId);
-    setNativeTurnState(threadId, { turnId, status: 'running' });
+    if (!turnId) return res.status(409).json({ error: '该会话没有可引导的运行中任务' });
+    setNativeTurnState(threadId, { turnId, status: 'running', transport: result.transport });
     nativeSessions.scheduleRefresh();
     res.status(202).json({ ok: true, threadId, turnId });
   } catch (err) {
@@ -470,16 +681,21 @@ app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
 app.post('/api/native-sessions/:id/interrupt', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+  const requestedTurnId = String(req.body?.turnId || '').trim();
+  const currentTurnId = currentNativeTurnId(threadId);
+  if (!requestedTurnId || !currentTurnId) {
+    return res.status(409).json({ error: '当前任务状态已变化，请刷新后重试' });
+  }
+  if (requestedTurnId !== currentTurnId) {
+    return res.status(409).json({ error: '页面中的任务已过期，未取消当前新任务' });
+  }
 
   try {
-    let turnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
-    if (!turnId) {
-      const resumed = await appServerClient.request('thread/resume', { threadId });
-      turnId = findInProgressTurnId(resumed?.thread);
-    }
+    let turnId = requestedTurnId;
+    const result = await interruptNativeTurn(threadId, turnId);
+    turnId = String(result?.interruptedTurnId || turnId);
     if (!turnId) return res.status(409).json({ error: '该会话没有可取消的任务' });
-    await appServerClient.request('turn/interrupt', { threadId, turnId });
-    setNativeTurnState(threadId, { turnId, status: 'interrupted' });
+    setNativeTurnState(threadId, { turnId, status: 'interrupted', transport: result.transport });
     res.json({ ok: true, threadId, turnId });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `取消 Codex App 任务失败: ${err.message}` });
@@ -507,14 +723,59 @@ app.delete('/api/native-sessions/:id', requireAuth, async (req, res) => {
   if (activeNativeTurns.get(threadId)?.status === 'running') {
     return res.status(409).json({ error: '会话任务正在运行，请先取消' });
   }
+  const threadCwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
 
   try {
     await appServerClient.request('thread/archive', { threadId });
+    await notifyDesktopThreadArchived(threadId, threadCwd);
     nativeSessions.scheduleRefresh();
     res.json({ ok: true, id: threadId });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `归档 Codex App 会话失败: ${err.message}` });
   }
+});
+
+app.post('/api/native-projects/archive', requireAuth, async (req, res) => {
+  const projectPath = normalizeNativeProjectPath(req.body?.cwd);
+  if (!projectPath) return res.status(400).json({ error: '项目路径无效' });
+
+  const targets = nativeSessionSummaries().filter((session) => (
+    normalizeNativeProjectPath(session.cwd) === projectPath
+  ));
+  if (!targets.length) return res.status(404).json({ error: '该项目没有可归档任务' });
+
+  const running = targets.filter((session) => {
+    const active = activeNativeTurns.get(session.id);
+    return active ? active.status === 'running' : session.status === 'running';
+  });
+  if (running.length) {
+    return res.status(409).json({
+      error: `项目中有 ${running.length} 个任务正在运行，请先停止后再归档`,
+      running: running.map((session) => session.id),
+    });
+  }
+
+  const archived = [];
+  const failed = [];
+  for (const session of targets) {
+    try {
+      await appServerClient.request('thread/archive', { threadId: session.id });
+      await notifyDesktopThreadArchived(session.id, session.cwd);
+      archived.push(session.id);
+    } catch (err) {
+      failed.push({ id: session.id, error: err.message });
+    }
+  }
+  nativeSessions.scheduleRefresh();
+
+  if (failed.length) {
+    return res.status(502).json({
+      error: `已归档 ${archived.length} 个任务，${failed.length} 个失败`,
+      archived,
+      failed,
+    });
+  }
+  res.json({ ok: true, cwd: projectPath, archived });
 });
 
 app.get('/api/native-requests', requireAuth, (_req, res) => {
@@ -528,10 +789,14 @@ app.post('/api/native-requests/:id/respond', requireAuth, async (req, res) => {
 
   try {
     const result = buildNativeRequestResponse(pending, req.body || {});
-    pending.respond(result);
+    await respondToNativeRequest(pending, result);
     pendingNativeRequests.delete(key);
+    if (pending.transport === 'desktop-ipc') {
+      desktopResolvedRequestKeys.set(key, Date.now() + 30000);
+      removeDesktopRequestFromState(pending.threadId, pending.requestId);
+    }
     broadcastNativeRequest({ type: 'resolved', id: key, threadId: pending.threadId });
-    if (req.body?.decision === 'cancel' && pending.threadId && pending.turnId) {
+    if (pending.transport !== 'desktop-ipc' && req.body?.decision === 'cancel' && pending.threadId && pending.turnId) {
       appServerClient.request('turn/interrupt', {
         threadId: pending.threadId,
         turnId: pending.turnId,
@@ -539,7 +804,7 @@ app.post('/api/native-requests/:id/respond', requireAuth, async (req, res) => {
     }
     res.json({ ok: true, id: key });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(pending.transport === 'desktop-ipc' ? 502 : 400).json({ error: err.message });
   }
 });
 
@@ -876,6 +1141,7 @@ server.listen(listenPort, HOST, () => {
   writeFileSync(path.join(RUNTIME_DIR, 'port'), String(actual));
   writeFileSync(PID_FILE, String(process.pid));
   console.log(`${APP_NAME}: http://${getLanAddress()}:${actual}`);
+  imagePromptLibrary.start();
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -885,8 +1151,10 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 function shutdown(signal) {
   console.log(`${APP_NAME}: stopping on ${signal}`);
   if (activeProcess) terminateProcess(activeProcess);
+  desktopIpcClient.close();
   appServerClient.close();
   nativeSessions.stop();
+  imagePromptLibrary.stop();
   for (const client of sessionEventClients) client.end();
   sessionEventClients.clear();
   server.close(() => {
@@ -1089,12 +1357,14 @@ function saveUploadedBackground(body) {
   const filename = `background-${Date.now()}-${randomBytes(6).toString('hex')}.${ext}`;
   const filePath = path.join(BACKGROUND_DIR, filename);
   writeFileSync(filePath, buffer, { mode: 0o600 });
+  const themeId = cleanDreamSkinThemeId(body.themeId);
   return {
     name: cleanBackgroundName(body.name || 'background'),
     type,
     size: buffer.length,
     value: `bg:${filename}`,
     url: `/assets/backgrounds/${filename}`,
+    ...(themeId ? { themeId } : {}),
   };
 }
 
@@ -1119,11 +1389,125 @@ function deleteCustomBackground(value) {
   return saveAppearance({ chatBackground, customBackgrounds });
 }
 
+function readDreamSkinThemePresets() {
+  if (!existsSync(DREAM_SKIN_THEME_FILE)) return {};
+  try {
+    const payload = JSON.parse(readFileSync(DREAM_SKIN_THEME_FILE, 'utf8'));
+    if (payload?.schemaVersion !== 1 || !payload.themes || Array.isArray(payload.themes)) return {};
+    const requiredColors = ['background', 'panel', 'panelAlt', 'accent', 'accentAlt', 'secondary', 'highlight', 'text', 'muted', 'line'];
+    return Object.fromEntries(Object.entries(payload.themes).flatMap(([id, theme]) => {
+      if (!/^skin-0[1-8]$/.test(id) || !theme || typeof theme !== 'object') return [];
+      const light = theme.colors?.light;
+      const dark = theme.colors?.dark;
+      if (!requiredColors.every((key) => typeof light?.[key] === 'string' && typeof dark?.[key] === 'string')) return [];
+      const focusX = Number(theme.art?.focusX);
+      const focusY = Number(theme.art?.focusY);
+      return [[id, {
+        art: {
+          focusX: Number.isFinite(focusX) ? Math.min(1, Math.max(0, focusX)) : 0.72,
+          focusY: Number.isFinite(focusY) ? Math.min(1, Math.max(0, focusY)) : 0.45,
+          safeArea: ['left', 'right', 'center', 'none'].includes(theme.art?.safeArea) ? theme.art.safeArea : 'left',
+          taskMode: ['ambient', 'banner', 'off'].includes(theme.art?.taskMode) ? theme.art.taskMode : 'ambient',
+        },
+        colors: { light, dark },
+      }]];
+    }));
+  } catch {
+    return {};
+  }
+}
+
+function readDreamSkinConceptStyles() {
+  if (!existsSync(DREAM_SKIN_CONCEPT_FILE)) return [];
+  const source = readFileSync(DREAM_SKIN_CONCEPT_FILE, 'utf8');
+  const headings = [...source.matchAll(/^## (skin-0[1-8])｜([^\n]+)$/gm)];
+  const metadata = {
+    'skin-01': { mode: 'fictional-adult', swatches: ['#f8eee9', '#efa9bd', '#945268'] },
+    'skin-02': { mode: 'fictional-adult', swatches: ['#f5ead0', '#d53b2f', '#c99a32'] },
+    'skin-03': { mode: 'no-person', swatches: ['#f4f2ef', '#ec5b51', '#9e1f2f'] },
+    'skin-04': { mode: 'fictional-adult', swatches: ['#f0ecdf', '#a7b6a0', '#64756b'] },
+    'skin-05': { mode: 'fictional-adult', swatches: ['#f4eddb', '#37a99a', '#efbf3d'] },
+    'skin-06': { mode: 'fictional-adult', swatches: ['#25266d', '#8b4fd6', '#ee75bb'] },
+    'skin-07': { mode: 'fictional-adult', swatches: ['#54d8d1', '#4b9fe8', '#ef829f'] },
+    'skin-08': { mode: 'fictional-adult', swatches: ['#111111', '#6d5130', '#d8b56a'] },
+  };
+  return headings.map((heading, index) => {
+    const body = source.slice(heading.index + heading[0].length, headings[index + 1]?.index ?? source.length);
+    const summary = body.match(/^视觉拆解：(.+)$/m)?.[1]?.trim() || '';
+    const prompt = body.match(/```text\r?\n([\s\S]*?)\r?\n```/)?.[1]?.trim() || '';
+    const id = heading[1];
+    const wallpaperFile = path.join(DREAM_SKIN_DIR, 'wallpapers', `${id}.jpg`);
+    return {
+      id,
+      name: heading[2].trim(),
+      summary,
+      prompt,
+      wallpaper: existsSync(wallpaperFile) ? `/assets/dream-skin/wallpapers/${id}.jpg` : '',
+      theme: DREAM_SKIN_THEMES[id] || null,
+      ...(metadata[id] || { mode: 'no-person', swatches: ['#777777', '#999999', '#bbbbbb'] }),
+    };
+  }).filter((concept) => concept.prompt);
+}
+
+function buildDreamSkinTask(body) {
+  if (!existsSync(DREAM_SKIN_SKILL_FILE)) throw new Error('Dream Skin 技能文件不存在');
+  const concept = DREAM_SKIN_CONCEPTS.find((item) => item.id === String(body.conceptId || '')) || null;
+  const description = String(body.description || '')
+    .trim()
+    .replace(/\r\n?/g, '\n')
+    .slice(0, 2000) || (concept ? '没有额外补充，严格按所选概念风格生成。' : '生成一张安静、高级、适合长时间使用的 Codex Web 背景。');
+  const mode = ['no-person', 'fictional-adult', 'reference'].includes(body.mode)
+    ? body.mode
+    : concept?.mode || 'no-person';
+  const referenceCount = Math.min(3, Math.max(0, Number(body.referenceCount) || 0));
+  if (mode === 'reference' && !referenceCount) throw new Error('参考图模式至少需要添加 1 张图片');
+  const skill = path.relative(ROOT, DREAM_SKIN_SKILL_FILE).split(path.sep).join('/');
+  const modeInstruction = {
+    'no-person': '无人物：只生成连续环境、抽象艺术、建筑、自然或材质背景。',
+    'fictional-adult': '原创人物：最多一位明确成年的原创虚构人物，不模仿任何真实人物或受版权保护角色。',
+    reference: '参考图：严格按技能中的 Image 1/2/3 合约使用附件；参考图不是擦除 UI 的修图底稿。',
+  }[mode];
+  const attachmentInstruction = referenceCount
+    ? `本任务附带 ${referenceCount} 张参考图，编号按实际附件顺序排列。`
+    : '本任务没有参考图，不要自行推断或寻找人物身份。';
+  const prompt = [
+    'Dream Skin 背景生成任务',
+    '',
+    `先完整读取并遵循项目内置技能：${skill}`,
+    modeInstruction,
+    attachmentInstruction,
+    ...(concept ? [
+      '',
+      `选用概念风格：${concept.id} · ${concept.name}`,
+      `视觉拆解：${concept.summary}`,
+      '这是完整 Dream Skin 的 artwork 层；Codex Web 会使用相同概念 ID 的真实 UI 色板、面板和透明度主题。',
+      '参考效果图里的窗口与控件只用于判断整体氛围，严禁把侧栏、卡片、按钮、输入框或文字画进图片。',
+      '',
+      '完整概念提示词：',
+      concept.prompt,
+    ] : []),
+    '',
+    concept ? '用户补充需求：' : '用户视觉需求：',
+    description,
+    '',
+    '必须实际调用 $imagegen 生成最终位图，不要只返回提示词或教程。',
+    '返回一张 2560x1440、16:9、无 UI、无文字、可直接作为 Codex Web 背景的最终图片。',
+    '不要修改项目代码、配置或现有图片。',
+  ].join('\n');
+  return { prompt, cwd: ROOT, skill, mode, conceptId: concept?.id || '' };
+}
+
 function cleanChatBackground(value, customBackgrounds = []) {
   const text = String(value || '');
-  if (['default', 'plain', 'paper', 'grid'].includes(text)) return text;
+  if (text === 'default') return text;
+  if (DREAM_SKIN_CONCEPTS.some((concept) => concept.wallpaper && text === `dream:${concept.id}`)) return text;
   if (customBackgrounds.some((item) => item.value === text)) return text;
   return 'default';
+}
+
+function cleanDreamSkinThemeId(value) {
+  const id = String(value || '');
+  return DREAM_SKIN_CONCEPTS.some((concept) => concept.id === id && concept.theme) ? id : '';
 }
 
 function isBackgroundAssetUrl(value) {
@@ -1148,10 +1532,12 @@ function normalizeCustomBackgrounds(items) {
     const value = backgroundValueFromUrl(url);
     if (!value || seen.has(value)) continue;
     seen.add(value);
+    const themeId = cleanDreamSkinThemeId(item?.themeId);
     list.push({
       name: cleanBackgroundName(item?.name),
       value,
       url,
+      ...(themeId ? { themeId } : {}),
     });
   }
   return list.slice(-20);
@@ -1367,12 +1753,235 @@ function broadcastNativeSessionChange(change) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'sessions', change);
 }
 
+function handleNativeSessionChange(change) {
+  for (const threadId of change.changedIds || []) {
+    const active = activeNativeTurns.get(threadId);
+    if (active?.transport !== 'desktop-ipc' || active.status !== 'running') continue;
+    const conversation = nativeSessions.get(threadId);
+    if (!conversation || conversation.status === 'running') continue;
+    activeNativeTurns.delete(threadId);
+    broadcastNativeRuntime({
+      type: 'turn-cleared',
+      threadId,
+      turnId: active.turnId,
+      status: conversation.status,
+    });
+  }
+  broadcastNativeSessionChange(change);
+}
+
 function broadcastNativeRuntime(event) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'native-runtime', event);
 }
 
 function broadcastNativeRequest(event) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'native-request', event);
+}
+
+function handleDesktopIpcBroadcast(message) {
+  if (message?.method !== 'thread-stream-state-changed') return;
+  const params = message.params || {};
+  const change = params.change || {};
+  const threadId = cleanNativeThreadId(params.conversationId);
+  const ownerClientId = String(message.sourceClientId || '');
+  if (!threadId || !ownerClientId) return;
+
+  if (change.type === 'snapshot') {
+    const state = {
+      ownerClientId,
+      revision: Number(change.revision) || 0,
+      requests: normalizeDesktopRequests(change.conversationState?.requests),
+    };
+    desktopThreadStates.set(threadId, state);
+    syncDesktopPendingRequests(threadId, state);
+    return;
+  }
+
+  if (change.type !== 'patches') return;
+  const state = desktopThreadStates.get(threadId);
+  if (
+    !state
+    || state.ownerClientId !== ownerClientId
+    || state.revision !== Number(change.baseRevision)
+  ) {
+    requestDesktopThreadSnapshot(threadId, { force: true });
+    return;
+  }
+  const requests = applyDesktopRequestPatches(state.requests, change.patches);
+  if (requests === null) {
+    requestDesktopThreadSnapshot(threadId, { force: true });
+    return;
+  }
+  state.requests = requests;
+  state.revision = Number(change.revision) || state.revision;
+  syncDesktopPendingRequests(threadId, state);
+}
+
+function normalizeDesktopRequests(requests) {
+  return Array.isArray(requests)
+    ? requests.filter((request) => request && typeof request === 'object').slice(0, 100)
+    : [];
+}
+
+function applyDesktopRequestPatches(requests, patches) {
+  if (!Array.isArray(patches)) return null;
+  const state = { requests: normalizeDesktopRequests(requests) };
+  let requestPatchCount = 0;
+  for (const patch of patches) {
+    const patchPath = Array.isArray(patch?.path) ? patch.path : [];
+    if (!patchPath.length) {
+      if (patch?.op === 'remove') state.requests = [];
+      else if (patch?.value && typeof patch.value === 'object') {
+        state.requests = normalizeDesktopRequests(patch.value.requests);
+      }
+      continue;
+    }
+    if (patchPath[0] !== 'requests' || patchPath.length > 32) continue;
+    requestPatchCount += 1;
+    if (requestPatchCount > 2000) return null;
+    applyDesktopRequestPatch(state, patch, patchPath);
+  }
+  return normalizeDesktopRequests(state.requests);
+}
+
+function applyDesktopRequestPatch(root, patch, patchPath) {
+  let target = root;
+  for (const segment of patchPath.slice(0, -1)) {
+    if (!target || typeof target !== 'object') return;
+    target = target[segment];
+  }
+  if (!target || typeof target !== 'object') return;
+  const key = patchPath.at(-1);
+  if (Array.isArray(target)) {
+    const index = key === '-' ? target.length : Number(key);
+    if (!Number.isInteger(index) || index < 0 || index > target.length) return;
+    if (patch.op === 'remove') target.splice(index, 1);
+    else if (patch.op === 'add') target.splice(index, 0, patch.value);
+    else if (patch.op === 'replace' && index < target.length) target[index] = patch.value;
+    return;
+  }
+  if (patch.op === 'remove') delete target[key];
+  else if (patch.op === 'add' || patch.op === 'replace') target[key] = patch.value;
+}
+
+function desktopPendingKey(threadId, requestId) {
+  return `${DESKTOP_PENDING_PREFIX}${threadId}:${encodeURIComponent(requestId)}`;
+}
+
+function syncDesktopPendingRequests(threadId, state) {
+  const now = Date.now();
+  for (const [key, expiresAt] of desktopResolvedRequestKeys) {
+    if (expiresAt <= now) desktopResolvedRequestKeys.delete(key);
+  }
+
+  const seen = new Set();
+  for (const request of state.requests) {
+    const requestId = String(request.id ?? '');
+    const method = String(request.method || '');
+    if (!requestId || !DESKTOP_INTERACTIVE_METHODS.has(method)) continue;
+    const key = desktopPendingKey(threadId, requestId);
+    seen.add(key);
+    if (desktopResolvedRequestKeys.get(key) > now) continue;
+    const existing = pendingNativeRequests.get(key);
+    const pending = {
+      key,
+      requestId,
+      method,
+      params: request.params || {},
+      threadId,
+      turnId: String(request.params?.turnId || ''),
+      createdAt: existing?.createdAt || new Date().toISOString(),
+      transport: 'desktop-ipc',
+      ownerClientId: state.ownerClientId,
+    };
+    pendingNativeRequests.set(key, pending);
+    if (!existing) broadcastNativeRequest({ type: 'pending', request: publicNativeRequest(pending) });
+  }
+
+  for (const [key, pending] of pendingNativeRequests) {
+    if (pending.transport !== 'desktop-ipc' || pending.threadId !== threadId || seen.has(key)) continue;
+    pendingNativeRequests.delete(key);
+    broadcastNativeRequest({ type: 'resolved', id: key, threadId });
+  }
+}
+
+function removeDesktopRequestFromState(threadId, requestId) {
+  const state = desktopThreadStates.get(threadId);
+  if (!state) return;
+  state.requests = state.requests.filter((request) => String(request.id ?? '') !== String(requestId));
+}
+
+function clearDesktopThreadStates(reason = '') {
+  desktopThreadStates.clear();
+  desktopResolvedRequestKeys.clear();
+  desktopSnapshotRequestTimes.clear();
+  desktopSnapshotRequests.clear();
+  for (const [key, pending] of pendingNativeRequests) {
+    if (pending.transport !== 'desktop-ipc') continue;
+    pendingNativeRequests.delete(key);
+    broadcastNativeRequest({ type: 'resolved', id: key, threadId: pending.threadId, error: reason });
+  }
+}
+
+function requestDesktopThreadSnapshot(threadId, { force = false } = {}) {
+  if (desktopSnapshotRequests.has(threadId)) return desktopSnapshotRequests.get(threadId);
+  const now = Date.now();
+  if (!force && now - (desktopSnapshotRequestTimes.get(threadId) || 0) < 15000) return null;
+  desktopSnapshotRequestTimes.set(threadId, now);
+  const request = desktopIpcClient.loadCompleteHistory(threadId)
+    .catch(() => {})
+    .finally(() => {
+      if (desktopSnapshotRequests.get(threadId) === request) desktopSnapshotRequests.delete(threadId);
+    });
+  desktopSnapshotRequests.set(threadId, request);
+  return request;
+}
+
+async function respondToNativeRequest(pending, response) {
+  if (pending.transport !== 'desktop-ipc') {
+    pending.respond(response);
+    return;
+  }
+  const options = { targetClientId: pending.ownerClientId };
+  switch (pending.method) {
+    case 'item/commandExecution/requestApproval':
+      await desktopIpcClient.commandApprovalDecision(
+        pending.threadId,
+        pending.requestId,
+        response.decision,
+        options,
+      );
+      return;
+    case 'item/fileChange/requestApproval':
+      await desktopIpcClient.fileApprovalDecision(
+        pending.threadId,
+        pending.requestId,
+        response.decision,
+        options,
+      );
+      return;
+    case 'item/permissions/requestApproval':
+      await desktopIpcClient.permissionsApprovalResponse(
+        pending.threadId,
+        pending.requestId,
+        response,
+        options,
+      );
+      return;
+    case 'item/tool/requestUserInput':
+      await desktopIpcClient.submitUserInput(pending.threadId, pending.requestId, response, options);
+      return;
+    case 'mcpServer/elicitation/request':
+      await desktopIpcClient.submitMcpElicitationResponse(
+        pending.threadId,
+        pending.requestId,
+        response,
+        options,
+      );
+      return;
+    default:
+      throw new Error(`Codex Desktop 不支持处理 ${pending.method}`);
+  }
 }
 
 function handleAppServerError(params = {}) {
@@ -1506,16 +2115,30 @@ function handleAppServerRequest(request) {
   broadcastNativeRequest({ type: 'pending', request: publicNativeRequest(entry) });
 }
 
-function clearPendingNativeRequests(reason = '') {
-  if (!pendingNativeRequests.size) return;
-  const requests = [...pendingNativeRequests.values()];
-  pendingNativeRequests.clear();
-  for (const request of requests) {
+function clearAppServerPendingRequests(reason = '') {
+  for (const [key, request] of pendingNativeRequests) {
+    if (request.transport === 'desktop-ipc') continue;
+    pendingNativeRequests.delete(key);
     broadcastNativeRequest({
       type: 'resolved',
       id: request.key,
       threadId: request.threadId,
       error: reason,
+    });
+  }
+}
+
+function clearAppServerNativeTurns(reason = '') {
+  for (const [threadId, active] of activeNativeTurns) {
+    if (active.transport === 'desktop-ipc') continue;
+    activeNativeTurns.delete(threadId);
+    broadcastNativeRuntime({
+      type: 'turn',
+      threadId,
+      turnId: active.turnId || '',
+      status: 'interrupted',
+      error: reason,
+      updatedAt: new Date().toISOString(),
     });
   }
 }
@@ -1613,14 +2236,28 @@ function buildNativeRequestResponse(request, body) {
 function setNativeTurnState(threadId, state) {
   const cleanId = cleanNativeThreadId(threadId);
   if (!cleanId) return;
+  const current = activeNativeTurns.get(cleanId);
   const next = {
     turnId: String(state.turnId || ''),
     status: nativeTurnStatus(state.status),
+    transport: String(state.transport || current?.transport || 'app-server'),
     updatedAt: new Date().toISOString(),
   };
   activeNativeTurns.set(cleanId, next);
+  if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
   broadcastNativeRuntime({ type: 'turn', threadId: cleanId, ...next });
   nativeSessions.scheduleRefresh();
+}
+
+function currentNativeTurnId(threadId) {
+  const active = activeNativeTurns.get(threadId);
+  if (active?.status === 'running' && active.turnId) return String(active.turnId);
+  try {
+    const conversation = nativeSessions.get(threadId);
+    return conversation?.status === 'running' ? String(conversation.latestTurnId || '') : '';
+  } catch {
+    return '';
+  }
 }
 
 function nativeTurnStatus(status) {
@@ -1643,14 +2280,283 @@ function nativeSessionSummaries() {
   });
 }
 
-function decorateNativeConversation(conversation) {
+function normalizeNativeProjectPath(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const normalized = path.normalize(raw);
+  const root = path.parse(normalized).root;
+  return normalized === root ? root : normalized.replace(/[\\/]+$/, '');
+}
+
+function executableOrchestratedToolCallOffsets(source, toolName) {
+  const text = String(source || '');
+  const needle = `tools.${toolName}`;
+  const offsets = [];
+  let quote = '';
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = '';
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (!text.startsWith(needle, index)) continue;
+    let cursor = index + needle.length;
+    while (/\s/.test(text[cursor] || '')) cursor += 1;
+    if (text[cursor] === '(') offsets.push(index);
+  }
+  return offsets;
+}
+
+function extractNativeToolImagePaths(message) {
+  if (message?.role !== 'tool') return [];
+  const source = String(message.content || '');
+  const paths = [];
+  const orchestratedPattern = /^tools\.view_image\s*\(\s*\{\s*path\s*:\s*"((?:\\.|[^"\\])*)"/;
+  for (const offset of executableOrchestratedToolCallOffsets(source, 'view_image')) {
+    const match = source.slice(offset).match(orchestratedPattern);
+    if (!match) continue;
+    try {
+      paths.push(JSON.parse(`"${match[1]}"`));
+    } catch {
+      // Ignore malformed tool arguments rather than exposing an arbitrary path.
+    }
+  }
+  if (paths.length) return paths;
+  if (!source.startsWith('view_image\n')) return [];
+  try {
+    const input = JSON.parse(source.slice(source.indexOf('\n') + 1));
+    return typeof input?.path === 'string' && input.path.trim() ? [input.path.trim()] : [];
+  } catch {
+    return [];
+  }
+}
+
+function readNativeToolImage(filePath, cwd) {
+  if (!filePath) return null;
+  try {
+    const candidate = path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(String(cwd || DEFAULT_CWD), filePath);
+    const resolved = realpathSync(candidate);
+    const type = TOOL_IMAGE_TYPES.get(path.extname(resolved).toLowerCase());
+    if (!type) return null;
+    const stats = statSync(resolved);
+    if (!stats.isFile() || stats.size < 1 || stats.size > TOOL_IMAGE_MAX_BYTES) return null;
+    return { type, data: readFileSync(resolved) };
+  } catch {
+    return null;
+  }
+}
+
+function decorateNativeConversation(conversation, { externalizeImages = false } = {}) {
   const active = activeNativeTurns.get(conversation.id);
+  const activeTurnId = active?.status === 'running' && active.turnId
+    ? active.turnId
+    : conversation.status === 'running'
+      ? conversation.latestTurnId || ''
+      : '';
   return {
     ...conversation,
+    messages: externalizeImages
+      ? conversation.messages.map((message) => externalizeNativeImage(conversation, message))
+      : conversation.messages,
     status: active?.status === 'running' ? 'running' : conversation.status,
     readOnly: false,
-    activeTurnId: active?.turnId || '',
+    activeTurnId,
   };
+}
+
+function externalizeNativeImage(conversation, message) {
+  if (message.role !== 'image' || !String(message.content || '').startsWith('data:image/')) return message;
+  const path = `/api/native-sessions/${encodeURIComponent(conversation.id)}/images/${message.seq}`;
+  return {
+    ...message,
+    content: `${path}?generation=${conversation.generation}`,
+  };
+}
+
+function decodeNativeImage(message) {
+  if (message?.role !== 'image') return null;
+  const match = String(message.content || '').match(/^data:(image\/(?:png|jpe?g|webp|gif|avif));base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) return null;
+  return { type: match[1].toLowerCase(), data: Buffer.from(match[2], 'base64') };
+}
+
+async function continueNativeTurn(threadId, turn) {
+  const baseline = nativeSessions.get(threadId);
+  const requestedAt = Date.now();
+  const echoController = new AbortController();
+  const desktopAttempt = desktopIpcClient.startTurn(threadId, buildDesktopTurnStartParams(turn)).then(
+    (result) => ({ type: 'ipc-result', result }),
+    (error) => ({ type: 'ipc-error', error }),
+  );
+  const echoAttempt = waitForNativeTurnEcho(threadId, turn, baseline, requestedAt, echoController.signal).then(
+    (conversation) => ({ type: 'native-echo', conversation }),
+  );
+  const outcome = await Promise.race([desktopAttempt, echoAttempt]);
+  echoController.abort();
+
+  if (outcome.type === 'native-echo' && outcome.conversation) {
+    return recoverDesktopNativeTurn(threadId, outcome.conversation);
+  }
+
+  if (outcome.type === 'ipc-result') {
+    const result = outcome.result;
+    const turnId = String(result?.turn?.id || '');
+    if (!turnId) throw new Error('Codex Desktop IPC 未返回有效 turn id');
+    setNativeTurnState(threadId, { turnId, status: 'running', transport: 'desktop-ipc' });
+    return { turnId, result, transport: 'desktop-ipc' };
+  }
+
+  const error = outcome.error;
+  if (!isCodexDesktopIpcUnavailableError(error)) {
+    const conversation = findNativeTurnEcho(threadId, turn, baseline, requestedAt);
+    if (conversation) return recoverDesktopNativeTurn(threadId, conversation);
+    throw error;
+  }
+
+  await appServerClient.request('thread/resume', compactObject({
+    threadId,
+    cwd: turn.cwd,
+    model: turn.model,
+    modelProvider: turn.provider,
+    sandbox: turn.sandbox,
+    approvalPolicy: turn.approval,
+    excludeTurns: true,
+  }));
+  return startNativeTurn(threadId, turn);
+}
+
+async function waitForNativeTurnEcho(threadId, turn, baseline, requestedAt, signal) {
+  const deadline = Date.now() + CODEX_DESKTOP_IPC_TIMEOUT_MS + 2000;
+  while (!signal.aborted && Date.now() < deadline) {
+    const conversation = findNativeTurnEcho(threadId, turn, baseline, requestedAt);
+    if (conversation) return conversation;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return null;
+}
+
+function findNativeTurnEcho(threadId, turn, baseline, requestedAt) {
+  const conversation = nativeSessions.get(threadId, baseline ? {
+    after: baseline.cursor,
+    generation: baseline.generation,
+  } : {});
+  if (!conversation) return null;
+  const expected = String(turn.input?.find((item) => item?.type === 'text')?.text || turn.message || '').trim();
+  const earliest = requestedAt - 1000;
+  const matched = conversation.messages.some((message) => {
+    if (message.role !== 'user' || Date.parse(message.at || '') < earliest) return false;
+    const content = String(message.content || '').trim();
+    if (!expected) return Boolean(content && turn.attachments?.length);
+    return content === expected || content.startsWith(`${expected}\n`);
+  });
+  return matched ? conversation : null;
+}
+
+function recoverDesktopNativeTurn(threadId, conversation) {
+  const turnId = String(conversation.latestTurnId || `desktop-${randomBytes(8).toString('hex')}`);
+  const status = conversation.status === 'running' ? 'running' : 'done';
+  setNativeTurnState(threadId, { turnId, status, transport: 'desktop-ipc' });
+  if (status !== 'running') {
+    setTimeout(() => {
+      const current = activeNativeTurns.get(threadId);
+      if (current?.turnId === turnId && current.status !== 'running') activeNativeTurns.delete(threadId);
+    }, 1800).unref?.();
+  }
+  return {
+    turnId,
+    result: { turn: { id: turnId, status: status === 'running' ? 'inProgress' : 'completed' } },
+    transport: 'desktop-ipc',
+    recovered: true,
+  };
+}
+
+async function steerNativeTurn(threadId, steer, expectedTurnId) {
+  const cwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
+  const clientUserMessageId = randomBytes(16).toString('hex');
+  try {
+    const result = await desktopIpcClient.steerTurn(threadId, {
+      input: buildDesktopTurnInput(steer.input),
+      restoreMessage: buildDesktopRestoreMessage(steer, cwd, clientUserMessageId),
+      serviceTier: null,
+      attachments: [],
+      clientUserMessageId,
+    });
+    return { ...result, transport: 'desktop-ipc' };
+  } catch (error) {
+    if (!isCodexDesktopIpcUnavailableError(error)) throw error;
+  }
+
+  let turnId = expectedTurnId;
+  if (!turnId) {
+    const resumed = await appServerClient.request('thread/resume', { threadId });
+    turnId = findInProgressTurnId(resumed?.thread);
+  }
+  if (!turnId) throw new Error('该会话没有可引导的运行中任务');
+  const result = await appServerClient.request('turn/steer', {
+    threadId,
+    expectedTurnId: turnId,
+    input: steer.input,
+  });
+  return { ...result, transport: 'app-server' };
+}
+
+async function interruptNativeTurn(threadId, expectedTurnId) {
+  try {
+    const result = await desktopIpcClient.interruptTurn(threadId);
+    return { ...result, transport: 'desktop-ipc' };
+  } catch (error) {
+    if (!isCodexDesktopIpcUnavailableError(error)) throw error;
+  }
+
+  let turnId = expectedTurnId;
+  if (!turnId) {
+    const resumed = await appServerClient.request('thread/resume', { threadId });
+    turnId = findInProgressTurnId(resumed?.thread);
+  }
+  if (!turnId) throw new Error('该会话没有可取消的任务');
+  await appServerClient.request('turn/interrupt', { threadId, turnId });
+  return { interruptedTurnId: turnId, ok: true, transport: 'app-server' };
+}
+
+async function notifyDesktopThreadArchived(threadId, cwd) {
+  try {
+    await desktopIpcClient.threadArchived(threadId, cwd);
+  } catch (error) {
+    console.warn(`Codex Desktop IPC 归档同步失败: ${error.message}`);
+  }
 }
 
 async function startNativeTurn(threadId, turn) {
@@ -1667,6 +2573,60 @@ async function startNativeTurn(threadId, turn) {
   if (!turnId) throw new Error('Codex app-server 未返回有效 turn id');
   setNativeTurnState(threadId, { turnId, status: 'running' });
   return { turnId, result };
+}
+
+function buildDesktopTurnStartParams(turn) {
+  const workspaceWrite = turn.sandbox === 'workspace-write';
+  return compactObject({
+    input: buildDesktopTurnInput(turn.input),
+    cwd: turn.cwd,
+    model: turn.model,
+    effort: turn.reasoningEffort,
+    approvalPolicy: turn.approval,
+    sandboxPolicy: desktopSandboxPolicy(turn.sandbox, turn.cwd),
+    runtimeWorkspaceRoots: workspaceWrite ? [turn.cwd] : undefined,
+    attachments: [],
+  });
+}
+
+function buildDesktopTurnInput(input) {
+  return (input || []).map((item) => (
+    item?.type === 'text' ? { ...item, text_elements: [] } : { ...item }
+  ));
+}
+
+function desktopSandboxPolicy(sandbox, cwd) {
+  if (sandbox === 'danger-full-access') return { type: 'dangerFullAccess' };
+  if (sandbox === 'workspace-write') {
+    return {
+      type: 'workspaceWrite',
+      writableRoots: [cwd],
+      networkAccess: true,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+  }
+  return { type: 'readOnly', networkAccess: true };
+}
+
+function buildDesktopRestoreMessage(steer, cwd, id) {
+  const prompt = String(steer.message || '').trim()
+    || String(steer.input?.find((item) => item?.type === 'text')?.text || '').trim()
+    || '请分析上传的附件。';
+  return {
+    id,
+    text: prompt,
+    context: {
+      prompt,
+      addedFiles: [],
+      fileAttachments: [],
+      ideContext: null,
+      imageAttachments: [],
+      workspaceRoots: [cwd],
+    },
+    cwd,
+    createdAt: Date.now(),
+  };
 }
 
 function parseNativeTurnPayload(body) {
@@ -1756,6 +2716,11 @@ function findInProgressTurnId(thread) {
 function cleanNativeThreadId(value) {
   const id = String(value || '').trim().toLowerCase();
   return NATIVE_THREAD_ID_PATTERN.test(id) ? id : '';
+}
+
+function positiveInteger(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : 0;
 }
 
 function compactObject(value) {
@@ -2260,10 +3225,11 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
 <link rel="stylesheet" href="/ui.css">
+<link rel="stylesheet" href="/image-prompt.css">
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="plain">纯净</option><option value="paper">纸张</option><option value="grid">网格</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
 <div id="nativeRequestModal" class="requestOverlay hidden" role="presentation"><div class="requestPanel" role="dialog" aria-modal="true" aria-labelledby="nativeRequestTitle"><div class="requestHead"><div><div id="nativeRequestTitle" class="requestTitle">Codex 请求确认</div><div id="nativeRequestMeta" class="requestMeta"></div></div></div><pre id="nativeRequestDetail" class="requestDetail"></pre><form id="nativeRequestForm"><div id="nativeRequestFields" class="requestFields"></div><div id="nativeRequestActions" class="requestActions"></div></form></div></div>
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
@@ -2295,21 +3261,17 @@ let activeNativeTurnId = '';
 let forceFullAccess = false;
 let nativeRunningElement = null;
 let nativeOptimisticElements = [];
+let nativeOptimisticSteering = new Map();
 let nativeLiveItems = new Map();
 let latestToolElement = null;
 let latestAssistantElement = null;
 let latestFinalAssistantElement = null;
 let latestUserElement = null;
 let turnProcessElements = [];
-let visibleTurnProcessElement = null;
+let currentActivityCluster = null;
 let collectingTurnProcess = false;
 let turnProcessHeader = null;
-let turnProcessLabel = null;
 let turnProcessTimeline = null;
-let turnProcessStartedAt = 0;
-let turnProcessTimer = null;
-let turnProcessAutoFollow = true;
-let turnProcessFollowFrame = null;
 let currentNativeRequest = null;
 let dangerConfirmed = false;
 let pendingAttachments = [];
@@ -2317,6 +3279,12 @@ let historyFilter = null;
 let historyItems = [];
 let composerPermissionToggle = null;
 let composerModelToggle = null;
+let composerProjectPicker = null;
+let composerProjectToggle = null;
+let composerProjectPanel = null;
+let composerProjectName = null;
+let composerProjectPathInput = null;
+let composerProjectOptions = null;
 let composerPermissionPanel = null;
 let composerModelPanel = null;
 let composerProviderSelect = null;
@@ -2331,11 +3299,25 @@ let promptQueues = readPromptQueues();
 let queueDispatchingThreads = new Set();
 let queueGuidingItems = new Set();
 let queueFailures = new Map();
+const syncCurrentNativeConversation = createTrailingSingleFlight(syncCurrentNativeConversationOnce);
 let settingsOverlay = null;
 let settingsDialog = null;
 let settingsClose = null;
 let passwordForm = null;
 let passwordStatus = null;
+let dreamSkinPanel = null;
+let dreamSkinIdea = null;
+let dreamSkinMode = null;
+let dreamSkinConceptList = null;
+let dreamSkinConceptPreview = null;
+let dreamSkinConcepts = [];
+let dreamSkinSelectedConcept = '';
+let dreamSkinApplying = false;
+let dreamSkinReferenceInput = null;
+let dreamSkinReferenceList = null;
+let dreamSkinGenerateButton = null;
+let dreamSkinStatus = null;
+let dreamSkinReferenceFiles = [];
 let imagePreview = null;
 let imagePreviewImage = null;
 let imagePreviewClose = null;
@@ -2344,8 +3326,17 @@ let appearance = {theme:'light',chatBackground:'default',customBackgrounds:[]};
 const desktopSidebarMedia=window.matchMedia('(min-width: 821px)');
 const SIDEBAR_STORAGE_KEY='codexWeb.sidebarCollapsed';
 const HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsCollapsed';
+const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
+const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
+const NATIVE_INITIAL_MESSAGE_LIMIT=60;
+const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
+let hiddenHistoryProjects=readHiddenHistoryProjects();
+let renamedHistoryProjects=readRenamedHistoryProjects();
+let activeHistoryProjectMenu=null;
+let historyProjectPreview=null;
+let historyProjectPreviewAnchor=null;
 function refreshIcons(root=document){if(!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
 function setIconLabel(element,name,label,showLabel=true){if(!element)return;element.replaceChildren();const icon=document.createElement('i');icon.setAttribute('data-lucide',name);icon.setAttribute('aria-hidden','true');element.appendChild(icon);if(showLabel){const text=document.createElement('span');text.className='buttonLabel';text.textContent=label;element.appendChild(text)}if(label&&!element.getAttribute('aria-label'))element.setAttribute('aria-label',label);refreshIcons(element)}
 function createComposerMirrorField(panel,labelText,ariaLabel){
@@ -2378,6 +3369,15 @@ function composerModelLabel(value){
   return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
 }
 function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高'})[String(value||'')]||String(value||'默认')}
+function createTrailingSingleFlight(task){
+  let active=null;
+  let rerun=false;
+  return function run(){
+    if(active){rerun=true;return active}
+    active=(async()=>{do{rerun=false;await task()}while(rerun)})().finally(()=>{active=null});
+    return active;
+  }
+}
 function readPromptQueues(){
   try{
     const parsed=JSON.parse(localStorage.getItem('codexWeb.promptQueue.v1')||'{}');
@@ -2439,6 +3439,54 @@ function queuedPromptLabel(item){
   if(text)return text;
   const count=item.attachments?.length||0;
   return count+' 个附件';
+}
+function composerProjectPaths(){
+  const paths=[];
+  const seen=new Set();
+  for(const value of [cwd.value,...historyItems.map((item)=>item.cwd)]){
+    const path=normalizeProjectPath(value);
+    const key=historyProjectKey(path);
+    if(!path||seen.has(key))continue;
+    seen.add(key);
+    paths.push(path);
+  }
+  return paths;
+}
+function selectComposerProjectPath(value){
+  const path=normalizeProjectPath(value);
+  if(!path)return;
+  cwd.value=path;
+  syncComposerChrome();
+  closeComposerPopovers();
+  statusEl.textContent='新任务项目 · '+historyProjectName(path);
+  input.focus();
+}
+function renderComposerProjectOptions(){
+  if(!composerProjectOptions)return;
+  composerProjectOptions.replaceChildren();
+  const paths=composerProjectPaths();
+  for(const path of paths){
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='composerProjectOption';
+    button.classList.toggle('active',normalizeProjectPath(cwd.value)===path);
+    button.setAttribute('aria-label','使用项目 '+historyProjectName(path));
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide','folder');
+    icon.setAttribute('aria-hidden','true');
+    const text=document.createElement('span');
+    const name=document.createElement('strong');
+    name.textContent=historyProjectName(path);
+    const detail=document.createElement('small');
+    detail.textContent=path;
+    text.appendChild(name);
+    text.appendChild(detail);
+    button.appendChild(icon);
+    button.appendChild(text);
+    button.addEventListener('click',()=>selectComposerProjectPath(path));
+    composerProjectOptions.appendChild(button);
+  }
+  refreshIcons(composerProjectOptions);
 }
 function queueActionButton(icon,label,handler,showLabel=false){
   const button=document.createElement('button');
@@ -2568,6 +3616,27 @@ function showNativePromptOptimistically(item){
   nativeRunningElement=addMsg('assistant','');
   nativeRunningElement.innerHTML='<span class="spinner"></span> Codex 正在运行...';
 }
+function showNativeSteerOptimistically(item){
+  if(currentConversationSource!=='codex')return null;
+  if(!collectingTurnProcess)beginTurnProcessCollection(item.createdAt);
+  const expected=String(item.message||'请分析上传的附件。').trim();
+  const existing=[...turnProcessElements].reverse().find((element)=>(
+    element?.classList?.contains('steeringUser')
+    && String(element.dataset.messageText||'').trim()===expected
+  ));
+  if(existing)return existing;
+  const element=addMsg('user',item.message||'请分析上传的附件。',{
+    kind:'steering_user',
+    at:new Date().toISOString(),
+    optimisticQueueId:item.id,
+  });
+  if(!element)return null;
+  nativeOptimisticSteering.set(item.id,element);
+  for(const attachment of item.attachments||[]){
+    if(attachment.kind==='image')appendInputImageToUser(element,attachment.url,element.dataset.messageAt);
+  }
+  return element;
+}
 async function steerQueuedPrompt(threadId,itemId){
   if(currentConversationSource!=='codex'||currentConversationId!==threadId)return;
   const item=promptQueueFor(threadId).find((entry)=>entry.id===itemId);
@@ -2585,6 +3654,7 @@ async function steerQueuedPrompt(threadId,itemId){
     activeNativeTurnId=data.turnId||activeNativeTurnId;
     queueFailures.delete(itemId);
     setPromptQueue(threadId,promptQueueFor(threadId).filter((entry)=>entry.id!==itemId));
+    showNativeSteerOptimistically(item);
     statusEl.textContent='Codex App · 已发送引导';
     setTimeout(syncCurrentNativeConversation,180);
     refreshHistory();
@@ -2657,7 +3727,7 @@ async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
   }
 }
 function closeComposerPopovers(){
-  for(const [panel,button] of [[composerPermissionPanel,composerPermissionToggle],[composerModelPanel,composerModelToggle]]){
+  for(const [panel,button] of [[composerProjectPanel,composerProjectToggle],[composerPermissionPanel,composerPermissionToggle],[composerModelPanel,composerModelToggle]]){
     panel?.classList.add('hidden');
     button?.setAttribute('aria-expanded','false');
   }
@@ -2667,9 +3737,10 @@ function toggleComposerPopover(panel,button){
   const open=panel.classList.contains('hidden');
   closeComposerPopovers();
   if(!open)return;
+  if(panel===composerProjectPanel)renderComposerProjectOptions();
   panel.classList.remove('hidden');
   button.setAttribute('aria-expanded','true');
-  panel.querySelector('select')?.focus();
+  panel.querySelector('select,input')?.focus();
 }
 function syncComposerChrome(){
   syncComposerSelect(provider,composerProviderSelect);
@@ -2677,6 +3748,23 @@ function syncComposerChrome(){
   syncComposerSelect(reasoningEffort,composerReasoningSelect);
   if(composerModelName)composerModelName.textContent=composerModelLabel(model.value);
   if(composerEffortName)composerEffortName.textContent=composerEffortLabel(reasoningEffort.value);
+  const projectPath=normalizeProjectPath(cwd.value);
+  const hasConversation=Boolean(currentConversationId);
+  if(composerProjectPicker){
+    composerProjectPicker.classList.toggle('hidden',hasConversation);
+    composerProjectPicker.setAttribute('aria-hidden',String(hasConversation));
+  }
+  if(hasConversation){
+    composerProjectPanel?.classList.add('hidden');
+    composerProjectToggle?.setAttribute('aria-expanded','false');
+  }
+  if(composerProjectName)composerProjectName.textContent=historyProjectName(projectPath);
+  if(composerProjectPathInput&&document.activeElement!==composerProjectPathInput)composerProjectPathInput.value=projectPath;
+  if(composerProjectToggle){
+    composerProjectToggle.title=projectPath;
+    composerProjectToggle.setAttribute('aria-label','项目 '+historyProjectName(projectPath)+'，点击选择');
+    composerProjectToggle.disabled=webRunActive||hasConversation;
+  }
   composerModelToggle?.classList.toggle('running',webRunActive);
   if(composerModelToggle)composerModelToggle.disabled=webRunActive;
   for(const control of [composerProviderSelect,composerModelSelect,composerReasoningSelect])if(control)control.disabled=webRunActive;
@@ -2694,6 +3782,54 @@ function syncComposerChrome(){
 function enhanceComposer(){
   if(!dropZone||!attachFile||!sendBtn)return;
   const composer=dropZone.parentElement;
+  composerProjectPicker=document.createElement('div');
+  composerProjectPicker.className='composerProjectPicker';
+  composerProjectToggle=document.createElement('button');
+  composerProjectToggle.type='button';
+  composerProjectToggle.className='composerProjectToggle';
+  composerProjectToggle.setAttribute('aria-expanded','false');
+  composerProjectToggle.setAttribute('aria-controls','composerProjectPanel');
+  const projectIcon=document.createElement('i');
+  projectIcon.setAttribute('data-lucide','folder');
+  projectIcon.setAttribute('aria-hidden','true');
+  composerProjectName=document.createElement('span');
+  composerProjectName.className='composerProjectName';
+  const projectChevron=document.createElement('i');
+  projectChevron.className='composerProjectChevron';
+  projectChevron.setAttribute('data-lucide','chevron-down');
+  projectChevron.setAttribute('aria-hidden','true');
+  composerProjectToggle.appendChild(projectIcon);
+  composerProjectToggle.appendChild(composerProjectName);
+  composerProjectToggle.appendChild(projectChevron);
+  composerProjectPanel=document.createElement('div');
+  composerProjectPanel.id='composerProjectPanel';
+  composerProjectPanel.className='composerProjectPanel hidden';
+  const projectTitle=document.createElement('div');
+  projectTitle.className='composerPopoverTitle';
+  projectTitle.textContent='选择项目路径';
+  composerProjectOptions=document.createElement('div');
+  composerProjectOptions.className='composerProjectOptions';
+  const customProject=document.createElement('div');
+  customProject.className='composerProjectCustom';
+  composerProjectPathInput=document.createElement('input');
+  composerProjectPathInput.type='text';
+  composerProjectPathInput.placeholder='/path/to/project';
+  composerProjectPathInput.setAttribute('aria-label','自定义项目路径');
+  const useProjectPath=document.createElement('button');
+  useProjectPath.type='button';
+  useProjectPath.className='composerProjectApply';
+  useProjectPath.textContent='使用';
+  const applyProjectPath=()=>selectComposerProjectPath(composerProjectPathInput.value);
+  useProjectPath.addEventListener('click',applyProjectPath);
+  composerProjectPathInput.addEventListener('keydown',(event)=>{if(event.key==='Enter'){event.preventDefault();applyProjectPath()}});
+  customProject.appendChild(composerProjectPathInput);
+  customProject.appendChild(useProjectPath);
+  composerProjectPanel.appendChild(projectTitle);
+  composerProjectPanel.appendChild(composerProjectOptions);
+  composerProjectPanel.appendChild(customProject);
+  composerProjectPicker.appendChild(composerProjectToggle);
+  composerProjectPicker.appendChild(composerProjectPanel);
+  composer.insertBefore(composerProjectPicker,composer.firstChild);
   if(attachmentTray&&composer&&attachmentTray.parentElement===composer)composer.insertBefore(attachmentTray,dropZone);
   promptQueuePanel=document.createElement('section');
   promptQueuePanel.className='promptQueue hidden';
@@ -2763,13 +3899,14 @@ function enhanceComposer(){
   composerModelSelect=createComposerMirrorField(composerModelPanel,'模型','模型');
   composerReasoningSelect=createComposerMirrorField(composerModelPanel,'思考档位','思考档位');
   dropZone.appendChild(composerModelPanel);
+  composerProjectToggle.addEventListener('click',()=>toggleComposerPopover(composerProjectPanel,composerProjectToggle));
   composerPermissionToggle.addEventListener('click',()=>toggleComposerPopover(composerPermissionPanel,composerPermissionToggle));
   composerModelToggle.addEventListener('click',()=>toggleComposerPopover(composerModelPanel,composerModelToggle));
   composerProviderSelect.addEventListener('change',async()=>{provider.value=composerProviderSelect.value;await loadModels(provider.value);syncComposerChrome()});
   composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;syncComposerChrome()});
   composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;syncComposerChrome()});
   input.addEventListener('focus',closeComposerPopovers);
-  document.addEventListener('click',(event)=>{if(!dropZone.contains(event.target))closeComposerPopovers()});
+  document.addEventListener('click',(event)=>{if(!dropZone.contains(event.target)&&!composerProjectPicker.contains(event.target))closeComposerPopovers()});
   syncComposerChrome();
   refreshIcons(dropZone);
 }
@@ -2778,6 +3915,154 @@ function settingsSectionTitle(text){
   title.className='settingsSectionTitle';
   title.textContent=text;
   return title;
+}
+function createDreamSkinGenerator(general){
+  const backgroundControls=general?.querySelector('.backgroundControls');
+  if(!backgroundControls||dreamSkinPanel)return;
+  dreamSkinPanel=document.createElement('section');
+  dreamSkinPanel.className='dreamSkinGenerator hidden';
+  dreamSkinPanel.setAttribute('aria-label','Dream Skin 背景生成');
+  const head=document.createElement('div');
+  head.className='dreamSkinGeneratorHead';
+  const identity=document.createElement('div');
+  identity.className='dreamSkinIdentity';
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','sparkles');
+  icon.setAttribute('aria-hidden','true');
+  const title=document.createElement('span');
+  title.textContent='Dream Skin';
+  identity.appendChild(icon);
+  identity.appendChild(title);
+  const close=document.createElement('button');
+  close.type='button';
+  close.className='dreamSkinClose';
+  close.title='关闭背景生成';
+  close.setAttribute('aria-label','关闭背景生成');
+  setIconLabel(close,'x','关闭背景生成',false);
+  close.addEventListener('click',closeDreamSkinGenerator);
+  head.appendChild(identity);
+  head.appendChild(close);
+  const conceptSection=document.createElement('section');
+  conceptSection.className='dreamSkinConceptSection';
+  const conceptHead=document.createElement('div');
+  conceptHead.className='dreamSkinConceptHead';
+  const conceptTitle=document.createElement('span');
+  conceptTitle.textContent='概念风格';
+  const conceptHint=document.createElement('span');
+  conceptHint.textContent='点击立即应用';
+  conceptHead.appendChild(conceptTitle);
+  conceptHead.appendChild(conceptHint);
+  dreamSkinConceptList=document.createElement('div');
+  dreamSkinConceptList.className='dreamSkinConceptList';
+  dreamSkinConceptList.setAttribute('aria-label','Dream Skin 八种概念风格');
+  dreamSkinConceptPreview=document.createElement('div');
+  dreamSkinConceptPreview.className='dreamSkinConceptPreview hidden';
+  dreamSkinConceptPreview.setAttribute('aria-live','polite');
+  conceptSection.appendChild(conceptHead);
+  conceptSection.appendChild(dreamSkinConceptList);
+  conceptSection.appendChild(dreamSkinConceptPreview);
+  const ideaField=document.createElement('label');
+  ideaField.className='field dreamSkinIdeaField';
+  const ideaLabel=document.createElement('span');
+  ideaLabel.textContent='背景需求';
+  dreamSkinIdea=document.createElement('textarea');
+  dreamSkinIdea.rows=3;
+  dreamSkinIdea.maxLength=2000;
+  dreamSkinIdea.placeholder='例如：雨夜东京工作室，青绿色霓虹，右侧有窗景，左侧安静留白';
+  ideaField.appendChild(ideaLabel);
+  ideaField.appendChild(dreamSkinIdea);
+  const options=document.createElement('div');
+  options.className='dreamSkinOptions';
+  const modeField=document.createElement('label');
+  modeField.className='field';
+  const modeLabel=document.createElement('span');
+  modeLabel.textContent='生成模式';
+  dreamSkinMode=document.createElement('select');
+  [['no-person','无人物'],['fictional-adult','原创人物'],['reference','参考图重绘']].forEach(([value,label])=>{
+    const option=document.createElement('option');
+    option.value=value;
+    option.textContent=label;
+    dreamSkinMode.appendChild(option);
+  });
+  dreamSkinMode.addEventListener('change',renderDreamSkinConceptPreview);
+  modeField.appendChild(modeLabel);
+  modeField.appendChild(dreamSkinMode);
+  const referenceField=document.createElement('div');
+  referenceField.className='field dreamSkinReferenceField';
+  const referenceLabel=document.createElement('span');
+  referenceLabel.textContent='参考图';
+  const referenceButton=document.createElement('button');
+  referenceButton.type='button';
+  referenceButton.className='miniSecondary dreamSkinReferenceButton';
+  setIconLabel(referenceButton,'image-plus','添加参考图');
+  dreamSkinReferenceInput=document.createElement('input');
+  dreamSkinReferenceInput.type='file';
+  dreamSkinReferenceInput.accept='image/png,image/jpeg,image/webp,image/gif';
+  dreamSkinReferenceInput.multiple=true;
+  dreamSkinReferenceInput.className='hidden';
+  referenceButton.addEventListener('click',()=>dreamSkinReferenceInput.click());
+  dreamSkinReferenceInput.addEventListener('change',()=>{
+    const candidates=[...(dreamSkinReferenceInput.files||[])].filter((file)=>file.type.startsWith('image/'));
+    dreamSkinReferenceFiles=[...dreamSkinReferenceFiles,...candidates].slice(0,3);
+    dreamSkinReferenceInput.value='';
+    renderDreamSkinReferences();
+  });
+  referenceField.appendChild(referenceLabel);
+  referenceField.appendChild(referenceButton);
+  referenceField.appendChild(dreamSkinReferenceInput);
+  options.appendChild(modeField);
+  options.appendChild(referenceField);
+  dreamSkinReferenceList=document.createElement('div');
+  dreamSkinReferenceList.className='dreamSkinReferenceList hidden';
+  const guide=document.createElement('details');
+  guide.className='dreamSkinGuide';
+  const guideSummary=document.createElement('summary');
+  const guideIcon=document.createElement('i');
+  guideIcon.setAttribute('data-lucide','book-open');
+  guideIcon.setAttribute('aria-hidden','true');
+  const guideLabel=document.createElement('span');
+  guideLabel.textContent='背景生成规范';
+  guideSummary.appendChild(guideIcon);
+  guideSummary.appendChild(guideLabel);
+  const guideBody=document.createElement('div');
+  guideBody.className='dreamSkinGuideBody';
+  const guideList=document.createElement('ul');
+  ['2560 x 1440、16:9 纯背景','左侧低信息，主体和细节集中在右侧','不生成窗口、控件、文字、Logo 或水印'].forEach((text)=>{
+    const item=document.createElement('li');
+    item.textContent=text;
+    guideList.appendChild(item);
+  });
+  const guideLink=document.createElement('a');
+  guideLink.href='/assets/dream-skin/SKILL.md';
+  guideLink.target='_blank';
+  guideLink.rel='noopener noreferrer';
+  guideLink.textContent='查看完整 Markdown skill';
+  guideBody.appendChild(guideList);
+  guideBody.appendChild(guideLink);
+  guide.appendChild(guideSummary);
+  guide.appendChild(guideBody);
+  const actions=document.createElement('div');
+  actions.className='dreamSkinActions';
+  dreamSkinStatus=document.createElement('div');
+  dreamSkinStatus.className='dreamSkinStatus';
+  dreamSkinStatus.setAttribute('role','status');
+  dreamSkinGenerateButton=document.createElement('button');
+  dreamSkinGenerateButton.type='button';
+  dreamSkinGenerateButton.className='miniPrimary dreamSkinGenerate';
+  setIconLabel(dreamSkinGenerateButton,'sparkles','生成新壁纸版本');
+  dreamSkinGenerateButton.addEventListener('click',generateDreamSkinBackground);
+  actions.appendChild(dreamSkinStatus);
+  actions.appendChild(dreamSkinGenerateButton);
+  dreamSkinPanel.appendChild(head);
+  dreamSkinPanel.appendChild(conceptSection);
+  dreamSkinPanel.appendChild(ideaField);
+  dreamSkinPanel.appendChild(options);
+  dreamSkinPanel.appendChild(dreamSkinReferenceList);
+  dreamSkinPanel.appendChild(guide);
+  dreamSkinPanel.appendChild(actions);
+  backgroundControls.insertAdjacentElement('afterend',dreamSkinPanel);
+  renderDreamSkinConcepts();
+  refreshIcons(dreamSkinPanel);
 }
 function enhanceSettingsModal(){
   if(!settingsPanel||settingsOverlay)return;
@@ -2810,6 +4095,7 @@ function enhanceSettingsModal(){
   if(general){
     general.classList.add('settingsSection');
     general.prepend(settingsSectionTitle('默认配置'));
+    createDreamSkinGenerator(general);
   }
   providerManager?.classList.add('settingsSection','providerSettings');
   const passwordSection=document.createElement('section');
@@ -2869,6 +4155,7 @@ function openSettings(){
   syncModalOpenState();
   settingsToggle.setAttribute('aria-expanded','true');
   settingsToggle.title='关闭设置';
+  if(findDreamSkinConcept(appearance.chatBackground))openDreamSkinGenerator();
   requestAnimationFrame(()=>settingsClose?.focus());
 }
 function closeSettings(){
@@ -2879,6 +4166,7 @@ function closeSettings(){
   settingsToggle.title='设置';
   passwordForm?.reset();
   if(passwordStatus){passwordStatus.textContent='';passwordStatus.classList.remove('success')}
+  closeDreamSkinGenerator();
   settingsToggle.focus();
 }
 function syncModalOpenState(){
@@ -3025,6 +4313,9 @@ function enhanceInterface(){
     search.appendChild(historyFilter);
     historyTitle.after(search);
   }
+  history?.addEventListener('scroll',()=>hideHistoryProjectPreview(),{passive:true});
+  window.addEventListener('resize',()=>hideHistoryProjectPreview(),{passive:true});
+  desktopSidebarMedia.addEventListener('change',()=>hideHistoryProjectPreview());
   const empty=document.querySelector('.empty');
   if(empty){
     const heading=empty.querySelector('b');
@@ -3046,8 +4337,9 @@ document.getElementById('deleteProvider')?.addEventListener('click', deleteSelec
 settingsToggle?.addEventListener('click', toggleSettings);
 menuBtn?.addEventListener('click', toggleMenu);
 document.getElementById('scrim')?.addEventListener('click', closeMenu);
+document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{app.classList.remove('menuOpen');syncMenuButton()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',async()=>{await loadModels(provider.value);syncComposerChrome()});
@@ -3059,7 +4351,7 @@ themeToggle?.addEventListener('click',toggleTheme);
 chatBackground?.addEventListener('change',handleChatBackgroundChange);
 chatBackgroundFile?.addEventListener('change',()=>handleCustomBackground(chatBackgroundFile.files?.[0]));
 deleteBackground?.addEventListener('click',deleteSelectedBackground);
-sendBtn?.addEventListener('click', send);input?.addEventListener('keydown',(e)=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});input?.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';applyConversationMode()});
+sendBtn?.addEventListener('click', send);input?.addEventListener('keydown',(e)=>{if(e.key!=='Enter'||e.shiftKey||e.isComposing||e.keyCode===229)return;e.preventDefault();if(!e.repeat)send()});input?.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';applyConversationMode()});
 attachFile?.addEventListener('click',()=>fileInput?.click());
 fileInput?.addEventListener('change',()=>{handleAttachmentFiles(fileInput.files);fileInput.value=''});
 dropZone?.addEventListener('dragover',(e)=>{if(hasFileDrag(e)){e.preventDefault();dropZone.classList.add('drag')}});
@@ -3074,17 +4366,119 @@ window.addEventListener('pageshow',syncNativeAfterPageResume);
 window.addEventListener('online',syncNativeAfterPageResume);
 if (${authenticated ? 'true' : 'false'}) boot(true);
 async function toggleTheme(){const next=appearance.theme==='dark'?'light':'dark';await saveAppearance({theme:next})}
-function applyAppearance(){const theme=appearance.theme==='dark'?'dark':'light';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const bg=custom?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.chatBg=bg;document.body.style.setProperty('--custom-chat-bg',custom?'url("'+custom.url+'")':'none');if(themeToggle){setIconLabel(themeToggle,theme==='dark'?'sun':'moon','',false);themeToggle.title=theme==='dark'?'切换明亮模式':'切换黑暗模式';themeToggle.setAttribute('aria-label',themeToggle.title)}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
+function colorWithAlpha(value,alpha){const match=String(value||'').match(/^#([0-9a-f]{6})$/i);if(!match)return value;const hex=match[1];return'rgba('+parseInt(hex.slice(0,2),16)+','+parseInt(hex.slice(2,4),16)+','+parseInt(hex.slice(4,6),16)+','+alpha+')'}
+function applyDreamSkinTheme(concept,theme){const root=document.documentElement;for(const property of DREAM_SKIN_THEME_PROPERTIES)root.style.removeProperty(property);delete document.body.dataset.skinConcept;delete document.body.dataset.skinSafeArea;const palette=concept?.theme?.colors?.[theme];if(!palette)return;const art=concept.theme.art||{};const variables={'--canvas':palette.background,'--surface':palette.panel,'--surface-raised':palette.panelAlt,'--surface-hover':colorWithAlpha(palette.accent,theme==='light'?.09:.14),'--surface-active':colorWithAlpha(palette.accent,theme==='light'?.15:.2),'--border':palette.line,'--border-strong':colorWithAlpha(palette.accent,.5),'--text':palette.text,'--text-muted':palette.muted,'--text-subtle':colorWithAlpha(palette.muted,.82),'--primary':palette.accent,'--primary-hover':palette.accentAlt,'--primary-soft':colorWithAlpha(palette.accent,.14),'--primary-line':palette.line,'--info':palette.secondary,'--thinking':palette.highlight,'--user-bg':palette.accent,'--code-bg':palette.panelAlt,'--skin-canvas-wash':colorWithAlpha(palette.background,theme==='light'?.08:.26),'--skin-content-wash':colorWithAlpha(palette.background,theme==='light'?.24:.38),'--skin-surface':colorWithAlpha(palette.panel,.74),'--skin-surface-soft':colorWithAlpha(palette.panel,.58),'--skin-surface-strong':colorWithAlpha(palette.panel,.88),'--skin-accent-glow':colorWithAlpha(palette.accent,.2),'--skin-art-position':((Number(art.focusX)||.72)*100).toFixed(2)+'% '+((Number(art.focusY)||.45)*100).toFixed(2)+'%'};for(const [property,value] of Object.entries(variables))root.style.setProperty(property,value);document.body.dataset.skinConcept=concept.id;document.body.dataset.skinSafeArea=art.safeArea||'left'}
+function applyAppearance(){const theme=appearance.theme==='dark'?'dark':'light';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const dream=findDreamSkinConcept(selected);const skin=dream||(custom?.themeId?dreamSkinConcepts.find((concept)=>concept.id===custom.themeId&&concept.theme):null);const backgroundUrl=custom?.url||dream?.wallpaper||'';const bg=skin&&backgroundUrl?'skin':backgroundUrl?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.chatBg=bg;applyDreamSkinTheme(skin,theme);document.body.style.setProperty('--custom-chat-bg',backgroundUrl?'url("'+backgroundUrl+'")':'none');if(themeToggle){setIconLabel(themeToggle,theme==='dark'?'sun':'moon','',false);themeToggle.title=theme==='dark'?'切换明亮模式':'切换黑暗模式';themeToggle.setAttribute('aria-label',themeToggle.title)}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
 async function saveAppearance(patch){const res=await fetch('/api/appearance',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'外观保存失败';applyAppearance();return null}appearance=data.appearance;applyAppearance();return appearance}
-function renderBackgroundOptions(selected){if(!chatBackground)return;const options=[['default','默认'],['plain','纯净'],['paper','纸张'],['grid','网格']];for(const item of appearance.customBackgrounds||[])options.push([item.value,item.name]);options.push(['custom','自定义']);chatBackground.innerHTML='';for(const [value,label] of options){const opt=document.createElement('option');opt.value=value;opt.textContent=label;chatBackground.appendChild(opt)}chatBackground.value=options.some(([value])=>value===selected)?selected:'default'}
-function cleanBackgroundValue(value){const text=String(value||'');if(['default','plain','paper','grid'].includes(text))return text;return findCustomBackground(text)?text:'default'}
+function renderBackgroundOptions(selected){if(!chatBackground)return;const options=[['default','默认'],['dream-skin','Dream Skin']];for(const item of appearance.customBackgrounds||[])options.push([item.value,item.name]);options.push(['custom','自定义']);chatBackground.innerHTML='';for(const [value,label] of options){const opt=document.createElement('option');opt.value=value;opt.textContent=label;chatBackground.appendChild(opt)}chatBackground.value=findDreamSkinConcept(selected)?'dream-skin':options.some(([value])=>value===selected)?selected:'default'}
+function cleanBackgroundValue(value){const text=String(value||'');if(text==='default'||findDreamSkinConcept(text))return text;return findCustomBackground(text)?text:'default'}
+function findDreamSkinConcept(value){const id=String(value||'').replace(/^dream:/,'');return dreamSkinConcepts.find((concept)=>concept.id===id&&concept.wallpaper)}
 function findCustomBackground(value){return (appearance.customBackgrounds||[]).find((item)=>item.value===value&&item.url)}
 function updateDeleteBackgroundButton(selected){if(!deleteBackground)return;deleteBackground.classList.toggle('hidden',!findCustomBackground(selected));deleteBackground.disabled=!findCustomBackground(selected)}
-async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
+function renderDreamSkinConcepts(){
+  if(!dreamSkinConceptList)return;
+  dreamSkinConceptList.replaceChildren();
+  for(const concept of dreamSkinConcepts){
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='dreamSkinConcept';
+    button.disabled=dreamSkinApplying;
+    const selected=dreamSkinSelectedConcept===concept.id;
+    button.classList.toggle('active',selected);
+    button.setAttribute('aria-pressed',String(selected));
+    button.setAttribute('aria-label','应用壁纸 '+concept.name);
+    button.title=concept.summary||concept.name;
+    const thumb=document.createElement('img');
+    thumb.className='dreamSkinConceptThumb';
+    thumb.src=concept.wallpaper;
+    thumb.alt='';
+    thumb.loading='lazy';
+    thumb.setAttribute('aria-hidden','true');
+    const label=document.createElement('span');
+    label.className='dreamSkinConceptLabel';
+    const index=document.createElement('span');
+    index.className='dreamSkinConceptIndex';
+    index.textContent=concept.id.replace('skin-','');
+    const name=document.createElement('span');
+    name.className='dreamSkinConceptName';
+    name.textContent=concept.name;
+    const check=document.createElement('i');
+    check.setAttribute('data-lucide','check');
+    check.setAttribute('aria-hidden','true');
+    label.appendChild(index);
+    label.appendChild(name);
+    button.appendChild(thumb);
+    button.appendChild(label);
+    button.appendChild(check);
+    button.addEventListener('click',()=>selectDreamSkinConcept(concept));
+    dreamSkinConceptList.appendChild(button);
+  }
+  refreshIcons(dreamSkinConceptList);
+  renderDreamSkinConceptPreview();
+}
+function renderDreamSkinConceptPreview(){
+  if(!dreamSkinConceptPreview)return;
+  const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.wallpaper);
+  dreamSkinConceptPreview.replaceChildren();
+  dreamSkinConceptPreview.classList.toggle('hidden',!concept);
+  if(!concept)return;
+  const media=document.createElement('button');
+  media.type='button';
+  media.className='dreamSkinPreviewMedia';
+  media.title='放大查看 '+concept.name;
+  media.setAttribute('aria-label','放大查看壁纸 '+concept.name);
+  const image=document.createElement('img');
+  image.src=concept.wallpaper;
+  image.alt=concept.name+' 壁纸预览';
+  media.appendChild(image);
+  media.addEventListener('click',()=>openImagePreview(concept.wallpaper,image.alt,media));
+  const info=document.createElement('div');
+  info.className='dreamSkinPreviewInfo';
+  const title=document.createElement('strong');
+  title.textContent=concept.id+' · '+concept.name;
+  const summary=document.createElement('p');
+  summary.textContent=concept.summary;
+  const mode=document.createElement('span');
+  mode.className='dreamSkinPreviewMode';
+  mode.textContent=({'no-person':'无人物','fictional-adult':'原创人物',reference:'参考图重绘'})[dreamSkinMode?.value||concept.mode]||'原创人物';
+  info.appendChild(title);
+  info.appendChild(summary);
+  info.appendChild(mode);
+  dreamSkinConceptPreview.appendChild(media);
+  dreamSkinConceptPreview.appendChild(info);
+  if(dreamSkinGenerateButton){const label='重新生成 '+concept.id.replace('skin-','')+' 壁纸';setIconLabel(dreamSkinGenerateButton,'sparkles',label);dreamSkinGenerateButton.title=label;dreamSkinGenerateButton.setAttribute('aria-label',label)}
+  refreshIcons(dreamSkinConceptPreview);
+}
+async function selectDreamSkinConcept(concept){
+  if(!concept||!concept.wallpaper||dreamSkinApplying)return;
+  dreamSkinSelectedConcept=concept.id;
+  if(dreamSkinMode&&['no-person','fictional-adult'].includes(concept.mode))dreamSkinMode.value=concept.mode;
+  dreamSkinApplying=true;
+  if(dreamSkinStatus)dreamSkinStatus.textContent='正在应用 '+concept.name+'...';
+  renderDreamSkinConcepts();
+  const saved=await saveAppearance({chatBackground:'dream:'+concept.id});
+  dreamSkinApplying=false;
+  if(saved){
+    if(dreamSkinStatus)dreamSkinStatus.textContent='已应用 '+concept.name;
+    statusEl.textContent='Dream Skin · '+concept.name;
+  }else{
+    const active=findDreamSkinConcept(appearance.chatBackground);
+    dreamSkinSelectedConcept=active?.id||concept.id;
+    if(dreamSkinStatus)dreamSkinStatus.textContent='壁纸应用失败';
+  }
+  renderDreamSkinConcepts();
+}
+function openDreamSkinGenerator(){if(!dreamSkinPanel)return;const active=findDreamSkinConcept(appearance.chatBackground);if(active)dreamSkinSelectedConcept=active.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept);if(concept&&dreamSkinMode&&['no-person','fictional-adult'].includes(concept.mode))dreamSkinMode.value=concept.mode;dreamSkinPanel.classList.remove('hidden');renderDreamSkinConcepts();renderDreamSkinReferences();chatBackground.value='dream-skin';requestAnimationFrame(()=>dreamSkinPanel.scrollIntoView({block:'nearest'}))}
+function closeDreamSkinGenerator(){dreamSkinPanel?.classList.add('hidden');if(chatBackground)chatBackground.value=findDreamSkinConcept(appearance.chatBackground)?'dream-skin':cleanBackgroundValue(appearance.chatBackground)}
+function renderDreamSkinReferences(){if(!dreamSkinReferenceList)return;dreamSkinReferenceList.replaceChildren();dreamSkinReferenceList.classList.toggle('hidden',!dreamSkinReferenceFiles.length);dreamSkinReferenceFiles.forEach((file,index)=>{const chip=document.createElement('div');chip.className='dreamSkinReferenceChip';const image=document.createElement('img');image.alt='参考图 '+(index+1);const url=URL.createObjectURL(file);image.src=url;image.addEventListener('load',()=>URL.revokeObjectURL(url),{once:true});const name=document.createElement('span');name.textContent=file.name;name.title=file.name;const remove=document.createElement('button');remove.type='button';remove.title='移除参考图';remove.setAttribute('aria-label','移除参考图 '+(index+1));setIconLabel(remove,'x','移除参考图',false);remove.addEventListener('click',()=>{dreamSkinReferenceFiles.splice(index,1);renderDreamSkinReferences()});chip.appendChild(image);chip.appendChild(name);chip.appendChild(remove);dreamSkinReferenceList.appendChild(chip)});refreshIcons(dreamSkinReferenceList)}
+async function uploadDreamSkinReference(file){const data=await readFileDataUrl(file);const res=await fetch('/api/uploads/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'参考图上传失败');return body.attachment}
+async function generateDreamSkinBackground(){if(!dreamSkinGenerateButton||dreamSkinGenerateButton.disabled)return;const mode=dreamSkinMode?.value||'no-person';if(mode==='reference'&&!dreamSkinReferenceFiles.length){dreamSkinStatus.textContent='参考图模式至少需要添加 1 张图片';dreamSkinReferenceInput?.focus();return}dreamSkinGenerateButton.disabled=true;dreamSkinStatus.textContent='准备生成任务...';try{const attachments=[];for(let index=0;index<dreamSkinReferenceFiles.length;index++){dreamSkinStatus.textContent='上传参考图 '+(index+1)+' / '+dreamSkinReferenceFiles.length;attachments.push(await uploadDreamSkinReference(dreamSkinReferenceFiles[index]))}const res=await fetch('/api/dream-skin/prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({description:dreamSkinIdea?.value||'',conceptId:dreamSkinSelectedConcept,mode,referenceCount:attachments.length})});const body=await res.json();if(!res.ok)throw new Error(body.error||'生成任务创建失败');dreamSkinStatus.textContent='正在启动 Codex App...';closeSettings();newChat();cwd.value=body.cwd||cwd.value;syncComposerChrome();input.value=body.prompt;input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';pendingAttachments=attachments;renderAttachmentTray();dreamSkinReferenceFiles=[];if(dreamSkinIdea)dreamSkinIdea.value='';renderDreamSkinReferences();closeDreamSkinGenerator();dreamSkinGenerateButton.disabled=false;dreamSkinStatus.textContent='';await send()}catch(error){dreamSkinStatus.textContent=error.message;dreamSkinGenerateButton.disabled=false}}
+async function handleChatBackgroundChange(){const value=chatBackground.value;if(value==='dream-skin'){openDreamSkinGenerator();return}closeDreamSkinGenerator();if(value==='custom'){const reset=saveAppearance({chatBackground:'default'});chatBackgroundFile?.click();await reset;return}await saveAppearance({chatBackground:value});statusEl.textContent='会话背景已更新'}
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
+async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();appearance=data.appearance||appearance;applyAppearance();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);cwd.value=data.defaults.cwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
-async function refreshHistory(){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);cwd.value=data.defaults.cwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
+async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor)return;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
 async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
 async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
@@ -3092,41 +4486,218 @@ async function deleteSelectedProvider(){const name=provider.value;if(!name){defa
 async function requestModels(payload){try{const res=await fetch('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();return res.ok?data:{error:data.error||'获取模型失败'}}catch(e){return{error:e.message}}}
 function fillSelect(select,items,selected){select.innerHTML='';const list=[...new Set((items||[]).filter(Boolean))];if(!list.length)list.push(selected||'gpt-5.5');for(const item of list){const opt=document.createElement('option');opt.value=item;opt.textContent=item;select.appendChild(opt)}select.value=list.includes(selected)?selected:list[0];syncComposerChrome()}
 function conversationKey(source,id){return (source==='codex'?'codex':'web')+':'+id}
+function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown__'}
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
 function projectNameFromPath(value){const clean=String(value||'').replace(/\\\\/g,'/').replace(/\\/+$/,'');const parts=clean.split('/').filter(Boolean);return parts.length?parts[parts.length-1]:'未指定项目'}
+function readRenamedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECT_NAMES_STORAGE_KEY)||'{}');if(!saved||Array.isArray(saved)||typeof saved!=='object')return new Map();return new Map(Object.entries(saved).filter(([key,value])=>key&&typeof value==='string'&&value.trim()).map(([key,value])=>[key,value.trim().replace(/\s+/g,' ').slice(0,80)]))}catch{return new Map()}}
+function storeRenamedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECT_NAMES_STORAGE_KEY,JSON.stringify(Object.fromEntries([...renamedHistoryProjects.entries()].sort(([left],[right])=>left.localeCompare(right)))))}catch{}}
+function historyProjectName(value){return renamedHistoryProjects.get(historyProjectKey(value))||projectNameFromPath(value)}
+function ensureHistoryProjectPreview(){
+  if(historyProjectPreview)return historyProjectPreview;
+  const preview=document.createElement('aside');
+  preview.id='historyProjectPreview';
+  preview.className='historyProjectPreview';
+  preview.setAttribute('role','tooltip');
+  preview.setAttribute('aria-hidden','true');
+  preview.hidden=true;
+  document.body.appendChild(preview);
+  historyProjectPreview=preview;
+  return preview;
+}
+function appendHistoryProjectPreviewRow(container,iconName,text,className=''){
+  const row=document.createElement('div');
+  row.className='historyProjectPreviewRow'+(className?' '+className:'');
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide',iconName);
+  icon.setAttribute('aria-hidden','true');
+  const copy=document.createElement('span');
+  copy.textContent=text;
+  row.appendChild(icon);
+  row.appendChild(copy);
+  container.appendChild(row);
+  return row;
+}
+function showHistoryProjectPreview(anchor,{projectName,projectPath,itemCount,runningCount}){
+  if(!desktopSidebarMedia.matches||activeHistoryProjectMenu)return;
+  const preview=ensureHistoryProjectPreview();
+  preview.replaceChildren();
+  const heading=document.createElement('div');
+  heading.className='historyProjectPreviewHeading';
+  const identity=document.createElement('div');
+  identity.className='historyProjectPreviewIdentity';
+  const folder=document.createElement('i');
+  folder.setAttribute('data-lucide','folder');
+  folder.setAttribute('aria-hidden','true');
+  const name=document.createElement('strong');
+  name.textContent=projectName;
+  identity.appendChild(folder);
+  identity.appendChild(name);
+  const pin=document.createElement('span');
+  pin.className='historyProjectPreviewPin';
+  const pinIcon=document.createElement('i');
+  pinIcon.setAttribute('data-lucide','pin');
+  pinIcon.setAttribute('aria-hidden','true');
+  pin.appendChild(pinIcon);
+  heading.appendChild(identity);
+  heading.appendChild(pin);
+  preview.appendChild(heading);
+  appendHistoryProjectPreviewRow(preview,'message-circle',itemCount+' 个对话串 · '+runningCount+' 个已开启','historyProjectPreviewStats');
+  const divider=document.createElement('div');
+  divider.className='historyProjectPreviewDivider';
+  preview.appendChild(divider);
+  appendHistoryProjectPreviewRow(preview,'folder',projectPath||'路径未知','historyProjectPreviewPath');
+  refreshIcons(preview);
+  historyProjectPreviewAnchor=anchor;
+  preview.hidden=false;
+  preview.setAttribute('aria-hidden','false');
+  preview.classList.add('visible');
+  const anchorRect=anchor.getBoundingClientRect();
+  const left=Math.max(10,Math.min(anchorRect.right+10,window.innerWidth-preview.offsetWidth-10));
+  const top=Math.max(10,Math.min(anchorRect.top-6,window.innerHeight-preview.offsetHeight-10));
+  preview.style.left=left+'px';
+  preview.style.top=top+'px';
+}
+function hideHistoryProjectPreview(anchor){
+  if(anchor&&anchor!==historyProjectPreviewAnchor)return;
+  historyProjectPreviewAnchor=null;
+  if(!historyProjectPreview)return;
+  historyProjectPreview.classList.remove('visible');
+  historyProjectPreview.setAttribute('aria-hidden','true');
+  historyProjectPreview.hidden=true;
+}
 function readCollapsedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
 function storeCollapsedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...collapsedHistoryProjects].sort()))}catch{}}
+function readHiddenHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
+function storeHiddenHistoryProjects(){try{localStorage.setItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...hiddenHistoryProjects].sort()))}catch{}}
+function closeHistoryProjectMenu(restoreFocus=false){
+  const active=activeHistoryProjectMenu;
+  if(!active)return;
+  active.menu.hidden=true;
+  active.menu.classList.remove('openAbove');
+  active.button.setAttribute('aria-expanded','false');
+  activeHistoryProjectMenu=null;
+  if(restoreFocus&&active.button.isConnected)active.button.focus();
+}
+function toggleHistoryProjectMenu(button,menu){
+  const shouldOpen=menu.hidden;
+  hideHistoryProjectPreview();
+  closeHistoryProjectMenu();
+  if(!shouldOpen)return;
+  menu.hidden=false;
+  button.setAttribute('aria-expanded','true');
+  activeHistoryProjectMenu={button,menu};
+  requestAnimationFrame(()=>{
+    const bounds=history.getBoundingClientRect();
+    const anchor=button.getBoundingClientRect();
+    menu.classList.toggle('openAbove',anchor.bottom+menu.offsetHeight+8>bounds.bottom&&anchor.top-menu.offsetHeight>bounds.top);
+    menu.querySelector('button:not(:disabled)')?.focus();
+  });
+}
+function addHistoryProjectMenuAction(menu,iconName,label,handler,{danger=false,disabled=false}={}){
+  const action=document.createElement('button');
+  action.type='button';
+  action.className='historyProjectMenuAction'+(danger?' danger':'');
+  action.setAttribute('role','menuitem');
+  action.disabled=disabled;
+  setIconLabel(action,iconName,label);
+  action.addEventListener('click',(event)=>{event.stopPropagation();closeHistoryProjectMenu();handler()});
+  menu.appendChild(action);
+  return action;
+}
+function createHistoryProjectMenu(groupKey,groupData,projectName){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='historyProjectMenuButton';
+  button.title='项目操作';
+  button.setAttribute('aria-label','项目 '+projectName+' 的操作');
+  button.setAttribute('aria-haspopup','menu');
+  button.setAttribute('aria-expanded','false');
+  setIconLabel(button,'ellipsis','项目操作',false);
+  const menu=document.createElement('div');
+  menu.className='historyProjectMenu';
+  menu.setAttribute('role','menu');
+  menu.setAttribute('aria-label','项目 '+projectName+' 的操作');
+  menu.hidden=true;
+  addHistoryProjectMenuAction(menu,'pencil','重命名项目',()=>renameHistoryProject(groupKey,groupData.path,projectName));
+  addHistoryProjectMenuAction(menu,'archive','归档项目任务',()=>archiveHistoryProject(groupData.path,projectName,groupData.items),{disabled:!groupData.path});
+  const hidden=hiddenHistoryProjects.has(groupKey);
+  addHistoryProjectMenuAction(menu,hidden?'undo-2':'x',hidden?'恢复项目':'移除项目',()=>toggleHistoryProjectHidden(groupKey,projectName,groupData.items.length),{danger:!hidden});
+  button.addEventListener('click',(event)=>{event.stopPropagation();toggleHistoryProjectMenu(button,menu)});
+  menu.addEventListener('click',(event)=>event.stopPropagation());
+  return{button,menu};
+}
+function renameHistoryProject(groupKey,projectPath,projectName){
+  const next=prompt('重命名项目（留空恢复默认名称）',projectName);
+  if(next===null)return;
+  const clean=next.trim().replace(/\s+/g,' ').slice(0,80);
+  const defaultName=projectNameFromPath(projectPath);
+  if(!clean||clean===defaultName)renamedHistoryProjects.delete(groupKey);
+  else renamedHistoryProjects.set(groupKey,clean);
+  storeRenamedHistoryProjects();
+  renderHistory();
+  statusEl.textContent=clean&&clean!==defaultName?'项目已重命名':'项目名称已恢复默认';
+}
+async function archiveHistoryProject(projectPath,projectName,items){
+  if(!projectPath)return;
+  if(!confirm('归档项目「'+projectName+'」下的 '+items.length+' 个任务？归档后可在 Codex App 中恢复。'))return;
+  statusEl.textContent='正在归档项目任务...';
+  try{
+    const res=await fetch('/api/native-projects/archive',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cwd:projectPath})});
+    const data=await res.json().catch(()=>({}));
+    if((data.archived||[]).includes(currentConversationId))newChat();
+    await refreshHistory();
+    if(!res.ok)throw new Error(data.error||'归档项目任务失败');
+    statusEl.textContent='已归档 '+data.archived.length+' 个项目任务';
+  }catch(error){
+    await refreshHistory();
+    statusEl.textContent=error.message;
+  }
+}
+function toggleHistoryProjectHidden(groupKey,projectName,itemCount){
+  const hidden=hiddenHistoryProjects.has(groupKey);
+  if(!hidden&&!confirm('从侧栏移除项目「'+projectName+'」？不会删除目录或 '+itemCount+' 个任务，可通过搜索恢复。'))return;
+  if(hidden)hiddenHistoryProjects.delete(groupKey);else hiddenHistoryProjects.add(groupKey);
+  storeHiddenHistoryProjects();
+  renderHistory();
+  statusEl.textContent=hidden?'项目已恢复':'项目已从侧栏移除';
+}
 function setHistoryProjectExpanded(group,expanded){
   const head=group?.querySelector('.historyProjectHead');
   const rows=group?.querySelector('.historyProjectItems');
   if(!head||!rows)return;
   const projectName=group.dataset.projectName||'未指定项目';
   const projectPath=group.dataset.projectPath||'路径未知';
+  const itemCount=group.dataset.projectCount||'0';
+  const runningCount=group.dataset.projectRunningCount||'0';
   group.classList.toggle('collapsed',!expanded);
   head.setAttribute('aria-expanded',String(expanded));
-  head.setAttribute('aria-label',(expanded?'收起':'展开')+'项目 '+projectName);
+  head.setAttribute('aria-label',(expanded?'收起':'展开')+'项目 '+projectName+'，'+itemCount+' 个对话串，'+runningCount+' 个已开启');
   head.title=(expanded?'收起':'展开')+' '+projectName+'\\n'+projectPath;
   rows.hidden=!expanded;
 }
 function renderHistory(items){
   if(Array.isArray(items))historyItems=items;
+  renderComposerProjectOptions();
   const query=String(historyFilter?.value||'').trim().toLocaleLowerCase();
-  const visibleItems=query?historyItems.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')).toLocaleLowerCase().includes(query)):historyItems;
+  const candidates=query?historyItems:historyItems.filter((item)=>!hiddenHistoryProjects.has(historyProjectKey(item.cwd)));
+  const visibleItems=query?candidates.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')+' '+historyProjectName(item.cwd)).toLocaleLowerCase().includes(query)):candidates;
   const scrollTop=history.scrollTop;
+  hideHistoryProjectPreview();
+  closeHistoryProjectMenu();
   history.innerHTML='';
   const historyCount=document.getElementById('historyTitleCount');
-  if(historyCount)historyCount.textContent=query?visibleItems.length+'/'+historyItems.length:String(historyItems.length);
+  if(historyCount)historyCount.textContent=(query||visibleItems.length!==historyItems.length)?visibleItems.length+'/'+historyItems.length:String(historyItems.length);
   if(!visibleItems.length){
     const empty=document.createElement('div');
     empty.className='historyEmpty';
-    empty.textContent=query?'没有匹配的任务':'暂无任务';
+    empty.textContent=query?'没有匹配的任务':hiddenHistoryProjects.size?'项目已从侧栏移除，可通过搜索恢复':'暂无任务';
     history.appendChild(empty);
     return;
   }
   const groups=new Map();
   for(const item of visibleItems){
     const projectPath=normalizeProjectPath(item.cwd);
-    const groupKey=projectPath||'__unknown__';
+    const groupKey=historyProjectKey(projectPath);
     if(!groups.has(groupKey))groups.set(groupKey,{path:projectPath,items:[]});
     groups.get(groupKey).items.push(item);
   }
@@ -3135,19 +4706,25 @@ function renderHistory(items){
     const group=document.createElement('section');
     group.className='historyProject';
     group.dataset.projectPath=groupData.path;
-    const projectName=projectNameFromPath(groupData.path);
+    const projectName=historyProjectName(groupData.path);
+    const runningCount=groupData.items.filter((item)=>item.status==='running').length;
     group.dataset.projectName=projectName;
+    group.dataset.projectCount=String(groupData.items.length);
+    group.dataset.projectRunningCount=String(runningCount);
     group.setAttribute('aria-label','项目 '+projectName+'，路径 '+(groupData.path||'未知'));
+    const header=document.createElement('div');
+    header.className='historyProjectHeader';
     const head=document.createElement('button');
     head.type='button';
     head.className='historyProjectHead';
     const rowsId='history-project-items-'+groupIndex++;
     head.setAttribute('aria-controls',rowsId);
+    const folder=document.createElement('span');
+    folder.className='historyProjectFolder';
+    setIconLabel(folder,'folder','',false);
     const chevron=document.createElement('span');
     chevron.className='historyProjectChevron';
     setIconLabel(chevron,'chevron-right','',false);
-    const headText=document.createElement('span');
-    headText.className='historyProjectHeadText';
     const title=document.createElement('span');
     title.className='historyProjectTitle';
     const name=document.createElement('span');
@@ -3158,18 +4735,23 @@ function renderHistory(items){
     count.textContent=String(groupData.items.length);
     title.appendChild(name);
     title.appendChild(count);
-    const projectPath=document.createElement('span');
-    projectPath.className='historyProjectPath';
-    projectPath.textContent=groupData.path||'路径未知';
-    headText.appendChild(title);
-    headText.appendChild(projectPath);
+    head.appendChild(folder);
+    head.appendChild(title);
     head.appendChild(chevron);
-    head.appendChild(headText);
+    const projectMenu=createHistoryProjectMenu(groupKey,groupData,projectName);
+    header.appendChild(head);
+    header.appendChild(projectMenu.button);
+    header.appendChild(projectMenu.menu);
+    const previewData={projectName,projectPath:groupData.path,itemCount:groupData.items.length,runningCount};
+    header.addEventListener('pointerenter',()=>showHistoryProjectPreview(header,previewData));
+    header.addEventListener('pointerleave',()=>hideHistoryProjectPreview(header));
+    header.addEventListener('focusin',()=>showHistoryProjectPreview(header,previewData));
+    header.addEventListener('focusout',(event)=>{if(!header.contains(event.relatedTarget))hideHistoryProjectPreview(header)});
     const rows=document.createElement('div');
     rows.className='historyProjectItems';
     rows.id=rowsId;
     for(const item of groupData.items)rows.appendChild(createHistoryRow(item,groupData.path));
-    group.appendChild(head);
+    group.appendChild(header);
     group.appendChild(rows);
     history.appendChild(group);
     const currentKey=conversationKey(currentConversationSource,currentConversationId);
@@ -3200,13 +4782,22 @@ function createHistoryRow(item,projectPath){
   open.textContent=item.title;
   open.title=row.title;
   open.addEventListener('click',(e)=>{e.stopPropagation();loadConversation(item.id,source)});
-  row.appendChild(open);
   if(source==='codex'){
     const badge=document.createElement('span');
     badge.className='histSource';
     badge.textContent='App';
     badge.title='Codex App 原生会话';
     row.appendChild(badge);
+  }
+  row.appendChild(open);
+  if(item.status==='running'){
+    const running=document.createElement('span');
+    running.className='histRunning';
+    running.title='运行中';
+    running.setAttribute('aria-label','运行中');
+    row.appendChild(running);
+  }
+  if(source==='codex'){
     const rename=document.createElement('button');
     rename.type='button';
     rename.className='histRename';
@@ -3278,13 +4869,14 @@ function applyConversationMode(){
   syncComposerChrome();
   renderPromptQueue();
 }
-function newChat(){closeComposerPopovers();clearNativeCompletionSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
+function newChat(){closeComposerPopovers();clearNativeCompletionSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
-async function loadConversation(id,source='web'){
+async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   clearNativeCompletionSync();
   const seq=++conversationLoadSeq;
   nativeOptimisticElements=[];
+  nativeOptimisticSteering=new Map();
   nativeRunningElement=null;
   nativeLiveItems=new Map();
   latestToolElement=null;
@@ -3300,7 +4892,9 @@ async function loadConversation(id,source='web'){
   updateActiveHistory();
   statusEl.textContent='Loading...';
   const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
-  const res=await fetch(endpoint+encodeURIComponent(id));
+  const fastNativeLoad=currentConversationSource==='codex'&&!options.full;
+  const requestUrl=endpoint+encodeURIComponent(id)+(currentConversationSource==='codex'?'?images=external'+(fastNativeLoad?'&limit='+NATIVE_INITIAL_MESSAGE_LIMIT:''):'');
+  const res=await fetch(requestUrl);
   if(seq!==conversationLoadSeq)return false;
   if(!res.ok){statusEl.textContent='加载失败';return false}
   const data=await res.json();
@@ -3320,6 +4914,7 @@ async function loadConversation(id,source='web'){
   beginTurnProcessCollection();
   (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoScroll:false,kind:msg.kind,at:msg.at}));
   if(!(conversation.messages||[]).length)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
+  if(currentConversationSource==='codex'&&conversation.hasEarlierMessages&&!options.full)addNativeHistoryLoadButton(conversation.id);
   updateConversationStatus(conversation);
   renderPromptQueue();
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
@@ -3327,23 +4922,34 @@ async function loadConversation(id,source='web'){
   scrollChatToLatest();
   return true;
 }
+function addNativeHistoryLoadButton(id){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='nativeHistoryLoad';
+  button.textContent='加载完整近期记录';
+  button.addEventListener('click',()=>loadConversation(id,'codex',{full:true}));
+  chat.prepend(button);
+}
 function updateConversationStatus(conversation){
   const time=new Date(conversation.updatedAt||conversation.createdAt);
   const stamp=Number.isNaN(time.getTime())?'':time.toLocaleString();
   statusEl.classList.toggle('running',conversation.status==='running');
   if(conversation.source==='codex'){
     statusEl.textContent='Codex App · '+(conversation.status==='running'?'运行中':'已同步')+(stamp?' · '+stamp:'');
-    nativeNotice.textContent='Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':'');
+    nativeNotice.textContent='Codex App 会话 · 双向同步'+(conversation.hasEarlierMessages?' · 已快速加载最近消息':conversation.truncated?' · 仅显示最近记录':'');
   }else{
     statusEl.textContent='Loaded '+stamp;
   }
 }
 function applyNativeConversationMetadata(metadata){if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
-async function forkNativeConversation(messageSeq){
+async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
   if(!currentConversationId||currentConversationSource!=='codex')return;
   if(webRunActive){statusEl.textContent='任务运行中，不能创建历史分支';return}
-  if(!confirm('从这条消息重新开始？原会话会保留，新分支不会撤销已经产生的本地文件修改，原消息中的附件需要重新添加。'))return;
+  const prompt=continueAfter
+    ?'在新任务中从这条回答之后继续？原任务会保留，已经产生的本地文件修改不会撤销。'
+    :'从这条消息重新开始？原会话会保留，新分支不会撤销已经产生的本地文件修改，原消息中的附件需要重新添加。';
+  if(!confirm(prompt))return;
   const sourceThreadId=currentConversationId;
   statusEl.textContent='正在创建历史分支...';
   try{
@@ -3367,7 +4973,7 @@ async function forkNativeConversation(messageSeq){
     input.style.height='auto';
     input.style.height=Math.min(input.scrollHeight,180)+'px';
     await refreshHistory();
-    statusEl.textContent='已创建分支，可修改后发送；原会话保持不变';
+    statusEl.textContent=continueAfter?'已在新任务中继续；原任务保持不变':'已创建分支，可修改后发送；原会话保持不变';
     input.focus();
   }catch(e){
     statusEl.textContent=e.message;
@@ -3431,12 +5037,12 @@ function connectSessionEvents(){
   });
   sessionEvents.addEventListener('native-request',()=>refreshNativeRequests());
 }
-async function syncCurrentNativeConversation(){
+async function syncCurrentNativeConversationOnce(){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
   const id=currentConversationId;
   const seq=conversationLoadSeq;
   const nearBottom=chat.scrollHeight-chat.scrollTop-chat.clientHeight<120;
-  const url='/api/native-sessions/'+encodeURIComponent(id)+'?after='+nativeCursor+'&generation='+nativeGeneration;
+  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&limit='+NATIVE_INITIAL_MESSAGE_LIMIT+'&after='+nativeCursor+'&generation='+nativeGeneration;
   const res=await fetch(url);
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
@@ -3767,16 +5373,43 @@ function renderReviewComments(body,comments){
 }
 function decodeEmbeddedToolString(value){try{return JSON.parse('"'+value+'"')}catch(e){return String(value||'')}}
 function readEmbeddedToolString(source,marker){const start=String(source||'').indexOf(marker);if(start<0)return null;let value='';let escaped=false;for(let index=start+marker.length;index<source.length;index++){const char=source[index];if(char==='"'&&!escaped)return decodeEmbeddedToolString(value);value+=char;if(char==='\\\\'&&!escaped)escaped=true;else escaped=false}return null}
-function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim();let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};const imagePath=readEmbeddedToolString(detail,'tools.view_image({path:"');if(imagePath!==null)return{name:'view_image',detail:imagePath};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail};if(detail.includes('view_image'))return{name:'view_image',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
+function executableOrchestratedToolCallOffsets(source,toolName){
+  const text=String(source||'');
+  const needle='tools.'+toolName;
+  const offsets=[];
+  let quote='';
+  let escaped=false;
+  let lineComment=false;
+  let blockComment=false;
+  for(let index=0;index<text.length;index++){
+    const char=text[index];
+    const next=text[index+1];
+    if(lineComment){if(char==='\\n')lineComment=false;continue}
+    if(blockComment){if(char==='*'&&next==='/'){blockComment=false;index++}continue}
+    if(quote){if(escaped)escaped=false;else if(char==='\\\\')escaped=true;else if(char===quote)quote='';continue}
+    if(char==='/'&&next==='/'){lineComment=true;index++;continue}
+    if(char==='/'&&next==='*'){blockComment=true;index++;continue}
+    if(char==='"'||char==="'"||char.charCodeAt(0)===96){quote=char;continue}
+    if(!text.startsWith(needle,index))continue;
+    let cursor=index+needle.length;
+    while(/\\s/.test(text[cursor]||''))cursor++;
+    if(text[cursor]==='(')offsets.push(index);
+  }
+  return offsets;
+}
+function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim().replace(/^调用工具:\\s*/,'');let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
 function activityFileLabel(file){const clean=String(file||'').trim().replace(/^["']|["',;)]$/g,'');const parts=clean.split('/').filter(Boolean);return parts[parts.length-1]||clean||'文件'}
 function extractActivityFiles(source){const matches=String(source||'').match(/[A-Za-z0-9_@.+-]+\\.(?:mjs|cjs|js|css|jsonl?|md|toml|ya?ml|py|sh|html|tsx?|jsx?|go|rs|java|cpp|hpp|c|h)/g)||[];return[...new Set(matches.map(activityFileLabel))].slice(0,4)}
 function shortActivityText(value,max=100){const clean=String(value||'').replace(/\\s+/g,' ').trim();return clean.length>max?clean.slice(0,max-3)+'...':clean}
+function embeddedToolObject(detail){const source=String(detail||'').split('\\n').filter((line)=>!/^call_id=/.test(line.trim())).join('\\n').trim();const candidates=[source];const start=source.indexOf('{');const end=source.lastIndexOf('}');if(start>=0&&end>start)candidates.push(source.slice(start,end+1));for(const candidate of candidates){try{const parsed=JSON.parse(candidate);if(parsed&&typeof parsed==='object')return parsed}catch(e){}}return{}}
+function agentActivityLabel(value){const pathParts=String(value||'').trim().split('/').filter(Boolean);const clean=(pathParts.at(-1)||'Agent').replace(/[_-]+/g,' ').replace(/\\s+/g,' ').trim();return clean?clean.charAt(0).toUpperCase()+clean.slice(1):'Agent'}
+function agentSpawnActivityPresentation(detail){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?task_name["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];return{variant:'agent',label:agentActivityLabel(payload.task_name||fallback),status:'已开始工作',icon:'flower-2',expandable:false}}
 function orchestratedActivityPresentations(text){
   const source=String(text||'');
   if(!source.startsWith('exec\\n'))return[];
   const detail=source.slice(source.indexOf('\\n')+1);
-  const imageCount=(detail.match(/tools\\.view_image\\s*\\(/g)||[]).length;
-  const commandCount=(detail.match(/tools\\.exec_command\\s*\\(/g)||[]).length;
+  const imageCount=executableOrchestratedToolCallOffsets(detail,'view_image').length;
+  const commandCount=executableOrchestratedToolCallOffsets(detail,'exec_command').length;
   const items=[];
   if(imageCount)items.push({verb:'已查看',target:imageCount+' 张图像',icon:'images'});
   if(commandCount>1)items.push({verb:'已读取文件并运行了多个命令',icon:'search'});
@@ -3800,11 +5433,83 @@ function runningActivityVerb(verb){
 }
 function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){current={verb:match[1],icon:match[2],target:activityFileLabel(line.slice(match[0].length)),added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
 function commandActivityPresentation(command){const source=String(command||'');const clean=shortActivityText(source,120);const files=extractActivityFiles(source);if(/(?:^|\\s)(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files.join('、')||clean,icon:'book-open'};if(/\\brg\\b/.test(source)){const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';return{verb:'已搜索',target:(files.join('、')||'内容')+(query?' · “'+shortActivityText(query,48)+'”':''),icon:'search'}}if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files.join('、')||shortActivityText(source.split('\\n')[0],84),icon:'circle-check'};if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};return{verb:'已运行',target:files.join('、')||clean||'工具调用',icon:'terminal'}}
-function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name+(descriptor.detail?' · '+descriptor.detail:''),100),icon:'wrench'}]}
+function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(toolName==='spawn_agent')return[agentSpawnActivityPresentation(descriptor.detail)];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
+function isImageViewActivityPresentation(presentation){return presentation?.verb==='已查看'&&/\\d+ 张图像$/.test(String(presentation.target||''))&&['image','images'].includes(presentation.icon)}
+function nativeToolImageUrls(presentations,messageSeq){
+  const sequence=Number(messageSeq);
+  if(currentConversationSource!=='codex'||!currentConversationId||!Number.isInteger(sequence)||sequence<1)return[];
+  const count=presentations.reduce((total,presentation)=>total+(Number(String(presentation.target||'').match(/^(\\d+) 张图像$/)?.[1])||0),0);
+  if(!count)return[];
+  const base='/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/tool-images/'+sequence+'/';
+  return Array.from({length:count},(_,index)=>base+(index+1));
+}
+function createActivityImageGallery(urls){
+  const gallery=document.createElement('div');
+  gallery.className='activityImageGallery'+(urls.length===1?' single':'');
+  urls.forEach((url,index)=>{
+    const preview=document.createElement('button');
+    preview.type='button';
+    preview.className='activityImagePreview';
+    preview.title='放大查看第 '+(index+1)+' 张图片';
+    preview.setAttribute('aria-label',preview.title);
+    const img=document.createElement('img');
+    img.alt='查看的图像 '+(index+1);
+    img.loading='lazy';
+    img.decoding='async';
+    img.addEventListener('load',()=>preview.classList.add('loaded'),{once:true});
+    img.src=url;
+    const unavailable=document.createElement('span');
+    unavailable.className='activityImageUnavailable';
+    unavailable.hidden=true;
+    const unavailableIcon=document.createElement('i');
+    unavailableIcon.setAttribute('data-lucide','image-off');
+    unavailableIcon.setAttribute('aria-hidden','true');
+    const unavailableText=document.createElement('span');
+    unavailableText.textContent='图片已不可用';
+    unavailable.appendChild(unavailableIcon);
+    unavailable.appendChild(unavailableText);
+    img.addEventListener('error',()=>{img.remove();unavailable.hidden=false;preview.classList.add('unavailable');preview.disabled=true;refreshIcons(unavailable)});
+    preview.appendChild(img);
+    preview.appendChild(unavailable);
+    preview.addEventListener('click',()=>openImagePreview(url,img.alt,preview));
+    gallery.appendChild(preview);
+  });
+  return gallery;
+}
 function createToolActivityItem(presentation,rawText,running=false){
+  if(presentation.variant==='agent'){
+    const item=document.createElement('div');
+    item.className='activityItem agentActivityItem static';
+    item.dataset.messageText=String(rawText||'');
+    const row=document.createElement('div');
+    row.className='agentActivityRow';
+    const identity=document.createElement('span');
+    identity.className='agentActivityIdentity';
+    const iconWrap=document.createElement('span');
+    iconWrap.className='agentActivityIcon';
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide',presentation.icon||'flower-2');
+    icon.setAttribute('aria-hidden','true');
+    iconWrap.appendChild(icon);
+    const label=document.createElement('span');
+    label.className='agentActivityLabel';
+    label.textContent=presentation.label||'Agent';
+    const status=document.createElement('span');
+    status.className='agentActivityStatus';
+    status.textContent=presentation.status||'已开始工作';
+    identity.appendChild(iconWrap);
+    identity.appendChild(label);
+    row.appendChild(identity);
+    row.appendChild(status);
+    item.appendChild(row);
+    return item;
+  }
   const expandable=presentation.expandable!==false;
+  const galleryOnly=Boolean(presentation.galleryOnly);
+  const imageUrls=Array.isArray(presentation.imageUrls)?presentation.imageUrls.filter(Boolean):[];
   const item=document.createElement(expandable?'details':'div');
-  item.className='activityItem'+(expandable?'':' static');
+  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'');
+  if(expandable)item.open=false;
   item.dataset.messageText=String(rawText||'');
   const summary=document.createElement(expandable?'summary':'div');
   summary.className='activityItemSummary'+(presentation.target?'':' standalone');
@@ -3833,8 +5538,16 @@ function createToolActivityItem(presentation,rawText,running=false){
     meta.textContent=presentation.meta;
     summary.appendChild(meta);
   }
-  item.appendChild(summary);
   if(expandable){
+    const chevron=document.createElement('i');
+    chevron.className='activityItemChevron';
+    chevron.setAttribute('data-lucide','chevron-right');
+    chevron.setAttribute('aria-hidden','true');
+    summary.appendChild(chevron);
+  }
+  item.appendChild(summary);
+  if(imageUrls.length)item.appendChild(createActivityImageGallery(imageUrls));
+  if(expandable&&!galleryOnly){
     const content=document.createElement('div');
     content.className='activityItemContent';
     const raw=document.createElement('pre');
@@ -3861,16 +5574,115 @@ function createActivityBatch(presentations,rawText,kind,running=false){
   for(const presentation of presentations)batch.appendChild(createToolActivityItem(presentation,rawText,running));
   return batch;
 }
-function appendTurnTool(text){
-  const batch=createActivityBatch(toolActivityPresentations(text),text,'tool_activity',true);
+function joinActivityActions(actions){
+  if(actions.length<2)return actions[0]||'';
+  return actions.length===2?actions[0]+'并'+actions[1]:actions.slice(0,-1).join('、')+'并'+actions.at(-1);
+}
+function activityClusterPresentation(cluster){
+  const batches=[...cluster.querySelectorAll(':scope > .activityClusterItems > .activityBatch')];
+  const items=[...cluster.querySelectorAll('.activityItem')];
+  const running=batches.some((batch)=>batch.classList.contains('streaming'));
+  const records=items.map((item)=>({
+    verb:String(item.querySelector('.activityVerb')?.dataset.completedVerb||'').trim(),
+    currentVerb:String(item.querySelector('.activityVerb')?.textContent||'').trim(),
+    target:String(item.querySelector('.activityTarget')?.textContent||'').trim(),
+    icon:item.querySelector('.activityItemIcon [data-lucide]')?.getAttribute('data-lucide')||'activity',
+  }));
+  const browser=records.some((record)=>record.icon==='panel-top'||/浏览器/.test(record.target));
+  if(browser)return{icon:'panel-top',text:(running?'正在使用':'已使用')+' 浏览器'};
+  if(records.length===1&&batches.length===1){
+    const record=records[0];
+    return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'工具调用'};
+  }
+  const edited=records.some((record)=>['已编辑','已新增','已删除'].includes(record.verb));
+  const read=records.some((record)=>['已读取','已搜索','已查看'].includes(record.verb));
+  const ran=batches.length>1||records.some((record)=>[
+    '已运行','已检查','已请求','已调用','已使用','已读取文件并运行了多个命令',
+  ].includes(record.verb));
+  const actions=[];
+  if(edited)actions.push(running?'编辑文件':'编辑了文件');
+  if(read)actions.push(running?'读取文件':'读取文件');
+  if(ran)actions.push(running?'运行多个命令':'运行了多个命令');
+  const text=joinActivityActions(actions)||(running?'正在使用工具':'已使用工具');
+  return{
+    icon:edited?'pencil':read?'book-open':'terminal',
+    text:running&&!text.startsWith('正在')?'正在'+text:text,
+  };
+}
+function createActivityCluster(){
+  const cluster=document.createElement('details');
+  cluster.className='msg activityCluster';
+  cluster.dataset.messageKind='activity_cluster';
+  cluster.open=false;
+  const summary=document.createElement('summary');
+  summary.className='activityClusterSummary';
+  const icon=document.createElement('span');
+  icon.className='activityItemIcon activityClusterIcon';
+  const label=document.createElement('span');
+  label.className='activityClusterText';
+  const chevron=document.createElement('i');
+  chevron.className='activityClusterChevron';
+  chevron.setAttribute('data-lucide','chevron-right');
+  chevron.setAttribute('aria-hidden','true');
+  summary.appendChild(icon);
+  summary.appendChild(label);
+  summary.appendChild(chevron);
+  const items=document.createElement('div');
+  items.className='activityClusterItems';
+  cluster.appendChild(summary);
+  cluster.appendChild(items);
+  return cluster;
+}
+function updateActivityCluster(cluster){
+  if(!cluster)return;
+  const presentation=activityClusterPresentation(cluster);
+  const iconWrap=cluster.querySelector(':scope > summary .activityClusterIcon');
+  const label=cluster.querySelector(':scope > summary .activityClusterText');
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide',presentation.icon);
+  icon.setAttribute('aria-hidden','true');
+  iconWrap?.replaceChildren(icon);
+  if(label){label.textContent=presentation.text;label.title=presentation.text}
+  cluster.dataset.messageText=presentation.text;
+  cluster.classList.toggle('streaming',Boolean(cluster.querySelector('.activityBatch.streaming')));
+  refreshIcons(cluster);
+}
+function appendActivityBatchToCluster(cluster,batch){
+  cluster.querySelector(':scope > .activityClusterItems')?.appendChild(batch);
+  updateActivityCluster(cluster);
+}
+function settleActivityCluster(cluster){
+  for(const batch of cluster?.querySelectorAll('.activityBatch')||[])settleTurnTool(batch);
+  cluster?.classList.remove('streaming');
+  updateActivityCluster(cluster);
+}
+function appendTurnTool(text,options={}){
+  const presentations=toolActivityPresentations(text);
+  const imageViews=presentations.filter(isImageViewActivityPresentation);
+  const folded=presentations.filter((presentation)=>!isImageViewActivityPresentation(presentation));
+  const imageUrls=nativeToolImageUrls(imageViews,options.nativeMessageSeq);
+  let visibleBatch=null;
+  if(imageViews.length){
+    visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true);
+    activateTurnProcessElement(visibleBatch);
+    refreshIcons(visibleBatch);
+  }
+  if(!folded.length)return visibleBatch;
+  const activityKind=folded.some((presentation)=>presentation.variant==='agent')?'agent_activity':'tool_activity';
+  const batch=createActivityBatch(folded,text,activityKind,true);
+  if(visibleBatch)batch._relatedActivityBatches=[visibleBatch];
   activateTurnProcessElement(batch);
   refreshIcons(batch);
   return batch;
 }
 function settleTurnTool(batch){
   if(!batch)return;
-  batch.classList.remove('streaming');
-  for(const verb of batch.querySelectorAll('.activityVerb[data-completed-verb]'))verb.textContent=verb.dataset.completedVerb;
+  for(const item of [batch,...(batch._relatedActivityBatches||[])]){
+    item.classList.remove('streaming');
+    for(const verb of item.querySelectorAll('.activityVerb[data-completed-verb]'))verb.textContent=verb.dataset.completedVerb;
+    const cluster=item.closest('.activityCluster');
+    if(cluster)updateActivityCluster(cluster);
+  }
 }
 function appendTurnProcessActivity(text,kind){
   const presentation=kind==='context_compacted'
@@ -3887,68 +5699,26 @@ function contextMessageTitle(text,kind){const lines=String(text||'').split('\\n'
 function completionMessageTitle(text){
   const seconds=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
   if(!Number.isFinite(seconds))return'已处理';
-  if(seconds<60)return'已处理 '+Math.max(1,Math.round(seconds))+'s';
-  const minutes=Math.floor(seconds/60);
-  const remainder=Math.round(seconds%60);
+  const rounded=Math.max(1,Math.round(seconds));
+  if(rounded<60)return'已处理 '+rounded+'s';
+  const minutes=Math.floor(rounded/60);
+  const remainder=rounded%60;
   return'已处理 '+minutes+'m'+(remainder?' '+remainder+'s':'');
 }
-function liveProcessMessageTitle(){
-  const seconds=Math.max(1,(Date.now()-turnProcessStartedAt)/1000);
-  return completionMessageTitle('耗时 '+seconds+'s');
-}
-function updateTurnProcessTimer(){
-  if(turnProcessLabel)turnProcessLabel.textContent=liveProcessMessageTitle();
-}
-function followLatestTurnProcess(){
-  const content=turnProcessTimeline?.parentElement;
-  if(!content||!turnProcessAutoFollow)return;
-  if(turnProcessFollowFrame)cancelAnimationFrame(turnProcessFollowFrame);
-  turnProcessFollowFrame=requestAnimationFrame(()=>{
-    turnProcessFollowFrame=null;
-    if(turnProcessAutoFollow&&content.isConnected)content.scrollTop=content.scrollHeight;
-  });
-}
 function clearTurnProcessHeader(){
-  if(turnProcessTimer)clearInterval(turnProcessTimer);
-  if(turnProcessFollowFrame)cancelAnimationFrame(turnProcessFollowFrame);
-  turnProcessTimer=null;
-  turnProcessFollowFrame=null;
   if(turnProcessHeader?.parentNode)turnProcessHeader.remove();
   turnProcessHeader=null;
-  turnProcessLabel=null;
   turnProcessTimeline=null;
-  turnProcessAutoFollow=true;
 }
 function ensureTurnProcessHeader(){
   if(turnProcessHeader)return turnProcessHeader;
-  turnProcessHeader=document.createElement('details');
-  turnProcessHeader.className='msg process completionSummary liveProcessPanel';
+  turnProcessHeader=document.createElement('div');
+  turnProcessHeader.className='liveProcessPanel';
   turnProcessHeader.dataset.messageKind='live_process';
-  turnProcessHeader.open=true;
-  const summary=document.createElement('summary');
-  turnProcessLabel=document.createElement('span');
-  const chevron=document.createElement('i');
-  chevron.setAttribute('data-lucide','chevron-right');
-  chevron.setAttribute('aria-hidden','true');
-  summary.appendChild(turnProcessLabel);
-  summary.appendChild(chevron);
-  const content=document.createElement('div');
-  content.className='completionContent';
-  content.addEventListener('wheel',(event)=>{if(event.deltaY<0)turnProcessAutoFollow=false},{passive:true});
-  content.addEventListener('touchmove',()=>{turnProcessAutoFollow=false},{passive:true});
-  content.addEventListener('pointermove',(event)=>{if(event.buttons)turnProcessAutoFollow=false},{passive:true});
-  content.addEventListener('scroll',()=>{
-    if(content.scrollHeight-content.scrollTop-content.clientHeight<64)turnProcessAutoFollow=true;
-  },{passive:true});
   turnProcessTimeline=document.createElement('div');
-  turnProcessTimeline.className='completionTimeline';
-  content.appendChild(turnProcessTimeline);
-  turnProcessHeader.appendChild(summary);
-  turnProcessHeader.appendChild(content);
-  updateTurnProcessTimer();
-  turnProcessTimer=setInterval(updateTurnProcessTimer,1000);
+  turnProcessTimeline.className='completionTimeline liveProcessTimeline';
+  turnProcessHeader.appendChild(turnProcessTimeline);
   chat.appendChild(turnProcessHeader);
-  refreshIcons(turnProcessHeader);
   return turnProcessHeader;
 }
 function formatMessageTime(value){
@@ -3959,29 +5729,35 @@ function formatMessageTime(value){
 function resetTurnProcessCollection(){
   clearTurnProcessHeader();
   turnProcessElements=[];
-  visibleTurnProcessElement=null;
+  currentActivityCluster=null;
+  nativeOptimisticSteering.clear();
   collectingTurnProcess=false;
-  turnProcessStartedAt=0;
 }
-function beginTurnProcessCollection(startAt){
+function beginTurnProcessCollection(){
   for(const element of turnProcessElements)if(element?.parentNode===chat)element.remove();
   clearTurnProcessHeader();
   turnProcessElements=[];
-  visibleTurnProcessElement=null;
+  currentActivityCluster=null;
+  nativeOptimisticSteering.clear();
   collectingTurnProcess=true;
-  turnProcessAutoFollow=true;
-  const parsed=Date.parse(startAt||'');
-  turnProcessStartedAt=Number.isFinite(parsed)?Math.min(Date.now(),parsed):Date.now();
 }
 function activateTurnProcessElement(element){
   if(!collectingTurnProcess||!element)return;
   ensureTurnProcessHeader();
+  if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='tool_activity'){
+    if(!currentActivityCluster?.isConnected){
+      currentActivityCluster=createActivityCluster();
+      turnProcessElements.push(currentActivityCluster);
+      turnProcessTimeline.appendChild(currentActivityCluster);
+    }
+    appendActivityBatchToCluster(currentActivityCluster,element);
+    return currentActivityCluster;
+  }
+  currentActivityCluster=null;
   if(!turnProcessElements.includes(element))turnProcessElements.push(element);
   turnProcessTimeline.appendChild(element);
-  followLatestTurnProcess();
-  visibleTurnProcessElement=element;
+  return element;
 }
-window.addEventListener('resize',followLatestTurnProcess);
 function takeTurnProcessElements(){
   const elements=[...turnProcessElements];
   resetTurnProcessCollection();
@@ -4017,6 +5793,7 @@ function createCompletionMessage(text,processElements=[]){
   const label=document.createElement('span');
   label.textContent=completionMessageTitle(text);
   const chevron=document.createElement('i');
+  chevron.className='completionChevron';
   chevron.setAttribute('data-lucide','chevron-right');
   chevron.setAttribute('aria-hidden','true');
   summary.appendChild(label);
@@ -4029,6 +5806,7 @@ function createCompletionMessage(text,processElements=[]){
     for(const item of processElements){
       item.classList.remove('streaming');
       if(item.classList.contains('activityBatch'))settleTurnTool(item);
+      if(item.classList.contains('activityCluster'))settleActivityCluster(item);
       if(item.tagName==='DETAILS')item.open=false;
       timeline.appendChild(item);
     }
@@ -4041,7 +5819,7 @@ function createCompletionMessage(text,processElements=[]){
   return el;
 }
 function appendInputImageToUser(userElement,source,at){
-  if(!userElement||userElement.parentNode!==chat||!userElement._messageBody)return null;
+  if(!userElement?.isConnected||!userElement._messageBody)return null;
   const userAt=String(userElement.dataset.messageAt||'');
   const imageAt=String(at||'');
   if(userAt&&imageAt&&userAt!==imageAt)return null;
@@ -4051,6 +5829,8 @@ function appendInputImageToUser(userElement,source,at){
     stack.className='userAttachmentStack';
     userElement.insertBefore(stack,userElement._messageBody);
   }
+  const existing=[...stack.querySelectorAll('img')].find((image)=>image.getAttribute('src')===source);
+  if(existing)return existing.closest('button');
   const item=document.createElement('button');
   item.type='button';
   item.className='userAttachment';
@@ -4064,12 +5844,28 @@ function appendInputImageToUser(userElement,source,at){
   item.appendChild(img);
   item.addEventListener('click',()=>openImagePreview(source,img.alt,item));
   stack.appendChild(item);
+  stack.classList.toggle('single',stack.children.length===1);
   userElement.classList.add('hasInputImage');
   return item;
 }
+function consumeNativeOptimisticSteering(text,at){
+  const expected=String(text||'').trim();
+  for(const [id,element] of nativeOptimisticSteering){
+    if(!element?.isConnected){nativeOptimisticSteering.delete(id);continue}
+    if(String(element.dataset.messageText||'').trim()!==expected)continue;
+    nativeOptimisticSteering.delete(id);
+    element.classList.remove('optimistic');
+    delete element.dataset.optimisticQueueId;
+    element.dataset.messageAt=String(at||element.dataset.messageAt||'');
+    latestUserElement=element;
+    return element;
+  }
+  return null;
+}
 function addMsg(role,text,options={}){
   const kind=String(options.kind||'');
-  const inputImage=role==='image'&&kind==='input_image';
+  const steeringUser=role==='user'&&kind==='steering_user';
+  const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   if(role!=='user'&&!inputImage)latestUserElement=null;
   if(role==='thinking')return null;
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
@@ -4091,24 +5887,45 @@ function addMsg(role,text,options={}){
     return activity;
   }
   if(role==='user'){
-    if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
-    latestToolElement=null;
-    latestAssistantElement=null;
-    latestFinalAssistantElement=null;
+    if(steeringUser){
+      if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
+    }else{
+      if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
+      latestToolElement=null;
+      latestAssistantElement=null;
+      latestFinalAssistantElement=null;
+    }
   }
   const empty=chat.querySelector('.empty');
   if(empty)empty.remove();
+  if(steeringUser&&!options.optimisticQueueId){
+    const optimistic=consumeNativeOptimisticSteering(text,options.at);
+    if(optimistic){
+      if(options.autoScroll!==false)scrollChatToLatest();
+      return optimistic;
+    }
+  }
   if(role==='process'&&kind==='task_complete'){
     const anchor=latestFinalAssistantElement?.parentNode===chat?latestFinalAssistantElement:null;
-    const completion=createCompletionMessage(text,collectTurnArtifactsFromDom(anchor,takeTurnProcessElements()));
-    if(anchor)chat.insertBefore(completion,anchor);else chat.appendChild(completion);
+    const artifacts=collectTurnArtifactsFromDom(anchor,takeTurnProcessElements());
+    const visibleActivities=artifacts.filter((item)=>item.dataset?.messageKind==='image_view_activity');
+    const foldedActivities=artifacts.filter((item)=>item.dataset?.messageKind!=='image_view_activity');
+    for(const item of visibleActivities)settleTurnTool(item);
+    const completion=createCompletionMessage(text,foldedActivities);
+    if(anchor){
+      chat.insertBefore(completion,anchor);
+      for(const item of visibleActivities)chat.insertBefore(item,anchor);
+    }else{
+      chat.appendChild(completion);
+      for(const item of visibleActivities)chat.appendChild(item);
+    }
     latestToolElement=null;
-    refreshIcons(completion);
+    refreshIcons(chat);
     if(options.autoScroll!==false)scrollChatToLatest();
     return completion;
   }
   if(collectingTurnProcess&&role==='tool'){
-    const activity=appendTurnTool(text);
+    const activity=appendTurnTool(text,options);
     latestToolElement=activity;
     if(options.autoScroll!==false)scrollChatToLatest();
     return activity;
@@ -4125,15 +5942,22 @@ function addMsg(role,text,options={}){
   const el=document.createElement(collapsible?'details':'div');
   el.className='msg '+role+(collapsible?' toolDetails':'')+(options.streaming?' streaming':'');
   if(role==='assistant'&&['commentary','live_progress'].includes(kind))el.classList.add('progressCommentary');
-  if(role==='image'&&kind==='input_image')el.classList.add('inputImage');
+  if(role==='image'&&inputImage)el.classList.add('inputImage');
   el.dataset.messageText=String(text||'');
   el.dataset.messageKind=kind;
   el.dataset.messageAt=String(options.at||'');
+  if(steeringUser){
+    el.classList.add('steeringUser');
+    if(options.optimisticQueueId){
+      el.classList.add('optimistic');
+      el.dataset.optimisticQueueId=String(options.optimisticQueueId);
+    }
+  }
   if(options.streaming&&collapsible)el.open=true;
   if(role==='image'){
     const img=document.createElement('img');
     img.src=text;
-    img.alt=kind==='input_image'?'用户上传的图片':'生成的图片';
+    img.alt=inputImage?'用户上传的图片':'生成的图片';
     img.loading='lazy';
     img.decoding='async';
     img.tabIndex=0;
@@ -4146,6 +5970,19 @@ function addMsg(role,text,options={}){
       openImagePreview(text,img.alt,img);
     });
     el.appendChild(img);
+    if(!inputImage){
+      const imageActions=document.createElement('div');
+      imageActions.className='generatedImageActions';
+      const applyBackground=document.createElement('button');
+      applyBackground.type='button';
+      applyBackground.className='generatedBackgroundApply';
+      applyBackground.title='设为会话背景';
+      applyBackground.setAttribute('aria-label','设为会话背景');
+      setIconLabel(applyBackground,'paintbrush','设为会话背景',false);
+      applyBackground.addEventListener('click',(event)=>{event.stopPropagation();applyGeneratedImageBackground(text,applyBackground)});
+      imageActions.appendChild(applyBackground);
+      el.appendChild(imageActions);
+    }
   }else{
     const body=document.createElement('div');
     body.className='msgBody';
@@ -4158,11 +5995,21 @@ function addMsg(role,text,options={}){
       tag.textContent=role==='process'?'过程':'日志';
       actions.appendChild(tag);
     }
+    const copy=document.createElement('button');
+    copy.type='button';
+    copy.className='copyMsg messageAction';
+    copy.title='复制此消息';
+    copy.dataset.tooltip='复制';
+    copy.setAttribute('aria-label','复制此消息');
+    setIconLabel(copy,'copy','复制此消息',false);
+    copy.addEventListener('click',(e)=>{e.stopPropagation();copyText(el.dataset.messageText||'',copy)});
+    actions.appendChild(copy);
     if(role==='user'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId){
       const fork=document.createElement('button');
       fork.type='button';
-      fork.className='rollbackMsg';
+      fork.className='rollbackMsg messageAction';
       fork.title='从这里重新开始';
+      fork.dataset.tooltip='从这里重新开始';
       fork.setAttribute('aria-label','从这里重新开始');
       setIconLabel(fork,'git-branch','从这里重新开始',false);
       fork.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq)});
@@ -4170,28 +6017,32 @@ function addMsg(role,text,options={}){
     }else if(role==='user'&&Number.isInteger(options.messageIndex)){
       const rollback=document.createElement('button');
       rollback.type='button';
-      rollback.className='rollbackMsg';
+      rollback.className='rollbackMsg messageAction';
       rollback.title='回退到这条消息';
+      rollback.dataset.tooltip='回退到这条消息';
       rollback.setAttribute('aria-label','回退到这条消息');
       setIconLabel(rollback,'rotate-ccw','回退到这条消息',false);
       rollback.addEventListener('click',(e)=>{e.stopPropagation();rollbackConversation(options.messageIndex)});
       actions.appendChild(rollback);
     }
-    if(role==='user'){
+    if(role==='assistant'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId&&['','message','final_answer'].includes(kind)){
+      const continueTask=document.createElement('button');
+      continueTask.type='button';
+      continueTask.className='continueMsg messageAction';
+      continueTask.title='在新任务中继续';
+      continueTask.dataset.tooltip='在新任务中继续';
+      continueTask.setAttribute('aria-label','在新任务中继续');
+      setIconLabel(continueTask,'corner-up-right','在新任务中继续',false);
+      continueTask.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true})});
+      actions.appendChild(continueTask);
+    }
+    if(['user','assistant'].includes(role)){
       const time=document.createElement('time');
       time.className='messageTime';
       time.dateTime=String(options.at||new Date().toISOString());
       time.textContent=formatMessageTime(time.dateTime);
       actions.appendChild(time);
     }
-    const copy=document.createElement('button');
-    copy.type='button';
-    copy.className='copyMsg';
-    copy.title='复制此消息';
-    copy.setAttribute('aria-label','复制此消息');
-    setIconLabel(copy,'copy','复制此消息',false);
-    copy.addEventListener('click',(e)=>{e.stopPropagation();copyText(el.dataset.messageText||'',copy)});
-    actions.appendChild(copy);
     if(collapsible){
       const summary=document.createElement('summary');
       const row=document.createElement('span');
@@ -4226,7 +6077,7 @@ function addMsg(role,text,options={}){
   }
   if(role==='tool'&&latestToolElement?.parentNode)latestToolElement.remove();
   chat.appendChild(el);
-  if(isTurnProcessMessage(role,kind))activateTurnProcessElement(el);
+  if(steeringUser||isTurnProcessMessage(role,kind))activateTurnProcessElement(el);
   refreshIcons(el);
   if(role==='tool')latestToolElement=el;
   if(role==='assistant'){
@@ -4401,6 +6252,7 @@ async function send(){
   }
 }
 </script>
+<script src="/image-prompt.js"></script>
 </body>
 </html>`;
 }

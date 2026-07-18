@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "themes": {
+    "skin-01": {
+      "art": { "focusX": 0.72, "focusY": 0.45, "safeArea": "left", "taskMode": "ambient" },
+      "colors": {
+        "light": {
+          "background": "#fff7fa", "panel": "#fffafd", "panelAlt": "#fceef4",
+          "accent": "#b83f70", "accentAlt": "#dc759c", "secondary": "#8b68b8",
+          "highlight": "#cb4f82", "text": "#3e2531", "muted": "#8d6877",
+          "line": "rgba(184, 63, 112, 0.28)"
+        },
+        "dark": {
+          "background": "#170d13", "panel": "#21121b", "panelAlt": "#301b28",
+          "accent": "#f08aae", "accentAlt": "#f4abc3", "secondary": "#b997df",
+          "highlight": "#df6c9a", "text": "#fff2f7", "muted": "#c8a5b3",
+          "line": "rgba(240, 138, 174, 0.3)"
+        }
+      }
+    },
+    "skin-02": {
+      "art": { "focusX": 0.72, "focusY": 0.46, "safeArea": "left", "taskMode": "ambient" },
+      "colors": {
+        "light": {
+          "background": "#fff8e9", "panel": "#fffdf6", "panelAlt": "#fcebcf",
+          "accent": "#ad352d", "accentAlt": "#d85b47", "secondary": "#a47a20",
+          "highlight": "#c28a29", "text": "#46281f", "muted": "#8e6d5d",
+          "line": "rgba(173, 53, 45, 0.28)"
+        },
+        "dark": {
+          "background": "#1b0d09", "panel": "#28130e", "panelAlt": "#3a1d14",
+          "accent": "#f26f55", "accentAlt": "#f79a71", "secondary": "#e1b753",
+          "highlight": "#ffc96d", "text": "#fff3df", "muted": "#caa58a",
+          "line": "rgba(242, 111, 85, 0.32)"
+        }
+      }
+    },
+    "skin-03": {
+      "art": { "focusX": 0.7, "focusY": 0.45, "safeArea": "left", "taskMode": "ambient" },
+      "colors": {
+        "light": {
+          "background": "#faf6f4", "panel": "#fffdfc", "panelAlt": "#f9e9e7",
+          "accent": "#b8333a", "accentAlt": "#de6260", "secondary": "#7f3948",
+          "highlight": "#e05650", "text": "#35262a", "muted": "#887377",
+          "line": "rgba(184, 51, 58, 0.27)"
+        },
+        "dark": {
+          "background": "#160b0d", "panel": "#211013", "panelAlt": "#34191d",
+          "accent": "#ff7470", "accentAlt": "#ff9b93", "secondary": "#d36a7d",
+          "highlight": "#ff5b61", "text": "#fff2f1", "muted": "#c7a5a7",
+          "line": "rgba(255, 116, 112, 0.31)"
+        }
+      }
+    },
+    "skin-04": {
+      "art": { "focusX": 0.72, "focusY": 0.45, "safeArea": "left", "taskMode": "ambient" },
+      "colors": {
+        "light": {
+          "background": "#f7f6ef", "panel": "#fffef9", "panelAlt": "#edf2e9",
+          "accent": "#587463", "accentAlt": "#789681", "secondary": "#8b8453",
+          "highlight": "#496958", "text": "#2d3931", "muted": "#738077",
+          "line": "rgba(88, 116, 99, 0.27)"
+        },
+        "dark": {
+          "background": "#0e1511", "panel": "#152019", "panelAlt": "#203026",
+          "accent": "#8fc5a1", "accentAlt": "#b2d8b8", "secondary": "#c2bd7d",
+          "highlight": "#6eb48a", "text": "#edf7ef", "muted": "#a4b6a9",
+          "line": "rgba(143, 197, 161, 0.29)"
+        }
+      }
+    },
+    "skin-05": {
+      "art": { "focusX": 0.7, "focusY": 0.46, "safeArea": "left", "taskMode": "ambient" },
+      "colors": {
+        "light": {
+          "background": "#fffaf0", "panel": "#fffdf7", "panelAlt": "#eaf6f1",
+          "accent": "#147f78", "accentAlt": "#35a9a0", "secondary": "#b98616",
+          "highlight": "#c55449", "text": "#263b39", "muted": "#667d78",
+          "line": "rgba(20, 127, 120, 0.27)"
+        },
+        "dark": {
+          "background": "#0a1514", "panel": "#10211f", "panelAlt": "#19312d",
+          "accent": "#4bd4c7", "accentAlt": "#7be2d8", "secondary": "#efc353",
+          "highlight": "#ef786b", "text": "#edfffb", "muted": "#9fc1ba",
+          "line": "rgba(75, 212, 199, 0.3)"
+        }
+      }
+    },
+    "skin-06": {
+      "art": { "focusX": 0.72, "focusY": 0.44, "safeArea": "left", "taskMode": "ambient" },
+      "colors": {
+        "light": {
+          "background": "#f6f3ff", "panel": "#fcfaff", "panelAlt": "#eee8fb",
+          "accent": "#6550a8", "accentAlt": "#8b70ce", "secondary": "#a84f8f",
+          "highlight": "#395da8", "text": "#29253f", "muted": "#756d93",
+          "line": "rgba(101, 80, 168, 0.28)"
+        },
+        "dark": {
+          "background": "#0d0d25", "panel": "#151532", "panelAlt": "#20204a",
+          "accent": "#a68cff", "accentAlt": "#c1afff", "secondary": "#f279c0",
+          "highlight": "#67a0ff", "text": "#f5f2ff", "muted": "#aaa5cf",
+          "line": "rgba(166, 140, 255, 0.32)"
+        }
+      }
+    },
+    "skin-07": {
+      "art": { "focusX": 0.73, "focusY": 0.44, "safeArea": "left", "taskMode": "ambient" },
+      "colors": {
+        "light": {
+          "background": "#effbfe", "panel": "#fbfeff", "panelAlt": "#e6f6fa",
+          "accent": "#0b7f91", "accentAlt": "#26a9b8", "secondary": "#c4537d",
+          "highlight": "#6d5eb2", "text": "#153840", "muted": "#63818a",
+          "line": "rgba(11, 127, 145, 0.27)"
+        },
+        "dark": {
+          "background": "#07151a", "panel": "#0d2228", "panelAlt": "#14343c",
+          "accent": "#55d7df", "accentAlt": "#86e7e9", "secondary": "#f18aab",
+          "highlight": "#a89aee", "text": "#edfdff", "muted": "#9cbfc5",
+          "line": "rgba(85, 215, 223, 0.31)"
+        }
+      }
+    },
+    "skin-08": {
+      "art": { "focusX": 0.72, "focusY": 0.44, "safeArea": "left", "taskMode": "ambient" },
+      "colors": {
+        "light": {
+          "background": "#f8f5ee", "panel": "#fffdf8", "panelAlt": "#eee8dc",
+          "accent": "#755a2a", "accentAlt": "#9b7937", "secondary": "#5f5140",
+          "highlight": "#9d7222", "text": "#332d25", "muted": "#766d60",
+          "line": "rgba(117, 90, 42, 0.28)"
+        },
+        "dark": {
+          "background": "#090806", "panel": "#12100d", "panelAlt": "#211b14",
+          "accent": "#ddb96d", "accentAlt": "#efd08d", "secondary": "#a88a62",
+          "highlight": "#f0c05c", "text": "#fff6e7", "muted": "#b9a991",
+          "line": "rgba(221, 185, 109, 0.3)"
+        }
+      }
+    }
+  }
+}

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -17,6 +18,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const traceFile = path.join(temporary, 'codex-trace.json');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
   const webEnv = path.join(temporary, 'web.env');
+  const toolImagePath = path.join(temporary, 'tool-preview.png');
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
   const nativeFirstTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa780';
   const nativeSecondTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa781';
@@ -25,10 +27,15 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const archivedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa730';
   const automationNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa731';
   let child;
+  let desktopIpc;
 
   try {
     await mkdir(runtime, { recursive: true });
     await mkdir(codexHome, { recursive: true });
+    await writeFile(
+      toolImagePath,
+      Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
+    );
     await writeFile(path.join(codexHome, 'config.toml'), `model_provider = "fake"
 model = "test-model"
 model_reasoning_effort = "max"
@@ -90,6 +97,26 @@ experimental_bearer_token = "test-token"
           },
         }),
         JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.997Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: 'native assistant answer' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.997Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'false-tool-image-patch',
+            input: 'const patch = "*** Begin Patch\\n*** Update File: /tmp/fake-ui.js\\n+tools.view_image({path:\\"/tmp/not-a-real-image.png\\"})\\n*** End Patch";\ntext(await tools.apply_patch(patch));',
+          },
+        }),
+        JSON.stringify({
           timestamp: '2026-07-11T04:52:31.998Z',
           type: 'event_msg',
           payload: { type: 'task_complete', turn_id: nativeFirstTurnId },
@@ -109,6 +136,16 @@ experimental_bearer_token = "test-token"
               { type: 'input_text', text: 'native fixture message' },
               { type: 'input_image', image_url: 'data:image/png;base64,c21va2U=' },
             ],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:32.004Z',
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            name: 'exec',
+            call_id: 'tool-image-preview',
+            input: `const result = await tools.view_image({path:${JSON.stringify(toolImagePath)},detail:"original"});\nimage(result.image_url);`,
           },
         }),
         JSON.stringify({
@@ -312,7 +349,17 @@ if (args[0] === 'app-server') {
 `);
     await chmod(fakeCodex, 0o755);
 
-    child = await startServer({ temporary, runtime, codexHome, fakeCodex, traceFile, appServerTraceFile });
+    desktopIpc = await createDesktopIpcFixture(temporary);
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+      desktopIpcEnabled: 'true',
+      desktopIpcSocket: desktopIpc.socketPath,
+    });
     let port = await waitForServer(child, runtime);
     const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -336,10 +383,36 @@ if (args[0] === 'app-server') {
     const uiStyles = await uiAsset.text();
     assert.match(uiStyles, /\.historyProjectHead\[aria-expanded="true"\]/);
     assert.match(uiStyles, /\.historyProjectItems\[hidden\]/);
+    assert.match(uiStyles, /\.historyProjectMenu\s*\{/);
+    assert.match(uiStyles, /\.historyProjectMenu\.openAbove/);
+    assert.match(uiStyles, /\.historyProjectMenuAction\.danger/);
+    assert.match(uiStyles, /body\[data-theme\] \.requestAction\s*\{[^}]*background:\s*var\(--surface-raised\);[^}]*color:\s*var\(--text\)/s);
+    assert.match(uiStyles, /body\[data-theme\] \.requestAction\.danger\s*\{[^}]*background:\s*var\(--danger-soft\);[^}]*color:\s*var\(--danger\)/s);
+    assert.match(uiStyles, /\.settingsDialog \.dreamSkinGenerator/);
+    assert.match(uiStyles, /\.dreamSkinConceptList\s*\{/);
+    assert.match(uiStyles, /\.dreamSkinConcept\.active\s*\{/);
+    assert.match(uiStyles, /\.dreamSkinConceptThumb\s*\{/);
+    assert.match(uiStyles, /\.dreamSkinConceptPreview\s*\{/);
+    assert.match(uiStyles, /body\[data-chat-bg="custom"\] \.chat\s*\{[^}]*background-image:\s*var\(--custom-chat-bg\)/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.app\s*\{[^}]*background-image:[^}]*var\(--custom-chat-bg\)[^}]*background-position:\s*var\(--skin-art-position\)/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.main\s*\{[^}]*background:\s*transparent/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.chat\s*\{[^}]*var\(--skin-content-wash\)/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.side,[^}]*body\[data-chat-bg="skin"\] \.top\s*\{[^}]*var\(--skin-surface-soft\)/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.miniPrimary,[^}]*body\[data-chat-bg="skin"\] \.send\s*\{[^}]*background:\s*var\(--primary\)/s);
+    assert.match(uiStyles, /\.generatedBackgroundApply/);
+    assert.doesNotMatch(uiStyles, /data-chat-bg="dream-skin"|portal-hero\.png/);
+    assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
+    assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto auto/s);
+    assert.match(uiStyles, /\.historyProjectFolder\s*\{/);
+    assert.match(uiStyles, /\.historyProjectPreview\.visible\s*\{/);
+    assert.match(uiStyles, /\.historyProjectItems\s*\{[^}]*padding-left:\s*22px/s);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
     assert.match(uiStyles, /\.memoryCitationItem\[open\]/);
     assert.match(uiStyles, /\.composerModelToggle/);
     assert.match(uiStyles, /\.composerPermissionToggle/);
+    assert.match(uiStyles, /\.composerProjectToggle/);
+    assert.match(uiStyles, /\.composerProjectPanel/);
+    assert.match(uiStyles, /\.composerProjectPicker:not\(\.hidden\) \+ \.box/);
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
@@ -347,16 +420,76 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.msg\.user \.msgActions\s*\{[^}]*top:\s*calc\(100% - 1px\);[^}]*padding:\s*5px 0 0 8px/s);
     assert.match(uiStyles, /\.completionTimeline > \.activityBatch \+ \.activityBatch/);
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.activityClusterText\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
+    assert.match(uiStyles, /\.activityCluster\[open\] > summary \.activityClusterChevron/);
+    assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
+    assert.match(uiStyles, /\.activityImageGallery\s*\{/);
+    assert.match(uiStyles, /\.activityImagePreview\s*\{[^}]*display:\s*grid;[^}]*border:\s*0;[^}]*background:\s*transparent/s);
+    assert.match(uiStyles, /\.activityImagePreview\.loaded\s*\{[^}]*aspect-ratio:\s*auto/s);
+    assert.match(uiStyles, /\.activityImagePreview img\s*\{[^}]*width:\s*100%;[^}]*object-fit:\s*contain/s);
+    assert.match(uiStyles, /\.activityImagePreview\.loaded img\s*\{[^}]*height:\s*auto/s);
+    assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary:last-child \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming:last-child > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.match(uiStyles, /@keyframes liveProcessFlow/);
+    assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgBody > :not\(\.memoryCitations\)\s*\{[^}]*max-width:\s*min\(780px, 100%\)/s);
-    assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*100%/s);
+    assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*fit-content;[^}]*opacity:\s*0/s);
+    assert.match(uiStyles, /\.messageAction::after\s*\{[^}]*content:\s*attr\(data-tooltip\)/s);
+    assert.match(uiStyles, /\.msg\.assistant \.continueMsg\s*\{[^}]*background:\s*transparent/s);
+    assert.match(uiStyles, /--conversation-width:\s*760px/);
+    assert.match(uiStyles, /body \.chat > :is\([^}]*\.msg:not\(\.user\):not\(\.inputImage\)[^}]*\.liveProcessPanel[^}]*\)\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\);[^}]*align-self:\s*center/s);
+    assert.match(uiStyles, /body \.chat > :is\(\.msg\.user, \.msg\.image\.inputImage\)\s*\{[^}]*margin-right:\s*max\(0px, calc\(\(100% - var\(--conversation-width\)\) \/ 2\)\)/s);
+    assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
+    assert.match(uiStyles, /\.userAttachmentStack\.single\s*\{[^}]*width:\s*144px/s);
+    assert.match(uiStyles, /\.msg\.user\.hasInputImage > \.msgBody:empty/);
     assert.match(uiStyles, /\.settingsDialog/);
+
+    const imagePromptStylesResponse = await fetch(`${baseUrl}/image-prompt.css`);
+    assert.equal(imagePromptStylesResponse.status, 200);
+    const imagePromptStyles = await imagePromptStylesResponse.text();
+    assert.match(imagePromptStyles, /\.workspaceNavButton\.active/);
+    assert.match(imagePromptStyles, /\.imagePromptGrid/);
+    assert.match(imagePromptStyles, /\.imagePromptDetailDialog/);
+    assert.match(imagePromptStyles, /\.imagePromptPreviewFrame\.imageLoading img/);
+    assert.match(imagePromptStyles, /\.imagePromptPlaygroundFrame/);
+    assert.match(imagePromptStyles, /\.imagePromptViewTab\.active/);
+    assert.match(imagePromptStyles, /\.imagePromptSyncStatus\[data-status="error"\]/);
+    assert.match(imagePromptStyles, /\.imagePromptSyncButton\.syncing \.lucide/);
+
+    const imagePromptScriptResponse = await fetch(`${baseUrl}/image-prompt.js`);
+    assert.equal(imagePromptScriptResponse.status, 200);
+    const imagePromptScript = await imagePromptScriptResponse.text();
+    assert.doesNotThrow(() => new Function(imagePromptScript));
+    assert.match(imagePromptScript, /function loadDetailImage/);
+    assert.match(imagePromptScript, /function useSelectedPromptInPlayground/);
+    assert.match(imagePromptScript, /function handlePlaygroundBridgeMessage/);
+    assert.match(imagePromptScript, /codex-web:image-prompt/);
+    assert.match(imagePromptScript, /在生图工作台使用/);
+    assert.match(imagePromptScript, /transparent_output/);
+    assert.doesNotMatch(imagePromptScript, /发送到 Codex App|function composeCodexImagePrompt/);
+    assert.match(imagePromptScript, /function setImagePromptView/);
+    assert.match(imagePromptScript, /function syncPromptLibrary/);
+    assert.match(imagePromptScript, /function checkLibraryStatus/);
+    assert.match(imagePromptScript, /data-src="\/playground\/"/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
     assert.equal(unauthorized.status, 401);
+    const unauthorizedPlaygroundConfig = await fetch(`${baseUrl}/api/playground-config`);
+    assert.equal(unauthorizedPlaygroundConfig.status, 401);
+    const unauthorizedImagePrompts = await fetch(`${baseUrl}/api/image-prompts`);
+    assert.equal(unauthorizedImagePrompts.status, 401);
+    const unauthorizedImagePromptStatus = await fetch(`${baseUrl}/api/image-prompts/status`);
+    assert.equal(unauthorizedImagePromptStatus.status, 401);
+    const unauthorizedImagePromptSync = await fetch(`${baseUrl}/api/image-prompts/sync`, { method: 'POST' });
+    assert.equal(unauthorizedImagePromptSync.status, 401);
+    const unauthorizedDreamSkin = await fetch(`${baseUrl}/api/dream-skin/prompt`, { method: 'POST' });
+    assert.equal(unauthorizedDreamSkin.status, 401);
+    const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
+    assert.equal(unauthorizedPlayground.status, 401);
 
     const login = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
@@ -366,20 +499,262 @@ if (args[0] === 'app-server') {
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
 
+    const playgroundResponse = await fetch(`${baseUrl}/playground/`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundResponse.status, 200);
+    assert.match(playgroundResponse.headers.get('cache-control'), /private, no-store/);
+    const playgroundPage = await playgroundResponse.text();
+    assert.match(playgroundPage, /<title>GPT Image Playground<\/title>/);
+    const playgroundAssetPath = playgroundPage.match(/src="\.\/(assets\/[^\"]+\.js)"/)?.[1];
+    assert.ok(playgroundAssetPath);
+    const playgroundAsset = await fetch(`${baseUrl}/playground/${playgroundAssetPath}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundAsset.status, 200);
+    assert.match(playgroundAsset.headers.get('content-type'), /javascript/);
+    assert.match(playgroundAsset.headers.get('cache-control'), /private, max-age=31536000, immutable/);
+    const playgroundAssetScript = await playgroundAsset.text();
+    assert.match(playgroundAssetScript, /codex-web:playground-ready/);
+    assert.match(playgroundAssetScript, /codex-web:image-prompt-applied/);
+    assert.match(playgroundAssetScript, /\/api\/playground-config/);
+    assert.match(playgroundAssetScript, /codex-web-agent/);
+    assert.match(playgroundAssetScript, /agentApiConfigMode/);
+    assert.match(playgroundAssetScript, /输入 @ 选择或上传参考图/);
+    assert.match(playgroundAssetScript, /上传新的参考图/);
+    const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundServiceWorker.status, 200);
+    assert.match(playgroundServiceWorker.headers.get('content-type'), /javascript/);
+    assert.match(await playgroundServiceWorker.text(), /registration\.unregister/);
+
+    const dreamSkinSkill = await fetch(`${baseUrl}/assets/dream-skin/SKILL.md`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(dreamSkinSkill.status, 200);
+    assert.match(dreamSkinSkill.headers.get('content-type'), /markdown|text\/plain/);
+    const dreamSkinSkillMarkdown = await dreamSkinSkill.text();
+    assert.match(dreamSkinSkillMarkdown, /Required Workflow[\s\S]*imagegen/);
+    assert.match(dreamSkinSkillMarkdown, /Theme Integration Contract[\s\S]*concept-themes\.json/);
+
+    const dreamSkinConceptSource = await fetch(
+      `${baseUrl}/assets/dream-skin/background-generation-prompts.md`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(dreamSkinConceptSource.status, 200);
+    const dreamSkinConceptMarkdown = await dreamSkinConceptSource.text();
+    assert.equal((dreamSkinConceptMarkdown.match(/^## skin-0[1-8]｜/gm) || []).length, 8);
+    assert.match(dreamSkinConceptMarkdown, /skin-03｜红白未来城市主题/);
+    assert.match(dreamSkinConceptMarkdown, /完整皮肤由本文件生成的纯背景与 `concept-themes\.json`/);
+
+    const dreamSkinThemeSource = await fetch(
+      `${baseUrl}/assets/dream-skin/concept-themes.json`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(dreamSkinThemeSource.status, 200);
+    const dreamSkinThemePayload = await dreamSkinThemeSource.json();
+    assert.equal(dreamSkinThemePayload.schemaVersion, 1);
+    assert.equal(Object.keys(dreamSkinThemePayload.themes).length, 8);
+
+    const dreamSkinConfigResponse = await fetch(`${baseUrl}/api/config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(dreamSkinConfigResponse.status, 200);
+    const dreamSkinConfig = await dreamSkinConfigResponse.json();
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.length, 8);
+    assert.deepEqual(
+      dreamSkinConfig.dreamSkinConcepts.map((concept) => concept.id),
+      [
+        'skin-01',
+        'skin-02',
+        'skin-03',
+        'skin-04',
+        'skin-05',
+        'skin-06',
+        'skin-07',
+        'skin-08',
+      ],
+    );
+    assert.deepEqual(
+      dreamSkinConfig.dreamSkinConcepts.map((concept) => concept.name),
+      [
+        '粉系玫瑰人物主题',
+        '财神打工主题',
+        '红白未来城市主题',
+        '清透鼠尾草人物主题',
+        '彩色灵感小宇宙主题',
+        '蓝紫星夜人物主题',
+        '青蓝虚拟歌姬主题',
+        '舞台黑金人物主题',
+      ],
+    );
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.find((concept) => concept.id === 'skin-03').mode, 'no-person');
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.every((concept) => !('prompt' in concept)), true);
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.every((concept) => concept.theme?.colors?.light && concept.theme?.colors?.dark), true);
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.find((concept) => concept.id === 'skin-07').theme.colors.light.accent, '#0b7f91');
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.find((concept) => concept.id === 'skin-07').theme.art.focusX, 0.73);
+    assert.deepEqual(
+      dreamSkinConfig.dreamSkinConcepts.map((concept) => concept.wallpaper),
+      [
+        '/assets/dream-skin/wallpapers/skin-01.jpg',
+        '/assets/dream-skin/wallpapers/skin-02.jpg',
+        '/assets/dream-skin/wallpapers/skin-03.jpg',
+        '/assets/dream-skin/wallpapers/skin-04.jpg',
+        '/assets/dream-skin/wallpapers/skin-05.jpg',
+        '/assets/dream-skin/wallpapers/skin-06.jpg',
+        '/assets/dream-skin/wallpapers/skin-07.jpg',
+        '/assets/dream-skin/wallpapers/skin-08.jpg',
+      ],
+    );
+
+    const dreamSkinWallpaper = await fetch(
+      `${baseUrl}/assets/dream-skin/wallpapers/skin-03.jpg`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(dreamSkinWallpaper.status, 200);
+    assert.match(dreamSkinWallpaper.headers.get('content-type'), /image\/jpeg/);
+    assert.ok((await dreamSkinWallpaper.arrayBuffer()).byteLength > 100_000);
+
+    const retiredDreamSkinPresetAppearance = await fetch(`${baseUrl}/api/appearance`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chatBackground: 'dream:preset-midnight-aurora',
+        theme: 'dark',
+      }),
+    });
+    assert.equal(retiredDreamSkinPresetAppearance.status, 200);
+    const retiredDreamSkinPresetState = (await retiredDreamSkinPresetAppearance.json()).appearance;
+    assert.equal(retiredDreamSkinPresetState.chatBackground, 'default');
+    assert.equal(retiredDreamSkinPresetState.theme, 'dark');
+
+    const appliedDreamSkinWallpaper = await fetch(`${baseUrl}/api/appearance`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatBackground: 'dream:skin-03' }),
+    });
+    assert.equal(appliedDreamSkinWallpaper.status, 200);
+    assert.equal((await appliedDreamSkinWallpaper.json()).appearance.chatBackground, 'dream:skin-03');
+
+    const generatedDreamSkinUpload = await fetch(`${baseUrl}/api/appearance/background`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Dream Skin generated.png',
+        type: 'image/png',
+        data: `data:image/png;base64,${Buffer.from('dream-skin-smoke').toString('base64')}`,
+        themeId: 'skin-07',
+      }),
+    });
+    assert.equal(generatedDreamSkinUpload.status, 200);
+    const generatedDreamSkinState = await generatedDreamSkinUpload.json();
+    assert.equal(generatedDreamSkinState.background.themeId, 'skin-07');
+    assert.equal(
+      generatedDreamSkinState.appearance.customBackgrounds.find(
+        (background) => background.value === generatedDreamSkinState.background.value,
+      ).themeId,
+      'skin-07',
+    );
+
+    const persistedDreamSkinConfig = await fetch(`${baseUrl}/api/config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(persistedDreamSkinConfig.status, 200);
+    assert.equal(
+      (await persistedDreamSkinConfig.json()).appearance.customBackgrounds.find(
+        (background) => background.value === generatedDreamSkinState.background.value,
+      ).themeId,
+      'skin-07',
+    );
+
+    const dreamSkinAppearanceResponse = await fetch(`${baseUrl}/api/appearance`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatBackground: 'dream-skin' }),
+    });
+    assert.equal(dreamSkinAppearanceResponse.status, 200);
+    assert.equal((await dreamSkinAppearanceResponse.json()).appearance.chatBackground, 'default');
+
+    const dreamSkinPromptResponse = await fetch(`${baseUrl}/api/dream-skin/prompt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: '雨夜东京工作室，右侧霓虹窗景',
+        conceptId: 'skin-03',
+        referenceCount: 0,
+      }),
+    });
+    assert.equal(dreamSkinPromptResponse.status, 200);
+    const dreamSkinTask = await dreamSkinPromptResponse.json();
+    assert.equal(dreamSkinTask.mode, 'no-person');
+    assert.equal(dreamSkinTask.conceptId, 'skin-03');
+    assert.equal(dreamSkinTask.skill, 'vendor/codex-dream-skin/SKILL.md');
+    assert.match(dreamSkinTask.prompt, /完整读取并遵循项目内置技能/);
+    assert.match(dreamSkinTask.prompt, /选用概念风格：skin-03 · 红白未来城市主题/);
+    assert.match(dreamSkinTask.prompt, /完整 Dream Skin 的 artwork 层/);
+    assert.match(dreamSkinTask.prompt, /严禁把侧栏、卡片、按钮、输入框或文字画进图片/);
+    assert.match(dreamSkinTask.prompt, /A colossal translucent coral-red energy sphere rises above the horizon/);
+    assert.match(dreamSkinTask.prompt, /必须实际调用 \$imagegen/);
+    assert.match(dreamSkinTask.prompt, /雨夜东京工作室/);
+    assert.ok(dreamSkinTask.cwd.endsWith('codex-web'));
+
+    const dreamSkinReferenceError = await fetch(`${baseUrl}/api/dream-skin/prompt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'reference', referenceCount: 0 }),
+    });
+    assert.equal(dreamSkinReferenceError.status, 400);
+
     const pageResponse = await fetch(baseUrl, { headers: { Cookie: cookie } });
     assert.equal(pageResponse.status, 200);
     const page = await pageResponse.text();
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
+    assert.match(page, /href="\/image-prompt\.css"/);
+    assert.match(page, /src="\/image-prompt\.js"/);
+    assert.match(page, /\['dream-skin','Dream Skin'\]/);
+    assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
+    assert.match(page, /function createDreamSkinGenerator/);
+    assert.match(page, /function renderDreamSkinConcepts/);
+    assert.match(page, /function renderDreamSkinConceptPreview/);
+    assert.match(page, /function selectDreamSkinConcept/);
+    assert.match(page, /saveAppearance\(\{chatBackground:'dream:'\+concept\.id\}\)/);
+    assert.match(page, /function applyDreamSkinTheme/);
+    assert.match(page, /const bg=skin&&backgroundUrl\?'skin':backgroundUrl\?'custom':selected/);
+    assert.match(page, /themeId:concept\?\.id\|\|''/);
+    assert.match(page, /if\(findDreamSkinConcept\(appearance\.chatBackground\)\)openDreamSkinGenerator\(\)/);
+    assert.match(page, /conceptId:dreamSkinSelectedConcept/);
+    assert.match(page, /function generateDreamSkinBackground/);
+    assert.match(page, /function applyGeneratedImageBackground/);
+    assert.match(page, /generatedBackgroundApply/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
+    assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
+    assert.doesNotMatch(page, /descriptor\.name\+\(descriptor\.detail/);
     assert.match(page, /activityBatch/);
     assert.match(page, /liveProcessPanel/);
+    assert.match(page, /turnProcessHeader=document\.createElement\('div'\)/);
+    assert.match(page, /function createActivityCluster/);
+    assert.match(page, /function isImageViewActivityPresentation/);
+    assert.match(page, /image_view_activity/);
+    assert.match(page, /function nativeToolImageUrls/);
+    assert.match(page, /function createActivityImageGallery/);
+    assert.match(page, /row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(item\.status==='running'\)[\s\S]*row\.appendChild\(running\);\s*}\s*if\(source==='codex'\)/s);
+    assert.match(page, /galleryOnly:true/);
+    assert.doesNotMatch(page, /base\+\(index\+1\)\+generation/);
+    assert.match(page, /continueMsg messageAction/);
+    assert.match(page, /className='completionTimeline liveProcessTimeline'/);
+    assert.doesNotMatch(page, /function updateTurnProcessLatest/);
     assert.match(page, /function appendInputImageToUser/);
     assert.match(page, /latestUserElement/);
     assert.match(page, /addMsg\('image',attachment\.url,\{kind:'input_image'\}\)/);
+    assert.match(page, /stack\.classList\.toggle\('single',stack\.children\.length===1\)/);
     assert.match(page, /function runningActivityVerb/);
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
+    assert.match(page, /NATIVE_INITIAL_MESSAGE_LIMIT=60/);
+    assert.match(page, /images=external&limit=/);
+    assert.match(page, /function addNativeHistoryLoadButton/);
     assert.match(page, /function scheduleNativeCompletionSync/);
     assert.match(page, /function reconcileNativeCompletion/);
     assert.match(page, /runtime\.type==='connection-error'/);
@@ -387,24 +762,48 @@ if (args[0] === 'app-server') {
     assert.match(page, /document\.addEventListener\('visibilitychange',syncNativeAfterPageResume\)/);
     assert.match(page, /window\.addEventListener\('pageshow',syncNativeAfterPageResume\)/);
     assert.doesNotMatch(page, /setTimeout\(\(\)=>\{if\(currentConversationSource==='codex'.*loadConversation\(completedId,'codex'\)/);
-    assert.match(page, /turnProcessAutoFollow/);
+    assert.doesNotMatch(page, /turnProcessAutoFollow/);
     assert.match(page, /上下文已自动压缩/);
     assert.doesNotMatch(page, /function appendTurnThinking/);
     assert.match(page, /id="sidePanel"/);
     assert.match(page, /function syncMenuButton/);
     assert.match(page, /sideCollapsed/);
     assert.match(page, /function setHistoryProjectExpanded/);
+    assert.match(page, /function showHistoryProjectPreview/);
+    assert.match(page, /itemCount\+' 个对话串 · '\+runningCount\+' 个已开启'/);
     assert.match(page, /codexWeb\.historyProjectsCollapsed/);
+    assert.match(page, /codexWeb\.historyProjectsHidden/);
+    assert.match(page, /function createHistoryProjectMenu/);
+    assert.match(page, /function archiveHistoryProject/);
+    assert.match(page, /function toggleHistoryProjectHidden/);
+    assert.match(page, /codexWeb\.historyProjectNames\.v1/);
+    assert.match(page, /function renameHistoryProject/);
+    assert.match(page, /'pencil','重命名项目'/);
+    assert.match(page, /historyProjectName\(item\.cwd\)/);
+    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)return/);
+    assert.match(page, /\/api\/native-projects\/archive/);
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);
     assert.match(page, /group\.open=false/);
     assert.match(page, /function enhanceComposer/);
+    assert.match(page, /function renderComposerProjectOptions/);
+    assert.match(page, /function selectComposerProjectPath/);
+    assert.match(page, /composerProjectToggle/);
+    assert.match(page, /composerProjectPicker\.classList\.toggle\('hidden',hasConversation\)/);
+    assert.match(page, /composerProjectPicker\.setAttribute\('aria-hidden',String\(hasConversation\)\)/);
     assert.match(page, /function enqueuePrompt/);
     assert.match(page, /function steerQueuedPrompt/);
+    assert.match(page, /function showNativeSteerOptimistically/);
+    assert.match(page, /kind:'steering_user'/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
+    assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
+    assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
+    assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
     assert.match(page, /function enhanceSettingsModal/);
     assert.match(page, /function openImagePreview/);
+    assert.match(page, /在新任务中继续/);
+    assert.match(page, /continueAfter:true/);
     assert.doesNotMatch(page, /查看原图/);
     assert.match(page, /\/api\/password/);
     assert.match(page, /codexWeb\.promptQueue\.v1/);
@@ -414,6 +813,26 @@ if (args[0] === 'app-server') {
     const inlineScript = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert.ok(inlineScript);
     assert.doesNotThrow(() => new Function(inlineScript));
+    const singleFlightHelper = inlineScript.match(/(function createTrailingSingleFlight[\s\S]*?)(?=function readPromptQueues)/)?.[1];
+    assert.ok(singleFlightHelper);
+    const createTrailingSingleFlight = new Function(
+      singleFlightHelper + '; return createTrailingSingleFlight;',
+    )();
+    let singleFlightRuns = 0;
+    const singleFlightReleases = [];
+    const runSingleFlight = createTrailingSingleFlight(async () => {
+      singleFlightRuns += 1;
+      await new Promise((resolve) => singleFlightReleases.push(resolve));
+    });
+    const firstSingleFlight = runSingleFlight();
+    const joinedSingleFlight = runSingleFlight();
+    assert.equal(firstSingleFlight, joinedSingleFlight);
+    assert.equal(singleFlightRuns, 1);
+    singleFlightReleases.shift()();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(singleFlightRuns, 2);
+    singleFlightReleases.shift()();
+    await firstSingleFlight;
     const composerLabelHelpers = inlineScript.match(/(function composerModelLabel[\s\S]*?)(?=function closeComposerPopovers)/)?.[1];
     assert.ok(composerLabelHelpers);
     const composerLabels = new Function(
@@ -421,6 +840,12 @@ if (args[0] === 'app-server') {
     )();
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
+    const completionTitleHelper = inlineScript.match(/(function completionMessageTitle[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
+    assert.ok(completionTitleHelper);
+    const completionMessageTitle = new Function(
+      completionTitleHelper + '; return completionMessageTitle;',
+    )();
+    assert.equal(completionMessageTitle('任务完成，耗时 2159.6s'), '已处理 36m');
     const memoryHelper = inlineScript.match(/(function extractMemoryCitations[\s\S]*?)(?=function memoryCitationTitle)/)?.[1];
     assert.ok(memoryHelper);
     const parseMemoryCitations = new Function(memoryHelper + '; return extractMemoryCitations;')();
@@ -465,6 +890,20 @@ if (args[0] === 'app-server') {
       target: 'server.mjs、ui.css · “menuBtn|toggleMenu”',
       icon: 'search',
     }]);
+    assert.deepEqual(parseToolActivity('spawn_agent\n{\n  "task_name": "ui_trace",\n  "fork_turns": "all"\n}'), [{
+      variant: 'agent',
+      label: 'Ui trace',
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: false,
+    }]);
+    assert.deepEqual(parseToolActivity('调用工具: spawn_agent\ncall_id=call-1\n{"task_name":"ui_trace"}'), [{
+      variant: 'agent',
+      label: 'Ui trace',
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: false,
+    }]);
     const orchestratedCall = [
       'exec',
       'const calls = await Promise.all([',
@@ -482,6 +921,79 @@ if (args[0] === 'app-server') {
       { verb: '已编辑', icon: 'pencil', target: 'server.mjs', added: 1, removed: 1, meta: '+1 -1' },
       { verb: '已编辑', icon: 'pencil', target: 'ui.css', added: 1, removed: 0, meta: '+1 -0' },
     ]);
+    const falseImagePatchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/fake-ui.js\\n+tools.view_image({path:\\"/tmp/not-a-real-image.png\\"})\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
+    assert.deepEqual(parseToolActivity(falseImagePatchCall), [
+      { verb: '已编辑', icon: 'pencil', target: 'fake-ui.js', added: 1, removed: 0, meta: '+1 -0' },
+    ]);
+
+    class FixtureElement {
+      constructor(tagName) {
+        this.tagName = String(tagName).toUpperCase();
+        this.children = [];
+        this.dataset = {};
+        this.attributes = new Map();
+        this.className = '';
+        this.open = false;
+      }
+
+      appendChild(child) {
+        this.children.push(child);
+        child.parentNode = this;
+        return child;
+      }
+
+      setAttribute(name, value) {
+        this.attributes.set(name, String(value));
+      }
+
+      addEventListener() {}
+    }
+    const activityDomHelpers = inlineScript.match(
+      /(function createActivityImageGallery[\s\S]*?)(?=function createActivityBatch)/,
+    )?.[1];
+    assert.ok(activityDomHelpers);
+    const createToolActivityItem = new Function(
+      'document',
+      'openImagePreview',
+      'refreshIcons',
+      'setIconLabel',
+      `${activityDomHelpers}; return createToolActivityItem;`,
+    )(
+      { createElement: (tagName) => new FixtureElement(tagName) },
+      () => {},
+      () => {},
+      () => {},
+    );
+    const imageActivity = createToolActivityItem({
+      verb: '已查看',
+      target: '1 张图像',
+      icon: 'image',
+      expandable: true,
+      galleryOnly: true,
+      imageUrls: ['/api/native-sessions/thread/tool-images/7/1'],
+    }, 'exec\nreal image call');
+    const activityNodes = (node) => [node, ...node.children.flatMap(activityNodes)];
+    const renderedActivityNodes = activityNodes(imageActivity);
+    assert.equal(imageActivity.tagName, 'DETAILS');
+    assert.equal(imageActivity.open, false);
+    assert.equal(renderedActivityNodes.filter((node) => node.className.includes('activityImageGallery')).length, 1);
+    assert.equal(renderedActivityNodes.filter((node) => node.className === 'activityRaw').length, 0);
+    assert.equal(renderedActivityNodes.filter((node) => node.className === 'activityItemChevron').length, 1);
+    assert.equal(renderedActivityNodes.find((node) => node.tagName === 'IMG').src, '/api/native-sessions/thread/tool-images/7/1');
+
+    const agentActivity = createToolActivityItem({
+      variant: 'agent',
+      label: 'Ui trace',
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: false,
+    }, 'spawn_agent\n{"task_name":"ui_trace"}', true);
+    const agentActivityNodes = activityNodes(agentActivity);
+    assert.equal(agentActivity.tagName, 'DIV');
+    assert.equal(agentActivity.className, 'activityItem agentActivityItem static');
+    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityLabel').textContent, 'Ui trace');
+    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityStatus').textContent, '已开始工作');
+    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityIcon').children[0].attributes.get('data-lucide'), 'flower-2');
 
     const configResponse = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
     assert.equal(configResponse.status, 200);
@@ -489,6 +1001,50 @@ if (args[0] === 'app-server') {
     assert.equal(config.defaults.model, 'test-model');
     assert.equal(config.defaults.reasoningEffort, 'max');
     assert.equal(config.capabilities.manageProviders, false);
+    assert.equal(config.appearance.chatBackground, 'default');
+
+    const playgroundConfigResponse = await fetch(`${baseUrl}/api/playground-config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundConfigResponse.status, 200);
+    assert.match(playgroundConfigResponse.headers.get('cache-control'), /private, no-store/);
+    assert.deepEqual(await playgroundConfigResponse.json(), {
+      profile: {
+        id: 'codex-web-default',
+        name: 'Codex Image · Fake',
+        provider: 'openai',
+        baseUrl: 'http://127.0.0.1:9/v1',
+        apiKey: 'test-token',
+        model: 'gpt-image-2',
+        apiMode: 'images',
+        codexCli: true,
+      },
+      profiles: [
+        {
+          id: 'codex-web-default',
+          name: 'Codex Image · Fake',
+          provider: 'openai',
+          baseUrl: 'http://127.0.0.1:9/v1',
+          apiKey: 'test-token',
+          model: 'gpt-image-2',
+          apiMode: 'images',
+          codexCli: true,
+        },
+        {
+          id: 'codex-web-agent',
+          name: 'Codex Agent · Fake',
+          provider: 'openai',
+          baseUrl: 'http://127.0.0.1:9/v1',
+          apiKey: 'test-token',
+          model: 'test-model',
+          apiMode: 'responses',
+          codexCli: false,
+        },
+      ],
+      agentApiConfigMode: 'hybrid',
+      agentTextProfileId: 'codex-web-agent',
+      agentImageProfileId: 'codex-web-default',
+    });
     assert.ok(config.conversations.some((conversation) => (
       conversation.id === nativeSessionId
       && conversation.source === 'codex'
@@ -497,6 +1053,33 @@ if (args[0] === 'app-server') {
     )));
     assert.equal(config.conversations.some((conversation) => conversation.id === archivedNativeSessionId), false);
     assert.equal(config.conversations.some((conversation) => conversation.id === automationNativeSessionId), false);
+
+    const imagePromptsResponse = await fetch(`${baseUrl}/api/image-prompts`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(imagePromptsResponse.status, 200);
+    assert.match(imagePromptsResponse.headers.get('cache-control'), /private, no-store/);
+    const imagePrompts = await imagePromptsResponse.json();
+    assert.equal(imagePrompts.totalCases, 517);
+    assert.equal(imagePrompts.totalTemplates, 22);
+    assert.equal(imagePrompts.cases.length, 517);
+    assert.equal(imagePrompts.templates.length, 22);
+    assert.match(imagePrompts.imageBaseUrl, /awesome-gpt-image-2\/60b6e1d3/);
+    assert.equal(imagePrompts.revision, '60b6e1d3ddaf1c982426d6c8181827764c6b2012');
+    assert.equal(imagePrompts.sync.source, 'bundled');
+    assert.equal(imagePrompts.sync.status, 'ready');
+    assert.equal(imagePrompts.sync.autoSync, false);
+    assert.ok(imagePrompts.sources.some((source) => source.name === 'gpt_image_playground'));
+    assert.ok(imagePrompts.cases.some((item) => item.id === 520 && item.prompt));
+
+    const imagePromptStatusResponse = await fetch(`${baseUrl}/api/image-prompts/status`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(imagePromptStatusResponse.status, 200);
+    assert.match(imagePromptStatusResponse.headers.get('cache-control'), /private, no-store/);
+    const imagePromptStatus = await imagePromptStatusResponse.json();
+    assert.equal(imagePromptStatus.version, imagePrompts.version);
+    assert.equal(imagePromptStatus.totalCases, 517);
 
     const nativeSessions = await fetch(`${baseUrl}/api/native-sessions`, {
       headers: { Cookie: cookie },
@@ -522,8 +1105,12 @@ if (args[0] === 'app-server') {
     const nativeFirstMessage = nativeConversation.messages.find((message) => (
       message.role === 'user' && message.content === 'native earlier message'
     ));
+    const nativeAssistantMessage = nativeConversation.messages.find((message) => (
+      message.role === 'assistant' && message.content === 'native assistant answer'
+    ));
     assert.equal(nativeFirstMessage.turnId, nativeFirstTurnId);
     assert.equal(nativeFirstMessage.previousTurnId, undefined);
+    assert.equal(nativeAssistantMessage.turnId, nativeFirstTurnId);
     assert.equal(nativeTargetMessage.turnId, nativeSecondTurnId);
     assert.equal(nativeTargetMessage.previousTurnId, nativeFirstTurnId);
     assert.ok(nativeConversation.messages.some((message) => (
@@ -531,6 +1118,59 @@ if (args[0] === 'app-server') {
       && message.kind === 'input_image'
       && message.content === 'data:image/png;base64,c21va2U='
     )));
+    const nativeToolImageMessage = nativeConversation.messages.find((message) => (
+      message.role === 'tool' && message.content.includes(toolImagePath)
+    ));
+    assert.ok(nativeToolImageMessage);
+    const toolImageUrl = `/api/native-sessions/${nativeSessionId}/tool-images/${nativeToolImageMessage.seq}/1`;
+    const unauthorizedToolImage = await fetch(`${baseUrl}${toolImageUrl}`);
+    assert.equal(unauthorizedToolImage.status, 401);
+    const toolImage = await fetch(`${baseUrl}${toolImageUrl}`, { headers: { Cookie: cookie } });
+    assert.equal(toolImage.status, 200);
+    assert.equal(toolImage.headers.get('content-type'), 'image/png');
+    assert.deepEqual(Buffer.from(await toolImage.arrayBuffer()), await readFile(toolImagePath));
+
+    const falseToolImageMessage = nativeConversation.messages.find((message) => (
+      message.role === 'tool' && message.content.includes('not-a-real-image.png')
+    ));
+    assert.ok(falseToolImageMessage);
+    const falseToolImage = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/tool-images/${falseToolImageMessage.seq}/1`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(falseToolImage.status, 404);
+
+    const limitedNativeSession = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}?limit=3`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(limitedNativeSession.status, 200);
+    const limitedNativeConversation = (await limitedNativeSession.json()).conversation;
+    assert.equal(limitedNativeConversation.messages.length, 3);
+    assert.equal(limitedNativeConversation.hasEarlierMessages, true);
+    const externalizedImage = limitedNativeConversation.messages.find((message) => message.role === 'image');
+    assert.match(externalizedImage.content, new RegExp(
+      `^/api/native-sessions/${nativeSessionId}/images/${externalizedImage.seq}\\?generation=\\d+$`,
+    ));
+
+    const externalizedNativeSession = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}?images=external`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(externalizedNativeSession.status, 200);
+    const externalizedNativeConversation = (await externalizedNativeSession.json()).conversation;
+    assert.equal(externalizedNativeConversation.messages.length, nativeConversation.messages.length);
+    assert.match(
+      externalizedNativeConversation.messages.find((message) => message.role === 'image').content,
+      new RegExp(`^/api/native-sessions/${nativeSessionId}/images/\\d+\\?generation=\\d+$`),
+    );
+
+    const nativeImage = await fetch(`${baseUrl}${externalizedImage.content}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(nativeImage.status, 200);
+    assert.equal(nativeImage.headers.get('content-type'), 'image/png');
+    assert.equal(Buffer.from(await nativeImage.arrayBuffer()).toString(), 'smoke');
 
     const restartedFromFirst = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
       method: 'POST',
@@ -570,6 +1210,24 @@ if (args[0] === 'app-server') {
     assert.equal(forkedPayload.draft, 'native fixture message');
     assert.equal(forkedPayload.conversation.status, 'done');
 
+    const continuedFromAssistant = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messageSeq: nativeAssistantMessage.seq,
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'workspace-write',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(continuedFromAssistant.status, 201);
+    const continuedFromAssistantPayload = await continuedFromAssistant.json();
+    assert.equal(continuedFromAssistantPayload.threadId, forkedNativeSessionId);
+    assert.equal(continuedFromAssistantPayload.forkedThroughTurnId, nativeFirstTurnId);
+    assert.equal(continuedFromAssistantPayload.draft, '');
+
     const archivedNativeSession = await fetch(`${baseUrl}/api/native-sessions/${archivedNativeSessionId}`, {
       headers: { Cookie: cookie },
     });
@@ -579,6 +1237,241 @@ if (args[0] === 'app-server') {
       headers: { Cookie: cookie },
     });
     assert.equal(automationNativeSession.status, 404);
+
+    const desktopContinued = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'sync through desktop owner',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(desktopContinued.status, 202);
+    const desktopContinuedPayload = await desktopContinued.json();
+    assert.equal(desktopContinuedPayload.turnId, 'desktop-turn-1');
+
+    const desktopSteered = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'steer through desktop owner',
+        turnId: desktopContinuedPayload.turnId,
+      }),
+    });
+    assert.equal(desktopSteered.status, 202);
+    assert.equal((await desktopSteered.json()).turnId, desktopContinuedPayload.turnId);
+
+    const desktopInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: desktopContinuedPayload.turnId }),
+    });
+    assert.equal(desktopInterrupted.status, 200);
+
+    desktopIpc.startTurnMode = 'echo-only';
+    desktopIpc.onStartTurn = async (message) => {
+      const text = message.params.turnStartParams.input.find((item) => item.type === 'text')?.text || '';
+      assert.equal(text, 'recover from native echo');
+      const records = [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'desktop-echo-turn' },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text }],
+          },
+        },
+      ];
+      await appendFile(nativeSessionFile, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`);
+    };
+    const echoStartedAt = Date.now();
+    const echoedContinuation = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'recover from native echo',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    const echoedContinuationPayload = await echoedContinuation.json();
+    const echoedSessionContent = await readFile(nativeSessionFile, 'utf8');
+    assert.equal(desktopIpc.lastError, null);
+    assert.match(echoedSessionContent, /recover from native echo/);
+    assert.equal(echoedContinuation.status, 202, JSON.stringify(echoedContinuationPayload));
+    assert.ok(Date.now() - echoStartedAt < 3000);
+    assert.equal(echoedContinuationPayload.turnId, 'desktop-echo-turn');
+
+    const interruptCountBeforeStaleRequest = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-follower-interrupt-turn',
+    ).length;
+    const staleInterrupt = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: desktopContinuedPayload.turnId }),
+    });
+    assert.equal(staleInterrupt.status, 409);
+    assert.match((await staleInterrupt.json()).error, /任务已过期/);
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-interrupt-turn').length,
+      interruptCountBeforeStaleRequest,
+    );
+    const missingTurnInterrupt = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(missingTurnInterrupt.status, 409);
+    assert.match((await missingTurnInterrupt.json()).error, /状态已变化/);
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-interrupt-turn').length,
+      interruptCountBeforeStaleRequest,
+    );
+
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'snapshot',
+          revision: 1,
+          conversationState: {
+            requests: [],
+          },
+        },
+      },
+    });
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'patches',
+          baseRevision: 1,
+          revision: 2,
+          patches: [{
+            op: 'add',
+            path: ['requests', 0],
+            value: {
+              id: 'desktop-approval-1',
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: nativeSessionId,
+                turnId: echoedContinuationPayload.turnId,
+                command: 'printf desktop',
+                cwd: temporary,
+                reason: 'desktop approval test',
+              },
+            },
+          }],
+        },
+      },
+    });
+    const desktopApproval = await waitForPendingRequest(baseUrl, cookie);
+    assert.equal(desktopApproval.method, 'item/commandExecution/requestApproval');
+    assert.equal(desktopApproval.threadId, nativeSessionId);
+    const desktopApproved = await fetch(`${baseUrl}/api/native-requests/${encodeURIComponent(desktopApproval.id)}/respond`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'accept' }),
+    });
+    assert.equal(desktopApproved.status, 200);
+    const desktopApprovalMessage = desktopIpc.messages.find(
+      (message) => message.method === 'thread-follower-command-approval-decision',
+    );
+    assert.equal(desktopApprovalMessage.version, 1);
+    assert.equal(desktopApprovalMessage.targetClientId, 'desktop-owner');
+    assert.deepEqual(desktopApprovalMessage.params, {
+      conversationId: nativeSessionId,
+      requestId: 'desktop-approval-1',
+      decision: 'accept',
+    });
+
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'patches',
+          baseRevision: 2,
+          revision: 3,
+          patches: [{
+            op: 'add',
+            path: ['requests', 0],
+            value: {
+              id: 'desktop-approval-removed',
+              method: 'item/fileChange/requestApproval',
+              params: {
+                threadId: nativeSessionId,
+                turnId: echoedContinuationPayload.turnId,
+                reason: 'desktop removal test',
+              },
+            },
+          }],
+        },
+      },
+    });
+    const removedDesktopApproval = await waitForPendingRequest(baseUrl, cookie);
+    assert.equal(removedDesktopApproval.method, 'item/fileChange/requestApproval');
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'patches',
+          baseRevision: 3,
+          revision: 4,
+          patches: [{ op: 'remove', path: ['requests', 0] }],
+        },
+      },
+    });
+    await waitForPendingRequestGone(baseUrl, cookie, removedDesktopApproval.id);
+
+    desktopIpc.startTurnMode = 'respond';
+    desktopIpc.onStartTurn = null;
+    const echoedInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: echoedContinuationPayload.turnId }),
+    });
+    assert.equal(echoedInterrupted.status, 200);
+
+    const desktopStart = desktopIpc.messages.find((message) => message.method === 'thread-follower-start-turn');
+    assert.equal(desktopStart.params.conversationId, nativeSessionId);
+    assert.deepEqual(desktopStart.params.turnStartParams.input, [{
+      type: 'text',
+      text: 'sync through desktop owner',
+      text_elements: [],
+    }]);
+    assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
+    assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
+    assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
+    desktopIpc.ownerAvailable = false;
 
     const blockedWrite = await fetch(`${baseUrl}/api/defaults`, {
       method: 'POST',
@@ -646,6 +1539,14 @@ if (args[0] === 'app-server') {
       headers: { Cookie: cookie },
     });
     assert.equal(archived.status, 200);
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.type === 'broadcast'
+      && message.method === 'thread-archived'
+      && message.version === 2
+      && message.params?.hostId === 'local'
+      && message.params?.conversationId === createdNativeSessionId
+      && message.params?.cwd === temporary
+    )));
 
     const continued = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
       method: 'POST',
@@ -684,20 +1585,54 @@ if (args[0] === 'app-server') {
     });
     assert.equal(approved.status, 200);
 
+    const runningProjectArchive = await fetch(`${baseUrl}/api/native-projects/archive`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd: temporary }),
+    });
+    assert.equal(runningProjectArchive.status, 409);
+
+    const stoppedForProjectArchive = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: continuedPayload.turnId }),
+    });
+    assert.equal(stoppedForProjectArchive.status, 200);
+
+    const archivedProject = await fetch(`${baseUrl}/api/native-projects/archive`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cwd: temporary }),
+    });
+    assert.equal(archivedProject.status, 200);
+    const archivedProjectPayload = await archivedProject.json();
+    assert.deepEqual(archivedProjectPayload.archived, [nativeSessionId]);
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.type === 'broadcast'
+      && message.method === 'thread-archived'
+      && message.version === 2
+      && message.params?.hostId === 'local'
+      && message.params?.conversationId === nativeSessionId
+      && message.params?.cwd === temporary
+    )));
+
     const protocolMessages = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
-    assert.ok(protocolMessages.some((message) => message.method === 'thread/resume'));
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 1);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 2);
     const restartFromFirstMessage = protocolMessages.find((message) => (
       message.method === 'thread/start'
       && message.params.sandbox === 'read-only'
       && message.params.approvalPolicy === 'untrusted'
     ));
     assert.ok(restartFromFirstMessage);
-    const forkMessage = protocolMessages.find((message) => message.method === 'thread/fork');
+    const forkMessages = protocolMessages.filter((message) => message.method === 'thread/fork');
+    assert.equal(forkMessages.length, 2);
+    const forkMessage = forkMessages[0];
     assert.equal(forkMessage.params.threadId, nativeSessionId);
     assert.equal(forkMessage.params.lastTurnId, nativeFirstTurnId);
     assert.equal(forkMessage.params.sandbox, 'workspace-write');
@@ -772,6 +1707,7 @@ if (args[0] === 'app-server') {
     assert.equal(restored.status, 200);
   } finally {
     if (child) await stopServer(child);
+    if (desktopIpc) await desktopIpc.close();
     await rm(temporary, { recursive: true, force: true });
   }
 });
@@ -895,6 +1831,8 @@ function startServer({
   appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl'),
   webEnv = path.join(temporary, 'web.env'),
   configWritable = 'false',
+  desktopIpcEnabled = 'false',
+  desktopIpcSocket = '',
 }) {
   return spawn(process.execPath, [path.join(ROOT, 'server.mjs')], {
     cwd: ROOT,
@@ -913,7 +1851,10 @@ function startServer({
       CODEX_WEB_ENV_FILE: webEnv,
       CODEX_WEB_RUNTIME_DIR: runtime,
       CODEX_CONFIG_WRITABLE: configWritable,
+      CODEX_DESKTOP_IPC_ENABLED: desktopIpcEnabled,
+      CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,
       HOMEPAGE_API_TOKEN: '',
+      IMAGE_PROMPT_AUTO_SYNC: 'false',
       DEFAULT_CWD: temporary,
       DEFAULT_SANDBOX: 'read-only',
       DEFAULT_APPROVAL: 'never',
@@ -923,6 +1864,103 @@ function startServer({
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+}
+
+async function createDesktopIpcFixture(temporary) {
+  const socketPath = path.join(tmpdir(), `cwi-${path.basename(temporary)}.sock`);
+  await unlink(socketPath).catch(() => {});
+  const sockets = new Set();
+  const fixture = {
+    socketPath,
+    messages: [],
+    ownerAvailable: true,
+    startTurnMode: 'respond',
+    onStartTurn: null,
+    lastError: null,
+    broadcast(message) {
+      for (const socket of sockets) writeDesktopFrame(socket, message);
+    },
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+      await unlink(socketPath).catch(() => {});
+    },
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    attachDesktopFrameReader(socket, (message) => {
+      fixture.messages.push(message);
+      if (message.method === 'initialize') {
+        writeDesktopFrame(socket, {
+          type: 'response',
+          requestId: message.requestId,
+          resultType: 'success',
+          method: message.method,
+          result: { clientId: 'desktop-test-client' },
+        });
+        return;
+      }
+      if (message.type === 'broadcast') return;
+      if (!fixture.ownerAvailable) {
+        writeDesktopFrame(socket, {
+          type: 'response',
+          requestId: message.requestId,
+          resultType: 'error',
+          error: 'no-client-found',
+        });
+        return;
+      }
+      if (message.method === 'thread-follower-start-turn' && fixture.startTurnMode === 'echo-only') {
+        Promise.resolve(fixture.onStartTurn?.(message)).catch((error) => {
+          fixture.lastError = error;
+        });
+        return;
+      }
+      const result = message.method === 'thread-follower-start-turn'
+        ? { turn: { id: 'desktop-turn-1', status: 'inProgress' } }
+        : message.method === 'thread-follower-steer-turn'
+          ? { turnId: 'desktop-turn-1' }
+          : message.method.includes('approval') || message.method.includes('submit-')
+            ? { ok: true }
+            : {};
+      writeDesktopFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner',
+        result: { result },
+      });
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  return fixture;
+}
+
+function attachDesktopFrameReader(socket, onMessage) {
+  let buffer = Buffer.alloc(0);
+  socket.on('data', (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length >= 4) {
+      const size = buffer.readUInt32LE(0);
+      if (buffer.length < size + 4) return;
+      const payload = buffer.subarray(4, size + 4);
+      buffer = buffer.subarray(size + 4);
+      onMessage(JSON.parse(payload.toString('utf8')));
+    }
+  });
+}
+
+function writeDesktopFrame(socket, message) {
+  const payload = Buffer.from(JSON.stringify(message));
+  const frame = Buffer.allocUnsafe(payload.length + 4);
+  frame.writeUInt32LE(payload.length, 0);
+  payload.copy(frame, 4);
+  socket.write(frame);
 }
 
 async function waitForPendingRequest(baseUrl, cookie) {
@@ -937,6 +1975,20 @@ async function waitForPendingRequest(baseUrl, cookie) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error('native approval request did not arrive');
+}
+
+async function waitForPendingRequestGone(baseUrl, cookie, requestId) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await fetch(`${baseUrl}/api/native-requests`, {
+      headers: { Cookie: cookie },
+    });
+    if (response.ok) {
+      const requests = (await response.json()).requests || [];
+      if (!requests.some((request) => request.id === requestId)) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error('native approval request did not clear');
 }
 
 async function waitForServer(child, runtime) {

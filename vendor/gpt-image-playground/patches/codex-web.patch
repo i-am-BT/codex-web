@@ -1,0 +1,263 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 5fc1614..ae33294 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,11 +1,11 @@
+ import { useEffect } from 'react'
+ import { initStore } from './store'
+-import { useStore } from './store'
++import { useStore, createInputImageFromFile } from './store'
+ import { activateFirstImportedProfile, buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
+ import { isDefaultConfigOnlyEnabled, mergeImportedSettings } from './lib/apiProfiles'
+ import { getCustomProviderConfigUrl, loadCustomProviderSettingsFromUrl } from './lib/customProviderConfigUrl'
+ import { useDockerApiUrlMigrationNotice } from './hooks/useDockerApiUrlMigrationNotice'
+-import type { AppSettings } from './types'
++import type { ApiProfile, AppSettings } from './types'
+ import Header from './components/Header'
+ import SearchBar from './components/SearchBar'
+ import TaskGrid from './components/TaskGrid'
+@@ -96,6 +96,59 @@ export default function App() {
+     initStore()
+   }, [setSettings])
+
++  useEffect(() => {
++    if (window.parent === window) return
++
++    void fetch('/api/playground-config', { cache: 'no-store' })
++      .then(async (response) => {
++        if (!response.ok) throw new Error(`HTTP ${response.status}`)
++        return response.json() as Promise<{
++          profile?: ApiProfile
++          profiles?: ApiProfile[]
++          agentApiConfigMode?: 'hybrid'
++          agentTextProfileId?: string
++          agentImageProfileId?: string
++        }>
++      })
++      .then((config) => {
++        const state = useStore.getState()
++        const importedProfiles = Array.isArray(config.profiles) && config.profiles.length
++          ? config.profiles
++          : config.profile
++            ? [config.profile]
++            : []
++        if (!importedProfiles.length) return
++
++        const imageProfileId = config.agentImageProfileId || 'codex-web-default'
++        const importedById = new Map(importedProfiles.map((profile) => [profile.id, profile]))
++        const updatedProfiles = importedProfiles.map((profile) => {
++          const existing = state.settings.profiles.find((item) => item.id === profile.id)
++          return {
++            ...existing,
++            ...profile,
++            model: profile.id === imageProfileId ? existing?.model || profile.model : profile.model,
++          }
++        })
++        const importedIds = new Set(importedProfiles.map((profile) => profile.id))
++        const profiles = [
++          ...state.settings.profiles.filter((profile) => !importedIds.has(profile.id)),
++          ...updatedProfiles,
++        ]
++        const imageProfile = importedById.get(imageProfileId) || updatedProfiles[0]
++        const textProfile = importedById.get(config.agentTextProfileId || 'codex-web-agent') || updatedProfiles[1] || updatedProfiles[0]
++        state.setSettings({
++          profiles,
++          activeProfileId: imageProfile.id,
++          agentApiConfigMode: config.agentApiConfigMode || (profiles.length > 1 ? 'hybrid' : undefined),
++          agentTextProfileId: textProfile.id,
++          agentImageProfileId: imageProfile.id,
++        })
++      })
++      .catch((error) => {
++        console.warn('Failed to import Codex Web API profiles:', error)
++      })
++  }, [])
++
+   useEffect(() => {
+     const preventPageImageDrag = (e: DragEvent) => {
+       if ((e.target as HTMLElement | null)?.closest('img')) {
+@@ -107,6 +160,64 @@ export default function App() {
+     return () => document.removeEventListener('dragstart', preventPageImageDrag)
+   }, [])
+
++  useEffect(() => {
++    if (window.parent === window) return
++
++    const post = (type: string, requestId = '', error = '') => {
++      window.parent.postMessage({ type, requestId, ...(error ? { error } : {}) }, window.location.origin)
++    }
++
++    const applyPrompt = async (message: { prompt?: unknown; params?: Record<string, unknown>; images?: unknown[] }) => {
++      const prompt = typeof message.prompt === 'string' ? message.prompt.trim() : ''
++      if (!prompt) throw new Error('提示词为空')
++      const params = message.params && typeof message.params === 'object' ? message.params : {}
++      const quality = params.quality === 'low' || params.quality === 'medium' || params.quality === 'high' ? params.quality : 'auto'
++      const outputFormat = params.output_format === 'jpeg' || params.output_format === 'webp' ? params.output_format : 'png'
++      const count = Number(params.n)
++      const state = useStore.getState()
++      state.setAppMode('gallery')
++      state.setParams({
++        size: typeof params.size === 'string' && params.size.trim() ? params.size : 'auto',
++        quality,
++        output_format: outputFormat,
++        n: Number.isInteger(count) ? Math.min(8, Math.max(1, count)) : 1,
++        transparent_output: params.transparent_output === true,
++      })
++
++      const inputImages = []
++      const images = Array.isArray(message.images) ? message.images.slice(0, 12) : []
++      for (const [index, item] of images.entries()) {
++        if (!item || typeof item !== 'object') continue
++        const dataUrl = typeof (item as { dataUrl?: unknown }).dataUrl === 'string' ? (item as { dataUrl: string }).dataUrl : ''
++        if (!dataUrl.startsWith('data:image/')) continue
++        const blob = await fetch(dataUrl).then((response) => response.blob())
++        if (!blob.type.startsWith('image/')) continue
++        const name = typeof (item as { name?: unknown }).name === 'string' && (item as { name: string }).name.trim()
++          ? (item as { name: string }).name
++          : `reference-${index + 1}`
++        const image = await createInputImageFromFile(new File([blob], name, { type: blob.type }))
++        if (image) inputImages.push(image)
++      }
++      state.setInputImages(inputImages)
++      state.setPrompt(prompt)
++      state.showToast('已从提示词库载入', 'success')
++    }
++
++    const handleMessage = (event: MessageEvent) => {
++      if (event.origin !== window.location.origin || event.source !== window.parent) return
++      const message = event.data
++      if (!message || typeof message !== 'object' || message.type !== 'codex-web:image-prompt') return
++      const requestId = typeof message.requestId === 'string' ? message.requestId : ''
++      void applyPrompt(message)
++        .then(() => post('codex-web:image-prompt-applied', requestId))
++        .catch((error: unknown) => post('codex-web:image-prompt-error', requestId, error instanceof Error ? error.message : String(error)))
++    }
++
++    window.addEventListener('message', handleMessage)
++    post('codex-web:playground-ready')
++    return () => window.removeEventListener('message', handleMessage)
++  }, [])
++
+   return (
+     <>
+       <Header />
+diff --git a/src/components/InputBar.tsx b/src/components/InputBar.tsx
+index 5f8239d..fdf1e32 100644
+--- a/src/components/InputBar.tsx
++++ b/src/components/InputBar.tsx
+@@ -350,6 +350,7 @@ function useIsMobile() {
+ type AtImageOption =
+   | { type: 'input'; key: string; label: string; imageId: string; dataUrl: string; imageIndex: number }
+   | { type: 'agent-output'; key: string; label: string; imageId: string; insertText: string }
++  | { type: 'upload'; key: string; label: string }
+
+ function agentImageMentionMatches(query: string, label: string) {
+   const normalized = query.trim().toLowerCase()
+@@ -359,13 +360,23 @@ function agentImageMentionMatches(query: string, label: string) {
+ }
+
+ function AtImageOptionThumb({ option }: { option: AtImageOption }) {
+-  const [src, setSrc] = useState(option.type === 'input' ? option.dataUrl : getCachedImage(option.imageId) || '')
++  const [src, setSrc] = useState(
++    option.type === 'input'
++      ? option.dataUrl
++      : option.type === 'agent-output'
++        ? getCachedImage(option.imageId) || ''
++        : '',
++  )
+
+   useEffect(() => {
+     if (option.type === 'input') {
+       setSrc(option.dataUrl)
+       return
+     }
++    if (option.type === 'upload') {
++      setSrc('')
++      return
++    }
+
+     let cancelled = false
+     setSrc(getCachedImage(option.imageId) || '')
+@@ -378,8 +389,14 @@ function AtImageOptionThumb({ option }: { option: AtImageOption }) {
+   }, [option])
+
+   return (
+-    <span className="h-9 w-9 shrink-0 overflow-hidden rounded-lg border border-gray-200/70 bg-gray-100 dark:border-white/[0.08] dark:bg-white/[0.04]">
+-      {src && <img src={src} className="h-full w-full object-cover" alt="" />}
++    <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-gray-200/70 bg-gray-100 text-gray-500 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-gray-300">
++      {option.type === 'upload' ? (
++        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
++          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
++        </svg>
++      ) : src ? (
++        <img src={src} className="h-full w-full object-cover" alt="" />
++      ) : null}
+     </span>
+   )
+ }
+@@ -744,7 +761,7 @@ export default function InputBar() {
+     ? maskDraft ? '遮罩编辑' : '生成图像'
+     : '请先配置 API'
+   const submitTooltipText = activeAgentIsRunning ? '停止生成' : '尚未完成 API 配置，请在右上角设置中进行'
+-  const promptPlaceholder = '描述你想生成的图片，可输入 @ 来指定参考图...'
++  const promptPlaceholder = '描述你想生成的图片，输入 @ 选择或上传参考图...'
+   const submitCurrentMode = useCallback(() => {
+     if (appMode === 'agent') {
+       void submitAgentMessage()
+@@ -837,7 +854,10 @@ export default function InputBar() {
+   const atImageSourceCount = inputImages.length + agentOutputImageOptions.length
+   const atImageQuery = isCursorInSelectedImageMention(prompt, cursorPosition)
+     ? null
+-    : getAtImageQuery(visiblePrompt, cursorPosition, { length: atImageSourceCount })
++    : getAtImageQuery(visiblePrompt, cursorPosition, { length: Math.max(1, atImageSourceCount) })
++  const uploadOptionMatches = atImageQuery
++    ? ['', '上传', '参考', '图片', '新图'].some((label) => label.includes(atImageQuery.query.trim().toLowerCase()))
++    : false
+   const atImageOptions = atImageQuery
+     ? [
+         ...inputImages
+@@ -851,6 +871,9 @@ export default function InputBar() {
+           } satisfies AtImageOption))
+           .filter((option) => imageMentionMatches(atImageQuery.query, option.imageIndex)),
+         ...agentOutputImageOptions.filter((option) => agentImageMentionMatches(atImageQuery.query, option.label)),
++        ...(!atImageLimit && uploadOptionMatches
++          ? [{ type: 'upload', key: 'upload-reference', label: inputImages.length ? '上传新的参考图' : '上传参考图' } satisfies AtImageOption]
++          : []),
+       ]
+     : []
+   const showAtImageMenu = !atImageMenuDismissed && atImageOptions.length > 0
+@@ -860,6 +883,13 @@ export default function InputBar() {
+
+
+   const selectAtImageOption = useCallback((option: AtImageOption) => {
++    if (option.type === 'upload') {
++      setAtImageMenuDismissed(true)
++      setAtImageMenuIndex(0)
++      fileInputRef.current?.click()
++      return
++    }
++
+     const el = textareaRef.current
+     const cursor = el ? getContentEditableCursor(el) : prompt.length
+     const query = getAtImageQuery(stripImageMentionMarkers(prompt), cursor, { length: atImageSourceCount })
+@@ -1189,8 +1219,20 @@ export default function InputBar() {
+   }, [commitReferenceEditChoice, openReplaceReferenceFilePicker, setConfirmDialog, setMaskEditorImageId, settings.referenceImageEditAction])
+
+   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
++    const imageCountBeforeUpload = useStore.getState().inputImages.length
++    const reopenMentionMenu = Boolean(
++      getAtImageQuery(stripImageMentionMarkers(prompt), cursorPosition, { length: 1 }),
++    )
+     await handleFilesRef.current(e.target.files || [])
+     e.target.value = ''
++    if (reopenMentionMenu && useStore.getState().inputImages.length > imageCountBeforeUpload) {
++      setAtImageMenuIndex(0)
++      setAtImageMenuDismissed(false)
++      window.requestAnimationFrame(() => {
++        textareaRef.current?.focus()
++        if (textareaRef.current) setContentEditableCursor(textareaRef.current, cursorPosition)
++      })
++    }
+   }
+
+   const handleReplaceFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
