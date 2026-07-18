@@ -3639,6 +3639,8 @@ let latestFinalAssistantElement = null;
 let latestUserElement = null;
 let turnProcessElements = [];
 let currentActivityCluster = null;
+let currentAgentActivityGroup = null;
+let pendingAgentActivityBatches = [];
 let pendingActivityReasoning = [];
 let turnReasoningStatus = null;
 let collectingTurnProcess = false;
@@ -6220,6 +6222,7 @@ function createToolActivityItem(presentation,rawText,running=false,options={}){
     item.dataset.messageText=String(rawText||'');
     item.dataset.agentKey=String(presentation.agentKey||'');
     item.dataset.parentThreadId=String(options.parentThreadId||'');
+    item.dataset.traceState=running?'starting':'ready';
     const row=document.createElement('summary');
     row.className='agentActivityRow';
     row.setAttribute('aria-label','查看 '+(presentation.label||'Agent')+' 子代理运行过程');
@@ -6370,12 +6373,73 @@ function createActivityBatch(presentations,rawText,kind,running=false,options={}
   for(const presentation of presentations)batch.appendChild(createToolActivityItem(presentation,rawText,running,options));
   return batch;
 }
+function createAgentActivityGroup(){
+  const group=document.createElement('div');
+  group.className='msg agentActivityGroup';
+  group.dataset.messageKind='agent_activity_group';
+  group._agentActivityBatches=[];
+  group._agentActivityItems=[];
+  const status=document.createElement('span');
+  status.className='agentActivityGroupStatus';
+  status.dataset.traceState='starting';
+  status.setAttribute('role','status');
+  status.setAttribute('aria-live','polite');
+  status.textContent='正在启动';
+  group._agentActivityStatus=status;
+  group.appendChild(status);
+  return group;
+}
+function agentActivityGroupPresentation(group){
+  const states=(group?._agentActivityItems||[]).map((item)=>String(item.dataset.traceState||item._subagentTrace?.status?.dataset?.traceState||'ready'));
+  if(states.some((state)=>state==='error'))return{label:states.length>1?'部分失败':'失败',kind:'error'};
+  if(states.some((state)=>state==='interrupted'))return{label:states.length>1?'部分中断':'已中断',kind:'interrupted'};
+  if(states.some((state)=>state==='running'))return{label:'正在工作',kind:'running'};
+  if(states.some((state)=>state==='starting'))return{label:'正在启动',kind:'starting'};
+  if(states.length&&states.every((state)=>state==='done'))return{label:'已完成',kind:'done'};
+  return{label:'已开始工作',kind:'ready'};
+}
+function updateAgentActivityGroupStatus(group){
+  if(!group?._agentActivityStatus)return;
+  const presentation=agentActivityGroupPresentation(group);
+  group._agentActivityStatus.textContent=presentation.label;
+  group._agentActivityStatus.dataset.traceState=presentation.kind;
+  group.classList.toggle('streaming',(group._agentActivityBatches||[]).some((batch)=>batch.classList.contains('streaming')));
+}
+function appendAgentActivityBatch(group,batch){
+  if(!group||!batch)return;
+  group._agentActivityBatches.push(batch);
+  for(const item of batch.children){
+    if(!item.classList?.contains('agentActivityItem'))continue;
+    item._agentActivityGroup=group;
+    group._agentActivityItems.push(item);
+  }
+  group.insertBefore(batch,group._agentActivityStatus);
+  updateAgentActivityGroupStatus(group);
+}
+function settleAgentActivityGroup(group){
+  for(const batch of group?._agentActivityBatches||[])settleTurnTool(batch);
+  updateAgentActivityGroupStatus(group);
+}
+function isAgentActivityOutput(text){
+  return /^spawn_agent\\s+output$/i.test(String(text||'').split('\\n')[0].trim().replace(/^调用工具:\\s*/,''));
+}
+function queueAgentActivityBatch(batch){
+  if(batch&&!pendingAgentActivityBatches.includes(batch))pendingAgentActivityBatches.push(batch);
+}
+function takePendingAgentActivityBatch(){
+  while(pendingAgentActivityBatches.length){
+    const batch=pendingAgentActivityBatches.shift();
+    if(batch?.classList?.contains('streaming'))return batch;
+  }
+  return null;
+}
 const SUBAGENT_TRACE_POLL_MS=1600;
 function setSubagentTraceSummaryStatus(state,label,kind){
   if(!state?.status)return;
   state.status.textContent=label;
   state.status.dataset.traceState=kind||'';
   state.item.dataset.traceState=kind||'';
+  updateAgentActivityGroupStatus(state.item._agentActivityGroup);
 }
 function setSubagentTraceNotice(state,text,kind='',retry=false){
   state.notice.textContent=String(text||'');
@@ -6738,6 +6802,7 @@ function settleTurnTool(batch){
     }
     const cluster=item.closest('.activityCluster');
     if(cluster)updateActivityCluster(cluster);
+    updateAgentActivityGroupStatus(item._agentActivityGroup||item.closest('.agentActivityGroup'));
   }
 }
 function appendTurnProcessActivity(text,kind){
@@ -6816,6 +6881,8 @@ function resetTurnProcessCollection(){
   clearTurnProcessHeader();
   turnProcessElements=[];
   currentActivityCluster=null;
+  currentAgentActivityGroup=null;
+  pendingAgentActivityBatches=[];
   pendingActivityReasoning=[];
   collectingTurnProcess=false;
 }
@@ -6824,12 +6891,27 @@ function beginTurnProcessCollection(){
   clearTurnProcessHeader();
   turnProcessElements=[];
   currentActivityCluster=null;
+  currentAgentActivityGroup=null;
+  pendingAgentActivityBatches=[];
   pendingActivityReasoning=[];
   collectingTurnProcess=true;
 }
 function activateTurnProcessElement(element){
   if(!collectingTurnProcess||!element)return;
   ensureTurnProcessHeader();
+  if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='agent_activity'){
+    currentActivityCluster=null;
+    if(!currentAgentActivityGroup?.isConnected){
+      currentAgentActivityGroup=createAgentActivityGroup();
+      turnProcessElements.push(currentAgentActivityGroup);
+      turnProcessTimeline.appendChild(currentAgentActivityGroup);
+    }
+    pendingActivityReasoning=[];
+    appendAgentActivityBatch(currentAgentActivityGroup,element);
+    queueAgentActivityBatch(element);
+    return currentAgentActivityGroup;
+  }
+  currentAgentActivityGroup=null;
   if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='tool_activity'){
     const group=String(element.dataset.activityGroup||'tools');
     if(!currentActivityCluster?.isConnected||currentActivityCluster.dataset.activityGroup!==group){
@@ -6908,6 +6990,7 @@ function createCompletionMessage(text,processElements=[],turnId=''){
       item.classList.remove('streaming');
       if(item.classList.contains('activityBatch'))settleTurnTool(item);
       if(item.classList.contains('activityCluster'))settleActivityCluster(item);
+      if(item.classList.contains('agentActivityGroup'))settleAgentActivityGroup(item);
       if(item.tagName==='DETAILS')item.open=false;
       timeline.appendChild(item);
     }
@@ -7199,7 +7282,8 @@ function addMsg(role,text,options={}){
   if(shouldClearTurnReasoningStatus(role,kind))clearTurnReasoningStatus();
   if(shouldClearPendingActivityReasoning(role,kind,steeringUser))pendingActivityReasoning=[];
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
-    settleTurnTool(latestToolElement);
+    const batch=isAgentActivityOutput(text)?takePendingAgentActivityBatch():latestToolElement;
+    settleTurnTool(batch||latestToolElement);
     return null;
   }
   if(role==='process'&&kind==='task_started'){

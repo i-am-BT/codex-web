@@ -596,6 +596,10 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
     assert.match(uiStyles, /\.agentActivityItem\[open\] > \.agentActivityRow \.agentActivityChevron/);
+    assert.match(uiStyles, /\.completionTimeline > \.msg\.agentActivityGroup\s*\{[^}]*display:\s*flex;[^}]*width:\s*100%;[^}]*flex-wrap:\s*wrap;[^}]*column-gap:\s*6px/s);
+    assert.match(uiStyles, /\.agentActivityGroup > \.activityBatch\s*\{[^}]*display:\s*contents/s);
+    assert.match(uiStyles, /\.agentActivityGroup \.agentActivityItem\[open\]\s*\{[^}]*flex:\s*1 0 100%/s);
+    assert.match(uiStyles, /\.agentActivityGroup \.agentActivityItem > \.agentActivityRow \.agentActivityStatus,[^}]*\.agentActivityChevron\s*\{[^}]*display:\s*none/s);
     assert.match(uiStyles, /\.subagentTraceTimeline\s*\{/);
     assert.match(uiStyles, /\.subagentTraceMessage\.final\s*\{/);
     assert.match(uiStyles, /\.subagentTraceNotice\.loading::before/);
@@ -1430,9 +1434,42 @@ if (args[0] === 'app-server') {
       }
 
       appendChild(child) {
+        if (child.parentNode) {
+          const previousIndex = child.parentNode.children.indexOf(child);
+          if (previousIndex >= 0) child.parentNode.children.splice(previousIndex, 1);
+        }
         this.children.push(child);
         child.parentNode = this;
         return child;
+      }
+
+      insertBefore(child, before) {
+        if (child.parentNode) {
+          const previousIndex = child.parentNode.children.indexOf(child);
+          if (previousIndex >= 0) child.parentNode.children.splice(previousIndex, 1);
+        }
+        const index = this.children.indexOf(before);
+        this.children.splice(index < 0 ? this.children.length : index, 0, child);
+        child.parentNode = this;
+        return child;
+      }
+
+      get classList() {
+        const element = this;
+        const values = () => new Set(String(element.className || '').split(/\s+/).filter(Boolean));
+        const write = (items) => { element.className = [...items].join(' '); };
+        return {
+          contains(name) { return values().has(name); },
+          add(name) { const items = values(); items.add(name); write(items); },
+          remove(name) { const items = values(); items.delete(name); write(items); },
+          toggle(name, force) {
+            const items = values();
+            const enabled = force === undefined ? !items.has(name) : Boolean(force);
+            if (enabled) items.add(name); else items.delete(name);
+            write(items);
+            return enabled;
+          },
+        };
       }
 
       setAttribute(name, value) {
@@ -1442,21 +1479,22 @@ if (args[0] === 'app-server') {
       addEventListener() {}
     }
     const activityDomHelpers = inlineScript.match(
-      /(function createActivityImageGallery[\s\S]*?)(?=function createActivityBatch)/,
+      /(function createActivityImageGallery[\s\S]*?)(?=const SUBAGENT_TRACE_POLL_MS)/,
     )?.[1];
     assert.ok(activityDomHelpers);
-    const createToolActivityItem = new Function(
+    const activityDomApi = new Function(
       'document',
       'openImagePreview',
       'refreshIcons',
       'setIconLabel',
-      `${activityDomHelpers}; return createToolActivityItem;`,
+      `let pendingAgentActivityBatches = []; ${activityDomHelpers}; return { createToolActivityItem, createActivityBatch, createAgentActivityGroup, appendAgentActivityBatch, updateAgentActivityGroupStatus, isAgentActivityOutput, queueAgentActivityBatch, takePendingAgentActivityBatch };`,
     )(
       { createElement: (tagName) => new FixtureElement(tagName) },
       () => {},
       () => {},
       () => {},
     );
+    const { createToolActivityItem } = activityDomApi;
     const imageActivity = createToolActivityItem({
       verb: '已查看',
       target: '1 张图像',
@@ -1493,6 +1531,50 @@ if (args[0] === 'app-server') {
     assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityIcon').children[0].attributes.get('data-lucide'), 'flower-2');
     assert.equal(agentActivityNodes.filter((node) => node.className.includes('subagentTraceTimeline')).length, 1);
     assert.equal(agentActivityNodes.filter((node) => node.className.includes('agentActivityChevron')).length, 1);
+
+    const agentPresentation = (agentKey, label) => ({
+      variant: 'agent',
+      agentKey,
+      label,
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: true,
+    });
+    const firstAgentBatch = activityDomApi.createActivityBatch(
+      [agentPresentation('final_diff_review', 'Final diff review')],
+      'spawn_agent\n{"task_name":"final_diff_review"}',
+      'agent_activity',
+      true,
+      { parentThreadId: nativeSessionId },
+    );
+    const secondAgentBatch = activityDomApi.createActivityBatch(
+      [agentPresentation('final_ui_review', 'Final ui review')],
+      'spawn_agent\n{"task_name":"final_ui_review"}',
+      'agent_activity',
+      true,
+      { parentThreadId: nativeSessionId },
+    );
+    const agentGroup = activityDomApi.createAgentActivityGroup();
+    activityDomApi.appendAgentActivityBatch(agentGroup, firstAgentBatch);
+    activityDomApi.appendAgentActivityBatch(agentGroup, secondAgentBatch);
+    assert.equal(agentGroup.className, 'msg agentActivityGroup streaming');
+    assert.deepEqual(agentGroup.children, [firstAgentBatch, secondAgentBatch, agentGroup._agentActivityStatus]);
+    assert.equal(agentGroup._agentActivityItems.length, 2);
+    assert.equal(agentGroup._agentActivityStatus.textContent, '正在启动');
+    assert.equal(agentGroup._agentActivityStatus.attributes.get('role'), 'status');
+    assert.equal(activityDomApi.isAgentActivityOutput('spawn_agent output\n{"task_name":"/root/final_diff_review"}'), true);
+    assert.equal(activityDomApi.isAgentActivityOutput('exec output\n[]'), false);
+    activityDomApi.queueAgentActivityBatch(firstAgentBatch);
+    activityDomApi.queueAgentActivityBatch(secondAgentBatch);
+    assert.strictEqual(activityDomApi.takePendingAgentActivityBatch(), firstAgentBatch);
+    firstAgentBatch.classList.remove('streaming');
+    assert.strictEqual(activityDomApi.takePendingAgentActivityBatch(), secondAgentBatch);
+    for (const item of agentGroup._agentActivityItems) item.dataset.traceState = 'ready';
+    firstAgentBatch.classList.remove('streaming');
+    secondAgentBatch.classList.remove('streaming');
+    activityDomApi.updateAgentActivityGroupStatus(agentGroup);
+    assert.equal(agentGroup.className, 'msg agentActivityGroup');
+    assert.equal(agentGroup._agentActivityStatus.textContent, '已开始工作');
 
     const searchActivity = createToolActivityItem({
       verb: '已在',
