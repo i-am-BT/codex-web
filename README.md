@@ -20,6 +20,9 @@
 - 浏览器断开后，已启动的任务会继续在服务端运行
 - 手机切换应用、页面恢复或 SSE 重连时会保留流式消息，并在完整历史落盘后安全同步
 - 支持上传图片、PDF、文本和代码附件
+- 内置 Image Prompt 案例与模板库，支持搜索、预览并发送到生图工作台
+- 内嵌 GPT Image Playground，支持生成、编辑、参考图、遮罩和浏览器本地历史
+- 提供登录保护的生图同源代理，可绕过第三方 Image API 的浏览器 CORS 限制
 - 支持管理模型服务商和默认模型
 - 支持为已有服务商重新获取最新模型列表
 - 支持选择并保存模型思考档位：默认、low、medium、high、xhigh
@@ -74,6 +77,8 @@ cp .env.example .env
 | `IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` | 提示词库自动检查间隔，默认 360 分钟 |
 | `IMAGE_PROMPT_SYNC_TIMEOUT_MS` | 单次 GitHub 请求超时，默认 20000 毫秒 |
 | `IMAGE_PROMPT_GITHUB_TOKEN` | 可选 GitHub Token，仅用于提高 API 速率限制 |
+| `PLAYGROUND_PROXY_TIMEOUT_MS` | 生图工作台同源代理请求超时，默认 300000 毫秒 |
+| `PLAYGROUND_PROXY_ALLOWED_ORIGINS` | 额外允许代理访问的 API Origin，多个值使用英文逗号分隔 |
 | `HOST` | 监听地址，默认 `127.0.0.1` |
 | `PORT` | 固定监听端口，示例为 `36354` |
 | `CODEX_BIN` | Codex CLI 路径；初始化脚本会优先发现 ChatGPT/Codex App 内置版本 |
@@ -90,8 +95,6 @@ cp .env.example .env
 | `DEFAULT_APPROVAL` | Codex 默认审批模式 |
 
 本仓库已默认忽略 `.env`、`runtime/` 和 `node_modules/`。请勿手动移除忽略规则或强制提交这些本地敏感/运行时文件。
-
-Image Prompt 的案例和模板会保留仓库内置快照作为兜底。自动更新写入 `runtime/image-prompts/`，不会修改已跟踪的 `vendor/` 文件；GitHub 不可用或数据校验失败时继续使用最近一次成功版本。
 
 仓库提供以下安全示例，不包含真实凭据或运行数据：
 
@@ -112,6 +115,49 @@ http://localhost:36354
 ```
 
 如果 `.env` 中配置了其他端口，请使用对应端口访问。
+
+## Image Prompt 与生图工作台
+
+Image Prompt 提供可搜索的生图案例、风格模板和参数参考。选择提示词后可点击“在生图工作台使用”，内容会发送到内嵌的 GPT Image Playground；该操作只填充提示词和参数，不会自动提交生图请求。
+
+生图工作台支持：
+
+- OpenAI 兼容的 Images API，包括生成与编辑接口
+- 参考图上传、`@` 引用、遮罩编辑和多图结果
+- 右上角 Playground 设置中修改 API URL、API Key 和模型
+- 浏览器本地保存 Playground 配置、历史和图片数据
+- 代理开启时继续编辑 API URL，并优先保留浏览器填写的 URL 与 Key
+
+服务端 Codex Provider 会作为首次打开时的默认配置。用户在 Playground 中填写的 API URL 和 API Key 只保存在当前浏览器，并在后续加载时优先于服务端默认值。切换浏览器、清理站点数据或使用无痕窗口时需要重新配置。
+
+### 同源代理
+
+浏览器直接请求第三方 Image API 时，可能因上游拒绝 CORS 预检而显示 `Failed to fetch`。Codex Web 内置登录保护的 `/api-proxy/*` 同源代理，Playground 会把当前浏览器配置的 API URL 作为上游目标，并转发浏览器提供的认证头。
+
+代理只允许以下 API 路径：
+
+- `images/generations`
+- `images/edits`
+- `responses`
+
+允许的上游源站包括：
+
+1. 已配置 Codex Provider 的 Origin。
+2. `PLAYGROUND_PROXY_ALLOWED_ORIGINS` 显式列出的 Origin。
+
+Origin 只包含协议、域名或 IP 和端口，不包含 `/v1` 等路径。例如：
+
+```dotenv
+PLAYGROUND_PROXY_ALLOWED_ORIGINS=https://images.example.com,http://192.168.1.20:8080
+```
+
+代理不会把 Codex Web 登录 Cookie 转发给上游，也不会跟随上游重定向。浏览器填写的 Authorization 会优先转发；只有目标属于已配置 Codex Provider 且浏览器没有提供 Authorization 时，服务端才会回退使用该 Provider 的凭据。未在白名单中的源站和未支持的路径会被拒绝，避免把 Codex Web 变成任意网络代理。
+
+### 提示词库更新
+
+Image Prompt 的案例和模板保留仓库内置快照作为兜底。自动更新写入 `runtime/image-prompts/`，不会修改已跟踪的 `vendor/` 文件；GitHub 不可用或数据校验失败时继续使用最近一次成功版本。可在 `.env` 中使用 `IMAGE_PROMPT_AUTO_SYNC`、`IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` 和 `IMAGE_PROMPT_SYNC_TIMEOUT_MS` 调整更新行为。
+
+能否实际生成图片仍取决于上游账户是否支持所选 Image 模型。网络代理正常但上游返回 `model_not_found` 时，需要在上游配置对应模型或切换到受支持的 Image API。
 
 ## 模型与服务商
 
@@ -200,6 +246,8 @@ Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
 - 旧版 Web 会话可能仍保存在 `runtime/conversations.json`，仅作兼容数据保留
 - 上传附件保存在 `runtime/uploads/`
 - 外观设置和自定义背景保存在 `runtime/` 下
+- Image Prompt 自动更新缓存保存在 `runtime/image-prompts/`
+- Playground 的 API 配置、历史和图片数据保存在当前浏览器站点数据中
 - 服务运行日志和临时文件也应保留在本地
 
 这些文件属于本机运行数据，不建议提交到远程仓库。
