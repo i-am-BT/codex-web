@@ -2684,6 +2684,65 @@ body[data-theme] .activityCluster {
   color: var(--text-muted);
 }
 
+.agentActivityRow {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 9px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.agentActivityIdentity {
+  display: inline-flex;
+  min-width: 0;
+  height: 28px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  color: var(--text-muted);
+  padding: 0 10px 0 8px;
+}
+
+.agentActivityIcon {
+  display: grid;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  place-items: center;
+  color: #f0c83e;
+}
+
+.agentActivityIcon .lucide {
+  width: 15px;
+  height: 15px;
+  stroke-width: 2.35;
+}
+
+.agentActivityLabel,
+.agentActivityStatus {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agentActivityLabel {
+  max-width: 180px;
+  font-weight: 500;
+}
+
+.agentActivityStatus {
+  color: var(--text-muted);
+}
+
+.activityBatch.streaming .agentActivityIcon {
+  animation: streamDot 1.1s ease-in-out infinite;
+}
+
 .activityItemChevron {
   width: 13px;
   height: 13px;

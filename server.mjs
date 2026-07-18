@@ -5386,10 +5386,13 @@ function executableOrchestratedToolCallOffsets(source,toolName){
   }
   return offsets;
 }
-function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim();let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
+function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim().replace(/^调用工具:\\s*/,'');let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
 function activityFileLabel(file){const clean=String(file||'').trim().replace(/^["']|["',;)]$/g,'');const parts=clean.split('/').filter(Boolean);return parts[parts.length-1]||clean||'文件'}
 function extractActivityFiles(source){const matches=String(source||'').match(/[A-Za-z0-9_@.+-]+\\.(?:mjs|cjs|js|css|jsonl?|md|toml|ya?ml|py|sh|html|tsx?|jsx?|go|rs|java|cpp|hpp|c|h)/g)||[];return[...new Set(matches.map(activityFileLabel))].slice(0,4)}
 function shortActivityText(value,max=100){const clean=String(value||'').replace(/\\s+/g,' ').trim();return clean.length>max?clean.slice(0,max-3)+'...':clean}
+function embeddedToolObject(detail){const source=String(detail||'').split('\\n').filter((line)=>!/^call_id=/.test(line.trim())).join('\\n').trim();const candidates=[source];const start=source.indexOf('{');const end=source.lastIndexOf('}');if(start>=0&&end>start)candidates.push(source.slice(start,end+1));for(const candidate of candidates){try{const parsed=JSON.parse(candidate);if(parsed&&typeof parsed==='object')return parsed}catch(e){}}return{}}
+function agentActivityLabel(value){const pathParts=String(value||'').trim().split('/').filter(Boolean);const clean=(pathParts.at(-1)||'Agent').replace(/[_-]+/g,' ').replace(/\\s+/g,' ').trim();return clean?clean.charAt(0).toUpperCase()+clean.slice(1):'Agent'}
+function agentSpawnActivityPresentation(detail){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?task_name["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];return{variant:'agent',label:agentActivityLabel(payload.task_name||fallback),status:'已开始工作',icon:'flower-2',expandable:false}}
 function orchestratedActivityPresentations(text){
   const source=String(text||'');
   if(!source.startsWith('exec\\n'))return[];
@@ -5419,7 +5422,7 @@ function runningActivityVerb(verb){
 }
 function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){current={verb:match[1],icon:match[2],target:activityFileLabel(line.slice(match[0].length)),added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
 function commandActivityPresentation(command){const source=String(command||'');const clean=shortActivityText(source,120);const files=extractActivityFiles(source);if(/(?:^|\\s)(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files.join('、')||clean,icon:'book-open'};if(/\\brg\\b/.test(source)){const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';return{verb:'已搜索',target:(files.join('、')||'内容')+(query?' · “'+shortActivityText(query,48)+'”':''),icon:'search'}}if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files.join('、')||shortActivityText(source.split('\\n')[0],84),icon:'circle-check'};if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};return{verb:'已运行',target:files.join('、')||clean||'工具调用',icon:'terminal'}}
-function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
+function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(toolName==='spawn_agent')return[agentSpawnActivityPresentation(descriptor.detail)];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
 function isImageViewActivityPresentation(presentation){return presentation?.verb==='已查看'&&/\\d+ 张图像$/.test(String(presentation.target||''))&&['image','images'].includes(presentation.icon)}
 function nativeToolImageUrls(presentations,messageSeq){
   const sequence=Number(messageSeq);
@@ -5463,6 +5466,33 @@ function createActivityImageGallery(urls){
   return gallery;
 }
 function createToolActivityItem(presentation,rawText,running=false){
+  if(presentation.variant==='agent'){
+    const item=document.createElement('div');
+    item.className='activityItem agentActivityItem static';
+    item.dataset.messageText=String(rawText||'');
+    const row=document.createElement('div');
+    row.className='agentActivityRow';
+    const identity=document.createElement('span');
+    identity.className='agentActivityIdentity';
+    const iconWrap=document.createElement('span');
+    iconWrap.className='agentActivityIcon';
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide',presentation.icon||'flower-2');
+    icon.setAttribute('aria-hidden','true');
+    iconWrap.appendChild(icon);
+    const label=document.createElement('span');
+    label.className='agentActivityLabel';
+    label.textContent=presentation.label||'Agent';
+    const status=document.createElement('span');
+    status.className='agentActivityStatus';
+    status.textContent=presentation.status||'已开始工作';
+    identity.appendChild(iconWrap);
+    identity.appendChild(label);
+    row.appendChild(identity);
+    row.appendChild(status);
+    item.appendChild(row);
+    return item;
+  }
   const expandable=presentation.expandable!==false;
   const galleryOnly=Boolean(presentation.galleryOnly);
   const imageUrls=Array.isArray(presentation.imageUrls)?presentation.imageUrls.filter(Boolean):[];
@@ -5627,7 +5657,8 @@ function appendTurnTool(text,options={}){
     refreshIcons(visibleBatch);
   }
   if(!folded.length)return visibleBatch;
-  const batch=createActivityBatch(folded,text,'tool_activity',true);
+  const activityKind=folded.some((presentation)=>presentation.variant==='agent')?'agent_activity':'tool_activity';
+  const batch=createActivityBatch(folded,text,activityKind,true);
   if(visibleBatch)batch._relatedActivityBatches=[visibleBatch];
   activateTurnProcessElement(batch);
   refreshIcons(batch);

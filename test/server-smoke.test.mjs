@@ -890,6 +890,20 @@ if (args[0] === 'app-server') {
       target: 'server.mjs、ui.css · “menuBtn|toggleMenu”',
       icon: 'search',
     }]);
+    assert.deepEqual(parseToolActivity('spawn_agent\n{\n  "task_name": "ui_trace",\n  "fork_turns": "all"\n}'), [{
+      variant: 'agent',
+      label: 'Ui trace',
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: false,
+    }]);
+    assert.deepEqual(parseToolActivity('调用工具: spawn_agent\ncall_id=call-1\n{"task_name":"ui_trace"}'), [{
+      variant: 'agent',
+      label: 'Ui trace',
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: false,
+    }]);
     const orchestratedCall = [
       'exec',
       'const calls = await Promise.all([',
@@ -966,6 +980,20 @@ if (args[0] === 'app-server') {
     assert.equal(renderedActivityNodes.filter((node) => node.className === 'activityRaw').length, 0);
     assert.equal(renderedActivityNodes.filter((node) => node.className === 'activityItemChevron').length, 1);
     assert.equal(renderedActivityNodes.find((node) => node.tagName === 'IMG').src, '/api/native-sessions/thread/tool-images/7/1');
+
+    const agentActivity = createToolActivityItem({
+      variant: 'agent',
+      label: 'Ui trace',
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: false,
+    }, 'spawn_agent\n{"task_name":"ui_trace"}', true);
+    const agentActivityNodes = activityNodes(agentActivity);
+    assert.equal(agentActivity.tagName, 'DIV');
+    assert.equal(agentActivity.className, 'activityItem agentActivityItem static');
+    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityLabel').textContent, 'Ui trace');
+    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityStatus').textContent, '已开始工作');
+    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityIcon').children[0].attributes.get('data-lucide'), 'flower-2');
 
     const configResponse = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
     assert.equal(configResponse.status, 200);
