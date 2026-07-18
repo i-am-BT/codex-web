@@ -157,13 +157,15 @@ test('plan updates preserve the active tool and agent rows', () => {
 
 test('the live progress pill stays out of completion artifacts', () => {
   const helpers = sourceBetween('function moveLiveEditedFilesResultToEnd', 'function createWebPreviewResultCard');
+  const detachNode = (node) => {
+    if (!node.parentNode) return;
+    const index = node.parentNode.children.indexOf(node);
+    if (index >= 0) node.parentNode.children.splice(index, 1);
+  };
   const timeline = {
     children: [],
     appendChild(node) {
-      if (node.parentNode) {
-        const index = node.parentNode.children.indexOf(node);
-        if (index >= 0) node.parentNode.children.splice(index, 1);
-      }
+      detachNode(node);
       node.parentNode = this;
       node.isConnected = true;
       this.children.push(node);
@@ -179,11 +181,43 @@ test('the live progress pill stays out of completion artifacts', () => {
       this.children.splice(index, 1, next);
     },
   };
+  const dropZone = { kind: 'drop-zone', parentNode: null, isConnected: true };
+  let composerInsertCalls = 0;
+  const composer = {
+    children: [dropZone],
+    insertBefore(node, reference) {
+      composerInsertCalls += 1;
+      assert.strictEqual(reference, dropZone);
+      detachNode(node);
+      const index = this.children.indexOf(reference);
+      assert.notEqual(index, -1);
+      node.parentNode = this;
+      node.isConnected = true;
+      this.children.splice(index, 0, node);
+      return node;
+    },
+    replaceChild(next, previous) {
+      const index = this.children.indexOf(previous);
+      assert.notEqual(index, -1);
+      previous.parentNode = null;
+      previous.isConnected = false;
+      next.parentNode = this;
+      next.isConnected = true;
+      this.children.splice(index, 1, next);
+      return previous;
+    },
+  };
+  dropZone.parentNode = composer;
   const toolArtifact = { kind: 'tool-artifact' };
   const processElements = [toolArtifact];
   const makeCard = () => ({
     parentNode: null,
     isConnected: false,
+    get nextSibling() {
+      if (!this.parentNode) return null;
+      const index = this.parentNode.children.indexOf(this);
+      return this.parentNode.children[index + 1] || null;
+    },
     remove() {
       if (!this.parentNode) return;
       const index = this.parentNode.children.indexOf(this);
@@ -199,6 +233,8 @@ test('the live progress pill stays out of completion artifacts', () => {
     'createEditedFilesResultCard',
     'refreshIcons',
     'initialPlan',
+    'composer',
+    'dropZone',
     `
       let liveEditedFilesResult = null;
       let liveTurnPlan = initialPlan;
@@ -218,12 +254,18 @@ test('the live progress pill stays out of completion artifacts', () => {
     makeCard,
     () => {},
     referencePlan,
+    composer,
+    dropZone,
   );
 
   const first = api.refresh();
   const second = api.refresh();
   assert.notStrictEqual(first, second);
-  assert.deepEqual(timeline.children, [second]);
+  assert.deepEqual(timeline.children, []);
+  assert.deepEqual(composer.children, [second, dropZone]);
+  assert.strictEqual(second.parentNode, composer);
+  assert.strictEqual(composer.children.at(-1), dropZone);
+  assert.equal(composerInsertCalls, 1);
   assert.deepEqual(api.state().turnProcessElements, [toolArtifact]);
   assert.equal(api.state().turnProcessElements.includes(second), false);
   assert.match(inlineScript, /if\(files\.length\)container\.appendChild\(createEditedFilesResultCard\(files,turnId\)\)/);
@@ -237,6 +279,7 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.match(uiStyles, /\.turnPlanProgressRing\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px;[^}]*flex:\s*0 0 12px/s);
   assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
   assert.match(uiStyles, /conic-gradient\(#339cff var\(--turn-plan-progress\), #2b3c4f 0\)/);
-  assert.match(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live\s*\{[^}]*justify-self:\s*center/s);
+  assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
+  assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
   assert.equal((inlineScript.match(/fileChanges:msg\.fileChanges/g) || []).length, 2);
 });

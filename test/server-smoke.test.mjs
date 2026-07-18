@@ -635,7 +635,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.editedFilesResult\.withPlan > \.turnResultHead\s*\{[^}]*min-height:\s*36px;[^}]*gap:\s*7px;[^}]*padding-inline:\s*12px/s);
     assert.match(uiStyles, /\.turnPlanProgressRing\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px;[^}]*flex:\s*0 0 12px;[^}]*conic-gradient\(var\(--info\) var\(--turn-plan-progress\)/s);
     assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
-    assert.match(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live\s*\{[^}]*justify-self:\s*center/s);
+    assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
+    assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult:not\(\[open\]\)\s*\{[^}]*border-color:\s*#383838;[^}]*background:\s*#272727/s);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult\.withPlan \.turnPlanProgressRing\s*\{[^}]*conic-gradient\(#339cff var\(--turn-plan-progress\), #2b3c4f 0\)/s);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult\.withPlan \.turnPlanProgressLabel,[^}]*\.turnResultFileLabel\s*\{[^}]*color:\s*#bbbbbb/s);
@@ -1992,13 +1993,15 @@ if (args[0] === 'app-server') {
       /(function moveLiveEditedFilesResultToEnd[\s\S]*?)(?=function createWebPreviewResultCard)/,
     )?.[1];
     assert.ok(liveResultHelpers);
+    const detachLiveNode = (node) => {
+      if (!node.parentNode) return;
+      const previousIndex = node.parentNode.children.indexOf(node);
+      if (previousIndex >= 0) node.parentNode.children.splice(previousIndex, 1);
+    };
     const liveTimeline = {
       children: [],
       appendChild(node) {
-        if (node.parentNode) {
-          const previousIndex = node.parentNode.children.indexOf(node);
-          if (previousIndex >= 0) node.parentNode.children.splice(previousIndex, 1);
-        }
+        detachLiveNode(node);
         node.parentNode = this;
         node.isConnected = true;
         this.children.push(node);
@@ -2015,6 +2018,33 @@ if (args[0] === 'app-server') {
         return previous;
       },
     };
+    const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true };
+    let liveComposerInsertCalls = 0;
+    const liveComposer = {
+      children: [liveDropZone],
+      insertBefore(node, reference) {
+        liveComposerInsertCalls += 1;
+        assert.strictEqual(reference, liveDropZone);
+        detachLiveNode(node);
+        const index = this.children.indexOf(reference);
+        assert.notEqual(index, -1);
+        node.parentNode = this;
+        node.isConnected = true;
+        this.children.splice(index, 0, node);
+        return node;
+      },
+      replaceChild(next, previous) {
+        const index = this.children.indexOf(previous);
+        assert.notEqual(index, -1);
+        previous.parentNode = null;
+        previous.isConnected = false;
+        next.parentNode = this;
+        next.isConnected = true;
+        this.children.splice(index, 1, next);
+        return previous;
+      },
+    };
+    liveDropZone.parentNode = liveComposer;
     const toolArtifact = { kind: 'tool-artifact' };
     const liveElements = [toolArtifact];
     const createdLiveCards = [];
@@ -2025,6 +2055,11 @@ if (args[0] === 'app-server') {
         options,
         parentNode: null,
         isConnected: false,
+        get nextSibling() {
+          if (!this.parentNode) return null;
+          const index = this.parentNode.children.indexOf(this);
+          return this.parentNode.children[index + 1] || null;
+        },
         remove() {
           if (!this.parentNode) return;
           const index = this.parentNode.children.indexOf(this);
@@ -2043,6 +2078,8 @@ if (args[0] === 'app-server') {
       'createEditedFilesResultCard',
       'refreshIcons',
       'initialPlan',
+      'composer',
+      'dropZone',
       `
         let liveEditedFilesResult = null;
         let liveTurnPlan = initialPlan;
@@ -2062,15 +2099,22 @@ if (args[0] === 'app-server') {
       makeLiveCard,
       () => {},
       referencePlan,
+      liveComposer,
+      liveDropZone,
     );
     const firstLivePill = liveResultApi.refresh();
     const secondLivePill = liveResultApi.refresh();
     assert.notStrictEqual(firstLivePill, secondLivePill);
-    assert.deepEqual(liveTimeline.children, [secondLivePill]);
+    assert.deepEqual(liveTimeline.children, []);
+    assert.deepEqual(liveComposer.children, [secondLivePill, liveDropZone]);
+    assert.strictEqual(secondLivePill.parentNode, liveComposer);
+    assert.strictEqual(liveComposer.children.at(-1), liveDropZone);
+    assert.equal(liveComposerInsertCalls, 1);
     assert.deepEqual(liveResultApi.state().turnProcessElements, [toolArtifact]);
     assert.equal(liveResultApi.state().turnProcessElements.includes(secondLivePill), false);
     assert.equal(createdLiveCards.length, 2);
     assert.deepEqual(createdLiveCards.at(-1).options, { live: true, plan: referencePlan });
+    assert.match(inlineScript, /composer\.insertBefore\(liveEditedFilesResult,dropZone\)/);
     assert.match(inlineScript, /if\(files\.length\)container\.appendChild\(createEditedFilesResultCard\(files,turnId\)\)/);
 
     const searchActivity = createToolActivityItem({

@@ -3023,11 +3023,6 @@ body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-
   display: none;
 }
 
-.liveProcessTimeline > .editedFilesResult.live {
-  justify-self: center;
-  margin-top: 2px;
-}
-
 body[data-theme="dark"] .liveProcessTimeline .markdownBody code,
 body[data-theme="dark"] .completionTimeline .markdownBody code {
   background: #373737;
@@ -4348,6 +4343,28 @@ body[data-theme="light"] .composer {
 .composer > * {
   width: min(var(--conversation-width), 100%);
   margin-inline: auto;
+}
+
+body .composer > .editedFilesResult.live {
+  flex: 0 0 auto;
+  align-self: center;
+  justify-self: auto;
+  margin: 0 auto 8px;
+}
+
+body .composer > .editedFilesResult.live:not([open]) {
+  width: min(160px, 100%);
+}
+
+body .composer > .editedFilesResult.live.withPlan:not([open]) {
+  width: max-content;
+  max-width: 100%;
+}
+
+body .composer > .editedFilesResult.live[open] {
+  width: min(520px, 100%);
+  max-height: min(38vh, 360px);
+  overflow: auto;
 }
 
 body .nativeNotice {

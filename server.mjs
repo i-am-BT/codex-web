@@ -7425,8 +7425,8 @@ function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
   return card;
 }
 function moveLiveEditedFilesResultToEnd(){
-  if(!liveEditedFilesResult?.isConnected||!turnProcessTimeline)return;
-  turnProcessTimeline.appendChild(liveEditedFilesResult);
+  if(!liveEditedFilesResult?.isConnected||!composer||!dropZone)return;
+  if(liveEditedFilesResult.parentNode!==composer||liveEditedFilesResult.nextSibling!==dropZone)composer.insertBefore(liveEditedFilesResult,dropZone);
 }
 function refreshLiveEditedFilesResult(){
   if(!turnProcessTimeline)return null;
