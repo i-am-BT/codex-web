@@ -317,6 +317,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(conversation.metadata.cliVersion, '0.144.0-alpha.4');
     assert.equal(conversation.status, 'done');
     assert.equal(conversation.latestTurnId, 'turn-2');
+    assert.equal(conversation.latestTurnStartedAt, '2026-07-11T04:52:33.000Z');
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '用户消息'));
     assert.ok(conversation.messages.some((message) => (
       message.role === 'user'
@@ -484,6 +485,220 @@ This block is automatically supplied ambient UI state, not part of the user's re
     await delayedCompactionChange;
     const afterDelayedCompaction = store.get(id);
     assert.ok(afterDelayedCompaction.messages.some((message) => message.content === '正常最终回复'));
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store recovers a truncated active turn start from tail metadata within a bounded scan', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-turn-start-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f638d-488c-7520-b72a-9c0be60aac01';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '18');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-18T10-00-00-${id}.jsonl`);
+  let boundedStore;
+  let recoveringStore;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-18T10:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace', source: 'vscode', cli_version: 'test' },
+      },
+      {
+        timestamp: '2026-07-18T10:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-long' },
+      },
+      {
+        timestamp: '2026-07-18T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: 'x'.repeat(6000) }],
+        },
+      },
+      {
+        timestamp: '2026-07-18T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: '尾部仍在运行' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn-long' },
+        },
+      },
+    ]));
+
+    boundedStore = new NativeSessionStore(codexHome, {
+      maxReadBytes: 512,
+      turnStartScanBytes: 1024,
+      watchChanges: false,
+    });
+    const bounded = boundedStore.get(id);
+    assert.equal(bounded.latestTurnId, 'turn-long');
+    assert.equal(bounded.latestTurnStartedAt, '');
+    boundedStore.stop();
+    boundedStore = null;
+
+    recoveringStore = new NativeSessionStore(codexHome, {
+      maxReadBytes: 512,
+      turnStartScanBytes: 64 * 1024,
+      watchChanges: false,
+    });
+    const recovered = recoveringStore.get(id);
+    assert.equal(recovered.status, 'running');
+    assert.equal(recovered.latestTurnId, 'turn-long');
+    assert.equal(recovered.latestTurnStartedAt, '2026-07-18T10:00:01.000Z');
+    assert.ok(recovered.messages.some((message) => message.content === '尾部仍在运行'));
+  } finally {
+    boundedStore?.stop();
+    recoveringStore?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native turn-start scan keeps its backward budget when the read window begins mid-record', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-turn-boundary-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f638d-488c-7520-b72a-9c0be60aac03';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '18');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-18T10-05-00-${id}.jsonl`);
+  const filler = 'x'.repeat(1500);
+  const source = jsonl([
+    {
+      timestamp: '2026-07-18T10:05:00.000Z',
+      type: 'session_meta',
+      payload: { id, cwd: '/workspace', source: 'vscode', cli_version: 'test' },
+    },
+    {
+      timestamp: '2026-07-18T10:05:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'turn-boundary' },
+    },
+    {
+      timestamp: '2026-07-18T10:05:02.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: filler }],
+      },
+    },
+    {
+      timestamp: '2026-07-18T10:05:03.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: 'tail' }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn-boundary' },
+      },
+    },
+  ]);
+  const boundaryOffset = source.indexOf(filler) + 600;
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, source);
+    store = new NativeSessionStore(codexHome, {
+      maxReadBytes: Buffer.byteLength(source) - boundaryOffset,
+      turnStartScanBytes: 1024,
+      watchChanges: false,
+    });
+    const conversation = store.get(id);
+    assert.equal(conversation.latestTurnId, 'turn-boundary');
+    assert.equal(conversation.latestTurnStartedAt, '2026-07-18T10:05:01.000Z');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store preserves full file-change stats when displayed patch text is truncated', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-patch-stats-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f638d-488c-7520-b72a-9c0be60aac02';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '18');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-18T10-10-00-${id}.jsonl`);
+  const firstFileLines = Array.from({ length: 120 }, (_, index) => `+line-${index}-${'x'.repeat(70)}`);
+  const fullPatch = [
+    '*** Begin Patch',
+    '*** Update File: /workspace/first.mjs',
+    ...firstFileLines,
+    '*** Update File: /workspace/second.css',
+    '-old-value',
+    '+new-value',
+    '---literal-minus',
+    '+++literal-plus',
+    '*** End Patch',
+  ].join('\n');
+  const execInput = 'const patch = String.raw`' + fullPatch + '`;\ntext(await tools.apply_patch(patch));';
+  const exampleInput = 'const example = "const patch = String.raw`*** Begin Patch\\n*** Add File: /workspace/fake.txt\\n+fake\\n*** End Patch`; tools.apply_patch(patch)";\ntext(example);';
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-18T10:10:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace', source: 'vscode', cli_version: 'test' },
+      },
+      {
+        timestamp: '2026-07-18T10:10:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-patch' },
+      },
+      {
+        timestamp: '2026-07-18T10:10:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          call_id: 'call-patch',
+          name: 'exec',
+          input: execInput,
+        },
+      },
+      {
+        timestamp: '2026-07-18T10:10:02.500Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          call_id: 'call-example',
+          name: 'exec',
+          input: exampleInput,
+        },
+      },
+      {
+        timestamp: '2026-07-18T10:10:03.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn-patch', duration_ms: 2000 },
+      },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const conversation = store.get(id);
+    const patchMessages = conversation.messages.filter((message) => message.kind === 'custom_tool_call');
+    const patchMessage = patchMessages[0];
+    const exampleMessage = patchMessages[1];
+    assert.ok(patchMessage);
+    assert.match(patchMessage.content, /\[内容过长，已截断 \d+ 字符\]$/);
+    assert.equal(patchMessage.content.includes('/workspace/second.css'), false);
+    assert.deepEqual(patchMessage.fileChanges, [
+      { filePath: '/workspace/first.mjs', verb: '已编辑', added: 120, removed: 0 },
+      { filePath: '/workspace/second.css', verb: '已编辑', added: 2, removed: 2 },
+    ]);
+    assert.equal(exampleMessage.fileChanges, undefined);
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });

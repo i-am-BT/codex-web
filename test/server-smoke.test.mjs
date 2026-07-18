@@ -603,7 +603,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.agentActivityGroup \.agentActivityItem\[open\]\s*\{[^}]*flex:\s*1 0 100%/s);
     assert.match(uiStyles, /\.agentActivityGroup \.agentActivityItem > \.agentActivityRow \.agentActivityStatus,[^}]*\.agentActivityChevron\s*\{[^}]*display:\s*none/s);
     assert.match(uiStyles, /\.agentActivityLabel\s*\{[^}]*max-width:\s*150px/s);
-    assert.match(uiStyles, /\.agentActivityGroupStatus\[data-trace-state="done"\]\s*\{[^}]*color:\s*var\(--text-muted\)/s);
+    assert.match(uiStyles, /\.agentActivityGroupStatus\[data-trace-state="done"\],\s*\.agentActivityGroupStatus\[data-trace-state="updated"\]\s*\{[^}]*color:\s*var\(--text-muted\)/s);
     assert.match(uiStyles, /\.subagentTraceTimeline\s*\{/);
     assert.match(uiStyles, /\.subagentTraceMessage\.final\s*\{/);
     assert.match(uiStyles, /\.subagentTraceNotice\.loading::before/);
@@ -612,7 +612,11 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.activityImagePreview\.loaded\s*\{[^}]*aspect-ratio:\s*auto/s);
     assert.match(uiStyles, /\.activityImagePreview img\s*\{[^}]*width:\s*100%;[^}]*object-fit:\s*contain/s);
     assert.match(uiStyles, /\.activityImagePreview\.loaded img\s*\{[^}]*height:\s*auto/s);
+    assert.match(uiStyles, /\.liveProcessElapsed\s*\{[^}]*width:\s*100%;[^}]*height:\s*40px;[^}]*align-items:\s*center;[^}]*border-bottom:\s*1px solid var\(--border\);[^}]*font-size:\s*14px;[^}]*white-space:\s*nowrap/s);
+    assert.match(uiStyles, /\.liveProcessElapsed \+ \.liveProcessTimeline\s*\{[^}]*margin-top:\s*14px/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.liveProcessElapsed\s*\{[^}]*border-bottom-color:\s*#303030;[^}]*color:\s*#acacac/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
+    assert.doesNotMatch(uiStyles, /\.turnPlanPanel|\.turnPlanList|\.turnPlanStep/);
     assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary\.streaming \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
@@ -623,8 +627,14 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body\[data-theme\] \.archiveProjectFilter select\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.turnResultArtifacts\s*\{[^}]*align-self:\s*center/s);
     assert.match(uiStyles, /\.editedFilesResult\s*\{[^}]*width:\s*min\(160px, 100%\);[^}]*border-radius:\s*999px/s);
+    assert.match(uiStyles, /\.editedFilesResult\.withPlan\s*\{[^}]*width:\s*max-content/s);
+    assert.match(uiStyles, /\.editedFilesResult\.withPlan > \.turnResultHead\s*\{[^}]*min-height:\s*36px;[^}]*gap:\s*7px;[^}]*padding-inline:\s*12px/s);
+    assert.match(uiStyles, /\.turnPlanProgressRing\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px;[^}]*flex:\s*0 0 12px;[^}]*conic-gradient\(var\(--info\) var\(--turn-plan-progress\)/s);
+    assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
     assert.match(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live\s*\{[^}]*justify-self:\s*center/s);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult:not\(\[open\]\)\s*\{[^}]*border-color:\s*#383838;[^}]*background:\s*#272727/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult\.withPlan \.turnPlanProgressRing\s*\{[^}]*conic-gradient\(#339cff var\(--turn-plan-progress\), #2b3c4f 0\)/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult\.withPlan \.turnPlanProgressLabel,[^}]*\.turnResultFileLabel\s*\{[^}]*color:\s*#bbbbbb/s);
     assert.match(uiStyles, /\.turnResultStat\.added\s*\{[^}]*color:\s*var\(--success\)/s);
     assert.match(uiStyles, /\.turnResultStat\.removed\s*\{[^}]*color:\s*var\(--danger\)/s);
     assert.match(uiStyles, /\.webPreviewResult\s*\{/);
@@ -981,11 +991,30 @@ if (args[0] === 'app-server') {
     assert.match(page, /generatedBackgroundApply/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
+    assert.match(page, /function planActivityPresentation/);
+    assert.doesNotMatch(page, /function createTurnPlanElement|turnPlanPanel/);
+    assert.match(page, /function upsertLiveTurnPlan/);
+    assert.match(page, /presentation\.variant==='plan'/);
     assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
     assert.doesNotMatch(page, /descriptor\.name\+\(descriptor\.detail/);
     assert.match(page, /activityBatch/);
     assert.match(page, /liveProcessPanel/);
+    assert.match(page, /let turnProcessStartedAt = 0;[\s\S]*let turnProcessElapsedLabel = null;[\s\S]*let turnProcessElapsedTimer = null;[\s\S]*let turnProcessElapsedFrozen = false;[\s\S]*let turnProcessElapsedTurnId = '';/);
     assert.match(page, /turnProcessHeader=document\.createElement\('div'\)/);
+    assert.match(page, /turnProcessHeader\.insertBefore\(turnProcessElapsedLabel,turnProcessTimeline\)/);
+    assert.match(page, /function beginTurnProcessCollection\(startedAt='',showElapsed=false,turnId=''\)/);
+    assert.match(page, /beginTurnProcessCollection\(options\.at,showElapsed,options\.turnId\)/);
+    assert.match(page, /function clearTurnProcessHeader\(\)\{\s*clearTurnReasoningStatus\(\);\s*clearTurnProcessElapsed\(\);/);
+    assert.match(page, /beginTurnProcessCollection\(activeStartedAt,true,activeNativeTurnId\)/);
+    assert.match(page, /hydrating:true/);
+    assert.match(page, /function turnProcessElapsedMatches\(turnId\)/);
+    assert.match(page, /if\(terminalProcess&&!turnProcessElapsedMatches\(options\.turnId\)\)return null/);
+    assert.match(page, /if\(isCompletedNativeRuntimeTurn\(runtime\.turnId\)&&\['delta','item-completed','connection-error','turn'\]\.includes\(runtime\.type\)\)return/);
+    assert.match(page, /\['delta','item-completed','connection-error','turn'\]\.includes\(runtime\.type\)\)return/);
+    assert.match(page, /freezeTurnProcessElapsed\(options\.at,options\.turnId\)/);
+    assert.match(page, /freezeTurnProcessElapsed\(runtime\.updatedAt,runtimeTurnId\)/);
+    assert.match(page, /freezeTurnProcessElapsed\(conversation\.updatedAt,completingTurnId\)/);
+    assert.match(page, /freezeTurnProcessElapsed\('',activeNativeTurnId\);webRunActive=false/);
     assert.match(page, /function createActivityCluster/);
     assert.match(page, /function updateTurnReasoningStatus/);
     assert.match(page, /if\(!turnReasoningStatus\)\{[\s\S]*turnReasoningStatus\.textContent=clean;[\s\S]*turnProcessTimeline\.appendChild\(turnReasoningStatus\)/);
@@ -1065,6 +1094,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /function createEditedFilesResultCard/);
     assert.match(page, /function createWebPreviewResultCard/);
     assert.match(page, /function refreshLiveEditedFilesResult/);
+    assert.match(page, /createEditedFilesResultCard\(files,'',\{live:true,plan:liveTurnPlan\}\)/);
     assert.match(page, /if\(item\._subagentTrace\?\.autoTrack\)loadSubagentTrace/);
     assert.doesNotMatch(page, /currentActivityCluster\.dataset\.activityGroup!==group/);
     assert.match(page, /turnProcessTimeline\.insertBefore\(element,matched\.nextSibling\)/);
@@ -1088,6 +1118,15 @@ if (args[0] === 'app-server') {
     assert.match(page, /async function boot\(selectRecent=false\)/);
     const inlineScript = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert.ok(inlineScript);
+    const completedRuntimeHelper = inlineScript.match(/(function isCompletedNativeRuntimeTurn[\s\S]*?)(?=function connectSessionEvents)/)?.[1];
+    assert.ok(completedRuntimeHelper);
+    const isCompletedNativeRuntimeTurn = new Function(
+      completedRuntimeHelper + '; return isCompletedNativeRuntimeTurn;',
+    )();
+    assert.equal(isCompletedNativeRuntimeTurn('turn-old', 'turn-old', ''), true);
+    assert.equal(isCompletedNativeRuntimeTurn('turn-old', '', 'turn-old'), true);
+    assert.equal(isCompletedNativeRuntimeTurn('turn-new', 'turn-old', 'turn-old'), false);
+    assert.equal(isCompletedNativeRuntimeTurn('', 'turn-old', 'turn-old'), false);
     assert.doesNotThrow(() => new Function(inlineScript));
     const singleFlightHelper = inlineScript.match(/(function createTrailingSingleFlight[\s\S]*?)(?=function readPromptQueues)/)?.[1];
     assert.ok(singleFlightHelper);
@@ -1116,12 +1155,126 @@ if (args[0] === 'app-server') {
     )();
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
-    const completionTitleHelper = inlineScript.match(/(function completionMessageTitle[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
-    assert.ok(completionTitleHelper);
-    const completionMessageTitle = new Function(
-      completionTitleHelper + '; return completionMessageTitle;',
+    const elapsedTitleHelpers = inlineScript.match(/(function processedMessageTitle[\s\S]*?)(?=function clearTurnReasoningStatus)/)?.[1];
+    assert.ok(elapsedTitleHelpers);
+    const elapsedTitleApi = new Function(
+      elapsedTitleHelpers + '; return { completionMessageTitle, liveProcessElapsedTitle, turnProcessStartTimestamp };',
     )();
-    assert.equal(completionMessageTitle('任务完成，耗时 2159.6s'), '已处理 36m');
+    assert.equal(elapsedTitleApi.completionMessageTitle('任务完成，耗时 0.1s'), '已处理 1s');
+    assert.equal(elapsedTitleApi.completionMessageTitle('任务完成，耗时 2159.6s'), '已处理 36m');
+    assert.equal(elapsedTitleApi.completionMessageTitle('任务完成', 65), '已处理 1m 5s');
+    assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 100_000), '已处理 0s');
+    assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 133_999), '已处理 33s');
+    assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 160_000), '已处理 1m');
+    assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 165_000), '已处理 1m 5s');
+    assert.equal(elapsedTitleApi.turnProcessStartTimestamp('not-a-date', 100_000), 100_000);
+    const elapsedLifecycleHelpers = inlineScript.match(/(function turnProcessElapsedMatches[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
+    assert.ok(elapsedLifecycleHelpers);
+    const elapsedHeader = {
+      children: [],
+      insertBefore(node, before) {
+        node.remove?.();
+        const index = this.children.indexOf(before);
+        node.parentNode = this;
+        this.children.splice(index >= 0 ? index : this.children.length, 0, node);
+        return node;
+      },
+    };
+    const elapsedTimeline = { parentNode: elapsedHeader };
+    elapsedHeader.children.push(elapsedTimeline);
+    const elapsedDocument = {
+      createElement() {
+        return {
+          className: '',
+          dataset: {},
+          parentNode: null,
+          textContent: '',
+          remove() {
+            if (!this.parentNode) return;
+            const index = this.parentNode.children.indexOf(this);
+            if (index >= 0) this.parentNode.children.splice(index, 1);
+            this.parentNode = null;
+          },
+        };
+      },
+    };
+    let elapsedTimerCallback = null;
+    let nextElapsedTimer = 17;
+    const clearedElapsedTimers = [];
+    const elapsedLifecycleApi = new Function(
+      'document',
+      'setInterval',
+      'clearInterval',
+      'liveProcessElapsedTitle',
+      'turnProcessStartTimestamp',
+      'turnProcessHeader',
+      'turnProcessTimeline',
+      `
+        let turnProcessStartedAt = 0;
+        let turnProcessElapsedLabel = null;
+        let turnProcessElapsedTimer = null;
+        let turnProcessElapsedFrozen = false;
+        let turnProcessElapsedTurnId = '';
+        function ensureTurnProcessHeader() { return turnProcessHeader; }
+        ${elapsedLifecycleHelpers}
+        return {
+          clear: clearTurnProcessElapsed,
+          ensure: ensureTurnProcessElapsedRunning,
+          freeze: freezeTurnProcessElapsed,
+          resume: resumeTurnProcessElapsed,
+          start: startTurnProcessElapsed,
+          update: updateTurnProcessElapsed,
+          state: () => ({ turnProcessStartedAt, turnProcessElapsedLabel, turnProcessElapsedTimer, turnProcessElapsedFrozen, turnProcessElapsedTurnId }),
+        };
+      `,
+    )(
+      elapsedDocument,
+      (callback, delay) => {
+        assert.equal(delay, 1000);
+        elapsedTimerCallback = callback;
+        return nextElapsedTimer++;
+      },
+      (timer) => clearedElapsedTimers.push(timer),
+      elapsedTitleApi.liveProcessElapsedTitle,
+      elapsedTitleApi.turnProcessStartTimestamp,
+      elapsedHeader,
+      elapsedTimeline,
+    );
+    const liveElapsed = elapsedLifecycleApi.start('', 100_000, 'turn-new');
+    assert.equal(liveElapsed.className, 'liveProcessElapsed');
+    assert.equal(liveElapsed.dataset.messageKind, 'live_elapsed');
+    assert.equal(liveElapsed.textContent, '已处理 0s');
+    assert.deepEqual(elapsedHeader.children, [liveElapsed, elapsedTimeline]);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, 17);
+    elapsedLifecycleApi.update(133_999);
+    assert.equal(liveElapsed.textContent, '已处理 33s');
+    elapsedLifecycleApi.freeze(133_999, 'turn-old');
+    assert.deepEqual(clearedElapsedTimers, []);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, 17);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedFrozen, false);
+    elapsedLifecycleApi.freeze(133_999, 'turn-new');
+    assert.deepEqual(clearedElapsedTimers, [17]);
+    assert.deepEqual(elapsedHeader.children, [liveElapsed, elapsedTimeline]);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, null);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedFrozen, true);
+    elapsedTimerCallback();
+    assert.equal(liveElapsed.textContent, '已处理 33s');
+    assert.strictEqual(elapsedLifecycleApi.resume(165_000), liveElapsed);
+    assert.equal(liveElapsed.textContent, '已处理 1m 5s');
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, 18);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedFrozen, false);
+    assert.strictEqual(elapsedLifecycleApi.ensure('ignored', 166_000, 'turn-new'), liveElapsed);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, 18);
+    elapsedLifecycleApi.clear();
+    assert.deepEqual(clearedElapsedTimers, [17, 18]);
+    assert.deepEqual(elapsedHeader.children, [elapsedTimeline]);
+    assert.deepEqual(elapsedLifecycleApi.state(), {
+      turnProcessStartedAt: 0,
+      turnProcessElapsedLabel: null,
+      turnProcessElapsedTimer: null,
+      turnProcessElapsedFrozen: false,
+      turnProcessElapsedTurnId: '',
+    });
     const reasoningStatusHelpers = inlineScript.match(/(function clearTurnReasoningStatus[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
     assert.ok(reasoningStatusHelpers);
     const reasoningTimeline = {
@@ -1221,7 +1374,7 @@ if (args[0] === 'app-server') {
     });
     const activityHelpers = inlineScript.match(/(function decodeEmbeddedToolString[\s\S]*?)(?=function toolMessageTitle)/)?.[1];
     assert.ok(activityHelpers);
-    const activityApi = new Function(`${activityHelpers}; return { toolActivityPresentations, activityClusterPresentation, activityClusterMatchesBrowserTarget };`)();
+    const activityApi = new Function(`${activityHelpers}; return { normalizeTurnPlanItems, toolActivityPresentations, activityClusterPresentation, activityClusterMatchesBrowserTarget };`)();
     const parseToolActivity = activityApi.toolActivityPresentations;
     const semanticCluster = (activityGroup, streaming = false) => ({
       dataset: { activityGroup },
@@ -1346,6 +1499,7 @@ if (args[0] === 'app-server') {
       variant: 'agent',
       agentKey: 'ui_trace',
       label: 'Ui trace',
+      agentAction: 'spawn',
       status: '已开始工作',
       icon: 'flower-2',
       expandable: true,
@@ -1354,9 +1508,43 @@ if (args[0] === 'app-server') {
       variant: 'agent',
       agentKey: 'agent_group_final_review',
       label: 'Agent group final review',
-      status: '已开始工作',
+      agentAction: 'followup',
+      status: '已更新',
       icon: 'flower-2',
       expandable: true,
+    }]);
+    assert.deepEqual(parseToolActivity([
+      '调用工具: update_plan',
+      'call_id=call-plan-1',
+      '{"explanation":"同步当前进度","plan":[{"step":"拆解参考图并对照当前实页 DOM、状态与样式","status":"completed"},{"step":"实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill","status":"in_progress"},{"step":"补充状态/DOM/CSS 回归测试并运行完整检查","status":"pending"}]}',
+    ].join('\n')), [{
+      variant: 'plan',
+      explanation: '同步当前进度',
+      plan: [
+        { step: '拆解参考图并对照当前实页 DOM、状态与样式', status: 'completed' },
+        { step: '实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill', status: 'in_progress' },
+        { step: '补充状态/DOM/CSS 回归测试并运行完整检查', status: 'pending' },
+      ],
+    }]);
+    assert.deepEqual(parseToolActivity([
+      'exec',
+      'const result = await tools.update_plan({',
+      '  explanation: "同步当前进度",',
+      '  plan: [',
+      '    { step: "拆解参考图并对照当前实页 DOM、状态与样式", status: "completed" },',
+      '    { step: "实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill", status: "in_progress" },',
+      '    { step: "补充状态/DOM/CSS 回归测试并运行完整检查", status: "pending" }',
+      '  ]',
+      '});',
+      'text(result);',
+    ].join('\n')), [{
+      variant: 'plan',
+      explanation: '同步当前进度',
+      plan: [
+        { step: '拆解参考图并对照当前实页 DOM、状态与样式', status: 'completed' },
+        { step: '实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill', status: 'in_progress' },
+        { step: '补充状态/DOM/CSS 回归测试并运行完整检查', status: 'pending' },
+      ],
     }]);
     assert.deepEqual(parseToolActivity([
       'exec_command',
@@ -1419,16 +1607,16 @@ if (args[0] === 'app-server') {
     assert.equal(archiveProtocolActivity[4].icon, 'square-terminal');
     assert.equal(archiveProtocolActivity[4].expandable, false);
     assert.match(archiveProtocolActivity[4].target, /^rg -n -i/);
-    const patchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/server.mjs\\n-old\\n+new\\n*** Update File: /workspace/ui.css\\n+added\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
+    const patchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/server.mjs\\n-old\\n---literal-minus\\n+new\\n+++literal-plus\\n*** Update File: /workspace/ui.css\\n+added\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
     assert.deepEqual(parseToolActivity(patchCall), [
       {
         verb: '已编辑',
         icon: 'pencil',
         target: 'server.mjs',
         filePath: '/workspace/server.mjs',
-        added: 1,
-        removed: 1,
-        meta: '+1 -1',
+        added: 2,
+        removed: 2,
+        meta: '+2 -2',
       },
       {
         verb: '已编辑',
@@ -1599,6 +1787,74 @@ if (args[0] === 'app-server') {
       imageUrls: ['/api/native-sessions/thread/tool-images/7/1'],
     }, 'exec\nreal image call');
     const activityNodes = (node) => [node, ...node.children.flatMap(activityNodes)];
+    const turnPlanProgressHelper = inlineScript.match(
+      /(function turnPlanProgress[\s\S]*?)(?=function upsertLiveTurnPlan)/,
+    )?.[1];
+    assert.ok(turnPlanProgressHelper);
+    const turnPlanDomApi = new Function(
+      'normalizeTurnPlanItems',
+      turnPlanProgressHelper + '; return { turnPlanProgress };',
+    )(
+      activityApi.normalizeTurnPlanItems,
+    );
+    const referencePlan = [
+      { step: '拆解参考图并对照当前实页 DOM、状态与样式', status: 'completed' },
+      { step: '实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill', status: 'in_progress' },
+      { step: '补充状态/DOM/CSS 回归测试并运行完整检查', status: 'pending' },
+      { step: '重启本地服务并在桌面、375px、345px 深浅主题验收', status: 'pending' },
+      { step: '提交、推送到 PR #12 并等待 CI', status: 'pending' },
+    ];
+    assert.deepEqual(turnPlanDomApi.turnPlanProgress(referencePlan), {
+      items: referencePlan,
+      total: 5,
+      current: 2,
+      completed: 1,
+      percent: 40,
+    });
+    const upsertLiveTurnPlanHelper = inlineScript.match(
+      /(function upsertLiveTurnPlan[\s\S]*?)(?=function appendTurnTool)/,
+    )?.[1];
+    assert.ok(upsertLiveTurnPlanHelper);
+    const planTransparencyApi = new Function('normalizeTurnPlanItems', `
+      const toolCluster = { kind: 'tool-cluster' };
+      const agentGroup = { kind: 'agent-group' };
+      const livePill = { kind: 'live-pill' };
+      let currentActivityCluster = toolCluster;
+      let currentAgentActivityGroup = agentGroup;
+      let pendingActivityReasoning = ['kept reasoning'];
+      let liveTurnPlan = [];
+      let ensureCalls = 0;
+      let refreshCalls = 0;
+      let moveCalls = 0;
+      function ensureTurnProcessHeader() { ensureCalls += 1; }
+      function refreshLiveEditedFilesResult() { refreshCalls += 1; return livePill; }
+      function moveLiveEditedFilesResultToEnd() { moveCalls += 1; }
+      ${upsertLiveTurnPlanHelper}
+      return {
+        run: upsertLiveTurnPlan,
+        state: () => ({
+          currentActivityCluster,
+          currentAgentActivityGroup,
+          pendingActivityReasoning,
+          liveTurnPlan,
+          ensureCalls,
+          refreshCalls,
+          moveCalls,
+          toolCluster,
+          agentGroup,
+          livePill,
+        }),
+      };
+    `)(activityApi.normalizeTurnPlanItems);
+    assert.strictEqual(planTransparencyApi.run(referencePlan), planTransparencyApi.state().livePill);
+    const transparentPlanState = planTransparencyApi.state();
+    assert.strictEqual(transparentPlanState.currentActivityCluster, transparentPlanState.toolCluster);
+    assert.strictEqual(transparentPlanState.currentAgentActivityGroup, transparentPlanState.agentGroup);
+    assert.deepEqual(transparentPlanState.pendingActivityReasoning, ['kept reasoning']);
+    assert.deepEqual(transparentPlanState.liveTurnPlan, referencePlan);
+    assert.equal(transparentPlanState.ensureCalls, 1);
+    assert.equal(transparentPlanState.refreshCalls, 1);
+    assert.equal(transparentPlanState.moveCalls, 1);
     const renderedActivityNodes = activityNodes(imageActivity);
     assert.equal(imageActivity.tagName, 'DETAILS');
     assert.equal(imageActivity.open, false);
@@ -1681,12 +1937,14 @@ if (args[0] === 'app-server') {
       'createResultCardButton',
       'prepareUndoEditedFiles',
       'reviewTurnArtifacts',
+      'turnPlanProgress',
       editedFilesCardHelper + '; return createEditedFilesResultCard;',
     )(
       { createElement: (tagName) => new FixtureElement(tagName) },
       () => new FixtureElement('button'),
       () => {},
       () => {},
+      turnPlanDomApi.turnPlanProgress,
     );
     const compactEditedFiles = createEditedFilesResultCard([
       { name: '/workspace/ui.css', verb: '已编辑', added: 1, removed: 1 },
@@ -1701,6 +1959,108 @@ if (args[0] === 'app-server') {
     assert.equal(compactEditedNodes.find((node) => node.className === 'turnResultStat added').textContent, '+2');
     assert.equal(compactEditedNodes.find((node) => node.className === 'turnResultStat removed').textContent, '-2');
     assert.equal(compactEditedNodes.some((node) => node.className === 'turnResultActions'), false);
+    const planProgressCard = createEditedFilesResultCard([
+      { name: '/workspace/ui.css', verb: '已编辑', added: 370, removed: 92 },
+      { name: '/workspace/server.mjs', verb: '已编辑', added: 0, removed: 0 },
+      { name: '/workspace/test/server-smoke.test.mjs', verb: '已编辑', added: 0, removed: 0 },
+    ], '', { live: true, plan: referencePlan });
+    const planProgressNodes = activityNodes(planProgressCard);
+    assert.equal(planProgressCard.className, 'turnResultCard editedFilesResult live withPlan');
+    assert.equal(planProgressCard.attributes.get('aria-label'), '第 2 / 5 步，3 个文件已更改');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnPlanProgressLabel').textContent, '第 2 / 5 步');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnPlanProgressRing').attributes.get('style'), '--turn-plan-progress:40%');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnResultFileLabel').textContent, '3 个文件已更改');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnResultStat added').textContent, '+370');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnResultStat removed').textContent, '-92');
+    const planOnlyProgressCard = createEditedFilesResultCard([], '', { live: true, plan: referencePlan });
+    assert.equal(planOnlyProgressCard.tagName, 'DIV');
+    assert.equal(planOnlyProgressCard.className, 'turnResultCard editedFilesResult live withPlan planOnly');
+    assert.equal(planOnlyProgressCard.children.length, 1);
+
+    const liveResultHelpers = inlineScript.match(
+      /(function moveLiveEditedFilesResultToEnd[\s\S]*?)(?=function createWebPreviewResultCard)/,
+    )?.[1];
+    assert.ok(liveResultHelpers);
+    const liveTimeline = {
+      children: [],
+      appendChild(node) {
+        if (node.parentNode) {
+          const previousIndex = node.parentNode.children.indexOf(node);
+          if (previousIndex >= 0) node.parentNode.children.splice(previousIndex, 1);
+        }
+        node.parentNode = this;
+        node.isConnected = true;
+        this.children.push(node);
+        return node;
+      },
+      replaceChild(next, previous) {
+        const index = this.children.indexOf(previous);
+        assert.notEqual(index, -1);
+        previous.parentNode = null;
+        previous.isConnected = false;
+        next.parentNode = this;
+        next.isConnected = true;
+        this.children.splice(index, 1, next);
+        return previous;
+      },
+    };
+    const toolArtifact = { kind: 'tool-artifact' };
+    const liveElements = [toolArtifact];
+    const createdLiveCards = [];
+    const makeLiveCard = (files, turnId, options) => {
+      const card = {
+        files,
+        turnId,
+        options,
+        parentNode: null,
+        isConnected: false,
+        remove() {
+          if (!this.parentNode) return;
+          const index = this.parentNode.children.indexOf(this);
+          if (index >= 0) this.parentNode.children.splice(index, 1);
+          this.parentNode = null;
+          this.isConnected = false;
+        },
+      };
+      createdLiveCards.push(card);
+      return card;
+    };
+    const liveResultApi = new Function(
+      'turnProcessTimeline',
+      'turnProcessElements',
+      'editedFilesFromTurnArtifacts',
+      'createEditedFilesResultCard',
+      'refreshIcons',
+      'initialPlan',
+      `
+        let liveEditedFilesResult = null;
+        let liveTurnPlan = initialPlan;
+        ${liveResultHelpers}
+        return {
+          refresh: refreshLiveEditedFilesResult,
+          state: () => ({ liveEditedFilesResult, liveTurnPlan, turnProcessElements }),
+        };
+      `,
+    )(
+      liveTimeline,
+      liveElements,
+      (elements) => {
+        assert.strictEqual(elements, liveElements);
+        return [{ name: '/workspace/server.mjs', verb: '已编辑', added: 2, removed: 1 }];
+      },
+      makeLiveCard,
+      () => {},
+      referencePlan,
+    );
+    const firstLivePill = liveResultApi.refresh();
+    const secondLivePill = liveResultApi.refresh();
+    assert.notStrictEqual(firstLivePill, secondLivePill);
+    assert.deepEqual(liveTimeline.children, [secondLivePill]);
+    assert.deepEqual(liveResultApi.state().turnProcessElements, [toolArtifact]);
+    assert.equal(liveResultApi.state().turnProcessElements.includes(secondLivePill), false);
+    assert.equal(createdLiveCards.length, 2);
+    assert.deepEqual(createdLiveCards.at(-1).options, { live: true, plan: referencePlan });
+    assert.match(inlineScript, /if\(files\.length\)container\.appendChild\(createEditedFilesResultCard\(files,turnId\)\)/);
 
     const searchActivity = createToolActivityItem({
       verb: '已在',
@@ -2065,6 +2425,13 @@ if (args[0] === 'app-server') {
     assert.equal(desktopContinued.status, 202);
     const desktopContinuedPayload = await desktopContinued.json();
     assert.equal(desktopContinuedPayload.turnId, 'desktop-turn-1');
+    const activeDesktopSession = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(activeDesktopSession.status, 200);
+    const activeDesktopConversation = (await activeDesktopSession.json()).conversation;
+    assert.equal(activeDesktopConversation.activeTurnId, desktopContinuedPayload.turnId);
+    assert.match(activeDesktopConversation.activeTurnStartedAt, /^\d{4}-\d{2}-\d{2}T/);
 
     const desktopSteered = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
       method: 'POST',

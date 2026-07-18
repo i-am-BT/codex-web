@@ -2369,11 +2369,18 @@ function setNativeTurnState(threadId, state) {
   const cleanId = cleanNativeThreadId(threadId);
   if (!cleanId) return;
   const current = activeNativeTurns.get(cleanId);
+  const turnId = String(state.turnId || '');
+  const status = nativeTurnStatus(state.status);
+  const updatedAt = new Date().toISOString();
+  const sameTurn = Boolean(current?.turnId && current.turnId === turnId);
   const next = {
-    turnId: String(state.turnId || ''),
-    status: nativeTurnStatus(state.status),
+    turnId,
+    status,
     transport: String(state.transport || current?.transport || 'app-server'),
-    updatedAt: new Date().toISOString(),
+    startedAt: status === 'running'
+      ? String(state.startedAt || (sameTurn ? current?.startedAt : '') || updatedAt)
+      : String(state.startedAt || current?.startedAt || ''),
+    updatedAt,
   };
   activeNativeTurns.set(cleanId, next);
   if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
@@ -2596,6 +2603,9 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
     : conversation.status === 'running'
       ? conversation.latestTurnId || ''
       : '';
+  const persistedStartedAt = activeTurnId && String(conversation.latestTurnId || '') === String(activeTurnId)
+    ? conversation.latestTurnStartedAt || ''
+    : '';
   return {
     ...conversation,
     messages: externalizeImages
@@ -2604,6 +2614,7 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
     status: active?.status === 'running' ? 'running' : conversation.status,
     readOnly: false,
     activeTurnId,
+    activeTurnStartedAt: activeTurnId ? persistedStartedAt || active?.startedAt || '' : '',
   };
 }
 
@@ -3643,10 +3654,16 @@ let currentAgentActivityGroup = null;
 let pendingAgentActivityBatches = [];
 let pendingActivityReasoning = [];
 let turnReasoningStatus = null;
+let liveTurnPlan = [];
 let liveEditedFilesResult = null;
 let collectingTurnProcess = false;
 let turnProcessHeader = null;
 let turnProcessTimeline = null;
+let turnProcessStartedAt = 0;
+let turnProcessElapsedLabel = null;
+let turnProcessElapsedTimer = null;
+let turnProcessElapsedFrozen = false;
+let turnProcessElapsedTurnId = '';
 let currentNativeRequest = null;
 let dangerConfirmed = false;
 let pendingAttachments = [];
@@ -5576,9 +5593,16 @@ async function loadConversation(id,source='web',options={}){
   applyConversationMode();
   updateActiveHistory();
   chat.innerHTML='';
+  const messages=conversation.messages||[];
+  const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
+  const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
   beginTurnProcessCollection();
-  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget}));
-  if(!(conversation.messages||[]).length)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
+  messages.forEach((msg,index)=>{
+    if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
+    addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,hydrating:true});
+  });
+  if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
+  if(!messages.length&&!webRunActive)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   if(currentConversationSource==='codex'&&conversation.hasEarlierMessages&&!options.full)addNativeHistoryLoadButton(conversation.id);
   updateConversationStatus(conversation);
   renderPromptQueue();
@@ -5644,6 +5668,10 @@ async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
     statusEl.textContent=e.message;
   }
 }
+function isCompletedNativeRuntimeTurn(turnId,frozenTurnId=turnProcessElapsedFrozen?turnProcessElapsedTurnId:'',pendingTurnId=nativeCompletionSync?.turnId||''){
+  const id=String(turnId||'');
+  return Boolean(id&&(id===String(frozenTurnId||'')||id===String(pendingTurnId||'')));
+}
 function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
@@ -5667,25 +5695,34 @@ function connectSessionEvents(){
     try{runtime=JSON.parse(event.data||'{}')}catch(e){}
     refreshHistory();
     if(runtime.threadId!==currentConversationId||currentConversationSource!=='codex')return;
+    if(isCompletedNativeRuntimeTurn(runtime.turnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
+    if(webRunActive&&activeNativeTurnId&&runtime.turnId&&String(runtime.turnId)!==String(activeNativeTurnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
     if(runtime.type==='delta'){
       updateNativeLiveDelta(runtime);
     }else if(runtime.type==='item-completed'){
       finishNativeLiveItem(runtime.itemId);
     }else if(runtime.type==='connection-error'){
-      activeNativeTurnId=runtime.turnId||activeNativeTurnId;
+      const connectionTurnId=runtime.turnId||activeNativeTurnId;
+      activeNativeTurnId=connectionTurnId;
       if(runtime.willRetry){
         webRunActive=true;
         clearNativeCompletionSync();
+        if(!collectingTurnProcess||!turnProcessElapsedMatches(connectionTurnId))beginTurnProcessCollection(runtime.updatedAt,true,connectionTurnId);
+        else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),connectionTurnId);
         statusEl.textContent='Codex App · 上游连接中断，正在重连';
       }else{
         statusEl.textContent='Codex App · 上游请求异常，等待任务状态';
       }
       applyConversationMode();
     }else if(runtime.type==='turn'){
+      const previousTurnId=activeNativeTurnId;
       const runtimeTurnId=runtime.turnId||activeNativeTurnId;
+      if(runtime.status!=='running'&&(!turnProcessElapsedMatches(runtimeTurnId)||(previousTurnId&&runtimeTurnId&&runtimeTurnId!==previousTurnId)))return;
       activeNativeTurnId=runtimeTurnId;
       webRunActive=runtime.status==='running';
       if(!webRunActive){
+        freezeTurnProcessElapsed(runtime.updatedAt,runtimeTurnId);
+        if(['error','interrupted'].includes(runtime.status))clearLiveTurnProgress();
         activeNativeTurnId='';
         removeNativeRunningElement();
         finishAllNativeLiveItems();
@@ -5696,6 +5733,8 @@ function connectSessionEvents(){
         schedulePromptQueueDispatch(completedId,320);
       }else{
         clearNativeCompletionSync();
+        if(!collectingTurnProcess||!turnProcessElapsedMatches(runtimeTurnId))beginTurnProcessCollection(runtime.updatedAt,true,runtimeTurnId);
+        else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),runtimeTurnId);
         statusEl.textContent='Codex App · 运行中';
       }
       applyConversationMode();
@@ -5718,23 +5757,31 @@ async function syncCurrentNativeConversationOnce(){
     if(webRunActive||nativeLiveItems.size){
       nativeCursor=Number(conversation.cursor||nativeCursor);
       nativeGeneration=Number(conversation.generation||nativeGeneration);
-      if(conversation.status!=='running')scheduleNativeCompletionSync(id,nativeCompletionSync?.turnId||activeNativeTurnId,120);
+      if(conversation.status!=='running'){
+        const resetTurnId=nativeCompletionSync?.turnId||activeNativeTurnId;
+        freezeTurnProcessElapsed(conversation.updatedAt,resetTurnId);
+        scheduleNativeCompletionSync(id,resetTurnId,120);
+      }
       return;
     }
     await loadConversation(id,'codex');return;
   }
   const wasRunning=webRunActive;
   const completingTurnId=activeNativeTurnId;
+  const incomingActiveTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
+  if(conversation.status==='running'&&incomingActiveTurnId&&incomingActiveTurnId!==activeNativeTurnId){activeNativeTurnId=incomingActiveTurnId;webRunActive=true}
   if((conversation.messages||[]).length){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
   }
-  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget})}
+  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges})}
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
-  activeNativeTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
+  activeNativeTurnId=incomingActiveTurnId;
   webRunActive=conversation.status==='running';
+  if(webRunActive){const activeStartedAt=conversation.activeTurnStartedAt||conversation.updatedAt;if(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(wasRunning&&!webRunActive){
+    freezeTurnProcessElapsed(conversation.updatedAt,completingTurnId);
     activeNativeTurnId='';
     finishAllNativeLiveItems();
     if(nativeTerminalPersisted(conversation,completingTurnId)&&nativeLiveItems.size){
@@ -6103,6 +6150,89 @@ function readJsToolString(source,start){
   }
   return null;
 }
+function readJsCollection(source,start){
+  const open=source[start];
+  const close={"(":")","[":"]","{":"}"}[open];
+  if(!close)return null;
+  let depth=0;
+  let quote='';
+  let escaped=false;
+  let lineComment=false;
+  let blockComment=false;
+  for(let index=start;index<source.length;index++){
+    const char=source[index];
+    const next=source[index+1];
+    if(lineComment){if(char.charCodeAt(0)===10)lineComment=false;continue}
+    if(blockComment){if(char==='*'&&next==='/'){blockComment=false;index++}continue}
+    if(quote){if(escaped)escaped=false;else if(char.charCodeAt(0)===92)escaped=true;else if(char===quote)quote='';continue}
+    if(char==='/'&&next==='/'){lineComment=true;index++;continue}
+    if(char==='/'&&next==='*'){blockComment=true;index++;continue}
+    if(char==='"'||char==="'"||char.charCodeAt(0)===96){quote=char;continue}
+    if(char===open){depth++;continue}
+    if(char!==close)continue;
+    depth--;
+    if(depth===0)return{value:source.slice(start+1,index),end:index+1};
+  }
+  return null;
+}
+function jsPropertyValueOffset(source,key){
+  const text=String(source||'');
+  for(let index=0;index<text.length;){
+    while(index<text.length&&(text[index]===','||text[index]==='{'||text[index].charCodeAt(0)<=32))index++;
+    if(index>=text.length)return-1;
+    let name='';
+    let cursor=index;
+    const code=text[index].charCodeAt(0);
+    if(code===34||code===39){
+      const parsed=readJsToolString(text,index);
+      if(!parsed){index++;continue}
+      name=parsed.value;
+      cursor=parsed.end;
+    }else{
+      while(cursor<text.length&&/[A-Za-z0-9_$]/.test(text[cursor]))cursor++;
+      name=text.slice(index,cursor);
+    }
+    while(cursor<text.length&&text[cursor].charCodeAt(0)<=32)cursor++;
+    if(text[cursor]!==':'){index=Math.max(index+1,cursor);continue}
+    cursor++;
+    while(cursor<text.length&&text[cursor].charCodeAt(0)<=32)cursor++;
+    if(name===key)return cursor;
+    index=Math.max(index+1,cursor);
+  }
+  return-1;
+}
+function readJsPropertyString(source,key){
+  const start=jsPropertyValueOffset(source,key);
+  return start>=0?readJsToolString(source,start)?.value||'':'';
+}
+function readJsPropertyCollection(source,key,open='['){
+  const start=jsPropertyValueOffset(source,key);
+  if(start<0)return null;
+  return source[start]===open?readJsCollection(source,start):null;
+}
+function jsObjectValues(source){
+  const values=[];
+  for(let index=0;index<source.length;index++){
+    if(source[index]!=='{')continue;
+    const parsed=readJsCollection(source,index);
+    if(!parsed)break;
+    values.push(parsed.value);
+    index=parsed.end-1;
+  }
+  return values;
+}
+function orchestratedUpdatePlanPresentation(source){
+  const offsets=executableOrchestratedToolCallOffsets(source,'update_plan');
+  for(let index=offsets.length-1;index>=0;index--){
+    const callStart=source.indexOf('(',offsets[index]);
+    const call=callStart>=0?readJsCollection(source,callStart):null;
+    const planSource=call?readJsPropertyCollection(call.value,'plan'):null;
+    if(!planSource)continue;
+    const plan=normalizeTurnPlanItems(jsObjectValues(planSource.value).map((item)=>({step:readJsPropertyString(item,'step'),status:readJsPropertyString(item,'status')})));
+    if(plan.length)return{variant:'plan',plan,explanation:readJsPropertyString(call.value,'explanation')};
+  }
+  return null;
+}
 function orchestratedExecCommands(source){
   const commands=[];
   for(const offset of executableOrchestratedToolCallOffsets(source,'exec_command')){
@@ -6115,12 +6245,16 @@ function orchestratedExecCommands(source){
 }
 function activityPresentationRank(presentation){if(presentation.icon==='book-open')return 0;if(presentation.icon==='search')return 1;return 2}
 function embeddedToolObject(detail){const source=String(detail||'').split('\\n').filter((line)=>!/^call_id=/.test(line.trim())).join('\\n').trim();const candidates=[source];const start=source.indexOf('{');const end=source.lastIndexOf('}');if(start>=0&&end>start)candidates.push(source.slice(start,end+1));for(const candidate of candidates){try{const parsed=JSON.parse(candidate);if(parsed&&typeof parsed==='object')return parsed}catch(e){}}return{}}
+function normalizeTurnPlanItems(value){const statuses=new Set(['completed','in_progress','pending']);return(Array.isArray(value)?value:[]).map((item)=>({step:String(item?.step||'').replace(/\\s+/g,' ').trim(),status:statuses.has(item?.status)?item.status:'pending'})).filter((item)=>item.step)}
+function planActivityPresentation(detail){const payload=embeddedToolObject(detail);const plan=normalizeTurnPlanItems(payload.plan);return plan.length?{variant:'plan',plan,explanation:String(payload.explanation||'').trim()}:null}
 function agentActivityLabel(value){const pathParts=String(value||'').trim().split('/').filter(Boolean);const clean=(pathParts.at(-1)||'Agent').replace(/[_-]+/g,' ').replace(/\\s+/g,' ').trim();return clean?clean.charAt(0).toUpperCase()+clean.slice(1):'Agent'}
-function agentSpawnActivityPresentation(detail){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?(?:task_name|target)["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];const agentKey=String(payload.task_name||payload.target||fallback||'').trim();return{variant:'agent',agentKey,label:agentActivityLabel(agentKey),status:'已开始工作',icon:'flower-2',expandable:true}}
+function agentSpawnActivityPresentation(detail,action='spawn'){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?(?:task_name|target)["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];const agentKey=String(payload.task_name||payload.target||fallback||'').trim();const followup=action==='followup';return{variant:'agent',agentKey,label:agentActivityLabel(agentKey),agentAction:followup?'followup':'spawn',status:followup?'已更新':'已开始工作',icon:'flower-2',expandable:true}}
 function orchestratedActivityPresentations(text){
   const source=String(text||'');
   if(!source.startsWith('exec\\n'))return[];
   const detail=source.slice(source.indexOf('\\n')+1);
+  const plan=orchestratedUpdatePlanPresentation(detail);
+  if(plan)return[plan];
   const imageCount=executableOrchestratedToolCallOffsets(detail,'view_image').length;
   const commandCount=executableOrchestratedToolCallOffsets(detail,'exec_command').length;
   const commands=orchestratedExecCommands(detail);
@@ -6154,7 +6288,8 @@ function runningActivityVerb(verb){
   };
   return exact[verb]||verb.replace(/^已/,'正在');
 }
-function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){const filePath=activityFilePath(line.slice(match[0].length));current={verb:match[1],icon:match[2],target:activityFileLabel(filePath),filePath,added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
+function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){const filePath=activityFilePath(line.slice(match[0].length));current={verb:match[1],icon:match[2],target:activityFileLabel(filePath),filePath,added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+'))current.added++;else if(line.startsWith('-'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
+function nativeFileChangePresentations(value){const icons={'已编辑':'pencil','已新增':'file-plus-2','已删除':'trash-2'};return(Array.isArray(value)?value:[]).map((item)=>{const filePath=activityFilePath(item?.filePath||item?.name);const verb=icons[item?.verb]?item.verb:'已编辑';const added=Math.max(0,Number(item?.added)||0);const removed=Math.max(0,Number(item?.removed)||0);return filePath?{verb,icon:icons[verb],target:activityFileLabel(filePath),filePath,added,removed,meta:'+'+added+' -'+removed}:null}).filter(Boolean)}
 function memoryActivityPresentation(command){const matches=[...String(command||'').matchAll(/\\.codex\\/memories\\/([A-Za-z0-9_@.+\\/-]+\\.md)\\b/gi)];if(!matches.length)return null;const relative=matches.at(-1)[1];const filename=relative.split('/').filter(Boolean).at(-1)||relative;return{verb:'已读取',target:filename.replace(/\\.md$/i,''),icon:'book-open',targetType:'memory',expandable:false}}
 function commandActivityPresentation(command){
   const source=String(command||'');
@@ -6175,7 +6310,7 @@ function commandActivityPresentation(command){
   if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};
   return{verb:'Ran',target:clean||'command',icon:'square-terminal'};
 }
-function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(['spawn_agent','followup_task'].includes(toolName))return[agentSpawnActivityPresentation(descriptor.detail)];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
+function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(toolName==='update_plan'){const plan=planActivityPresentation(descriptor.detail);if(plan)return[plan]}if(['spawn_agent','followup_task'].includes(toolName))return[agentSpawnActivityPresentation(descriptor.detail,toolName==='followup_task'?'followup':'spawn')];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
 function isImageViewActivityPresentation(presentation){return presentation?.verb==='已查看'&&/\\d+ 张图像$/.test(String(presentation.target||''))&&['image','images'].includes(presentation.icon)}
 function nativeToolImageUrls(presentations,messageSeq){
   const sequence=Number(messageSeq);
@@ -6225,6 +6360,7 @@ function createToolActivityItem(presentation,rawText,running=false,options={}){
     item.open=false;
     item.dataset.messageText=String(rawText||'');
     item.dataset.agentKey=String(presentation.agentKey||'');
+    item.dataset.agentAction=String(presentation.agentAction||'spawn');
     item.dataset.parentThreadId=String(options.parentThreadId||'');
     item.dataset.traceState=running?'starting':'ready';
     const row=document.createElement('summary');
@@ -6244,7 +6380,7 @@ function createToolActivityItem(presentation,rawText,running=false,options={}){
     const status=document.createElement('span');
     status.className='agentActivityStatus';
     status.dataset.traceState=running?'starting':'ready';
-    status.textContent=running?'正在启动':presentation.status||'已开始工作';
+    status.textContent=running?(presentation.agentAction==='followup'?'正在更新':'正在启动'):presentation.status||'已开始工作';
     const chevron=document.createElement('i');
     chevron.className='activityItemChevron agentActivityChevron';
     chevron.setAttribute('data-lucide','chevron-right');
@@ -6394,13 +6530,15 @@ function createAgentActivityGroup(){
   return group;
 }
 function agentActivityGroupPresentation(group){
-  const states=(group?._agentActivityItems||[]).map((item)=>String(item.dataset.traceState||item._subagentTrace?.status?.dataset?.traceState||'ready'));
+  const items=group?._agentActivityItems||[];
+  const states=items.map((item)=>String(item.dataset.traceState||item._subagentTrace?.status?.dataset?.traceState||'ready'));
+  const followupOnly=items.length>0&&items.every((item)=>item.dataset.agentAction==='followup');
   if(states.some((state)=>state==='error'))return{label:states.length>1?'部分失败':'失败',kind:'error'};
   if(states.some((state)=>state==='interrupted'))return{label:states.length>1?'部分中断':'已中断',kind:'interrupted'};
-  if(states.some((state)=>state==='running'))return{label:'正在工作',kind:'running'};
-  if(states.some((state)=>state==='starting'))return{label:'正在启动',kind:'starting'};
-  if(states.length&&states.every((state)=>state==='done'))return{label:'已完成',kind:'done'};
-  return{label:'已开始工作',kind:'ready'};
+  if(states.some((state)=>state==='running'))return{label:followupOnly?'正在更新':'正在工作',kind:'running'};
+  if(states.some((state)=>state==='starting'))return{label:followupOnly?'正在更新':'正在启动',kind:'starting'};
+  if(states.length&&states.every((state)=>['done','updated'].includes(state)))return{label:followupOnly?'已更新':'已完成',kind:followupOnly?'updated':'done'};
+  return{label:followupOnly?'已更新':'已开始工作',kind:followupOnly?'updated':'ready'};
 }
 function updateAgentActivityGroupStatus(group){
   if(!group?._agentActivityStatus)return;
@@ -6789,9 +6927,28 @@ function settleActivityCluster(cluster){
   cluster?.classList.remove('streaming');
   updateActivityCluster(cluster);
 }
+function turnPlanProgress(plan){
+  const items=normalizeTurnPlanItems(plan);
+  const total=items.length;
+  const activeIndex=items.findIndex((item)=>item.status==='in_progress');
+  const completed=items.filter((item)=>item.status==='completed').length;
+  const current=activeIndex>=0?activeIndex+1:completed>=total?total:Math.min(completed+1,total);
+  return{items,total,current,completed,percent:total?Math.round(current/total*100):0};
+}
+function upsertLiveTurnPlan(plan){
+  const normalized=normalizeTurnPlanItems(plan);
+  ensureTurnProcessHeader();
+  liveTurnPlan=normalized;
+  const next=refreshLiveEditedFilesResult();
+  moveLiveEditedFilesResultToEnd();
+  return next;
+}
 function appendTurnTool(text,options={}){
   clearTurnReasoningStatus();
-  const presentations=toolActivityPresentations(text);
+  const structuredFileChanges=nativeFileChangePresentations(options.fileChanges);
+  const presentations=structuredFileChanges.length?structuredFileChanges:toolActivityPresentations(text);
+  const plan=presentations.find((presentation)=>presentation.variant==='plan');
+  if(plan){const element=upsertLiveTurnPlan(plan.plan);moveTurnReasoningStatusToEnd();return element}
   const imageViews=presentations.filter(isImageViewActivityPresentation);
   const folded=presentations.filter((presentation)=>!isImageViewActivityPresentation(presentation));
   const imageUrls=nativeToolImageUrls(imageViews,options.nativeMessageSeq);
@@ -6819,7 +6976,7 @@ function settleTurnTool(batch){
     for(const verb of item.querySelectorAll('.activityVerb[data-completed-verb]'))verb.textContent=verb.dataset.completedVerb;
     for(const agent of item.querySelectorAll('.agentActivityItem')){
       const state=agent._subagentTrace;
-      if(state&&!state.loaded&&!state.loading)setSubagentTraceSummaryStatus(state,'已开始工作','ready');
+      if(state&&!state.loaded&&!state.loading){const followup=agent.dataset.agentAction==='followup';setSubagentTraceSummaryStatus(state,followup?'已更新':'已开始工作',followup?'updated':'ready')}
     }
     const cluster=item.closest('.activityCluster');
     if(cluster)updateActivityCluster(cluster);
@@ -6838,14 +6995,29 @@ function appendTurnProcessActivity(text,kind){
 function toolMessageTitle(text){const lines=String(text||'').split('\\n').map((line)=>line.trim()).filter(Boolean);if(!lines.length)return '工具调用';let title=lines[0].replace(/^调用工具:\\s*/,'').trim()||'工具调用';const output=/\\soutput$/i.test(title)||['工具返回','搜索结果'].includes(title);if(!output){const detail=lines.slice(1).find((line)=>!/^call_id=/.test(line)&&!/^workdir=/.test(line)&&!['[',']','{','}','],','},'].includes(line));if(detail)title+=' · '+detail}title=title.replace(/\\s+/g,' ');return title.length>120?title.slice(0,117)+'...':title}
 function thinkingMessageTitle(text){const line=String(text||'').split('\\n').map((item)=>item.trim()).find(Boolean)||'正在思考';const clean=line.replace(/[*_~\`#]/g,'').replace(/\\s+/g,' ').trim()||'正在思考';return clean.length>120?clean.slice(0,117)+'...':clean}
 function contextMessageTitle(text,kind){const lines=String(text||'').split('\\n').map((line)=>line.trim()).filter(Boolean);if(kind==='environment_context'){const date=lines.find((line)=>line.startsWith('日期 '))?.slice(3);const workspace=lines.find((line)=>line.startsWith('工作区 '))?.slice(4);return ['环境',date,workspace?workspace+' 个工作区':''].filter(Boolean).join(' · ')}if(kind==='browser_context'){const page=lines.find((line)=>line.startsWith('当前页面 '))?.slice(5);return page?'浏览器 · '+page:'浏览器上下文'}if(kind==='goal_context')return'持续目标';if(kind==='turn_aborted')return'任务已中断';return'上下文'}
-function completionMessageTitle(text){
-  const seconds=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
-  if(!Number.isFinite(seconds))return'已处理';
-  const rounded=Math.max(1,Math.round(seconds));
+function processedMessageTitle(seconds,{minimum=0,rounding='round'}={}){
+  const numeric=Number(seconds);
+  if(!Number.isFinite(numeric))return'已处理';
+  const rounded=Math.max(0,minimum,rounding==='floor'?Math.floor(numeric):Math.round(numeric));
   if(rounded<60)return'已处理 '+rounded+'s';
   const minutes=Math.floor(rounded/60);
   const remainder=rounded%60;
   return'已处理 '+minutes+'m'+(remainder?' '+remainder+'s':'');
+}
+function completionMessageTitle(text,fallbackSeconds=NaN){
+  const parsed=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
+  const seconds=Number.isFinite(parsed)?parsed:Number(fallbackSeconds);
+  return Number.isFinite(seconds)?processedMessageTitle(seconds,{minimum:1}):'已处理';
+}
+function liveProcessElapsedTitle(startedAt,now=Date.now()){
+  const start=Number(startedAt);
+  const current=Number(now);
+  if(!Number.isFinite(start)||start<=0||!Number.isFinite(current))return processedMessageTitle(0,{rounding:'floor'});
+  return processedMessageTitle((current-start)/1000,{rounding:'floor'});
+}
+function turnProcessStartTimestamp(value,now=Date.now()){
+  const parsed=new Date(value||now).getTime();
+  return Number.isFinite(parsed)?parsed:now;
 }
 function clearTurnReasoningStatus(){
   if(turnReasoningStatus?.parentNode)turnReasoningStatus.remove();
@@ -6878,10 +7050,65 @@ function shouldClearPendingActivityReasoning(role,kind,steeringUser=false){
   if(role==='user')return!steeringUser;
   return role==='assistant'&&!['commentary','live_progress'].includes(kind);
 }
+function turnProcessElapsedMatches(turnId){
+  const incoming=String(turnId||'');
+  return!incoming||!turnProcessElapsedTurnId||incoming===turnProcessElapsedTurnId;
+}
+function clearTurnProcessElapsed(){
+  if(turnProcessElapsedTimer!==null)clearInterval(turnProcessElapsedTimer);
+  if(turnProcessElapsedLabel?.parentNode)turnProcessElapsedLabel.remove();
+  turnProcessStartedAt=0;
+  turnProcessElapsedLabel=null;
+  turnProcessElapsedTimer=null;
+  turnProcessElapsedFrozen=false;
+  turnProcessElapsedTurnId='';
+}
+function updateTurnProcessElapsed(now=Date.now()){
+  if(!turnProcessElapsedLabel||turnProcessElapsedFrozen)return;
+  turnProcessElapsedLabel.textContent=liveProcessElapsedTitle(turnProcessStartedAt,now);
+}
+function freezeTurnProcessElapsed(endedAt='',turnId='',now=Date.now()){
+  if(!turnProcessElapsedLabel||turnProcessElapsedFrozen||!turnProcessElapsedMatches(turnId))return;
+  updateTurnProcessElapsed(turnProcessStartTimestamp(endedAt,now));
+  turnProcessElapsedFrozen=true;
+  if(turnProcessElapsedTimer!==null)clearInterval(turnProcessElapsedTimer);
+  turnProcessElapsedTimer=null;
+}
+function resumeTurnProcessElapsed(now=Date.now()){
+  if(!turnProcessElapsedLabel)return null;
+  if(!turnProcessElapsedFrozen&&turnProcessElapsedTimer!==null)return turnProcessElapsedLabel;
+  turnProcessElapsedFrozen=false;
+  updateTurnProcessElapsed(now);
+  turnProcessElapsedTimer=setInterval(updateTurnProcessElapsed,1000);
+  return turnProcessElapsedLabel;
+}
+function startTurnProcessElapsed(startedAt='',now=Date.now(),turnId=''){
+  clearTurnProcessElapsed();
+  turnProcessStartedAt=turnProcessStartTimestamp(startedAt,now);
+  ensureTurnProcessHeader();
+  turnProcessElapsedLabel=document.createElement('div');
+  turnProcessElapsedLabel.className='liveProcessElapsed';
+  turnProcessElapsedLabel.dataset.messageKind='live_elapsed';
+  turnProcessElapsedTurnId=String(turnId||'');
+  updateTurnProcessElapsed(now);
+  turnProcessHeader.insertBefore(turnProcessElapsedLabel,turnProcessTimeline);
+  turnProcessElapsedTimer=setInterval(updateTurnProcessElapsed,1000);
+  return turnProcessElapsedLabel;
+}
+function ensureTurnProcessElapsedRunning(startedAt='',now=Date.now(),turnId=''){
+  if(!turnProcessElapsedMatches(turnId))return null;
+  return turnProcessElapsedLabel?resumeTurnProcessElapsed(now):startTurnProcessElapsed(startedAt,now,turnId);
+}
+function clearLiveTurnProgress(){
+  liveTurnPlan=[];
+  if(liveEditedFilesResult?.parentNode)liveEditedFilesResult.remove();
+  liveEditedFilesResult=null;
+}
 function clearTurnProcessHeader(){
   clearTurnReasoningStatus();
+  clearTurnProcessElapsed();
+  clearLiveTurnProgress();
   if(turnProcessHeader?.parentNode)turnProcessHeader.remove();
-  liveEditedFilesResult=null;
   turnProcessHeader=null;
   turnProcessTimeline=null;
 }
@@ -6910,7 +7137,7 @@ function resetTurnProcessCollection(){
   pendingActivityReasoning=[];
   collectingTurnProcess=false;
 }
-function beginTurnProcessCollection(){
+function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
   for(const element of turnProcessElements)if(element?.parentNode===chat)element.remove();
   clearTurnProcessHeader();
   turnProcessElements=[];
@@ -6919,6 +7146,7 @@ function beginTurnProcessCollection(){
   pendingAgentActivityBatches=[];
   pendingActivityReasoning=[];
   collectingTurnProcess=true;
+  if(showElapsed)startTurnProcessElapsed(startedAt,Date.now(),turnId);
 }
 function activateTurnProcessElement(element){
   if(!collectingTurnProcess||!element)return;
@@ -6996,14 +7224,14 @@ function collectTurnArtifactsFromDom(anchor,elements){
   }
   return collected;
 }
-function createCompletionMessage(text,processElements=[],turnId=''){
+function createCompletionMessage(text,processElements=[],turnId='',elapsedSeconds=NaN){
   const el=document.createElement('details');
   el.className='msg process completionSummary';
   el.dataset.messageText=String(text||'');
   el.dataset.turnId=String(turnId||'');
   const summary=document.createElement('summary');
   const label=document.createElement('span');
-  label.textContent=completionMessageTitle(text);
+  label.textContent=completionMessageTitle(text,elapsedSeconds);
   const chevron=document.createElement('i');
   chevron.className='completionChevron';
   chevron.setAttribute('data-lucide','chevron-right');
@@ -7110,13 +7338,34 @@ function prepareUndoEditedFiles(files){
   statusEl.textContent='撤销请求已准备，请检查后发送';
   input.focus();
 }
-function createEditedFilesResultCard(files,turnId,{live=false}={}){
-  const card=document.createElement('details');
-  card.className='turnResultCard editedFilesResult'+(live?' live':'');
-  card.setAttribute('aria-label',files.length+' 个文件已更改');
-  const head=document.createElement('summary');
+function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
+  const progress=turnPlanProgress(plan);
+  const hasPlan=progress.total>0;
+  const hasFiles=files.length>0;
+  const card=document.createElement(hasFiles?'details':'div');
+  card.className='turnResultCard editedFilesResult'+(live?' live':'')+(hasPlan?' withPlan':'')+(!hasFiles?' planOnly':'');
+  const ariaParts=[];
+  if(hasPlan)ariaParts.push('第 '+progress.current+' / '+progress.total+' 步');
+  if(hasFiles)ariaParts.push(files.length+' 个文件已更改');
+  card.setAttribute('aria-label',ariaParts.join('，'));
+  if(live){card.setAttribute('role','status');card.setAttribute('aria-live','polite')}
+  if(hasPlan){card.dataset.planCurrent=String(progress.current);card.dataset.planTotal=String(progress.total)}
+  const head=document.createElement(hasFiles?'summary':'div');
   head.className='turnResultHead';
+  if(hasPlan){
+    const ring=document.createElement('span');
+    ring.className='turnPlanProgressRing';
+    ring.setAttribute('style','--turn-plan-progress:'+progress.percent+'%');
+    ring.setAttribute('aria-hidden','true');
+    const progressLabel=document.createElement('strong');
+    progressLabel.className='turnPlanProgressLabel';
+    progressLabel.textContent='第 '+progress.current+' / '+progress.total+' 步';
+    head.appendChild(ring);
+    head.appendChild(progressLabel);
+    if(hasFiles){const divider=document.createElement('span');divider.className='turnResultDivider';divider.textContent='·';divider.setAttribute('aria-hidden','true');head.appendChild(divider)}
+  }
   const title=document.createElement('strong');
+  title.className='turnResultFileLabel';
   title.textContent=files.length+' 个文件已更改';
   const added=files.reduce((total,file)=>total+file.added,0);
   const removed=files.reduce((total,file)=>total+file.removed,0);
@@ -7135,8 +7384,9 @@ function createEditedFilesResultCard(files,turnId,{live=false}={}){
     stats.appendChild(value);
   }
   if(!added&&!removed)stats.textContent='已完成';
-  head.appendChild(title);
-  head.appendChild(stats);
+  if(hasFiles){head.appendChild(title);head.appendChild(stats)}
+  card.appendChild(head);
+  if(!hasFiles)return card;
   const content=document.createElement('div');
   content.className='editedFilesContent';
   const actions=document.createElement('div');
@@ -7167,21 +7417,28 @@ function createEditedFilesResultCard(files,turnId,{live=false}={}){
     list.appendChild(row);
   }
   content.appendChild(list);
-  card.appendChild(head);
   card.appendChild(content);
   return card;
 }
 function moveLiveEditedFilesResultToEnd(){
-  if(liveEditedFilesResult?.isConnected&&turnProcessTimeline)turnProcessTimeline.appendChild(liveEditedFilesResult);
+  if(!liveEditedFilesResult?.isConnected||!turnProcessTimeline)return;
+  turnProcessTimeline.appendChild(liveEditedFilesResult);
 }
 function refreshLiveEditedFilesResult(){
   if(!turnProcessTimeline)return null;
   const files=editedFilesFromTurnArtifacts(turnProcessElements);
-  if(!files.length)return null;
-  const next=createEditedFilesResultCard(files,'',{live:true});
-  if(liveEditedFilesResult?.parentNode)liveEditedFilesResult.parentNode.replaceChild(next,liveEditedFilesResult);
+  const hasPlan=liveTurnPlan.length>0;
+  if(!files.length&&!hasPlan){
+    liveEditedFilesResult?.remove();
+    liveEditedFilesResult=null;
+    return null;
+  }
+  const previous=liveEditedFilesResult;
+  const next=createEditedFilesResultCard(files,'',{live:true,plan:liveTurnPlan});
+  if(previous?.parentNode)previous.parentNode.replaceChild(next,previous);
   else turnProcessTimeline.appendChild(next);
   liveEditedFilesResult=next;
+  moveLiveEditedFilesResultToEnd();
   refreshIcons(next);
   return next;
 }
@@ -7319,8 +7576,16 @@ function addMsg(role,text,options={}){
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   if(role!=='user'&&!inputImage)latestUserElement=null;
   if(role==='thinking')return null;
+  const terminalProcess=role==='process'&&['task_complete','task_error','turn_aborted','error'].includes(kind);
+  if(terminalProcess&&!turnProcessElapsedMatches(options.turnId))return null;
+  const activeTurnMessage=webRunActive&&options.turnId&&activeNativeTurnId&&String(options.turnId)===String(activeNativeTurnId);
+  if(activeTurnMessage&&kind!=='task_started'){
+    if(!collectingTurnProcess||!turnProcessElapsedMatches(options.turnId))beginTurnProcessCollection(options.at,true,options.turnId);
+    else if(!turnProcessElapsedLabel)ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);
+  }
   if(role==='process'&&kind==='reasoning_summary'){
-    if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
+    if(!collectingTurnProcess)beginTurnProcessCollection(options.at,webRunActive,options.turnId);
+    else if(webRunActive)ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);
     const clean=shortActivityText(text,160);
     if(clean&&!pendingActivityReasoning.includes(clean))pendingActivityReasoning.push(clean);
     const reasoning=updateTurnReasoningStatus(clean);
@@ -7329,20 +7594,25 @@ function addMsg(role,text,options={}){
   }
   if(shouldClearTurnReasoningStatus(role,kind))clearTurnReasoningStatus();
   if(shouldClearPendingActivityReasoning(role,kind,steeringUser))pendingActivityReasoning=[];
+  if(role==='process'&&['task_error','turn_aborted','error'].includes(kind)){freezeTurnProcessElapsed(options.at,options.turnId);clearLiveTurnProgress()}
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
     const batch=isAgentActivityOutput(text)?takePendingAgentActivityBatch():latestToolElement;
     settleTurnTool(batch||latestToolElement);
     return null;
   }
   if(role==='process'&&kind==='task_started'){
-    beginTurnProcessCollection(options.at);
+    if(!options.hydrating&&currentConversationSource==='codex'&&webRunActive&&options.turnId&&activeNativeTurnId&&String(options.turnId)!==String(activeNativeTurnId))return null;
+    const showElapsed=options.autoTrackAgent||(currentConversationSource!=='codex'&&webRunActive);
+    if(showElapsed&&collectingTurnProcess&&turnProcessElapsedLabel&&options.turnId&&turnProcessElapsedMatches(options.turnId)){ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);return null}
+    beginTurnProcessCollection(options.at,showElapsed,options.turnId);
     latestToolElement=null;
     latestAssistantElement=null;
     latestFinalAssistantElement=null;
     return null;
   }
   if(role==='process'&&kind==='context_compacted'){
-    if(!collectingTurnProcess)beginTurnProcessCollection();
+    if(!collectingTurnProcess)beginTurnProcessCollection(options.at,webRunActive,options.turnId);
+    else if(webRunActive)ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);
     chat.querySelector('.empty')?.remove();
     const activity=appendTurnProcessActivity(text,kind);
     moveTurnReasoningStatusToEnd();
@@ -7369,13 +7639,15 @@ function addMsg(role,text,options={}){
     }
   }
   if(role==='process'&&kind==='task_complete'){
+    const completedAt=turnProcessStartTimestamp(options.at);
+    const elapsedSeconds=turnProcessStartedAt>0?Math.max(0,(completedAt-turnProcessStartedAt)/1000):NaN;
     const anchor=latestFinalAssistantElement?.parentNode===chat?latestFinalAssistantElement:null;
     const artifacts=collectTurnArtifactsFromDom(anchor,takeTurnProcessElements());
     const visibleActivities=artifacts.filter((item)=>item.dataset?.messageKind==='image_view_activity');
     const foldedActivities=artifacts.filter((item)=>item.dataset?.messageKind!=='image_view_activity');
     const resultArtifacts=createTurnResultArtifacts(artifacts,options.turnId);
     for(const item of visibleActivities)settleTurnTool(item);
-    const completion=createCompletionMessage(text,foldedActivities,options.turnId);
+    const completion=createCompletionMessage(text,foldedActivities,options.turnId,elapsedSeconds);
     if(anchor){
       chat.insertBefore(completion,anchor);
       for(const item of visibleActivities)chat.insertBefore(item,anchor);
@@ -7563,7 +7835,9 @@ function updateNativeLiveDelta(runtime){
   const delta=String(runtime.delta||'');
   if(!itemId||!delta)return;
   removeNativeRunningElement();
-  if(!collectingTurnProcess)beginTurnProcessCollection();
+  const runtimeTurnId=runtime.turnId||activeNativeTurnId;
+  if(!collectingTurnProcess||!turnProcessElapsedMatches(runtimeTurnId))beginTurnProcessCollection(runtime.updatedAt,true,runtimeTurnId);
+  else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),runtimeTurnId);
   let live=nativeLiveItems.get(itemId);
   if(!live){
     const element=addMsg('assistant','',{streaming:true,kind:'live_progress'});
@@ -7669,7 +7943,7 @@ async function respondNativeRequest(payload){if(!currentNativeRequest)return;for
 function updateSafetyHint(){const mode=sandbox.value;safetyHint.className='safety '+(mode==='read-only'?'safe':mode==='workspace-write'?'warn':'danger');safetyHint.textContent=mode==='read-only'?'只读 · 不写入文件':mode==='workspace-write'?'工作区写入 · 当前目录':'高危全权限 · 首次发送需确认'}
 let completeAudioCtx;
 function playTaskCompleteSound(){try{const AudioContext=window.AudioContext||window.webkitAudioContext;if(!AudioContext)return;if(!completeAudioCtx)completeAudioCtx=new AudioContext();completeAudioCtx.resume?.();const now=completeAudioCtx.currentTime;const master=completeAudioCtx.createGain();master.gain.setValueAtTime(1.15,now);master.connect(completeAudioCtx.destination);[[660,0,.12],[880,.13,.22]].forEach(([freq,offset,duration])=>{const osc=completeAudioCtx.createOscillator();const gain=completeAudioCtx.createGain();osc.type='triangle';osc.frequency.value=freq;gain.gain.setValueAtTime(0.0001,now+offset);gain.gain.exponentialRampToValueAtTime(0.55,now+offset+0.006);gain.gain.exponentialRampToValueAtTime(0.0001,now+offset+duration);osc.connect(gain);gain.connect(master);osc.start(now+offset);osc.stop(now+offset+duration+.02)})}catch(e){}}
-async function cancelRun(){closeComposerPopovers();if(currentConversationSource!=='codex'||!currentConversationId)return;cancelBtn.disabled=true;statusEl.textContent='正在取消...';try{const res=await fetch('/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/interrupt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({turnId:activeNativeTurnId})});const data=await res.json();if(!res.ok)throw new Error(data.error||'取消失败');addMsg('log','已请求取消当前任务。');webRunActive=false;activeNativeTurnId='';removeNativeRunningElement();statusEl.textContent='Cancelled';applyConversationMode();setTimeout(syncCurrentNativeConversation,180);refreshHistory()}catch(e){statusEl.textContent=e.message;cancelBtn.disabled=false}}
+async function cancelRun(){closeComposerPopovers();if(currentConversationSource!=='codex'||!currentConversationId)return;cancelBtn.disabled=true;statusEl.textContent='正在取消...';try{const res=await fetch('/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/interrupt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({turnId:activeNativeTurnId})});const data=await res.json();if(!res.ok)throw new Error(data.error||'取消失败');addMsg('log','已请求取消当前任务。');freezeTurnProcessElapsed('',activeNativeTurnId);clearLiveTurnProgress();webRunActive=false;activeNativeTurnId='';removeNativeRunningElement();statusEl.textContent='Cancelled';applyConversationMode();setTimeout(syncCurrentNativeConversation,180);refreshHistory()}catch(e){statusEl.textContent=e.message;cancelBtn.disabled=false}}
 async function send(){
   closeComposerPopovers();
   const text=input.value.trim();
