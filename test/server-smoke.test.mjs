@@ -617,7 +617,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.archiveView\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*auto/s);
     assert.match(uiStyles, /\.archiveTaskRestore,[^}]*\.archiveTaskDelete\s*\{/s);
     assert.match(uiStyles, /body\[data-theme\] \.archiveProjectFilter select\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
-    assert.match(uiStyles, /\.turnResultArtifacts\s*\{/);
+    assert.match(uiStyles, /\.turnResultArtifacts\s*\{[^}]*align-self:\s*center/s);
     assert.match(uiStyles, /\.editedFilesResult/);
     assert.match(uiStyles, /\.webPreviewResult\s*\{/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
