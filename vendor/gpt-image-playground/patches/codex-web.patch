@@ -16,7 +16,7 @@ index 5fc1614..ae33294 100644
  import Header from './components/Header'
  import SearchBar from './components/SearchBar'
  import TaskGrid from './components/TaskGrid'
-@@ -96,6 +96,61 @@ export default function App() {
+@@ -96,6 +96,59 @@ export default function App() {
      initStore()
    }, [setSettings])
 
@@ -50,8 +50,6 @@ index 5fc1614..ae33294 100644
 +          return {
 +            ...existing,
 +            ...profile,
-+            baseUrl: existing?.baseUrl?.trim() || profile.baseUrl,
-+            apiKey: existing?.apiKey?.trim() || profile.apiKey,
 +            model: profile.id === imageProfileId ? existing?.model || profile.model : profile.model,
 +          }
 +        })
@@ -263,48 +261,3 @@ index 5f8239d..fdf1e32 100644
    }
 
    const handleReplaceFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-
-diff --git a/src/lib/devProxy.test.ts b/src/lib/devProxy.test.ts
-index adc16bb..fd5327a 100644
---- a/src/lib/devProxy.test.ts
-+++ b/src/lib/devProxy.test.ts
-@@ -4,13 +4,13 @@ import { buildApiUrl } from './devProxy'
- describe('buildApiUrl', () => {
-   it('uses the same-origin proxy prefix when API proxy is enabled', () => {
-     expect(buildApiUrl('http://api.example.com/v1', 'images/edits', null, true)).toBe(
--      '/api-proxy/images/edits',
-+      '/api-proxy/images/edits?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1',
-     )
-   })
-
-   it('leaves API versioning to the proxy target when proxying', () => {
-     expect(buildApiUrl('http://api.example.com', 'images/generations', null, true)).toBe(
--      '/api-proxy/images/generations',
-+      '/api-proxy/images/generations?codex_upstream=http%3A%2F%2Fapi.example.com',
-     )
-   })
-
-@@ -28,7 +28,7 @@ describe('buildApiUrl', () => {
-         },
-         true,
-       ),
--    ).toBe('/openai-proxy/responses')
-+    ).toBe('/openai-proxy/responses?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1')
-   })
-
-   it('uses the configured API URL directly when API proxy is disabled', () => {
-diff --git a/src/lib/devProxy.ts b/src/lib/devProxy.ts
-index ede2298..b9bc384 100644
---- a/src/lib/devProxy.ts
-+++ b/src/lib/devProxy.ts
-@@ -64,7 +64,9 @@ export function buildApiUrl(
-   const endpointPath = path.replace(/^\/+/, '')
-
-   if (useApiProxy) {
--    return `${proxyConfig?.prefix ?? DEFAULT_PROXY_PREFIX}/${endpointPath}`
-+    const proxyUrl = `${proxyConfig?.prefix ?? DEFAULT_PROXY_PREFIX}/${endpointPath}`
-+    const separator = proxyUrl.includes('?') ? '&' : '?'
-+    return `${proxyUrl}${separator}codex_upstream=${encodeURIComponent(normalizedBaseUrl)}`
-   }
-
-   const apiPath = normalizedBaseUrl.endsWith('/v1')
