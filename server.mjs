@@ -15,6 +15,7 @@ import { createServer } from 'http';
 import { homedir, networkInterfaces } from 'os';
 import path from 'path';
 import net from 'net';
+import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
 import { CodexAppServerClient } from './app-server-client.mjs';
 import {
@@ -106,6 +107,16 @@ const imagePromptSyncTimeoutMs = Number(process.env.IMAGE_PROMPT_SYNC_TIMEOUT_MS
 const IMAGE_PROMPT_SYNC_TIMEOUT_MS = Number.isFinite(imagePromptSyncTimeoutMs) && imagePromptSyncTimeoutMs > 0
   ? imagePromptSyncTimeoutMs
   : 20000;
+const playgroundProxyTimeoutMs = Number(process.env.PLAYGROUND_PROXY_TIMEOUT_MS || 300000);
+const PLAYGROUND_PROXY_TIMEOUT_MS = Number.isFinite(playgroundProxyTimeoutMs) && playgroundProxyTimeoutMs > 0
+  ? playgroundProxyTimeoutMs
+  : 300000;
+const PLAYGROUND_PROXY_ALLOWED_ORIGINS = new Set(
+  String(process.env.PLAYGROUND_PROXY_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((value) => normalizeHttpOrigin(value))
+    .filter(Boolean),
+);
 const NATIVE_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TOOL_IMAGE_MAX_BYTES = 25 * 1024 * 1024;
 const TOOL_IMAGE_TYPES = new Map([
@@ -334,6 +345,8 @@ app.use('/playground', requireAuth, express.static(GPT_IMAGE_PLAYGROUND_DIR, {
   },
 }));
 
+app.all('/api-proxy/*', requireAuth, proxyPlaygroundRequest);
+
 app.post('/api/uploads/image', requireAuth, (req, res) => {
   try {
     const upload = saveUploadedAttachment(req.body || {}, { imagesOnly: true });
@@ -427,6 +440,7 @@ app.get('/api/playground-config', requireAuth, (_req, res) => {
     model: 'gpt-image-2',
     apiMode: 'images',
     codexCli: true,
+    apiProxy: true,
   };
   const agentProfile = provider.wireApi === 'responses'
     ? {
@@ -438,6 +452,7 @@ app.get('/api/playground-config', requireAuth, (_req, res) => {
       model: defaults.model || DEFAULT_MODEL,
       apiMode: 'responses',
       codexCli: false,
+      apiProxy: true,
     }
     : null;
 
@@ -2788,6 +2803,135 @@ function isHttpUrl(value) {
   } catch {
     return false;
   }
+}
+
+async function proxyPlaygroundRequest(req, res) {
+  if (!['GET', 'POST'].includes(req.method)) {
+    res.setHeader('Allow', 'GET, POST');
+    return res.status(405).json({ error: 'Playground proxy only supports GET and POST' });
+  }
+
+  let upstream;
+  try {
+    upstream = resolvePlaygroundProxyTarget(req);
+  } catch (error) {
+    return res.status(error.statusCode || 400).json({ error: error.message });
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PLAYGROUND_PROXY_TIMEOUT_MS);
+  const abortOnDisconnect = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.once('close', abortOnDisconnect);
+
+  try {
+    const headers = playgroundProxyRequestHeaders(req, upstream.provider);
+    const body = req.method === 'GET'
+      ? undefined
+      : req.is('application/json')
+        ? JSON.stringify(req.body ?? {})
+        : req;
+    const response = await fetch(upstream.url, {
+      method: req.method,
+      headers,
+      body,
+      redirect: 'manual',
+      signal: controller.signal,
+      ...(body === req ? { duplex: 'half' } : {}),
+    });
+    res.status(response.status);
+    for (const name of ['content-type', 'cache-control', 'content-disposition', 'x-request-id']) {
+      const value = response.headers.get(name);
+      if (value) res.setHeader(name, value);
+    }
+    if (!response.body) return res.end();
+    await new Promise((resolve, reject) => {
+      const stream = Readable.fromWeb(response.body);
+      stream.once('error', reject);
+      res.once('finish', resolve);
+      stream.pipe(res);
+    });
+  } catch (error) {
+    if (res.headersSent) {
+      res.destroy(error);
+      return;
+    }
+    const message = error?.name === 'AbortError'
+      ? 'Playground proxy request timed out'
+      : `Playground proxy request failed: ${error.message}`;
+    res.status(502).json({ error: message });
+  } finally {
+    clearTimeout(timeout);
+    res.off('close', abortOnDisconnect);
+  }
+}
+
+function resolvePlaygroundProxyTarget(req) {
+  const requestUrl = new URL(req.originalUrl, 'http://codex-web.local');
+  const rawBaseUrl = String(requestUrl.searchParams.get('codex_upstream') || '').trim();
+  if (!isHttpUrl(rawBaseUrl)) throw playgroundProxyError(400, 'Playground API URL is invalid');
+
+  const endpoint = String(req.params[0] || '').replace(/^\/+/, '');
+  if (!/^(?:images\/(?:generations|edits)|responses)$/.test(endpoint)) {
+    throw playgroundProxyError(403, 'Playground proxy path is not allowed');
+  }
+
+  const normalizedBaseUrl = normalizePlaygroundProxyBaseUrl(rawBaseUrl);
+  const targetBaseUrl = normalizedBaseUrl.endsWith('/v1') ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
+  const targetUrl = new URL(endpoint, `${targetBaseUrl}/`);
+  for (const [key, value] of requestUrl.searchParams) {
+    if (key !== 'codex_upstream') targetUrl.searchParams.append(key, value);
+  }
+
+  const provider = readProviderDetails().find((item) => normalizeHttpOrigin(item.baseUrl) === targetUrl.origin);
+  if (!provider && !PLAYGROUND_PROXY_ALLOWED_ORIGINS.has(targetUrl.origin)) {
+    throw playgroundProxyError(403, 'Playground API URL is not an allowed origin');
+  }
+  return { url: targetUrl, provider };
+}
+
+function normalizePlaygroundProxyBaseUrl(value) {
+  const url = new URL(value);
+  const pathSegments = url.pathname.split('/').filter(Boolean);
+  const v1Index = pathSegments.indexOf('v1');
+  const normalizedSegments = v1Index >= 0
+    ? pathSegments.slice(0, v1Index + 1)
+    : pathSegments.length
+      ? [...pathSegments, 'v1']
+      : [];
+  url.pathname = normalizedSegments.length ? `/${normalizedSegments.join('/')}` : '';
+  url.search = '';
+  url.hash = '';
+  return url.toString().replace(/\/$/, '');
+}
+
+function normalizeHttpOrigin(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return ['http:', 'https:'].includes(url.protocol) ? url.origin : '';
+  } catch {
+    return '';
+  }
+}
+
+function playgroundProxyRequestHeaders(req, provider) {
+  const headers = new Headers();
+  for (const name of ['accept', 'authorization', 'content-type', 'openai-organization', 'openai-project', 'x-api-key']) {
+    const value = req.get(name);
+    if (value) headers.set(name, value);
+  }
+  if (!headers.has('authorization') && provider) {
+    const apiKey = providerCredential(provider);
+    if (apiKey) headers.set('authorization', `Bearer ${apiKey}`);
+  }
+  return headers;
+}
+
+function playgroundProxyError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 }
 
 function cleanSandbox(value) {

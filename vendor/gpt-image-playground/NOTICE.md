@@ -15,7 +15,7 @@ cp vendor/gpt-image-playground/package-lock.json <upstream-checkout>/package-loc
 git -C <upstream-checkout> apply <codex-web-checkout>/vendor/gpt-image-playground/patches/codex-web.patch
 cd <upstream-checkout>
 npm ci
-npm run build
+VITE_API_PROXY_AVAILABLE=true npm run build
 rsync -a --delete --exclude sw.js dist/ <codex-web-checkout>/vendor/gpt-image-playground/app/
 ```
 
@@ -44,6 +44,12 @@ Codex text model. Codex CLI compatibility mode remains enabled only on the image
 profile, so multi-image requests are split into concurrent single-image calls
 instead of sending an unsupported `n` parameter to Codex-compatible image
 gateways.
+
+The Codex Web build enables the Playground API proxy. Proxied requests include
+the normalized browser-configured API URL as `codex_upstream`; Codex Web only
+forwards supported image and Responses API paths to configured Provider origins
+or origins explicitly listed in `PLAYGROUND_PROXY_ALLOWED_ORIGINS`. Browser
+credentials remain authoritative and browser cookies are never sent upstream.
 
 Codex Web serves this build at `/playground/` behind its existing Web login.
 The upstream caching service worker is replaced with a non-caching shim that
