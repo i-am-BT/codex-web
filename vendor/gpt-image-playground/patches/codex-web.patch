@@ -16,7 +16,7 @@ index 5fc1614..ae33294 100644
  import Header from './components/Header'
  import SearchBar from './components/SearchBar'
  import TaskGrid from './components/TaskGrid'
-@@ -96,6 +96,59 @@ export default function App() {
+@@ -96,6 +96,61 @@ export default function App() {
      initStore()
    }, [setSettings])
 
@@ -50,6 +50,8 @@ index 5fc1614..ae33294 100644
 +          return {
 +            ...existing,
 +            ...profile,
++            baseUrl: existing?.baseUrl?.trim() || profile.baseUrl,
++            apiKey: existing?.apiKey?.trim() || profile.apiKey,
 +            model: profile.id === imageProfileId ? existing?.model || profile.model : profile.model,
 +          }
 +        })
@@ -76,7 +78,7 @@ index 5fc1614..ae33294 100644
    useEffect(() => {
      const preventPageImageDrag = (e: DragEvent) => {
        if ((e.target as HTMLElement | null)?.closest('img')) {
-@@ -107,6 +160,64 @@ export default function App() {
+@@ -107,6 +162,64 @@ export default function App() {
      return () => document.removeEventListener('dragstart', preventPageImageDrag)
    }, [])
 
@@ -306,3 +308,33 @@ index ede2298..b9bc384 100644
    }
 
    const apiPath = normalizedBaseUrl.endsWith('/v1')
+
+diff --git a/src/components/SettingsModal.tsx b/src/components/SettingsModal.tsx
+index 53f717c..0ac4cbf 100644
+--- a/src/components/SettingsModal.tsx
++++ b/src/components/SettingsModal.tsx
+@@ -1552,13 +1552,12 @@ export default function SettingsModal() {
+                     onChange={(e) => updateActiveProfile({ baseUrl: e.target.value })}
+                     onBlur={(e) => commitActiveProfilePatch({ baseUrl: e.target.value })}
+                     type="text"
+-                    disabled={apiProxyEnabled}
+                     placeholder={activeProfile.provider === 'fal' ? DEFAULT_FAL_BASE_URL : DEFAULT_SETTINGS.baseUrl}
+-                    className={`w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50 ${apiProxyEnabled ? 'opacity-50 cursor-not-allowed' : ''}`}
++                    className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
+                   />
+                   <div data-selectable-text className="mt-1.5 min-h-[22px] flex items-center text-xs text-gray-500 dark:text-gray-500">
+                     {apiProxyEnabled ? (
+-                      <span className="text-yellow-600 dark:text-yellow-500">已开启代理，实际请求目标由部署端决定，此处设置被忽略。</span>
++                      <span className="text-yellow-600 dark:text-yellow-500">请求将通过 Codex Web 同源代理转发到此 URL。</span>
+                     ) : activeProfile.provider === 'fal' ? (
+                       <span>默认使用 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">{DEFAULT_FAL_BASE_URL}</code>；填写自定义地址时将作为 fal.ai 代理 URL。</span>
+                     ) : (
+@@ -1588,7 +1587,7 @@ export default function SettingsModal() {
+                     </button>
+                   </div>
+                   <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
+-                    {apiProxyLocked ? '部署端已锁定代理开启，请求经服务器转发到上游 API，上方 URL 设置将失效。' : '开启后请求经服务器转发到上游 API，可绕过浏览器跨域限制，上方 URL 设置将失效。'}
++                    {apiProxyLocked ? '部署端已锁定代理开启，请求经服务器转发到上方 URL 指定的上游 API。' : '开启后请求经服务器转发到上方 URL 指定的上游 API，可绕过浏览器跨域限制。'}
+                   </div>
+                 </div>
+               )}
