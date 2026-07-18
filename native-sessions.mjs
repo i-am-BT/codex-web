@@ -35,6 +35,7 @@ export class NativeSessionStore extends EventEmitter {
     this.codexHome = path.resolve(codexHome);
     this.sessionsDir = path.join(this.codexHome, 'sessions');
     this.indexFile = path.join(this.codexHome, 'session_index.jsonl');
+    this.globalStateFile = path.join(this.codexHome, '.codex-global-state.json');
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.maxReadBytes = positiveNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
     this.turnStartScanBytes = positiveNumber(
@@ -52,6 +53,9 @@ export class NativeSessionStore extends EventEmitter {
     this.titles = new Map();
     this.details = new Map();
     this.indexStamp = '';
+    this.workspaceStateAvailable = false;
+    this.projectlessThreadIds = new Set();
+    this.projectThreadIds = new Set();
     this.appThreads = null;
     this.stateDb = null;
     this.stateDbIno = 0;
@@ -74,6 +78,7 @@ export class NativeSessionStore extends EventEmitter {
           const relative = String(filename || '').replace(/\\/g, '/');
           if (
             relative
+            && relative !== '.codex-global-state.json'
             && relative !== 'session_index.jsonl'
             && relative !== 'state_5.sqlite'
             && relative !== 'state_5.sqlite-wal'
@@ -116,8 +121,14 @@ export class NativeSessionStore extends EventEmitter {
 
   refresh() {
     this.refreshTitles();
+    this.refreshWorkspaceState();
     this.refreshAppThreads();
-    const nextEntries = scanSessionFiles(this.sessionsDir, this.titles, this.appThreads);
+    const nextEntries = scanSessionFiles(
+      this.sessionsDir,
+      this.titles,
+      this.appThreads,
+      (id) => this.workspaceKindForThread(id),
+    );
     const nextSubagentEntries = scanSessionFiles(this.sessionsDir, this.titles, this.subagentThreads);
     const changedIds = [
       ...new Set([
@@ -137,6 +148,54 @@ export class NativeSessionStore extends EventEmitter {
       this.emit('change', { version: this.version, changedIds });
     }
     return this.list();
+  }
+
+  refreshWorkspaceState() {
+    let state;
+    try {
+      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+    } catch {
+      // Codex Desktop replaces this file atomically. Keep the last valid
+      // snapshot while it is temporarily missing or incomplete.
+      return;
+    }
+
+    const hasProjectlessIds = state
+      && typeof state === 'object'
+      && !Array.isArray(state)
+      && Object.prototype.hasOwnProperty.call(state, 'projectless-thread-ids');
+    if (!hasProjectlessIds) {
+      this.projectlessThreadIds = new Set();
+      this.projectThreadIds = new Set();
+      this.workspaceStateAvailable = false;
+      return;
+    }
+
+    const value = state?.['projectless-thread-ids'];
+    const ids = Array.isArray(value)
+      ? value
+      : value && typeof value === 'object'
+        ? Object.keys(value)
+        : null;
+    if (!ids) return;
+
+    this.projectlessThreadIds = new Set(ids
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
+    const assignments = state?.['thread-project-assignments'];
+    this.projectThreadIds = new Set((assignments && typeof assignments === 'object' && !Array.isArray(assignments)
+      ? Object.keys(assignments)
+      : [])
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
+    this.workspaceStateAvailable = true;
+  }
+
+  workspaceKindForThread(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!this.workspaceStateAvailable || !SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return '';
+    if (this.projectThreadIds.has(threadId)) return 'project';
+    return this.projectlessThreadIds.has(threadId) ? 'projectless' : 'project';
   }
 
   refreshAppThreads() {
@@ -169,6 +228,7 @@ export class NativeSessionStore extends EventEmitter {
         next.set(id, {
           rolloutPath: path.resolve(rolloutPath),
           cwd: String(row.cwd || '').trim(),
+          workspaceKind: this.workspaceStateAvailable ? this.workspaceKindForThread(id) : '',
           title: cleanTitle(row.title),
           createdAtMs: timestampMs(row.created_at_ms),
           updatedAtMs: timestampMs(row.updated_at_ms),
@@ -464,7 +524,7 @@ export function readSessionIndex(file) {
   return titles;
 }
 
-function scanSessionFiles(root, titles, appThreads = null) {
+function scanSessionFiles(root, titles, appThreads = null, workspaceKindForThread = null) {
   const entries = new Map();
   if (!existsSync(root)) return entries;
   const pending = [root];
@@ -501,6 +561,7 @@ function scanSessionFiles(root, titles, appThreads = null) {
           id,
           title,
           cwd: appThread?.cwd || String(firstRecord?.payload?.cwd || '').trim(),
+          workspaceKind: appThread?.workspaceKind || workspaceKindForThread?.(id) || '',
           filePath,
           size: stat.size,
           ino: stat.ino,
@@ -535,7 +596,7 @@ function changedSessionIds(previous, next) {
 }
 
 function entrySignature(entry) {
-  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
+  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
 }
 
 function sessionSummary(entry, status) {
@@ -544,6 +605,7 @@ function sessionSummary(entry, status) {
     source: 'codex',
     title: entry.title,
     cwd: entry.cwd || '',
+    workspaceKind: entry.workspaceKind || '',
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     status,
@@ -568,7 +630,7 @@ function createDetailCache(entry, options) {
     nextSequence: 1,
     messagesTruncated: startOffset > 0,
     calls: new Map(),
-    metadata: {},
+    metadata: { workspaceKind: entry.workspaceKind || '' },
     currentTurnId: '',
     previousTurnId: '',
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
@@ -1433,7 +1495,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     cursor: Math.max(0, cache.nextSequence - 1),
     reset,
     revision: `${entry.ino}:${entry.size}:${entry.mtimeMs}`,
-    metadata: { ...cache.metadata },
+    metadata: { ...cache.metadata, workspaceKind: entry.workspaceKind || '' },
     messages: messages.map((message) => ({ ...message })),
   };
 }

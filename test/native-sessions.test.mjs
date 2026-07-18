@@ -927,10 +927,20 @@ test('native session store only exposes visible, non-archived Codex App threads'
     for (const row of rows) insert.run(...row);
     db.close();
 
+    const globalStateFile = path.join(codexHome, '.codex-global-state.json');
+    await writeFile(globalStateFile, JSON.stringify({
+      'projectless-thread-ids': [visibleOlder],
+      'thread-project-assignments': {
+        [visibleNewer]: { projectKind: 'local', projectId: 'project-newer', cwd: '/workspace/newer' },
+      },
+    }));
+
     store = new NativeSessionStore(codexHome, { watchChanges: false, maxSessions: 20 });
     assert.deepEqual(store.list().map((session) => session.id), [visibleNewer, visibleOlder]);
     assert.deepEqual(store.list().map((session) => session.cwd), ['/workspace/newer', '/workspace/older']);
     assert.deepEqual(store.list().map((session) => session.title), [`Title ${visibleNewer.slice(-3)}`, '数据库回退标题']);
+    assert.deepEqual(store.list().map((session) => session.workspaceKind), ['project', 'projectless']);
+    assert.equal(store.get(visibleOlder).metadata.workspaceKind, 'projectless');
     assert.equal(store.get(archived), null);
     assert.equal(store.get(execSession), null);
     assert.equal(store.get(subagent), null);
@@ -956,6 +966,23 @@ test('native session store only exposes visible, non-archived Codex App threads'
     assert.equal(store.get(modernAutomation), null);
     assert.equal(store.get(legacyAutomation), null);
 
+    const workspaceChanged = once(store, 'change');
+    await writeFile(globalStateFile, JSON.stringify({
+      'projectless-thread-ids': { [visibleNewer]: true },
+      'thread-project-assignments': {
+        [visibleOlder]: { projectKind: 'local', projectId: 'project-older', cwd: '/workspace/older' },
+      },
+    }));
+    store.refresh();
+    const [workspaceChange] = await workspaceChanged;
+    assert.ok(workspaceChange.changedIds.includes(visibleNewer));
+    assert.ok(workspaceChange.changedIds.includes(visibleOlder));
+    assert.deepEqual(store.list().map((session) => session.workspaceKind), ['projectless', 'project']);
+
+    await writeFile(globalStateFile, '{invalid');
+    store.refresh();
+    assert.deepEqual(store.list().map((session) => session.workspaceKind), ['projectless', 'project']);
+
     const changed = once(store, 'change');
     const writer = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
     writer.prepare('UPDATE threads SET archived = 1 WHERE id = ?').run(visibleNewer);
@@ -964,6 +991,58 @@ test('native session store only exposes visible, non-archived Codex App threads'
     const [change] = await changed;
     assert.ok(change.changedIds.includes(visibleNewer));
     assert.deepEqual(store.list().map((session) => session.id), [visibleOlder]);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store applies projectless state without a state database and safely resets missing fields', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-projectless-fallback-'));
+  const codexHome = path.join(temporary, '.codex');
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '19');
+  const projectlessId = '019f4f84-ea9f-73c2-b997-deba7b4aa711';
+  const projectId = '019f4f84-ea9f-73c2-b997-deba7b4aa712';
+  const globalStateFile = path.join(codexHome, '.codex-global-state.json');
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    for (const [id, cwd] of [[projectlessId, '/generated/task'], [projectId, '/workspace/project']]) {
+      await writeFile(path.join(sessionDir, `rollout-2026-07-19T10-00-00-${id}.jsonl`), jsonl([{
+        timestamp: '2026-07-19T02:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd, source: 'vscode' },
+      }]));
+    }
+    await writeFile(globalStateFile, JSON.stringify({
+      'projectless-thread-ids': { [projectlessId]: true, [projectId]: true },
+      'thread-project-assignments': { [projectId]: { projectId: 'explicit-project' } },
+    }));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.equal(store.workspaceKindForThread(projectlessId.toUpperCase()), 'projectless');
+    assert.equal(store.workspaceKindForThread(projectId), 'project');
+    assert.equal(store.workspaceKindForThread('invalid'), '');
+    assert.deepEqual(
+      Object.fromEntries(store.list().map((session) => [session.id, session.workspaceKind])),
+      { [projectlessId]: 'projectless', [projectId]: 'project' },
+    );
+    assert.equal(store.get(projectlessId).metadata.workspaceKind, 'projectless');
+
+    await writeFile(globalStateFile, '{invalid');
+    store.refresh();
+    assert.equal(store.workspaceKindForThread(projectlessId), 'projectless');
+
+    await rm(globalStateFile);
+    store.refresh();
+    assert.equal(store.workspaceKindForThread(projectlessId), 'projectless');
+
+    await writeFile(globalStateFile, JSON.stringify({ unrelated: true }));
+    store.refresh();
+    assert.equal(store.workspaceKindForThread(projectlessId), '');
+    assert.deepEqual(store.list().map((session) => session.workspaceKind), ['', '']);
+    assert.equal(store.get(projectlessId).metadata.workspaceKind, '');
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });
@@ -1012,6 +1091,7 @@ test('native session store supports Codex state databases without recency_at_ms'
 
     store = new NativeSessionStore(codexHome, { watchChanges: false });
     assert.deepEqual(store.list().map((session) => session.id), [id]);
+    assert.equal(store.list()[0].workspaceKind, '');
     assert.equal(store.get(id)?.metadata.cwd, '/workspace');
   } finally {
     store?.stop();

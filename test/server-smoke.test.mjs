@@ -1075,7 +1075,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /function renameHistoryProject/);
     assert.match(page, /'pencil','重命名项目'/);
     assert.match(page, /historyProjectName\(item\.cwd\)/);
-    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)return/);
+    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)\{historyRefreshPending=true;return\}/);
     assert.match(page, /\/api\/native-projects\/archive/);
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);

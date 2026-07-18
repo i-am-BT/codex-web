@@ -283,3 +283,147 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
   assert.equal((inlineScript.match(/fileChanges:msg\.fileChanges/g) || []).length, 2);
 });
+
+test('persisted active commentary renders progressively and deduplicates by sequence', () => {
+  const liveSource = sourceBetween('function isNativeSnapshotStreamingMessage', 'async function copyText');
+  let nextTimerId = 1;
+  const timers = new Map();
+  const rendered = [];
+  const addCalls = [];
+  const fakeSetTimeout = (callback, delay) => {
+    const id = nextTimerId++;
+    timers.set(id, { callback, delay });
+    return id;
+  };
+  const fakeClearTimeout = (id) => timers.delete(id);
+  const runNextTimer = () => {
+    const next = timers.entries().next().value;
+    assert.ok(next, 'expected a pending render timer');
+    const [id, timer] = next;
+    timers.delete(id);
+    timer.callback();
+  };
+  const drainTimers = () => {
+    while (timers.size) runNextTimer();
+  };
+  const createElement = () => {
+    const classes = new Set(['msg', 'assistant', 'streaming']);
+    return {
+      dataset: {},
+      _messageBody: { textContent: '' },
+      classList: {
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        contains: (name) => classes.has(name),
+      },
+    };
+  };
+  const addMsg = (role, text, options) => {
+    const element = createElement();
+    element.dataset.messageText = text;
+    addCalls.push({ role, text, options, element });
+    return element;
+  };
+  const renderAssistantMarkdown = (body, text) => {
+    body.textContent = text;
+    rendered.push(text);
+  };
+  const api = new Function(
+    'setTimeout',
+    'clearTimeout',
+    'addMsg',
+    'renderAssistantMarkdown',
+    'scrollChatToLatest',
+    `
+      let nativeGeneration = 4;
+      let nativeCompletionSync = null;
+      let nativeLiveItems = new Map();
+      let nativeRuntimeStreamTurnIds = new Set();
+      let nativeRenderedMessageKeys = new Set();
+      let activeNativeTurnId = 'turn-active';
+      ${liveSource}
+      return {
+        shouldStream: isNativeSnapshotStreamingMessage,
+        upsert: upsertNativeSnapshotLiveMessage,
+        finishAll: finishAllNativeLiveItems,
+        clear: clearNativeLiveItems,
+        setCompletionPending(value) { nativeCompletionSync = value; },
+        state: () => ({ nativeLiveItems, nativeRuntimeStreamTurnIds, nativeRenderedMessageKeys }),
+      };
+    `,
+  )(fakeSetTimeout, fakeClearTimeout, addMsg, renderAssistantMarkdown, () => {});
+
+  const conversation = {
+    status: 'running',
+    activeTurnId: 'turn-active',
+    generation: 4,
+  };
+  const message = {
+    seq: 7,
+    role: 'assistant',
+    kind: 'commentary',
+    turnId: 'turn-active',
+    content: '这是一段足够长的实时处理说明，用来确认第一次刷新不会整段同时出现。',
+    at: '2026-07-19T10:00:00.000Z',
+  };
+
+  assert.equal(api.shouldStream(message, conversation), true);
+  assert.equal(api.shouldStream({ ...message, kind: 'final_answer' }, conversation), false);
+  assert.equal(api.shouldStream({ ...message, turnId: 'turn-old' }, conversation), false);
+  assert.equal(api.shouldStream(message, { ...conversation, status: 'done' }), false);
+  api.setCompletionPending({ turnId: 'turn-active' });
+  assert.equal(api.shouldStream(message, conversation), false);
+  api.setCompletionPending(null);
+
+  const first = api.upsert(message, conversation);
+  const repeated = api.upsert(message, conversation);
+  assert.strictEqual(repeated, first);
+  assert.equal(addCalls.length, 1);
+  assert.equal(first.targetText, message.content);
+  assert.equal(first.text, '');
+  assert.equal(first.element.classList.contains('streaming'), true);
+  assert.equal(timers.size, 1);
+
+  runNextTimer();
+  assert.ok(message.content.startsWith(first.text));
+  assert.notEqual(first.text, message.content);
+  assert.ok(first.text.length <= 6, 'persisted snapshot should advance in visibly small steps');
+  assert.equal(first.element.dataset.messageText, first.text);
+  assert.equal(first.element.classList.contains('streaming'), true);
+
+  const extended = { ...message, content: `${message.content}继续补充新的尾部。` };
+  assert.strictEqual(api.upsert(extended, conversation), first);
+  assert.equal(first.targetText, extended.content);
+  assert.equal(addCalls.length, 1);
+  drainTimers();
+  assert.equal(first.text, extended.content);
+  assert.equal(first.element.dataset.messageText, extended.content);
+  assert.equal(first.element.classList.contains('streaming'), false);
+  assert.equal(api.state().nativeLiveItems.size, 0);
+  assert.equal(api.state().nativeRenderedMessageKeys.size, 1);
+  assert.equal(rendered.at(-1), extended.content);
+
+  assert.equal(api.upsert(extended, conversation), null);
+  assert.equal(addCalls.length, 1);
+  assert.equal(timers.size, 0);
+
+  const pending = api.upsert({ ...message, seq: 8, content: `${message.content}尚未逐字完成。` }, conversation);
+  assert.equal(timers.size, 1);
+  api.finishAll();
+  assert.equal(timers.size, 0);
+  assert.equal(pending.text, pending.targetText);
+  assert.equal(pending.element.dataset.messageText, pending.targetText);
+  assert.equal(pending.element.classList.contains('streaming'), false);
+
+  api.upsert({ ...message, seq: 9 }, conversation);
+  assert.equal(timers.size, 1);
+  api.clear();
+  assert.equal(timers.size, 0);
+  assert.equal(api.state().nativeLiveItems.size, 0);
+  assert.equal(api.state().nativeRuntimeStreamTurnIds.size, 0);
+  assert.equal(api.state().nativeRenderedMessageKeys.size, 0);
+
+  assert.match(inlineScript, /loadConversation[\s\S]*hydrating:true/);
+  assert.match(inlineScript, /nativeRuntimeStreamTurnIds\.has\(String\(msg\.turnId\|\|''\)\)/);
+  assert.doesNotMatch(inlineScript, /nativeLiveItems\.size&&\['assistant','thinking'\]/);
+});
