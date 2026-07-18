@@ -697,7 +697,7 @@ if (args[0] === 'app-server') {
     assert.match(dreamSkinTask.prompt, /A colossal translucent coral-red energy sphere rises above the horizon/);
     assert.match(dreamSkinTask.prompt, /必须实际调用 \$imagegen/);
     assert.match(dreamSkinTask.prompt, /雨夜东京工作室/);
-    assert.ok(dreamSkinTask.cwd.endsWith('codex-web'));
+    assert.equal(dreamSkinTask.cwd, ROOT);
 
     const dreamSkinReferenceError = await fetch(`${baseUrl}/api/dream-skin/prompt`, {
       method: 'POST',
@@ -1008,13 +1008,13 @@ if (args[0] === 'app-server') {
     });
     assert.equal(playgroundConfigResponse.status, 200);
     assert.match(playgroundConfigResponse.headers.get('cache-control'), /private, no-store/);
-    assert.deepEqual(await playgroundConfigResponse.json(), {
+    const playgroundConfig = await playgroundConfigResponse.json();
+    assert.deepEqual(playgroundConfig, {
       profile: {
         id: 'codex-web-default',
         name: 'Codex Image · Fake',
         provider: 'openai',
         baseUrl: 'http://127.0.0.1:9/v1',
-        apiKey: 'test-token',
         model: 'gpt-image-2',
         apiMode: 'images',
         codexCli: true,
@@ -1025,7 +1025,6 @@ if (args[0] === 'app-server') {
           name: 'Codex Image · Fake',
           provider: 'openai',
           baseUrl: 'http://127.0.0.1:9/v1',
-          apiKey: 'test-token',
           model: 'gpt-image-2',
           apiMode: 'images',
           codexCli: true,
@@ -1035,7 +1034,6 @@ if (args[0] === 'app-server') {
           name: 'Codex Agent · Fake',
           provider: 'openai',
           baseUrl: 'http://127.0.0.1:9/v1',
-          apiKey: 'test-token',
           model: 'test-model',
           apiMode: 'responses',
           codexCli: false,
@@ -1045,6 +1043,8 @@ if (args[0] === 'app-server') {
       agentTextProfileId: 'codex-web-agent',
       agentImageProfileId: 'codex-web-default',
     });
+    assert.equal(Object.hasOwn(playgroundConfig.profile, 'apiKey'), false);
+    assert.equal(playgroundConfig.profiles.every((profile) => !Object.hasOwn(profile, 'apiKey')), true);
     assert.ok(config.conversations.some((conversation) => (
       conversation.id === nativeSessionId
       && conversation.source === 'codex'

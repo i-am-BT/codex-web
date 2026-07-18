@@ -34,16 +34,17 @@ The patch also completes the gallery composer's `@` reference flow. Typing
 successful upload, the reference picker reopens so the new image can be
 inserted as an explicit mention.
 
-When embedded in Codex Web, the build imports a paired image and Agent profile
-from the authenticated `/api/playground-config` endpoint. Gallery requests and
-Agent image tools use the Images API profile, while Agent conversations use the
-Codex provider's Responses API profile. Both profiles refresh their URL and
-credential on each load. The image profile preserves a previously chosen image
-model and initially uses `gpt-image-2`; the Agent profile follows the current
-Codex text model. Codex CLI compatibility mode remains enabled only on the image
-profile, so multi-image requests are split into concurrent single-image calls
-instead of sending an unsupported `n` parameter to Codex-compatible image
-gateways.
+When embedded in Codex Web, the build imports paired image and Agent profile
+metadata from the authenticated `/api/playground-config` endpoint. Gallery
+requests and Agent image tools use the Images API profile, while Agent
+conversations use the Codex provider's Responses API profile. The endpoint
+never returns the server-side Provider credential; configure the credential in
+the Playground browser UI. The image profile preserves a previously chosen
+image model and initially uses `gpt-image-2`; the Agent profile follows the
+current Codex text model. Codex CLI compatibility mode remains enabled only on
+the image profile, so multi-image requests are split into concurrent
+single-image calls instead of sending an unsupported `n` parameter to
+Codex-compatible image gateways.
 
 Codex Web serves this build at `/playground/` behind its existing Web login.
 The upstream caching service worker is replaced with a non-caching shim that
