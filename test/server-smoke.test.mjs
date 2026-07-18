@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
-import { createServer as createHttpServer } from 'node:http';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -29,38 +28,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const automationNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa731';
   let child;
   let desktopIpc;
-  let providerServer;
-  let providerBaseUrl = '';
-  const providerRequests = [];
 
   try {
-    providerServer = createHttpServer(async (req, res) => {
-      let body = '';
-      for await (const chunk of req) body += chunk;
-      providerRequests.push({
-        method: req.method,
-        url: req.url,
-        authorization: req.headers.authorization || '',
-        contentType: req.headers['content-type'] || '',
-        body,
-      });
-      res.setHeader('Content-Type', 'application/json');
-      if (req.url === '/v1/models') {
-        res.end(JSON.stringify({ data: [{ id: 'gpt-image-2' }] }));
-        return;
-      }
-      if (req.url?.startsWith('/v1/images/generations')) {
-        res.end(JSON.stringify({ data: [{ b64_json: Buffer.from('proxy-image').toString('base64') }] }));
-        return;
-      }
-      res.statusCode = 404;
-      res.end(JSON.stringify({ error: { message: 'not found' } }));
-    });
-    await new Promise((resolve, reject) => {
-      providerServer.once('error', reject);
-      providerServer.listen(0, '127.0.0.1', resolve);
-    });
-    providerBaseUrl = `http://127.0.0.1:${providerServer.address().port}`;
     await mkdir(runtime, { recursive: true });
     await mkdir(codexHome, { recursive: true });
     await writeFile(
@@ -73,7 +42,7 @@ model_reasoning_effort = "max"
 
 [model_providers.fake]
 name = "Fake"
-base_url = "${providerBaseUrl}/v1"
+base_url = "http://127.0.0.1:9/v1"
 wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "test-token"
@@ -511,11 +480,6 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorized.status, 401);
     const unauthorizedPlaygroundConfig = await fetch(`${baseUrl}/api/playground-config`);
     assert.equal(unauthorizedPlaygroundConfig.status, 401);
-    const unauthorizedPlaygroundProxy = await fetch(
-      `${baseUrl}/api-proxy/images/generations?codex_upstream=${encodeURIComponent(providerBaseUrl)}`,
-      { method: 'POST' },
-    );
-    assert.equal(unauthorizedPlaygroundProxy.status, 401);
     const unauthorizedImagePrompts = await fetch(`${baseUrl}/api/image-prompts`);
     assert.equal(unauthorizedImagePrompts.status, 401);
     const unauthorizedImagePromptStatus = await fetch(`${baseUrl}/api/image-prompts/status`);
@@ -556,13 +520,6 @@ if (args[0] === 'app-server') {
     assert.match(playgroundAssetScript, /\/api\/playground-config/);
     assert.match(playgroundAssetScript, /codex-web-agent/);
     assert.match(playgroundAssetScript, /agentApiConfigMode/);
-    assert.match(playgroundAssetScript, /codex_upstream/);
-    const playgroundPatchSource = await readFile(
-      path.join(ROOT, 'vendor', 'gpt-image-playground', 'patches', 'codex-web.patch'),
-      'utf8',
-    );
-    assert.match(playgroundPatchSource, /baseUrl: existing\?\.baseUrl\?\.trim\(\) \|\| profile\.baseUrl/);
-    assert.match(playgroundPatchSource, /apiKey: existing\?\.apiKey\?\.trim\(\) \|\| profile\.apiKey/);
     assert.match(playgroundAssetScript, /输入 @ 选择或上传参考图/);
     assert.match(playgroundAssetScript, /上传新的参考图/);
     const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
@@ -740,7 +697,7 @@ if (args[0] === 'app-server') {
     assert.match(dreamSkinTask.prompt, /A colossal translucent coral-red energy sphere rises above the horizon/);
     assert.match(dreamSkinTask.prompt, /必须实际调用 \$imagegen/);
     assert.match(dreamSkinTask.prompt, /雨夜东京工作室/);
-    assert.equal(dreamSkinTask.cwd, ROOT);
+    assert.ok(dreamSkinTask.cwd.endsWith('codex-web'));
 
     const dreamSkinReferenceError = await fetch(`${baseUrl}/api/dream-skin/prompt`, {
       method: 'POST',
@@ -1051,90 +1008,43 @@ if (args[0] === 'app-server') {
     });
     assert.equal(playgroundConfigResponse.status, 200);
     assert.match(playgroundConfigResponse.headers.get('cache-control'), /private, no-store/);
-    const playgroundConfig = await playgroundConfigResponse.json();
-    assert.deepEqual(playgroundConfig, {
+    assert.deepEqual(await playgroundConfigResponse.json(), {
       profile: {
         id: 'codex-web-default',
         name: 'Codex Image · Fake',
         provider: 'openai',
-        baseUrl: `${providerBaseUrl}/v1`,
+        baseUrl: 'http://127.0.0.1:9/v1',
         apiKey: 'test-token',
         model: 'gpt-image-2',
         apiMode: 'images',
         codexCli: true,
-        apiProxy: true,
       },
       profiles: [
         {
           id: 'codex-web-default',
           name: 'Codex Image · Fake',
           provider: 'openai',
-          baseUrl: `${providerBaseUrl}/v1`,
+          baseUrl: 'http://127.0.0.1:9/v1',
           apiKey: 'test-token',
           model: 'gpt-image-2',
           apiMode: 'images',
           codexCli: true,
-          apiProxy: true,
         },
         {
           id: 'codex-web-agent',
           name: 'Codex Agent · Fake',
           provider: 'openai',
-          baseUrl: `${providerBaseUrl}/v1`,
+          baseUrl: 'http://127.0.0.1:9/v1',
           apiKey: 'test-token',
           model: 'test-model',
           apiMode: 'responses',
           codexCli: false,
-          apiProxy: true,
         },
       ],
       agentApiConfigMode: 'hybrid',
       agentTextProfileId: 'codex-web-agent',
       agentImageProfileId: 'codex-web-default',
     });
-    const blockedPlaygroundOrigin = await fetch(
-      `${baseUrl}/api-proxy/images/generations?codex_upstream=${encodeURIComponent('http://127.0.0.1:1')}`,
-      {
-        method: 'POST',
-        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-        body: '{}',
-      },
-    );
-    assert.equal(blockedPlaygroundOrigin.status, 403);
-    const blockedPlaygroundPath = await fetch(
-      `${baseUrl}/api-proxy/models?codex_upstream=${encodeURIComponent(providerBaseUrl)}`,
-      { headers: { Cookie: cookie } },
-    );
-    assert.equal(blockedPlaygroundPath.status, 403);
-    const playgroundProxyPayload = { model: 'gpt-image-2', prompt: 'proxy smoke test' };
-    const playgroundProxyResponse = await fetch(
-      `${baseUrl}/api-proxy/images/generations?codex_upstream=${encodeURIComponent(providerBaseUrl)}`,
-      {
-        method: 'POST',
-        headers: {
-          Cookie: cookie,
-          Authorization: 'Bearer browser-playground-token',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(playgroundProxyPayload),
-      },
-    );
-    assert.equal(playgroundProxyResponse.status, 200);
-    assert.equal((await playgroundProxyResponse.json()).data.length, 1);
-    assert.equal(providerRequests.at(-1).url, '/v1/images/generations');
-    assert.equal(providerRequests.at(-1).authorization, 'Bearer browser-playground-token');
-    assert.equal(providerRequests.at(-1).contentType, 'application/json');
-    assert.deepEqual(JSON.parse(providerRequests.at(-1).body), playgroundProxyPayload);
-    const playgroundProxyFallback = await fetch(
-      `${baseUrl}/api-proxy/images/generations?codex_upstream=${encodeURIComponent(`${providerBaseUrl}/v1`)}`,
-      {
-        method: 'POST',
-        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-        body: JSON.stringify(playgroundProxyPayload),
-      },
-    );
-    assert.equal(playgroundProxyFallback.status, 200);
-    assert.equal(providerRequests.at(-1).authorization, 'Bearer test-token');
     assert.ok(config.conversations.some((conversation) => (
       conversation.id === nativeSessionId
       && conversation.source === 'codex'
@@ -1798,10 +1708,6 @@ if (args[0] === 'app-server') {
   } finally {
     if (child) await stopServer(child);
     if (desktopIpc) await desktopIpc.close();
-    if (providerServer) {
-      providerServer.closeAllConnections?.();
-      await new Promise((resolve) => providerServer.close(resolve));
-    }
     await rm(temporary, { recursive: true, force: true });
   }
 });

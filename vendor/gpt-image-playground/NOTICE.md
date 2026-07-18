@@ -15,7 +15,7 @@ cp vendor/gpt-image-playground/package-lock.json <upstream-checkout>/package-loc
 git -C <upstream-checkout> apply <codex-web-checkout>/vendor/gpt-image-playground/patches/codex-web.patch
 cd <upstream-checkout>
 npm ci
-VITE_API_PROXY_AVAILABLE=true npm run build
+npm run build
 rsync -a --delete --exclude sw.js dist/ <codex-web-checkout>/vendor/gpt-image-playground/app/
 ```
 
@@ -37,20 +37,13 @@ inserted as an explicit mention.
 When embedded in Codex Web, the build imports a paired image and Agent profile
 from the authenticated `/api/playground-config` endpoint. Gallery requests and
 Agent image tools use the Images API profile, while Agent conversations use the
-Codex provider's Responses API profile. Server values initialize missing
-profiles, while a URL or credential entered in the Playground settings remains
-authoritative on later loads. The image profile also preserves a previously
-chosen image model and initially uses `gpt-image-2`; the Agent profile follows
-the current Codex text model. Codex CLI compatibility mode remains enabled only
-on the image profile, so multi-image requests are split into concurrent
-single-image calls instead of sending an unsupported `n` parameter to
-Codex-compatible image gateways.
-
-The Codex Web build enables the Playground API proxy. Proxied requests include
-the normalized browser-configured API URL as `codex_upstream`; Codex Web only
-forwards supported image and Responses API paths to origins already present in
-its Provider configuration. This keeps the browser settings authoritative
-while avoiding upstream browser CORS requirements.
+Codex provider's Responses API profile. Both profiles refresh their URL and
+credential on each load. The image profile preserves a previously chosen image
+model and initially uses `gpt-image-2`; the Agent profile follows the current
+Codex text model. Codex CLI compatibility mode remains enabled only on the image
+profile, so multi-image requests are split into concurrent single-image calls
+instead of sending an unsupported `n` parameter to Codex-compatible image
+gateways.
 
 Codex Web serves this build at `/playground/` behind its existing Web login.
 The upstream caching service worker is replaced with a non-caching shim that
