@@ -16,7 +16,7 @@ index 5fc1614..ae33294 100644
  import Header from './components/Header'
  import SearchBar from './components/SearchBar'
  import TaskGrid from './components/TaskGrid'
-@@ -96,6 +96,59 @@ export default function App() {
+@@ -96,6 +96,61 @@ export default function App() {
      initStore()
    }, [setSettings])
 
@@ -50,6 +50,8 @@ index 5fc1614..ae33294 100644
 +          return {
 +            ...existing,
 +            ...profile,
++            baseUrl: existing?.baseUrl?.trim() || profile.baseUrl,
++            apiKey: existing?.apiKey?.trim() || profile.apiKey,
 +            model: profile.id === imageProfileId ? existing?.model || profile.model : profile.model,
 +          }
 +        })
