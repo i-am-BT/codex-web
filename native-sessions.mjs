@@ -238,6 +238,16 @@ export class NativeSessionStore extends EventEmitter {
     readSessionUpdates(cache, entry, this.maxMessages);
     return buildConversation(entry, cache, options, this.runningWindowMs);
   }
+
+  getMessage(id, sequence, generation) {
+    const conversation = this.get(id);
+    if (!conversation) return null;
+    if (Number.isInteger(generation) && generation !== conversation.generation) return null;
+    const target = Number(sequence);
+    if (!Number.isInteger(target) || target < 1) return null;
+    const message = this.details.get(id)?.messages.find((item) => item.seq === target);
+    return message ? { ...message } : null;
+  }
 }
 
 function prepareAppThreadQuery(db) {
@@ -900,11 +910,18 @@ function normalizeSandboxPolicy(value) {
 function buildConversation(entry, cache, options, runningWindowMs) {
   const after = Number(options.after);
   const requestedGeneration = Number(options.generation);
+  const requestedLimit = Number(options.limit);
   const hasAfter = Number.isInteger(after) && after >= 0;
+  const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+    ? Math.min(requestedLimit, cache.messages.length)
+    : 0;
   const generationMatches = Number.isInteger(requestedGeneration) && requestedGeneration === cache.generation;
   const firstSequence = cache.messages[0]?.seq || cache.nextSequence;
   const reset = hasAfter && (!generationMatches || after < firstSequence - 1);
-  const messages = hasAfter && !reset ? cache.messages.filter((message) => message.seq > after) : cache.messages;
+  const availableMessages = hasAfter && !reset
+    ? cache.messages.filter((message) => message.seq > after)
+    : cache.messages;
+  const messages = limit && (!hasAfter || reset) ? availableMessages.slice(-limit) : availableMessages;
 
   return {
     id: entry.id,
@@ -916,6 +933,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     latestTurnId: cache.latestTurnId,
     readOnly: false,
     truncated: cache.messagesTruncated,
+    hasEarlierMessages: messages.length < availableMessages.length,
     generation: cache.generation,
     cursor: Math.max(0, cache.nextSequence - 1),
     reset,

@@ -32,6 +32,13 @@
   --radius: 8px;
   --radius-sm: 6px;
   --shadow-lg: 0 22px 70px rgba(0, 0, 0, 0.34);
+  --skin-canvas-wash: rgba(7, 9, 13, 0.3);
+  --skin-content-wash: rgba(7, 9, 13, 0.38);
+  --skin-surface: rgba(17, 20, 24, 0.76);
+  --skin-surface-soft: rgba(17, 20, 24, 0.58);
+  --skin-surface-strong: rgba(17, 20, 24, 0.88);
+  --skin-accent-glow: rgba(91, 140, 255, 0.2);
+  --skin-art-position: 72% 45%;
   --ease: cubic-bezier(0.2, 0, 0, 1);
 }
 
@@ -63,6 +70,13 @@ body[data-theme="light"] {
   --user-bg: #3267d5;
   --code-bg: #f0f2f5;
   --shadow-lg: 0 20px 54px rgba(33, 40, 50, 0.14);
+  --skin-canvas-wash: rgba(245, 249, 255, 0.12);
+  --skin-content-wash: rgba(245, 249, 255, 0.24);
+  --skin-surface: rgba(244, 248, 255, 0.74);
+  --skin-surface-soft: rgba(244, 248, 255, 0.58);
+  --skin-surface-strong: rgba(255, 255, 255, 0.86);
+  --skin-accent-glow: rgba(47, 103, 216, 0.2);
+  --skin-art-position: 72% 45%;
 }
 
 html {
@@ -369,18 +383,26 @@ body .pill {
 
 .sideActions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 40px;
+  grid-template-columns: minmax(0, 1fr) 36px;
   gap: 8px;
 }
 
 .sideActions .miniPrimary {
   width: 100%;
+  min-height: 36px;
+  padding: 0 12px;
+  font-size: 13px;
+}
+
+.sideActions .miniPrimary .lucide {
+  width: 14px;
+  height: 14px;
 }
 
 body .settingsToggle {
   display: inline-grid;
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   place-items: center;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -563,6 +585,188 @@ body.modalOpen {
   width: 16px;
   height: 16px;
   color: var(--primary);
+}
+
+.dreamSkinConceptSection {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+
+.dreamSkinConceptHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.dreamSkinConceptHead > :last-child {
+  color: var(--text-subtle);
+  font-size: 10px;
+  font-weight: 520;
+}
+
+.dreamSkinConceptList {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.dreamSkinConcept {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 84px;
+  grid-template-rows: 48px minmax(0, 1fr);
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  padding: 4px 5px 6px;
+  text-align: left;
+  transition: border-color 150ms var(--ease), background 150ms var(--ease), box-shadow 150ms var(--ease), color 150ms var(--ease);
+}
+
+.dreamSkinConcept:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.dreamSkinConcept.active {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  box-shadow: inset 0 0 0 1px var(--primary), 0 0 0 2px color-mix(in srgb, var(--primary) 18%, transparent);
+  color: var(--text);
+}
+
+.dreamSkinConcept:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.dreamSkinConcept:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.dreamSkinConceptThumb {
+  display: block;
+  width: 100%;
+  height: 48px;
+  border-radius: 4px;
+  object-fit: cover;
+  object-position: center;
+}
+
+.dreamSkinConceptLabel {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 17px minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+}
+
+.dreamSkinConceptIndex {
+  color: var(--text-subtle);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.dreamSkinConceptName {
+  min-width: 0;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.dreamSkinConcept > .lucide {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  width: 13px;
+  height: 13px;
+  color: var(--primary);
+  opacity: 0;
+}
+
+.dreamSkinConcept.active > .lucide {
+  opacity: 1;
+}
+
+.dreamSkinConceptPreview {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(220px, 42%) minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+}
+
+.dreamSkinConceptPreview.hidden {
+  display: none;
+}
+
+.dreamSkinPreviewMedia {
+  display: block;
+  min-width: 0;
+  height: 118px;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--canvas);
+  padding: 0;
+}
+
+.dreamSkinPreviewMedia:hover img {
+  transform: scale(1.015);
+}
+
+.dreamSkinPreviewMedia img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 180ms var(--ease);
+}
+
+.dreamSkinPreviewInfo {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 7px;
+  padding: 10px 12px;
+}
+
+.dreamSkinPreviewInfo strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.dreamSkinPreviewInfo p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.dreamSkinPreviewMode {
+  align-self: flex-start;
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .dreamSkinClose {
@@ -906,7 +1110,7 @@ body[data-theme] .providerBox {
 body .history {
   min-height: 120px;
   flex: 1 1 auto;
-  gap: 14px;
+  gap: 9px;
   padding-right: 2px;
 }
 
@@ -918,7 +1122,7 @@ body .history {
 }
 
 .historyProject {
-  gap: 5px;
+  gap: 2px;
 }
 
 .historyProjectHeader {
@@ -927,20 +1131,29 @@ body .history {
   grid-template-columns: minmax(0, 1fr) 28px;
   align-items: center;
   min-width: 0;
+  min-height: 34px;
+  border-radius: 7px;
+  transition: background 120ms var(--ease);
+}
+
+.historyProjectHeader:hover,
+.historyProjectHeader:focus-within {
+  background: var(--surface-hover);
 }
 
 .historyProjectHead {
   display: grid;
-  grid-template-columns: 15px minmax(0, 1fr);
+  grid-template-columns: 18px minmax(0, 1fr) 14px;
   align-items: center;
   width: 100%;
+  min-height: 34px;
   min-width: 0;
-  gap: 5px;
+  gap: 7px;
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: 7px 0 0 7px;
   background: transparent;
   color: inherit;
-  padding: 5px 7px;
+  padding: 3px 4px 3px 7px;
   text-align: left;
   cursor: pointer;
   transition: background 140ms var(--ease), color 140ms var(--ease);
@@ -956,7 +1169,8 @@ body .history {
   background: transparent;
   color: var(--text-subtle);
   padding: 0;
-  opacity: 0.62;
+  opacity: 0.36;
+  transition: background 120ms var(--ease), color 120ms var(--ease), opacity 120ms var(--ease);
 }
 
 .historyProjectMenuButton:hover,
@@ -974,7 +1188,7 @@ body .history {
 
 .historyProjectMenu {
   position: absolute;
-  z-index: 30;
+  z-index: 90;
   top: calc(100% + 4px);
   right: 2px;
   display: grid;
@@ -1031,14 +1245,24 @@ body .history {
   height: 15px;
 }
 
-.historyProjectHead:hover {
-  background: var(--surface-hover);
+.historyProjectFolder {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  color: var(--text-muted);
 }
 
-.historyProjectHeadText {
-  display: grid;
+.historyProjectFolder .lucide {
+  width: 17px;
+  height: 17px;
+  stroke-width: 1.75;
+}
+
+.historyProjectTitle {
+  display: flex;
   min-width: 0;
-  gap: 1px;
+  align-items: center;
 }
 
 .historyProjectChevron {
@@ -1047,13 +1271,14 @@ body .history {
   width: 15px;
   height: 15px;
   color: var(--text-subtle);
+  opacity: 0.72;
   transform: rotate(0deg);
   transition: transform 160ms var(--ease), color 140ms var(--ease);
 }
 
 .historyProjectChevron .lucide {
-  width: 13px;
-  height: 13px;
+  width: 12px;
+  height: 12px;
 }
 
 .historyProjectHead:hover .historyProjectChevron {
@@ -1065,44 +1290,32 @@ body .history {
 }
 
 .historyProjectName {
+  min-width: 0;
+  overflow: hidden;
   color: var(--text);
-  font-size: 11px;
-  font-weight: 740;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .historyProjectCount {
-  display: inline-grid;
-  min-width: 18px;
-  height: 18px;
-  flex: 0 0 auto;
-  place-items: center;
-  border: 1px solid color-mix(in srgb, var(--border) 86%, transparent);
-  border-radius: 6px;
-  background: var(--surface-raised);
-  color: var(--text-muted);
-  padding: 0 5px;
-  font-size: 9px;
-  font-variant-numeric: tabular-nums;
-  font-weight: 720;
-  line-height: 1;
-  transition: border-color 140ms var(--ease), background 140ms var(--ease), color 140ms var(--ease);
-}
-
-.historyProjectHead:hover .historyProjectCount,
-.historyProjectHead[aria-expanded="true"] .historyProjectCount {
-  border-color: var(--border-strong);
-  background: var(--surface);
-  color: var(--text);
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .historyProjectPath {
-  color: var(--text-subtle);
-  font-size: 9px;
-  line-height: 1.45;
+  display: none;
 }
 
 .historyProjectItems {
-  gap: 3px;
+  gap: 1px;
+  padding-left: 22px;
 }
 
 .historyProjectItems[hidden] {
@@ -1114,80 +1327,205 @@ body .history {
 }
 
 body .hist {
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  min-height: 42px;
-  gap: 3px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  min-height: 34px;
+  gap: 2px;
+  border: 0;
+  border-radius: 7px;
   background: transparent;
   color: var(--text-muted);
-  padding: 5px 5px 5px 9px;
+  padding: 2px 4px 2px 7px;
   font-size: 12px;
-  transition: border-color 140ms var(--ease), background 140ms var(--ease), color 140ms var(--ease);
+  transition: background 120ms var(--ease), color 120ms var(--ease);
 }
 
 body .hist.native {
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
 }
 
 body .hist:hover {
-  border-color: var(--border);
   background: var(--surface-hover);
   color: var(--text);
 }
 
 body .hist.active {
-  border-color: var(--primary-line);
-  background: var(--primary-soft);
+  border: 0;
+  background: var(--surface-active);
   color: var(--text);
-  box-shadow: inset 2px 0 0 var(--primary);
+  box-shadow: none;
+}
+
+body[data-theme] .hist {
+  background: transparent;
+}
+
+body[data-theme] .hist:hover {
+  background: var(--surface-hover);
+}
+
+body[data-theme] .hist.active {
+  background: var(--surface-active);
 }
 
 .histOpen {
   position: relative;
   min-width: 0;
-  min-height: 30px;
+  min-height: 28px;
+  overflow: hidden;
   color: inherit;
-  padding: 0 4px;
+  padding: 0 3px;
   font-size: 12px;
-  font-weight: 560;
-  line-height: 1.3;
+  font-weight: 520;
+  line-height: 28px;
   text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .histOpen.running {
-  padding-left: 17px;
+  padding-left: 3px;
 }
 
 .histOpen.running::before {
-  position: absolute;
-  top: 50%;
-  left: 4px;
-  width: 7px;
-  height: 7px;
+  content: none;
+}
+
+.histRunning {
+  display: block;
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border: 1.5px solid var(--success);
   border-radius: 50%;
-  background: var(--success);
-  box-shadow: 0 0 0 3px var(--success-soft);
-  content: "";
-  transform: translateY(-50%);
+  background: var(--surface);
+  box-shadow: 0 0 0 2px var(--success-soft);
 }
 
 body .histSource {
-  min-width: 26px;
-  height: 22px;
+  min-width: 20px;
+  height: 18px;
   border: 0;
-  border-radius: 4px;
-  background: var(--surface-active);
+  border-radius: 3px;
+  background: transparent;
   color: var(--text-subtle);
-  font-size: 9px;
-  font-weight: 760;
+  font-size: 8px;
+  font-weight: 700;
 }
 
 body .histRename,
 body .histDelete {
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   padding: 0;
+}
+
+body[data-theme] .histRename,
+body[data-theme] .histDelete {
+  background: transparent;
+}
+
+.historyProjectPreview {
+  position: fixed;
+  z-index: 70;
+  display: grid;
+  width: min(330px, calc(100vw - 32px));
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
+  color: var(--text);
+  padding: 14px 15px;
+  box-shadow: 0 16px 42px rgba(15, 23, 42, 0.16), 0 3px 10px rgba(15, 23, 42, 0.08);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-4px);
+  transition: opacity 120ms var(--ease), transform 120ms var(--ease);
+  backdrop-filter: blur(18px);
+}
+
+.historyProjectPreview[hidden] {
+  display: none;
+}
+
+.historyProjectPreview.visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.historyProjectPreviewHeading,
+.historyProjectPreviewIdentity,
+.historyProjectPreviewRow {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.historyProjectPreviewHeading {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.historyProjectPreviewIdentity {
+  gap: 9px;
+}
+
+.historyProjectPreviewIdentity > .lucide {
+  width: 19px;
+  height: 19px;
+  flex: 0 0 19px;
+}
+
+.historyProjectPreviewIdentity strong {
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.historyProjectPreviewPin {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  place-items: center;
+  color: var(--text-subtle);
+}
+
+.historyProjectPreviewPin .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.historyProjectPreviewRow {
+  gap: 9px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.historyProjectPreviewRow > .lucide {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
+  color: var(--text-subtle);
+}
+
+.historyProjectPreviewStats span {
+  font-variant-numeric: tabular-nums;
+}
+
+.historyProjectPreviewDivider {
+  height: 1px;
+  background: var(--border);
+}
+
+.historyProjectPreviewPath span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 body .histDelete {
@@ -1218,6 +1556,11 @@ body .histDelete:hover {
     opacity: 1;
     pointer-events: auto;
     transform: translateX(0);
+  }
+
+  .historyProjectHeader:hover .historyProjectMenuButton,
+  .historyProjectHeader:focus-within .historyProjectMenuButton {
+    opacity: 0.88;
   }
 }
 
@@ -2687,6 +3030,23 @@ body .nativeNotice {
   display: none;
 }
 
+body .nativeHistoryLoad {
+  align-self: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+body .nativeHistoryLoad:hover {
+  border-color: var(--primary-line);
+  background: var(--primary-soft);
+  color: var(--text);
+}
+
 .composerProjectPicker {
   position: relative;
   z-index: 4;
@@ -2849,10 +3209,11 @@ body[data-theme] .composerProjectCustom input {
   font-weight: 650;
 }
 
-.composerProjectPicker + .box {
+.composerProjectPicker:not(.hidden) + .box {
   border-top-left-radius: 0;
   border-top-right-radius: 0;
 }
+
 body .box {
   position: relative;
   display: grid;
@@ -3441,6 +3802,92 @@ body[data-theme="dark"][data-chat-bg="paper"] .chat {
 
 body[data-chat-bg="custom"] .chat {
   background-color: var(--canvas);
+  background-image: var(--custom-chat-bg);
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+}
+
+body[data-chat-bg="skin"] .app {
+  background-color: var(--canvas);
+  background-image:
+    linear-gradient(var(--skin-canvas-wash), var(--skin-canvas-wash)),
+    var(--custom-chat-bg);
+  background-position: var(--skin-art-position);
+  background-repeat: no-repeat;
+  background-size: cover;
+}
+
+body[data-chat-bg="skin"] .main {
+  background: transparent;
+}
+
+body[data-chat-bg="skin"] .chat {
+  background:
+    linear-gradient(90deg, var(--skin-content-wash), transparent 64%),
+    transparent;
+}
+
+body[data-chat-bg="skin"] .composer {
+  background: transparent;
+}
+
+body[data-chat-bg="skin"] .side,
+body[data-chat-bg="skin"] .top {
+  background: linear-gradient(90deg, var(--skin-surface), var(--skin-surface-soft));
+  border-color: var(--primary-line);
+  backdrop-filter: blur(16px) saturate(1.08);
+}
+
+body[data-chat-bg="skin"] .box,
+body[data-chat-bg="skin"] .composerPopover,
+body[data-chat-bg="skin"] .composerProjectPanel {
+  background: var(--skin-surface-strong);
+  border-color: var(--primary-line);
+  backdrop-filter: blur(18px) saturate(1.08);
+}
+
+body[data-chat-bg="skin"] .msg.image,
+body[data-chat-bg="skin"] .nativeHistoryLoad,
+body[data-chat-bg="skin"] .providerBox {
+  border-color: var(--primary-line);
+  background: var(--skin-surface);
+  box-shadow: 0 8px 24px var(--skin-accent-glow);
+  backdrop-filter: blur(10px) saturate(1.06);
+}
+
+body[data-chat-bg="skin"] .msg.assistant {
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+body[data-chat-bg="skin"] .miniPrimary,
+body[data-chat-bg="skin"] .send {
+  background: var(--primary);
+  color: var(--canvas);
+  box-shadow: 0 6px 18px var(--skin-accent-glow);
+}
+
+body[data-chat-bg="skin"] .miniPrimary:hover,
+body[data-chat-bg="skin"] .send:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+body[data-chat-bg="skin"] .logoMark,
+body[data-chat-bg="skin"] .settingsToggle,
+body[data-chat-bg="skin"] .themeToggle,
+body[data-chat-bg="skin"] .attachBtn,
+body[data-chat-bg="skin"] .composerPermissionToggle,
+body[data-chat-bg="skin"] .composerModelToggle {
+  border-color: var(--primary-line);
+  background: color-mix(in srgb, var(--primary) 9%, transparent);
+  color: var(--primary);
+}
+
+body[data-chat-bg="skin"] .hist.active {
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
+  box-shadow: inset 3px 0 0 var(--primary);
 }
 
 @keyframes statusPulse {
@@ -3558,6 +4005,10 @@ body[data-chat-bg="custom"] .chat {
     box-shadow: 20px 0 54px rgba(0, 0, 0, 0.28);
   }
 
+  .historyProjectPreview {
+    display: none !important;
+  }
+
   body .scrim {
     background: rgba(0, 0, 0, 0.5);
     backdrop-filter: blur(2px);
@@ -3650,6 +4101,24 @@ body[data-chat-bg="custom"] .chat {
 
   .dreamSkinOptions {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dreamSkinConceptList {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dreamSkinConcept {
+    min-height: 82px;
+  }
+
+  .dreamSkinConceptPreview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dreamSkinPreviewMedia {
+    height: 132px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
   }
 
   .dreamSkinActions {

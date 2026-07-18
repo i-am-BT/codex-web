@@ -361,6 +361,22 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(conversation.messages.filter((message) => message.content === '用户消息').length, 1);
     assert.equal(conversation.messages.filter((message) => message.content === '助手进度').length, 1);
 
+    const limited = store.get(id, { limit: 3 });
+    assert.equal(limited.messages.length, 3);
+    assert.equal(limited.hasEarlierMessages, true);
+    assert.deepEqual(limited.messages, conversation.messages.slice(-3));
+    assert.deepEqual(store.getMessage(id, limited.messages[0].seq, limited.generation), limited.messages[0]);
+    assert.equal(store.getMessage(id, limited.messages[0].seq, limited.generation + 1), null);
+
+    const limitedReset = store.get(id, {
+      after: conversation.cursor,
+      generation: conversation.generation + 1,
+      limit: 3,
+    });
+    assert.equal(limitedReset.reset, true);
+    assert.equal(limitedReset.messages.length, 3);
+    assert.equal(limitedReset.hasEarlierMessages, true);
+
     store.start();
     const changed = once(store, 'change');
     await appendFile(sessionFile, jsonl([{

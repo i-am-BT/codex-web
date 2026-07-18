@@ -389,16 +389,30 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body\[data-theme\] \.requestAction\s*\{[^}]*background:\s*var\(--surface-raised\);[^}]*color:\s*var\(--text\)/s);
     assert.match(uiStyles, /body\[data-theme\] \.requestAction\.danger\s*\{[^}]*background:\s*var\(--danger-soft\);[^}]*color:\s*var\(--danger\)/s);
     assert.match(uiStyles, /\.settingsDialog \.dreamSkinGenerator/);
+    assert.match(uiStyles, /\.dreamSkinConceptList\s*\{/);
+    assert.match(uiStyles, /\.dreamSkinConcept\.active\s*\{/);
+    assert.match(uiStyles, /\.dreamSkinConceptThumb\s*\{/);
+    assert.match(uiStyles, /\.dreamSkinConceptPreview\s*\{/);
+    assert.match(uiStyles, /body\[data-chat-bg="custom"\] \.chat\s*\{[^}]*background-image:\s*var\(--custom-chat-bg\)/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.app\s*\{[^}]*background-image:[^}]*var\(--custom-chat-bg\)[^}]*background-position:\s*var\(--skin-art-position\)/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.main\s*\{[^}]*background:\s*transparent/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.chat\s*\{[^}]*var\(--skin-content-wash\)/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.side,[^}]*body\[data-chat-bg="skin"\] \.top\s*\{[^}]*var\(--skin-surface-soft\)/s);
+    assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.miniPrimary,[^}]*body\[data-chat-bg="skin"\] \.send\s*\{[^}]*background:\s*var\(--primary\)/s);
     assert.match(uiStyles, /\.generatedBackgroundApply/);
     assert.doesNotMatch(uiStyles, /data-chat-bg="dream-skin"|portal-hero\.png/);
     assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
-    assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
+    assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto auto/s);
+    assert.match(uiStyles, /\.historyProjectFolder\s*\{/);
+    assert.match(uiStyles, /\.historyProjectPreview\.visible\s*\{/);
+    assert.match(uiStyles, /\.historyProjectItems\s*\{[^}]*padding-left:\s*22px/s);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
     assert.match(uiStyles, /\.memoryCitationItem\[open\]/);
     assert.match(uiStyles, /\.composerModelToggle/);
     assert.match(uiStyles, /\.composerPermissionToggle/);
     assert.match(uiStyles, /\.composerProjectToggle/);
     assert.match(uiStyles, /\.composerProjectPanel/);
+    assert.match(uiStyles, /\.composerProjectPicker:not\(\.hidden\) \+ \.box/);
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
@@ -520,7 +534,139 @@ if (args[0] === 'app-server') {
     });
     assert.equal(dreamSkinSkill.status, 200);
     assert.match(dreamSkinSkill.headers.get('content-type'), /markdown|text\/plain/);
-    assert.match(await dreamSkinSkill.text(), /Required Workflow[\s\S]*imagegen/);
+    const dreamSkinSkillMarkdown = await dreamSkinSkill.text();
+    assert.match(dreamSkinSkillMarkdown, /Required Workflow[\s\S]*imagegen/);
+    assert.match(dreamSkinSkillMarkdown, /Theme Integration Contract[\s\S]*concept-themes\.json/);
+
+    const dreamSkinConceptSource = await fetch(
+      `${baseUrl}/assets/dream-skin/background-generation-prompts.md`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(dreamSkinConceptSource.status, 200);
+    const dreamSkinConceptMarkdown = await dreamSkinConceptSource.text();
+    assert.equal((dreamSkinConceptMarkdown.match(/^## skin-0[1-8]｜/gm) || []).length, 8);
+    assert.match(dreamSkinConceptMarkdown, /skin-03｜红白未来城市主题/);
+    assert.match(dreamSkinConceptMarkdown, /完整皮肤由本文件生成的纯背景与 `concept-themes\.json`/);
+
+    const dreamSkinThemeSource = await fetch(
+      `${baseUrl}/assets/dream-skin/concept-themes.json`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(dreamSkinThemeSource.status, 200);
+    const dreamSkinThemePayload = await dreamSkinThemeSource.json();
+    assert.equal(dreamSkinThemePayload.schemaVersion, 1);
+    assert.equal(Object.keys(dreamSkinThemePayload.themes).length, 8);
+
+    const dreamSkinConfigResponse = await fetch(`${baseUrl}/api/config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(dreamSkinConfigResponse.status, 200);
+    const dreamSkinConfig = await dreamSkinConfigResponse.json();
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.length, 8);
+    assert.deepEqual(
+      dreamSkinConfig.dreamSkinConcepts.map((concept) => concept.id),
+      [
+        'skin-01',
+        'skin-02',
+        'skin-03',
+        'skin-04',
+        'skin-05',
+        'skin-06',
+        'skin-07',
+        'skin-08',
+      ],
+    );
+    assert.deepEqual(
+      dreamSkinConfig.dreamSkinConcepts.map((concept) => concept.name),
+      [
+        '粉系玫瑰人物主题',
+        '财神打工主题',
+        '红白未来城市主题',
+        '清透鼠尾草人物主题',
+        '彩色灵感小宇宙主题',
+        '蓝紫星夜人物主题',
+        '青蓝虚拟歌姬主题',
+        '舞台黑金人物主题',
+      ],
+    );
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.find((concept) => concept.id === 'skin-03').mode, 'no-person');
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.every((concept) => !('prompt' in concept)), true);
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.every((concept) => concept.theme?.colors?.light && concept.theme?.colors?.dark), true);
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.find((concept) => concept.id === 'skin-07').theme.colors.light.accent, '#0b7f91');
+    assert.equal(dreamSkinConfig.dreamSkinConcepts.find((concept) => concept.id === 'skin-07').theme.art.focusX, 0.73);
+    assert.deepEqual(
+      dreamSkinConfig.dreamSkinConcepts.map((concept) => concept.wallpaper),
+      [
+        '/assets/dream-skin/wallpapers/skin-01.jpg',
+        '/assets/dream-skin/wallpapers/skin-02.jpg',
+        '/assets/dream-skin/wallpapers/skin-03.jpg',
+        '/assets/dream-skin/wallpapers/skin-04.jpg',
+        '/assets/dream-skin/wallpapers/skin-05.jpg',
+        '/assets/dream-skin/wallpapers/skin-06.jpg',
+        '/assets/dream-skin/wallpapers/skin-07.jpg',
+        '/assets/dream-skin/wallpapers/skin-08.jpg',
+      ],
+    );
+
+    const dreamSkinWallpaper = await fetch(
+      `${baseUrl}/assets/dream-skin/wallpapers/skin-03.jpg`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(dreamSkinWallpaper.status, 200);
+    assert.match(dreamSkinWallpaper.headers.get('content-type'), /image\/jpeg/);
+    assert.ok((await dreamSkinWallpaper.arrayBuffer()).byteLength > 100_000);
+
+    const retiredDreamSkinPresetAppearance = await fetch(`${baseUrl}/api/appearance`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chatBackground: 'dream:preset-midnight-aurora',
+        theme: 'dark',
+      }),
+    });
+    assert.equal(retiredDreamSkinPresetAppearance.status, 200);
+    const retiredDreamSkinPresetState = (await retiredDreamSkinPresetAppearance.json()).appearance;
+    assert.equal(retiredDreamSkinPresetState.chatBackground, 'default');
+    assert.equal(retiredDreamSkinPresetState.theme, 'dark');
+
+    const appliedDreamSkinWallpaper = await fetch(`${baseUrl}/api/appearance`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chatBackground: 'dream:skin-03' }),
+    });
+    assert.equal(appliedDreamSkinWallpaper.status, 200);
+    assert.equal((await appliedDreamSkinWallpaper.json()).appearance.chatBackground, 'dream:skin-03');
+
+    const generatedDreamSkinUpload = await fetch(`${baseUrl}/api/appearance/background`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Dream Skin generated.png',
+        type: 'image/png',
+        data: `data:image/png;base64,${Buffer.from('dream-skin-smoke').toString('base64')}`,
+        themeId: 'skin-07',
+      }),
+    });
+    assert.equal(generatedDreamSkinUpload.status, 200);
+    const generatedDreamSkinState = await generatedDreamSkinUpload.json();
+    assert.equal(generatedDreamSkinState.background.themeId, 'skin-07');
+    assert.equal(
+      generatedDreamSkinState.appearance.customBackgrounds.find(
+        (background) => background.value === generatedDreamSkinState.background.value,
+      ).themeId,
+      'skin-07',
+    );
+
+    const persistedDreamSkinConfig = await fetch(`${baseUrl}/api/config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(persistedDreamSkinConfig.status, 200);
+    assert.equal(
+      (await persistedDreamSkinConfig.json()).appearance.customBackgrounds.find(
+        (background) => background.value === generatedDreamSkinState.background.value,
+      ).themeId,
+      'skin-07',
+    );
 
     const dreamSkinAppearanceResponse = await fetch(`${baseUrl}/api/appearance`, {
       method: 'PATCH',
@@ -535,15 +681,20 @@ if (args[0] === 'app-server') {
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         description: '雨夜东京工作室，右侧霓虹窗景',
-        mode: 'no-person',
+        conceptId: 'skin-03',
         referenceCount: 0,
       }),
     });
     assert.equal(dreamSkinPromptResponse.status, 200);
     const dreamSkinTask = await dreamSkinPromptResponse.json();
     assert.equal(dreamSkinTask.mode, 'no-person');
+    assert.equal(dreamSkinTask.conceptId, 'skin-03');
     assert.equal(dreamSkinTask.skill, 'vendor/codex-dream-skin/SKILL.md');
     assert.match(dreamSkinTask.prompt, /完整读取并遵循项目内置技能/);
+    assert.match(dreamSkinTask.prompt, /选用概念风格：skin-03 · 红白未来城市主题/);
+    assert.match(dreamSkinTask.prompt, /完整 Dream Skin 的 artwork 层/);
+    assert.match(dreamSkinTask.prompt, /严禁把侧栏、卡片、按钮、输入框或文字画进图片/);
+    assert.match(dreamSkinTask.prompt, /A colossal translucent coral-red energy sphere rises above the horizon/);
     assert.match(dreamSkinTask.prompt, /必须实际调用 \$imagegen/);
     assert.match(dreamSkinTask.prompt, /雨夜东京工作室/);
     assert.ok(dreamSkinTask.cwd.endsWith('codex-web'));
@@ -565,6 +716,15 @@ if (args[0] === 'app-server') {
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
     assert.match(page, /function createDreamSkinGenerator/);
+    assert.match(page, /function renderDreamSkinConcepts/);
+    assert.match(page, /function renderDreamSkinConceptPreview/);
+    assert.match(page, /function selectDreamSkinConcept/);
+    assert.match(page, /saveAppearance\(\{chatBackground:'dream:'\+concept\.id\}\)/);
+    assert.match(page, /function applyDreamSkinTheme/);
+    assert.match(page, /const bg=skin&&backgroundUrl\?'skin':backgroundUrl\?'custom':selected/);
+    assert.match(page, /themeId:concept\?\.id\|\|''/);
+    assert.match(page, /if\(findDreamSkinConcept\(appearance\.chatBackground\)\)openDreamSkinGenerator\(\)/);
+    assert.match(page, /conceptId:dreamSkinSelectedConcept/);
     assert.match(page, /function generateDreamSkinBackground/);
     assert.match(page, /function applyGeneratedImageBackground/);
     assert.match(page, /generatedBackgroundApply/);
@@ -580,7 +740,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /image_view_activity/);
     assert.match(page, /function nativeToolImageUrls/);
     assert.match(page, /function createActivityImageGallery/);
-    assert.match(page, /row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(source==='codex'\)/s);
+    assert.match(page, /row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(item\.status==='running'\)[\s\S]*row\.appendChild\(running\);\s*}\s*if\(source==='codex'\)/s);
     assert.match(page, /galleryOnly:true/);
     assert.doesNotMatch(page, /base\+\(index\+1\)\+generation/);
     assert.match(page, /continueMsg messageAction/);
@@ -592,6 +752,9 @@ if (args[0] === 'app-server') {
     assert.match(page, /stack\.classList\.toggle\('single',stack\.children\.length===1\)/);
     assert.match(page, /function runningActivityVerb/);
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
+    assert.match(page, /NATIVE_INITIAL_MESSAGE_LIMIT=60/);
+    assert.match(page, /images=external&limit=/);
+    assert.match(page, /function addNativeHistoryLoadButton/);
     assert.match(page, /function scheduleNativeCompletionSync/);
     assert.match(page, /function reconcileNativeCompletion/);
     assert.match(page, /runtime\.type==='connection-error'/);
@@ -606,6 +769,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /function syncMenuButton/);
     assert.match(page, /sideCollapsed/);
     assert.match(page, /function setHistoryProjectExpanded/);
+    assert.match(page, /function showHistoryProjectPreview/);
+    assert.match(page, /itemCount\+' 个对话串 · '\+runningCount\+' 个已开启'/);
     assert.match(page, /codexWeb\.historyProjectsCollapsed/);
     assert.match(page, /codexWeb\.historyProjectsHidden/);
     assert.match(page, /function createHistoryProjectMenu/);
@@ -615,7 +780,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /function renameHistoryProject/);
     assert.match(page, /'pencil','重命名项目'/);
     assert.match(page, /historyProjectName\(item\.cwd\)/);
-    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\)return/);
+    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)return/);
     assert.match(page, /\/api\/native-projects\/archive/);
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);
@@ -624,6 +789,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /function renderComposerProjectOptions/);
     assert.match(page, /function selectComposerProjectPath/);
     assert.match(page, /composerProjectToggle/);
+    assert.match(page, /composerProjectPicker\.classList\.toggle\('hidden',hasConversation\)/);
+    assert.match(page, /composerProjectPicker\.setAttribute\('aria-hidden',String\(hasConversation\)\)/);
     assert.match(page, /function enqueuePrompt/);
     assert.match(page, /function steerQueuedPrompt/);
     assert.match(page, /function showNativeSteerOptimistically/);
@@ -635,6 +802,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /function formatMessageTime/);
     assert.match(page, /function enhanceSettingsModal/);
     assert.match(page, /function openImagePreview/);
+    assert.match(page, /在新任务中继续/);
+    assert.match(page, /continueAfter:true/);
     assert.doesNotMatch(page, /查看原图/);
     assert.match(page, /\/api\/password/);
     assert.match(page, /codexWeb\.promptQueue\.v1/);
@@ -942,6 +1111,38 @@ if (args[0] === 'app-server') {
       { headers: { Cookie: cookie } },
     );
     assert.equal(falseToolImage.status, 404);
+
+    const limitedNativeSession = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}?limit=3`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(limitedNativeSession.status, 200);
+    const limitedNativeConversation = (await limitedNativeSession.json()).conversation;
+    assert.equal(limitedNativeConversation.messages.length, 3);
+    assert.equal(limitedNativeConversation.hasEarlierMessages, true);
+    const externalizedImage = limitedNativeConversation.messages.find((message) => message.role === 'image');
+    assert.match(externalizedImage.content, new RegExp(
+      `^/api/native-sessions/${nativeSessionId}/images/${externalizedImage.seq}\\?generation=\\d+$`,
+    ));
+
+    const externalizedNativeSession = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}?images=external`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(externalizedNativeSession.status, 200);
+    const externalizedNativeConversation = (await externalizedNativeSession.json()).conversation;
+    assert.equal(externalizedNativeConversation.messages.length, nativeConversation.messages.length);
+    assert.match(
+      externalizedNativeConversation.messages.find((message) => message.role === 'image').content,
+      new RegExp(`^/api/native-sessions/${nativeSessionId}/images/\\d+\\?generation=\\d+$`),
+    );
+
+    const nativeImage = await fetch(`${baseUrl}${externalizedImage.content}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(nativeImage.status, 200);
+    assert.equal(nativeImage.headers.get('content-type'), 'image/png');
+    assert.equal(Buffer.from(await nativeImage.arrayBuffer()).toString(), 'smoke');
 
     const restartedFromFirst = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
       method: 'POST',

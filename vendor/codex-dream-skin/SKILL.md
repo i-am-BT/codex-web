@@ -1,8 +1,11 @@
-# Dream Skin Background Generator
+# Dream Skin Theme Artwork Generator
 
 Use this skill when a Codex Web task asks you to generate a chat background or
-mentions Dream Skin. The deliverable is a real wallpaper bitmap, not a prompt,
-mockup, screenshot, theme preview, or application UI.
+mentions Dream Skin. The generated bitmap is the artwork layer of a complete
+theme pack. Codex Web applies the selected concept's real panel, accent, text,
+border, focus, and translucency metadata on top of that artwork. The image
+itself must remain a real wallpaper, not a prompt, mockup, screenshot, theme
+preview, or application UI.
 
 ## Required Workflow
 
@@ -14,7 +17,8 @@ mockup, screenshot, theme preview, or application UI.
 3. Use the available `imagegen` skill to generate the image. Do not stop after
    writing or refining a prompt.
 4. Return one final opaque wallpaper image in the task response so Codex Web can
-   offer it as a selectable background.
+   offer it as a selectable Dream Skin theme while retaining the selected
+   concept palette.
 
 ## Output Contract
 
@@ -29,6 +33,20 @@ mockup, screenshot, theme preview, or application UI.
 - Preserve usable midtones so the same image works beneath light and dark UI
   overlays. Avoid blank white and crushed black areas in the safe zone.
 - Output an opaque PNG or high-quality JPEG. Do not edit Codex Web source files.
+- Match the selected concept's dominant and secondary colors closely enough for
+  the real Web controls and translucent surfaces to feel like one designed skin.
+
+## Theme Integration Contract
+
+- The reference may show a complete themed Codex window. Treat that screenshot
+  as the target mood and composition, but generate only the underlying artwork.
+- Do not bake fake controls into the bitmap. Codex Web owns the real sidebar,
+  header, messages, cards, buttons, and composer and themes them from
+  `concept-themes.json`.
+- A generated revision must keep its selected `skin-01` through `skin-08`
+  concept identity so the matching palette is applied when the image is chosen.
+- The finished result is evaluated as artwork plus live themed controls, not as
+  the wallpaper in isolation.
 
 ## Reference Contract
 
