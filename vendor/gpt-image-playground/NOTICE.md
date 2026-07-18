@@ -37,13 +37,14 @@ inserted as an explicit mention.
 When embedded in Codex Web, the build imports a paired image and Agent profile
 from the authenticated `/api/playground-config` endpoint. Gallery requests and
 Agent image tools use the Images API profile, while Agent conversations use the
-Codex provider's Responses API profile. Both profiles refresh their URL and
-credential on each load. The image profile preserves a previously chosen image
-model and initially uses `gpt-image-2`; the Agent profile follows the current
-Codex text model. Codex CLI compatibility mode remains enabled only on the image
-profile, so multi-image requests are split into concurrent single-image calls
-instead of sending an unsupported `n` parameter to Codex-compatible image
-gateways.
+Codex provider's Responses API profile. Server values initialize missing
+profiles, while a URL or credential entered in the Playground settings remains
+authoritative on later loads. The image profile also preserves a previously
+chosen image model and initially uses `gpt-image-2`; the Agent profile follows
+the current Codex text model. Codex CLI compatibility mode remains enabled only
+on the image profile, so multi-image requests are split into concurrent
+single-image calls instead of sending an unsupported `n` parameter to
+Codex-compatible image gateways.
 
 The Codex Web build enables the Playground API proxy. Proxied requests include
 the normalized browser-configured API URL as `codex_upstream`; Codex Web only

@@ -567,6 +567,14 @@ if (args[0] === 'app-server') {
     assert.match(playgroundAssetScript, /codex-web-agent/);
     assert.match(playgroundAssetScript, /agentApiConfigMode/);
     assert.match(playgroundAssetScript, /codex_upstream/);
+    assert.match(playgroundAssetScript, /请求将通过 Codex Web 同源代理转发到此 URL/);
+    assert.doesNotMatch(playgroundAssetScript, /此处设置被忽略/);
+    const playgroundPatchSource = await readFile(
+      path.join(ROOT, 'vendor', 'gpt-image-playground', 'patches', 'codex-web.patch'),
+      'utf8',
+    );
+    assert.match(playgroundPatchSource, /baseUrl: existing\?\.baseUrl\?\.trim\(\) \|\| profile\.baseUrl/);
+    assert.match(playgroundPatchSource, /apiKey: existing\?\.apiKey\?\.trim\(\) \|\| profile\.apiKey/);
     assert.match(playgroundAssetScript, /输入 @ 选择或上传参考图/);
     assert.match(playgroundAssetScript, /上传新的参考图/);
     const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
