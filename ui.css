@@ -2902,6 +2902,14 @@ body .msg.process.completionSummary {
   gap: 15px;
 }
 
+body[data-theme="dark"] .completionTimeline {
+  --text: #ffffff;
+  --text-muted: #acacac;
+  --text-subtle: #7b7b7b;
+  --reasoning-flow-muted: #7b7b7b;
+  --reasoning-flow-strong: #ffffff;
+}
+
 .completionTimeline > .activityBatch + .activityBatch {
   margin-top: -10px;
 }
@@ -2947,8 +2955,8 @@ body[data-theme] .activityBatch {
   gap: 14px;
 }
 
-body .liveProcessTimeline > .progressCommentary:last-child .markdownBody > :last-child,
-body .liveProcessTimeline > .activityCluster.streaming:last-child > summary .activityClusterText {
+body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-child,
+body .liveProcessTimeline > .activityCluster.streaming > summary .activityClusterText {
   background: linear-gradient(90deg, var(--text-muted) 0%, var(--text-muted) 36%, var(--text) 50%, var(--text-muted) 64%, var(--text-muted) 100%);
   background-position: 100% 50%;
   background-size: 240% 100%;
@@ -2974,7 +2982,7 @@ body[data-theme] .msg.process.reasoningStatus {
   white-space: nowrap;
 }
 
-body[data-theme] .liveProcessTimeline > .msg.process.reasoningStatus:last-child {
+body[data-theme] .liveProcessTimeline > .msg.process.reasoningStatus.streaming {
   background: linear-gradient(90deg, var(--reasoning-flow-muted) 0%, var(--reasoning-flow-muted) 36%, var(--reasoning-flow-strong) 50%, var(--reasoning-flow-muted) 64%, var(--reasoning-flow-muted) 100%);
   background-position: 100% 50%;
   background-size: 240% 100%;
@@ -2985,8 +2993,19 @@ body[data-theme] .liveProcessTimeline > .msg.process.reasoningStatus:last-child 
   animation: liveProcessFlow 2.1s linear infinite;
 }
 
-body .liveProcessTimeline > .progressCommentary:last-child.streaming .markdownBody > :last-child::after {
+body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-child::after {
   display: none;
+}
+
+.liveProcessTimeline > .editedFilesResult.live {
+  justify-self: center;
+  margin-top: 2px;
+}
+
+body[data-theme="dark"] .liveProcessTimeline .markdownBody code,
+body[data-theme="dark"] .completionTimeline .markdownBody code {
+  background: #373737;
+  color: #ffffff;
 }
 
 .completionTimeline > .msg.user.steeringUser {
@@ -3133,16 +3152,62 @@ body .msg.user.browserCommentSteering::after {
 }
 
 .editedFilesResult {
+  width: min(160px, 100%);
+  max-width: 100%;
+  justify-self: center;
   overflow: hidden;
+  border-radius: 999px;
 }
 
 .turnResultHead {
-  display: flex;
-  min-height: 56px;
+  display: inline-grid;
+  min-height: 32px;
+  max-width: 100%;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 11px 12px;
+  gap: 8px;
+  cursor: pointer;
+  padding: 0 10px;
+  list-style: none;
+}
+
+.turnResultHead::marker,
+.turnResultHead::-webkit-details-marker {
+  display: none;
+  content: "";
+}
+
+.turnResultHead > strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editedFilesResult[open] {
+  width: min(520px, 100%);
+  max-width: 100%;
+  border-radius: var(--radius);
+}
+
+.editedFilesResult[open] > .turnResultHead {
+  display: grid;
+  width: 100%;
+  border-bottom: 1px solid var(--border);
+}
+
+.editedFilesContent {
+  display: grid;
+  min-width: 0;
+}
+
+.editedFilesContent > .turnResultActions {
+  justify-content: flex-end;
+  padding: 9px 12px 0;
 }
 
 .turnResultIdentity {
@@ -3176,6 +3241,24 @@ body .msg.user.browserCommentSteering::after {
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.turnResultStats {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  overflow: visible;
+  color: var(--text-subtle);
+  font: 13px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.turnResultStat.added {
+  color: var(--success);
+}
+
+.turnResultStat.removed {
+  color: var(--danger);
 }
 
 .turnResultIcon {
@@ -3236,8 +3319,26 @@ body .msg.user.browserCommentSteering::after {
 
 .editedFilesList {
   display: grid;
-  border-top: 1px solid var(--border);
   padding: 4px 12px 7px;
+}
+
+.editedFilesContent > .turnResultActions + .editedFilesList {
+  margin-top: 5px;
+  border-top: 1px solid var(--border);
+}
+
+body[data-theme="dark"] .editedFilesResult:not([open]) {
+  border-color: #383838;
+  background: #272727;
+  box-shadow: none;
+}
+
+body[data-theme="dark"] .editedFilesResult .turnResultStat.added {
+  color: #3fc977;
+}
+
+body[data-theme="dark"] .editedFilesResult .turnResultStat.removed {
+  color: #fa423e;
 }
 
 .editedFileRow {
@@ -3331,14 +3432,27 @@ body[data-theme] .activityCluster {
   color: var(--text);
 }
 
+.activityClusterSummary:hover .activityClusterText,
+.activityClusterSummary:focus-visible .activityClusterText,
+.activityClusterSummary:hover .activityClusterIcon,
+.activityClusterSummary:focus-visible .activityClusterIcon,
+.activityClusterSummary:hover .activityClusterChevron,
+.activityClusterSummary:focus-visible .activityClusterChevron {
+  color: var(--text);
+}
+
 .activityClusterText {
   min-width: 0;
   overflow: hidden;
-  color: var(--text-subtle);
+  color: var(--text-muted);
   font-size: 14px;
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.activityCluster.streaming .activityClusterText {
+  color: var(--text-subtle);
 }
 
 .activityClusterIcon {
@@ -3384,6 +3498,10 @@ body[data-theme] .activityCluster {
   margin: 3px 0 5px;
   border-left: 0;
   padding: 0;
+}
+
+.activityCluster:not([open]) > .activityClusterItems {
+  display: none;
 }
 
 .activityClusterItems > .activityBatch {
@@ -3496,7 +3614,7 @@ body[data-theme] .completionTimeline > .msg.agentActivityGroup {
 }
 
 .agentActivityGroupStatus[data-trace-state="done"] {
-  color: var(--success);
+  color: var(--text-muted);
 }
 
 .agentActivityGroupStatus[data-trace-state="error"],
@@ -3544,6 +3662,18 @@ body[data-theme] .completionTimeline > .msg.agentActivityGroup {
   padding: 0 10px 0 8px;
 }
 
+body[data-theme="dark"] .completionTimeline .agentActivityIdentity {
+  border-color: #242424;
+  background: transparent;
+}
+
+body[data-theme="dark"] .completionTimeline .agentActivityGroupStatus[data-trace-state="starting"],
+body[data-theme="dark"] .completionTimeline .agentActivityGroupStatus[data-trace-state="running"],
+body[data-theme="dark"] .completionTimeline .agentActivityStatus[data-trace-state="starting"],
+body[data-theme="dark"] .completionTimeline .agentActivityStatus[data-trace-state="running"] {
+  color: var(--text-muted);
+}
+
 .agentActivityIcon {
   display: grid;
   width: 15px;
@@ -3567,7 +3697,7 @@ body[data-theme] .completionTimeline > .msg.agentActivityGroup {
 }
 
 .agentActivityLabel {
-  max-width: 180px;
+  max-width: 150px;
   font-weight: 500;
 }
 
@@ -3581,7 +3711,7 @@ body[data-theme] .completionTimeline > .msg.agentActivityGroup {
 }
 
 .agentActivityStatus[data-trace-state="done"] {
-  color: var(--success);
+  color: var(--text-muted);
 }
 
 .agentActivityStatus[data-trace-state="error"],
@@ -5213,11 +5343,6 @@ body[data-chat-bg="skin"] .hist.active {
 }
 
 @media (max-width: 460px) {
-  .turnResultHead {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
   .turnResultActions {
     width: 100%;
   }
@@ -5424,9 +5549,9 @@ body[data-chat-bg="skin"] .hist.active {
     transition-duration: 0.01ms !important;
   }
 
-  body .liveProcessTimeline > .progressCommentary:last-child .markdownBody > :last-child,
-  body .liveProcessTimeline > .activityCluster.streaming:last-child > summary .activityClusterText,
-  body[data-theme] .liveProcessTimeline > .msg.process.reasoningStatus:last-child {
+  body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-child,
+  body .liveProcessTimeline > .activityCluster.streaming > summary .activityClusterText,
+  body[data-theme] .liveProcessTimeline > .msg.process.reasoningStatus.streaming {
     background: none;
     color: var(--text-muted);
     -webkit-text-fill-color: currentColor;

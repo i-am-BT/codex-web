@@ -585,13 +585,15 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.msg\.user::after\s*\{[^}]*width:\s*min\(124px, 100%\);[^}]*height:\s*6px/s);
     assert.match(uiStyles, /\.msg\.user \.msgActions\s*\{[^}]*top:\s*calc\(100% - 1px\);[^}]*padding:\s*5px 0 0 8px/s);
     assert.match(uiStyles, /\.completionTimeline > \.activityBatch \+ \.activityBatch/);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.completionTimeline\s*\{[^}]*--text:\s*#ffffff;[^}]*--text-muted:\s*#acacac;[^}]*--text-subtle:\s*#7b7b7b/s);
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.activityClusterText\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /\.activityCluster\[open\] > summary \.activityClusterChevron/);
+    assert.match(uiStyles, /\.activityCluster:not\(\[open\]\) > \.activityClusterItems\s*\{[^}]*display:\s*none/s);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.process\.reasoningStatus/);
     assert.match(uiStyles, /--reasoning-flow-muted:\s*#b0b0b1/);
     assert.match(uiStyles, /\.reasoningStatus\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
-    assert.match(uiStyles, /> \.msg\.process\.reasoningStatus:last-child\s*\{[^}]*var\(--reasoning-flow-muted\)[^}]*var\(--reasoning-flow-strong\)/s);
+    assert.match(uiStyles, /> \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*var\(--reasoning-flow-muted\)[^}]*var\(--reasoning-flow-strong\)/s);
     assert.match(uiStyles, /\.browserCommentChip\s*\{/);
     assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
@@ -600,6 +602,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.agentActivityGroup > \.activityBatch\s*\{[^}]*display:\s*contents/s);
     assert.match(uiStyles, /\.agentActivityGroup \.agentActivityItem\[open\]\s*\{[^}]*flex:\s*1 0 100%/s);
     assert.match(uiStyles, /\.agentActivityGroup \.agentActivityItem > \.agentActivityRow \.agentActivityStatus,[^}]*\.agentActivityChevron\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /\.agentActivityLabel\s*\{[^}]*max-width:\s*150px/s);
+    assert.match(uiStyles, /\.agentActivityGroupStatus\[data-trace-state="done"\]\s*\{[^}]*color:\s*var\(--text-muted\)/s);
     assert.match(uiStyles, /\.subagentTraceTimeline\s*\{/);
     assert.match(uiStyles, /\.subagentTraceMessage\.final\s*\{/);
     assert.match(uiStyles, /\.subagentTraceNotice\.loading::before/);
@@ -609,8 +613,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.activityImagePreview img\s*\{[^}]*width:\s*100%;[^}]*object-fit:\s*contain/s);
     assert.match(uiStyles, /\.activityImagePreview\.loaded img\s*\{[^}]*height:\s*auto/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
-    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary:last-child \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming:last-child > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
-    assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus:last-child\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary\.streaming \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
     assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 36px 36px/s);
@@ -618,7 +622,11 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.archiveTaskRestore,[^}]*\.archiveTaskDelete\s*\{/s);
     assert.match(uiStyles, /body\[data-theme\] \.archiveProjectFilter select\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.turnResultArtifacts\s*\{[^}]*align-self:\s*center/s);
-    assert.match(uiStyles, /\.editedFilesResult/);
+    assert.match(uiStyles, /\.editedFilesResult\s*\{[^}]*width:\s*min\(160px, 100%\);[^}]*border-radius:\s*999px/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live\s*\{[^}]*justify-self:\s*center/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult:not\(\[open\]\)\s*\{[^}]*border-color:\s*#383838;[^}]*background:\s*#272727/s);
+    assert.match(uiStyles, /\.turnResultStat\.added\s*\{[^}]*color:\s*var\(--success\)/s);
+    assert.match(uiStyles, /\.turnResultStat\.removed\s*\{[^}]*color:\s*var\(--danger\)/s);
     assert.match(uiStyles, /\.webPreviewResult\s*\{/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgBody > :not\(\.memoryCitations\)\s*\{[^}]*max-width:\s*min\(780px, 100%\)/s);
@@ -1056,6 +1064,11 @@ if (args[0] === 'app-server') {
     assert.match(page, /function createTurnResultArtifacts/);
     assert.match(page, /function createEditedFilesResultCard/);
     assert.match(page, /function createWebPreviewResultCard/);
+    assert.match(page, /function refreshLiveEditedFilesResult/);
+    assert.match(page, /if\(item\._subagentTrace\?\.autoTrack\)loadSubagentTrace/);
+    assert.doesNotMatch(page, /currentActivityCluster\.dataset\.activityGroup!==group/);
+    assert.match(page, /turnProcessTimeline\.insertBefore\(element,matched\.nextSibling\)/);
+    assert.doesNotMatch(page, /matched\.open=true/);
     assert.match(page, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
     assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
@@ -1148,6 +1161,7 @@ if (args[0] === 'app-server') {
         return clean.length > max ? clean.slice(0, max - 3) + '...' : clean;
       }
       function ensureTurnProcessHeader() { return turnProcessTimeline; }
+      function moveLiveEditedFilesResultToEnd() {}
       ${reasoningStatusHelpers}
       return {
         clear: clearTurnReasoningStatus,
@@ -1226,6 +1240,69 @@ if (args[0] === 'app-server') {
       icon: 'book-open',
       text: '已读取文件',
     });
+    const clusterItem = ({ verb, currentVerb = verb, target = '', icon = 'wrench', classes = [] }) => ({
+      classList: { contains: (name) => classes.includes(name) },
+      querySelector(selector) {
+        if (selector === '.activityVerb') return { dataset: { completedVerb: verb }, textContent: currentVerb };
+        if (selector === '.activityTarget') return { textContent: target };
+        if (selector === '.activityItemIcon [data-lucide]') {
+          return { getAttribute: (name) => name === 'data-lucide' ? icon : null };
+        }
+        return null;
+      },
+    });
+    const clusterBatch = (activityGroup, items, streaming = false) => ({
+      dataset: { activityGroup },
+      classList: { contains: (name) => name === 'streaming' && streaming },
+      querySelectorAll: (selector) => selector === '.activityItem' ? items : [],
+    });
+    const activityCluster = (batches) => ({
+      dataset: { activityGroup: 'tools' },
+      querySelectorAll(selector) {
+        if (selector === ':scope > .activityClusterItems > .activityBatch') return batches;
+        if (selector === '.activityItem') return batches.flatMap((batch) => batch.querySelectorAll('.activityItem'));
+        return [];
+      },
+    });
+    const commandItem = () => clusterItem({
+      verb: 'Ran',
+      currentVerb: 'Ran',
+      target: 'command',
+      icon: 'square-terminal',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('commands', [commandItem()]),
+      clusterBatch('commands', [commandItem()]),
+      clusterBatch('commands', [commandItem()]),
+    ])), {
+      icon: 'square-terminal',
+      text: '运行了多个命令',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('loaded_tools', [clusterItem({
+        verb: '读取',
+        currentVerb: '读取',
+        target: 'Browser 技能',
+        icon: 'wrench',
+        classes: ['skillTarget'],
+      })]),
+      clusterBatch('commands', [commandItem(), commandItem()]),
+    ])), {
+      icon: 'wrench',
+      text: '已加载工具运行了多个命令',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('files_read', [clusterItem({
+        verb: '已读取',
+        currentVerb: '正在读取',
+        target: '2026-07-11T04-52-18-ZaKl-codex_web',
+        icon: 'book-open',
+        classes: ['memoryTarget'],
+      })], true),
+    ])), {
+      icon: 'book-open',
+      text: '正在读取 2026-07-11T04-52-18-ZaKl-codex_web',
+    });
     const skillClusterAfterCommentary = {
       dataset: { activityReasoning: JSON.stringify(['Opening browser skill for execution']) },
     };
@@ -1272,6 +1349,24 @@ if (args[0] === 'app-server') {
       status: '已开始工作',
       icon: 'flower-2',
       expandable: true,
+    }]);
+    assert.deepEqual(parseToolActivity('followup_task\n{\n  "target": "agent_group_final_review",\n  "message": "复核当前改动"\n}'), [{
+      variant: 'agent',
+      agentKey: 'agent_group_final_review',
+      label: 'Agent group final review',
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: true,
+    }]);
+    assert.deepEqual(parseToolActivity([
+      'exec_command',
+      'nl -ba /Users/ikirito/.codex/memories/rollout_summaries/2026-07-11T04-52-18-ZaKl-codex_web.md',
+    ].join('\n')), [{
+      verb: '已读取',
+      target: '2026-07-11T04-52-18-ZaKl-codex_web',
+      icon: 'book-open',
+      targetType: 'memory',
+      expandable: false,
     }]);
     assert.deepEqual(parseToolActivity('调用工具: spawn_agent\ncall_id=call-1\n{"task_name":"ui_trace"}'), [{
       variant: 'agent',
@@ -1563,6 +1658,7 @@ if (args[0] === 'app-server') {
     assert.equal(agentGroup._agentActivityStatus.textContent, '正在启动');
     assert.equal(agentGroup._agentActivityStatus.attributes.get('role'), 'status');
     assert.equal(activityDomApi.isAgentActivityOutput('spawn_agent output\n{"task_name":"/root/final_diff_review"}'), true);
+    assert.equal(activityDomApi.isAgentActivityOutput('followup_task output\n{"target":"/root/final_diff_review"}'), true);
     assert.equal(activityDomApi.isAgentActivityOutput('exec output\n[]'), false);
     activityDomApi.queueAgentActivityBatch(firstAgentBatch);
     activityDomApi.queueAgentActivityBatch(secondAgentBatch);
@@ -1575,6 +1671,36 @@ if (args[0] === 'app-server') {
     activityDomApi.updateAgentActivityGroupStatus(agentGroup);
     assert.equal(agentGroup.className, 'msg agentActivityGroup');
     assert.equal(agentGroup._agentActivityStatus.textContent, '已开始工作');
+
+    const editedFilesCardHelper = inlineScript.match(
+      /(function createEditedFilesResultCard[\s\S]*?)(?=function moveLiveEditedFilesResultToEnd)/,
+    )?.[1];
+    assert.ok(editedFilesCardHelper);
+    const createEditedFilesResultCard = new Function(
+      'document',
+      'createResultCardButton',
+      'prepareUndoEditedFiles',
+      'reviewTurnArtifacts',
+      editedFilesCardHelper + '; return createEditedFilesResultCard;',
+    )(
+      { createElement: (tagName) => new FixtureElement(tagName) },
+      () => new FixtureElement('button'),
+      () => {},
+      () => {},
+    );
+    const compactEditedFiles = createEditedFilesResultCard([
+      { name: '/workspace/ui.css', verb: '已编辑', added: 1, removed: 1 },
+      { name: '/workspace/server.mjs', verb: '已编辑', added: 1, removed: 1 },
+    ], '', { live: true });
+    const compactEditedNodes = activityNodes(compactEditedFiles);
+    assert.equal(compactEditedFiles.tagName, 'DETAILS');
+    assert.equal(compactEditedFiles.className, 'turnResultCard editedFilesResult live');
+    assert.equal(compactEditedFiles.attributes.get('aria-label'), '2 个文件已更改');
+    assert.equal(compactEditedFiles.children[0].tagName, 'SUMMARY');
+    assert.equal(compactEditedNodes.find((node) => node.tagName === 'STRONG').textContent, '2 个文件已更改');
+    assert.equal(compactEditedNodes.find((node) => node.className === 'turnResultStat added').textContent, '+2');
+    assert.equal(compactEditedNodes.find((node) => node.className === 'turnResultStat removed').textContent, '-2');
+    assert.equal(compactEditedNodes.some((node) => node.className === 'turnResultActions'), false);
 
     const searchActivity = createToolActivityItem({
       verb: '已在',

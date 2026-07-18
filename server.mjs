@@ -3643,6 +3643,7 @@ let currentAgentActivityGroup = null;
 let pendingAgentActivityBatches = [];
 let pendingActivityReasoning = [];
 let turnReasoningStatus = null;
+let liveEditedFilesResult = null;
 let collectingTurnProcess = false;
 let turnProcessHeader = null;
 let turnProcessTimeline = null;
@@ -5576,7 +5577,7 @@ async function loadConversation(id,source='web',options={}){
   updateActiveHistory();
   chat.innerHTML='';
   beginTurnProcessCollection();
-  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget}));
+  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget}));
   if(!(conversation.messages||[]).length)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   if(currentConversationSource==='codex'&&conversation.hasEarlierMessages&&!options.full)addNativeHistoryLoadButton(conversation.id);
   updateConversationStatus(conversation);
@@ -5728,7 +5729,7 @@ async function syncCurrentNativeConversationOnce(){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
   }
-  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget})}
+  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget})}
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
   activeNativeTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
@@ -6115,7 +6116,7 @@ function orchestratedExecCommands(source){
 function activityPresentationRank(presentation){if(presentation.icon==='book-open')return 0;if(presentation.icon==='search')return 1;return 2}
 function embeddedToolObject(detail){const source=String(detail||'').split('\\n').filter((line)=>!/^call_id=/.test(line.trim())).join('\\n').trim();const candidates=[source];const start=source.indexOf('{');const end=source.lastIndexOf('}');if(start>=0&&end>start)candidates.push(source.slice(start,end+1));for(const candidate of candidates){try{const parsed=JSON.parse(candidate);if(parsed&&typeof parsed==='object')return parsed}catch(e){}}return{}}
 function agentActivityLabel(value){const pathParts=String(value||'').trim().split('/').filter(Boolean);const clean=(pathParts.at(-1)||'Agent').replace(/[_-]+/g,' ').replace(/\\s+/g,' ').trim();return clean?clean.charAt(0).toUpperCase()+clean.slice(1):'Agent'}
-function agentSpawnActivityPresentation(detail){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?task_name["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];const agentKey=String(payload.task_name||fallback||'').trim();return{variant:'agent',agentKey,label:agentActivityLabel(agentKey),status:'已开始工作',icon:'flower-2',expandable:true}}
+function agentSpawnActivityPresentation(detail){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?(?:task_name|target)["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];const agentKey=String(payload.task_name||payload.target||fallback||'').trim();return{variant:'agent',agentKey,label:agentActivityLabel(agentKey),status:'已开始工作',icon:'flower-2',expandable:true}}
 function orchestratedActivityPresentations(text){
   const source=String(text||'');
   if(!source.startsWith('exec\\n'))return[];
@@ -6154,10 +6155,13 @@ function runningActivityVerb(verb){
   return exact[verb]||verb.replace(/^已/,'正在');
 }
 function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){const filePath=activityFilePath(line.slice(match[0].length));current={verb:match[1],icon:match[2],target:activityFileLabel(filePath),filePath,added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
+function memoryActivityPresentation(command){const matches=[...String(command||'').matchAll(/\\.codex\\/memories\\/([A-Za-z0-9_@.+\\/-]+\\.md)\\b/gi)];if(!matches.length)return null;const relative=matches.at(-1)[1];const filename=relative.split('/').filter(Boolean).at(-1)||relative;return{verb:'已读取',target:filename.replace(/\\.md$/i,''),icon:'book-open',targetType:'memory',expandable:false}}
 function commandActivityPresentation(command){
   const source=String(command||'');
   const clean=shortActivityText(source,120);
   const files=extractActivityFiles(source);
+  const memory=memoryActivityPresentation(source);
+  if(memory)return memory;
   const skill=skillActivityPresentation(source);
   if(skill&&/^\\s*(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return skill;
   if(/^\\s*(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files[0]||clean,icon:'book-open',targetType:files.length?'file':''};
@@ -6171,7 +6175,7 @@ function commandActivityPresentation(command){
   if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};
   return{verb:'Ran',target:clean||'command',icon:'square-terminal'};
 }
-function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(toolName==='spawn_agent')return[agentSpawnActivityPresentation(descriptor.detail)];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
+function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(['spawn_agent','followup_task'].includes(toolName))return[agentSpawnActivityPresentation(descriptor.detail)];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
 function isImageViewActivityPresentation(presentation){return presentation?.verb==='已查看'&&/\\d+ 张图像$/.test(String(presentation.target||''))&&['image','images'].includes(presentation.icon)}
 function nativeToolImageUrls(presentations,messageSeq){
   const sequence=Number(messageSeq);
@@ -6273,17 +6277,17 @@ function createToolActivityItem(presentation,rawText,running=false,options={}){
     content.appendChild(retry);
     item.appendChild(row);
     item.appendChild(content);
-    const state={item,status,meta,notice,timeline,retry,parentThreadId:item.dataset.parentThreadId,agentRef:item.dataset.agentKey,subagentId:'',cursor:0,generation:0,messageSeqs:new Set(),loaded:false,loading:false,terminal:false,timer:null,controller:null,notFoundAttempts:0,failureCount:0};
+    const state={item,status,meta,notice,timeline,retry,parentThreadId:item.dataset.parentThreadId,agentRef:item.dataset.agentKey,subagentId:'',cursor:0,generation:0,messageSeqs:new Set(),loaded:false,loading:false,terminal:false,timer:null,controller:null,notFoundAttempts:0,failureCount:0,autoTrack:Boolean(options.autoTrack)};
     item._subagentTrace=state;
     retry.addEventListener('click',(event)=>{event.preventDefault();event.stopPropagation();state.terminal=false;state.notFoundAttempts=0;state.failureCount=0;loadSubagentTrace(state,{force:true})});
-    item.addEventListener('toggle',()=>{if(item.open)loadSubagentTrace(state);else stopSubagentTracePolling(state,true)});
+    item.addEventListener('toggle',()=>{if(item.open)loadSubagentTrace(state);else if(!state.autoTrack)stopSubagentTracePolling(state,true)});
     return item;
   }
   const expandable=presentation.expandable!==false;
   const galleryOnly=Boolean(presentation.galleryOnly);
   const imageUrls=Array.isArray(presentation.imageUrls)?presentation.imageUrls.filter(Boolean):[];
   const item=document.createElement(expandable?'details':'div');
-  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'')+(presentation.targetType==='file'?' fileTarget':'')+(presentation.targetType==='skill'?' skillTarget':'');
+  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'')+(presentation.targetType==='file'?' fileTarget':'')+(presentation.targetType==='skill'?' skillTarget':'')+(presentation.targetType==='memory'?' memoryTarget':'');
   if(expandable)item.open=false;
   item.dataset.messageText=String(rawText||'');
   if(presentation.filePath)item.dataset.filePath=String(presentation.filePath);
@@ -6421,7 +6425,7 @@ function settleAgentActivityGroup(group){
   updateAgentActivityGroupStatus(group);
 }
 function isAgentActivityOutput(text){
-  return /^spawn_agent\\s+output$/i.test(String(text||'').split('\\n')[0].trim().replace(/^调用工具:\\s*/,''));
+  return /^(?:spawn_agent|followup_task)\\s+output$/i.test(String(text||'').split('\\n')[0].trim().replace(/^调用工具:\\s*/,''));
 }
 function queueAgentActivityBatch(batch){
   if(batch&&!pendingAgentActivityBatches.includes(batch))pendingAgentActivityBatches.push(batch);
@@ -6465,17 +6469,17 @@ function clearSubagentTraceStates(){
 }
 function scheduleSubagentTracePoll(state,delay=SUBAGENT_TRACE_POLL_MS){
   stopSubagentTracePolling(state);
-  if(!state.item.open||state.terminal||state.item.isConnected===false)return;
+  if((!state.item.open&&!state.autoTrack)||state.terminal||state.item.isConnected===false)return;
   state.timer=setTimeout(()=>{state.timer=null;loadSubagentTrace(state)},delay);
 }
 function refreshOpenSubagentTraces(changedIds=[]){
   const changed=new Set((changedIds||[]).map((id)=>String(id)));
   for(const state of subagentTraceStates){
-    if(!state.item.open||state.terminal||state.loading)continue;
+    if((!state.item.open&&!state.autoTrack)||state.loading||state.terminal&&!state.autoTrack)continue;
     if(changed.size&&state.subagentId&&!changed.has(state.subagentId))continue;
     if(state.timer)clearTimeout(state.timer);
     state.timer=null;
-    loadSubagentTrace(state);
+    loadSubagentTrace(state,{force:state.terminal&&state.autoTrack});
   }
 }
 function subagentTraceEvent(message,label,icon,kind=''){
@@ -6677,33 +6681,48 @@ function activityClusterPresentation(cluster){
   const items=[...cluster.querySelectorAll('.activityItem')];
   const running=batches.some((batch)=>batch.classList.contains('streaming'));
   const semantic=semanticActivityGroupPresentation(String(cluster?.dataset?.activityGroup||''),running);
-  if(semantic)return semantic;
-  const records=items.map((item)=>({
+  if(!items.length)return semantic||{icon:'wrench',text:running?'正在使用工具':'已使用工具'};
+  const recordForItem=(item)=>({
+    item,
     verb:String(item.querySelector('.activityVerb')?.dataset.completedVerb||'').trim(),
     currentVerb:String(item.querySelector('.activityVerb')?.textContent||'').trim(),
     target:String(item.querySelector('.activityTarget')?.textContent||'').trim(),
     icon:item.querySelector('.activityItemIcon [data-lucide]')?.getAttribute('data-lucide')||'activity',
-  }));
-  const browser=records.some((record)=>record.icon==='panel-top'||/浏览器/.test(record.target));
-  if(browser)return{icon:'panel-top',text:(running?'正在使用':'已使用')+' 浏览器'};
-  if(records.length===1&&batches.length===1){
-    const record=records[0];
-    return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'工具调用'};
+  });
+  const records=items.map(recordForItem);
+  const activeBatch=[...batches].reverse().find((batch)=>batch.classList.contains('streaming'));
+  const activeItems=[...(activeBatch?.querySelectorAll?.('.activityItem')||[])];
+  const activeRecord=activeItems.length?recordForItem(activeItems.at(-1)):records.at(-1);
+  if(running&&activeRecord){
+    const text=[activeRecord.currentVerb||runningActivityVerb(activeRecord.verb),activeRecord.target].filter(Boolean).join(' ');
+    return{icon:activeRecord.icon,text:text||'正在使用工具'};
   }
+  const groups=new Set(batches.map((batch)=>String(batch.dataset?.activityGroup||'')).filter(Boolean));
+  const commandRecords=records.filter((record)=>['已运行','已检查','已请求','Ran'].includes(record.verb)||['square-terminal','terminal','git-branch','circle-check'].includes(record.icon));
+  const readRecords=records.filter((record)=>['已读取','已搜索','已在'].includes(record.verb));
   const edited=records.some((record)=>['已编辑','已新增','已删除'].includes(record.verb));
-  const read=records.some((record)=>['已读取','已搜索','已在','已查看'].includes(record.verb));
-  const ran=batches.length>1||records.some((record)=>[
-    '已运行','已检查','已请求','已调用','已使用','Ran','已读取文件并运行了多个命令',
-  ].includes(record.verb));
-  const actions=[];
-  if(edited)actions.push(running?'编辑文件':'编辑了文件');
-  if(read)actions.push(running?'读取文件':'读取文件');
-  if(ran)actions.push(running?'运行多个命令':'运行了多个命令');
-  const text=joinActivityActions(actions)||(running?'正在使用工具':'已使用工具');
-  return{
-    icon:edited?'pencil':read?'book-open':'terminal',
-    text:running&&!text.startsWith('正在')?'正在'+text:text,
-  };
+  const loadedTools=groups.has('loaded_tools')||records.some((record)=>record.item.classList?.contains('skillTarget'));
+  const browser=groups.has('browser')||records.some((record)=>record.icon==='panel-top'||/浏览器/.test(record.target));
+  const commands=groups.has('commands')||commandRecords.length>0;
+  const usedTools=groups.has('tools')||records.some((record)=>['已调用','已使用'].includes(record.verb));
+  if(loadedTools&&commands)return{icon:'wrench',text:'已加载工具运行了多个命令'};
+  if(loadedTools)return{icon:'wrench',text:'已加载工具'};
+  if(edited&&commands)return{icon:'pencil',text:'已编辑文件并运行了多个命令'};
+  if(readRecords.length&&commands)return{icon:'book-open',text:'已读取文件并运行了多个命令'};
+  if(commands){
+    if(commandRecords.length>1||[...groups].filter((group)=>group==='commands').length>1||batches.length>1)return{icon:'square-terminal',text:'运行了多个命令'};
+    const record=commandRecords.at(-1)||records.at(-1);
+    return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'已运行命令'};
+  }
+  if(readRecords.length){
+    const record=readRecords.at(-1);
+    return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'已读取文件'};
+  }
+  if(browser)return{icon:'panel-top',text:'已使用浏览器'};
+  if(edited)return{icon:'pencil',text:'已编辑文件'};
+  if(usedTools||records.length>1)return{icon:'wrench',text:'已使用工具'};
+  const record=records[0];
+  return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'工具调用'};
 }
 function createActivityCluster(group='tools',reasoning=[]){
   const cluster=document.createElement('details');
@@ -6771,11 +6790,12 @@ function settleActivityCluster(cluster){
   updateActivityCluster(cluster);
 }
 function appendTurnTool(text,options={}){
+  clearTurnReasoningStatus();
   const presentations=toolActivityPresentations(text);
   const imageViews=presentations.filter(isImageViewActivityPresentation);
   const folded=presentations.filter((presentation)=>!isImageViewActivityPresentation(presentation));
   const imageUrls=nativeToolImageUrls(imageViews,options.nativeMessageSeq);
-  const activityOptions={parentThreadId:currentConversationSource==='codex'?currentConversationId:''};
+  const activityOptions={parentThreadId:currentConversationSource==='codex'?currentConversationId:'',autoTrack:Boolean(options.autoTrackAgent)};
   let visibleBatch=null;
   if(imageViews.length){
     visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true,activityOptions);
@@ -6787,6 +6807,7 @@ function appendTurnTool(text,options={}){
   const batch=createActivityBatch(folded,text,activityKind,true,activityOptions);
   if(visibleBatch)batch._relatedActivityBatches=[visibleBatch];
   activateTurnProcessElement(batch);
+  if(folded.some((presentation)=>['已编辑','已新增','已删除'].includes(presentation.verb)))refreshLiveEditedFilesResult();
   moveTurnReasoningStatusToEnd();
   refreshIcons(batch);
   return batch;
@@ -6842,10 +6863,12 @@ function updateTurnReasoningStatus(text){
   turnReasoningStatus.dataset.messageText=clean;
   turnReasoningStatus.textContent=clean;
   turnProcessTimeline.appendChild(turnReasoningStatus);
+  moveLiveEditedFilesResultToEnd();
   return turnReasoningStatus;
 }
 function moveTurnReasoningStatusToEnd(){
   if(turnReasoningStatus?.isConnected&&turnProcessTimeline)turnProcessTimeline.appendChild(turnReasoningStatus);
+  moveLiveEditedFilesResultToEnd();
 }
 function shouldClearTurnReasoningStatus(role,kind){
   return role==='assistant'||role==='user'||['task_complete','task_error','turn_aborted','error'].includes(kind);
@@ -6858,6 +6881,7 @@ function shouldClearPendingActivityReasoning(role,kind,steeringUser=false){
 function clearTurnProcessHeader(){
   clearTurnReasoningStatus();
   if(turnProcessHeader?.parentNode)turnProcessHeader.remove();
+  liveEditedFilesResult=null;
   turnProcessHeader=null;
   turnProcessTimeline=null;
 }
@@ -6908,36 +6932,41 @@ function activateTurnProcessElement(element){
     }
     pendingActivityReasoning=[];
     appendAgentActivityBatch(currentAgentActivityGroup,element);
+    for(const item of element.querySelectorAll('.agentActivityItem'))if(item._subagentTrace?.autoTrack)loadSubagentTrace(item._subagentTrace);
     queueAgentActivityBatch(element);
+    moveLiveEditedFilesResultToEnd();
     return currentAgentActivityGroup;
   }
   currentAgentActivityGroup=null;
   if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='tool_activity'){
-    const group=String(element.dataset.activityGroup||'tools');
-    if(!currentActivityCluster?.isConnected||currentActivityCluster.dataset.activityGroup!==group){
-      currentActivityCluster=createActivityCluster(group,pendingActivityReasoning);
+    if(!currentActivityCluster?.isConnected){
+      currentActivityCluster=createActivityCluster('tools',pendingActivityReasoning);
       turnProcessElements.push(currentActivityCluster);
       turnProcessTimeline.appendChild(currentActivityCluster);
     }else mergeActivityClusterReasoning(currentActivityCluster,pendingActivityReasoning);
     pendingActivityReasoning=[];
     appendActivityBatchToCluster(currentActivityCluster,element);
+    moveLiveEditedFilesResultToEnd();
     return currentActivityCluster;
   }
   if(element.classList.contains('browserCommentSteering')){
     const target=String(element.dataset.browserTarget||'').trim().toLowerCase();
     const clusters=turnProcessElements.filter((item)=>item.classList?.contains('activityCluster'));
     const matched=[...clusters].reverse().find((cluster)=>activityClusterMatchesBrowserTarget(cluster,target));
-    const container=matched?.querySelector(':scope > .activityClusterItems');
-    if(container){
-      container.appendChild(element);
-      matched.open=true;
-      refreshIcons(matched);
+    if(matched?.parentNode===turnProcessTimeline){
+      const index=turnProcessElements.indexOf(matched);
+      if(!turnProcessElements.includes(element))turnProcessElements.splice(index+1,0,element);
+      turnProcessTimeline.insertBefore(element,matched.nextSibling);
+      currentActivityCluster=null;
+      refreshIcons(element);
+      moveLiveEditedFilesResultToEnd();
       return element;
     }
   }
   currentActivityCluster=null;
   if(!turnProcessElements.includes(element))turnProcessElements.push(element);
   turnProcessTimeline.appendChild(element);
+  moveLiveEditedFilesResultToEnd();
   return element;
 }
 function takeTurnProcessElements(){
@@ -7081,38 +7110,42 @@ function prepareUndoEditedFiles(files){
   statusEl.textContent='撤销请求已准备，请检查后发送';
   input.focus();
 }
-function createEditedFilesResultCard(files,turnId){
-  const card=document.createElement('section');
-  card.className='turnResultCard editedFilesResult';
-  card.setAttribute('aria-label','已编辑 '+files.length+' 个文件');
-  const head=document.createElement('div');
+function createEditedFilesResultCard(files,turnId,{live=false}={}){
+  const card=document.createElement('details');
+  card.className='turnResultCard editedFilesResult'+(live?' live':'');
+  card.setAttribute('aria-label',files.length+' 个文件已更改');
+  const head=document.createElement('summary');
   head.className='turnResultHead';
-  const identity=document.createElement('div');
-  identity.className='turnResultIdentity';
-  const iconWrap=document.createElement('span');
-  iconWrap.className='turnResultIcon';
-  const icon=document.createElement('i');
-  icon.setAttribute('data-lucide','files');
-  icon.setAttribute('aria-hidden','true');
-  iconWrap.appendChild(icon);
-  const copy=document.createElement('div');
   const title=document.createElement('strong');
-  title.textContent='已编辑 '+files.length+' 个文件';
+  title.textContent=files.length+' 个文件已更改';
   const added=files.reduce((total,file)=>total+file.added,0);
   const removed=files.reduce((total,file)=>total+file.removed,0);
   const stats=document.createElement('span');
   stats.className='turnResultStats';
-  stats.textContent=[added?'+'+added:'',removed?'-'+removed:''].filter(Boolean).join('  ')||'文件修改已完成';
-  copy.appendChild(title);
-  copy.appendChild(stats);
-  identity.appendChild(iconWrap);
-  identity.appendChild(copy);
+  if(added){
+    const value=document.createElement('span');
+    value.className='turnResultStat added';
+    value.textContent='+'+added;
+    stats.appendChild(value);
+  }
+  if(removed){
+    const value=document.createElement('span');
+    value.className='turnResultStat removed';
+    value.textContent='-'+removed;
+    stats.appendChild(value);
+  }
+  if(!added&&!removed)stats.textContent='已完成';
+  head.appendChild(title);
+  head.appendChild(stats);
+  const content=document.createElement('div');
+  content.className='editedFilesContent';
   const actions=document.createElement('div');
   actions.className='turnResultActions';
-  actions.appendChild(createResultCardButton('undo-2','撤销',()=>prepareUndoEditedFiles(files)));
-  actions.appendChild(createResultCardButton('list-tree','审查更改',()=>reviewTurnArtifacts(turnId)));
-  head.appendChild(identity);
-  head.appendChild(actions);
+  if(!live){
+    actions.appendChild(createResultCardButton('undo-2','撤销',()=>prepareUndoEditedFiles(files)));
+    actions.appendChild(createResultCardButton('list-tree','审查更改',()=>reviewTurnArtifacts(turnId)));
+    content.appendChild(actions);
+  }
   const list=document.createElement('div');
   list.className='editedFilesList';
   for(const file of files){
@@ -7133,9 +7166,24 @@ function createEditedFilesResultCard(files,turnId){
     row.appendChild(meta);
     list.appendChild(row);
   }
+  content.appendChild(list);
   card.appendChild(head);
-  card.appendChild(list);
+  card.appendChild(content);
   return card;
+}
+function moveLiveEditedFilesResultToEnd(){
+  if(liveEditedFilesResult?.isConnected&&turnProcessTimeline)turnProcessTimeline.appendChild(liveEditedFilesResult);
+}
+function refreshLiveEditedFilesResult(){
+  if(!turnProcessTimeline)return null;
+  const files=editedFilesFromTurnArtifacts(turnProcessElements);
+  if(!files.length)return null;
+  const next=createEditedFilesResultCard(files,'',{live:true});
+  if(liveEditedFilesResult?.parentNode)liveEditedFilesResult.parentNode.replaceChild(next,liveEditedFilesResult);
+  else turnProcessTimeline.appendChild(next);
+  liveEditedFilesResult=next;
+  refreshIcons(next);
+  return next;
 }
 function createWebPreviewResultCard(preview,turnId){
   const card=document.createElement('section');
