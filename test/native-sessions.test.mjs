@@ -334,6 +334,11 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '我想 UI 和这个一样'));
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content === '助手进度'));
     assert.equal(conversation.messages.some((message) => message.role === 'thinking'), false);
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'process'
+      && message.kind === 'reasoning_summary'
+      && message.content === '实现队列'
+    )));
     assert.equal(conversation.messages.some((message) => message.content.includes('Internal handoff summary')), false);
     assert.deepEqual(
       conversation.messages.filter((message) => message.kind === 'context_compacted').map((message) => ({
@@ -550,11 +555,77 @@ test('native session store only exposes visible, non-archived Codex App threads'
     for (const id of ids) {
       const file = path.join(sessionDir, `rollout-2026-07-11T12-52-18-${id}.jsonl`);
       sessionFiles.set(id, file);
-      await writeFile(file, jsonl([{
+      const source = id === subagent
+        ? { subagent: { thread_spawn: {
+          parent_thread_id: visibleNewer,
+          depth: 1,
+          agent_path: '/root/ui_trace',
+          agent_nickname: 'Russell',
+        } } }
+        : id === execSession ? 'exec' : 'vscode';
+      const records = [{
         timestamp: '2026-07-11T04:52:31.928Z',
         type: 'session_meta',
-        payload: { id, source: id === execSession ? 'exec' : 'vscode' },
-      }]));
+        payload: { id, source },
+      }];
+      if (id === subagent) records.push(
+        {
+          timestamp: '2026-07-11T04:52:31.929Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'parent-turn' },
+        },
+        {
+          timestamp: '2026-07-11T04:52:31.930Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: '继承的父任务消息' }],
+          },
+        },
+        {
+          timestamp: '2026-07-11T04:52:32.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'subagent-turn' },
+        },
+        {
+          timestamp: '2026-07-11T04:52:32.001Z',
+          type: 'inter_agent_communication_metadata',
+          payload: { trigger_turn: true },
+        },
+        {
+          timestamp: '2026-07-11T04:52:32.002Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: '子代理正在检查界面' }],
+          },
+        },
+        {
+          timestamp: '2026-07-11T04:52:32.003Z',
+          type: 'response_item',
+          payload: { type: 'function_call', call_id: 'call-subagent', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+        },
+        {
+          timestamp: '2026-07-11T04:52:33.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: '子代理检查完成' }],
+          },
+        },
+        {
+          timestamp: '2026-07-11T04:52:33.001Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'subagent-turn', duration_ms: 1000 },
+        },
+      );
+      await writeFile(file, jsonl(records));
     }
 
     await writeFile(
@@ -596,7 +667,12 @@ test('native session store only exposes visible, non-archived Codex App threads'
       [visibleNewer, sessionFiles.get(visibleNewer), 'vscode', '/workspace/newer', '[App 数据库标题](https://example.com/thread)', 0, 'newer', 'test', 'user', baseTime, baseTime + 20, baseTime + 20],
       [archived, sessionFiles.get(archived), 'vscode', '/workspace/archived', '归档任务', 1, 'archived', 'test', 'user', baseTime, baseTime + 30, baseTime + 30],
       [execSession, sessionFiles.get(execSession), 'exec', '/workspace/exec', 'Exec 任务', 0, 'exec', 'test', 'user', baseTime, baseTime + 40, baseTime + 40],
-      [subagent, sessionFiles.get(subagent), '{"subagent":{"thread_spawn":{}}}', '/workspace/subagent', '子任务', 0, 'subagent', 'test', 'subagent', baseTime, baseTime + 50, baseTime + 50],
+      [subagent, sessionFiles.get(subagent), JSON.stringify({ subagent: { thread_spawn: {
+        parent_thread_id: visibleNewer,
+        depth: 1,
+        agent_path: '/root/ui_trace',
+        agent_nickname: 'Russell',
+      } } }), '/workspace/subagent', '子任务', 0, 'subagent', 'test', 'subagent', baseTime, baseTime + 50, baseTime + 50],
       [emptyPreview, sessionFiles.get(emptyPreview), 'vscode', '/workspace/empty', '空预览', 0, '', 'test', 'user', baseTime, baseTime + 60, baseTime + 60],
       [incomplete, sessionFiles.get(incomplete), 'vscode', '/workspace/incomplete', '不完整任务', 0, 'legacy', '', 'user', baseTime, baseTime + 70, baseTime + 70],
       [modernAutomation, sessionFiles.get(modernAutomation), 'vscode', '/workspace/automation', '自动化任务', 0, 'automation', 'test', 'automation', baseTime, baseTime + 80, baseTime + 80],
@@ -625,6 +701,23 @@ test('native session store only exposes visible, non-archived Codex App threads'
     assert.equal(store.get(archived), null);
     assert.equal(store.get(execSession), null);
     assert.equal(store.get(subagent), null);
+    const subagentConversation = store.getSubagent(visibleNewer, 'ui_trace');
+    assert.equal(subagentConversation.id, subagent);
+    assert.equal(subagentConversation.source, 'subagent');
+    assert.equal(subagentConversation.status, 'done');
+    assert.equal(subagentConversation.metadata.parentThreadId, visibleNewer);
+    assert.equal(subagentConversation.metadata.agentPath, '/root/ui_trace');
+    assert.equal(subagentConversation.metadata.agentNickname, 'Russell');
+    assert.equal(subagentConversation.messages.some((message) => message.content === '继承的父任务消息'), false);
+    assert.ok(subagentConversation.messages.some((message) => message.content === '子代理正在检查界面'));
+    assert.ok(subagentConversation.messages.some((message) => message.content.includes('exec_command')));
+    assert.ok(subagentConversation.messages.some((message) => message.content === '子代理检查完成'));
+    const subagentIncrement = store.getSubagent(visibleNewer, '/root/ui_trace', {
+      after: subagentConversation.cursor,
+      generation: subagentConversation.generation,
+    });
+    assert.equal(subagentIncrement.reset, false);
+    assert.deepEqual(subagentIncrement.messages, []);
     assert.equal(store.get(emptyPreview), null);
     assert.equal(store.get(incomplete), null);
     assert.equal(store.get(modernAutomation), null);

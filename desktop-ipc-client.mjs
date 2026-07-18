@@ -23,6 +23,8 @@ const METHOD_VERSIONS = new Map([
 ]);
 const BROADCAST_VERSIONS = new Map([
   ['thread-archived', 2],
+  ['thread-unarchived', 1],
+  ['query-cache-invalidate', 0],
 ]);
 const SAFE_FALLBACK_ERRORS = new Set([
   'disabled',
@@ -148,6 +150,20 @@ export class CodexDesktopIpcClient extends EventEmitter {
       conversationId,
       cwd: String(cwd || ''),
     });
+  }
+
+  async threadUnarchived(conversationId, cwd) {
+    return this.broadcast('thread-unarchived', {
+      hostId: 'local',
+      conversationId,
+      cwd: String(cwd || ''),
+    });
+  }
+
+  async invalidateQueryCache(queryKey) {
+    const parts = Array.isArray(queryKey) ? queryKey.map((item) => String(item || '')).filter(Boolean) : [];
+    if (!parts.length) throw new Error('Codex Desktop 查询缓存键不能为空');
+    return this.broadcast('query-cache-invalidate', { queryKey: parts });
   }
 
   async commandApprovalDecision(conversationId, requestId, decision, options = {}) {

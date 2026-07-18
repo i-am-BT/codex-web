@@ -12,12 +12,13 @@ import {
 test('routes a turn through the Codex Desktop owner IPC client', async () => {
   const fixture = await createRouterFixture();
   let discoveryResponse;
-  let archivedBroadcast;
+  let outboundBroadcastsHandled;
+  const outboundBroadcasts = [];
   const discoveryHandled = new Promise((resolve) => {
     discoveryResponse = resolve;
   });
-  const archivedBroadcastHandled = new Promise((resolve) => {
-    archivedBroadcast = resolve;
+  const allOutboundBroadcastsHandled = new Promise((resolve) => {
+    outboundBroadcastsHandled = resolve;
   });
 
   fixture.onMessage = (socket, message) => {
@@ -49,7 +50,8 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
     }
 
     if (message.type === 'broadcast') {
-      archivedBroadcast(message);
+      outboundBroadcasts.push(message);
+      if (outboundBroadcasts.length === 3) outboundBroadcastsHandled(outboundBroadcasts);
       return;
     }
 
@@ -103,6 +105,8 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
     });
     assert.deepEqual(approval, { ok: true });
     await client.threadArchived('thread-1', '/workspace/project');
+    await client.threadUnarchived('thread-1', '/workspace/project');
+    await client.invalidateQueryCache(['archived-threads']);
     assert.deepEqual(await discoveryHandled, {
       type: 'client-discovery-response',
       requestId: 'discovery-1',
@@ -114,17 +118,37 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
       sourceClientId: 'desktop-owner-id',
       params: { conversationId: 'thread-1' },
     });
-    assert.deepEqual(await archivedBroadcastHandled, {
-      type: 'broadcast',
-      method: 'thread-archived',
-      sourceClientId: 'web-client-id',
-      version: 2,
-      params: {
-        hostId: 'local',
-        conversationId: 'thread-1',
-        cwd: '/workspace/project',
+    assert.deepEqual(await allOutboundBroadcastsHandled, [
+      {
+        type: 'broadcast',
+        method: 'thread-archived',
+        sourceClientId: 'web-client-id',
+        version: 2,
+        params: {
+          hostId: 'local',
+          conversationId: 'thread-1',
+          cwd: '/workspace/project',
+        },
       },
-    });
+      {
+        type: 'broadcast',
+        method: 'thread-unarchived',
+        sourceClientId: 'web-client-id',
+        version: 1,
+        params: {
+          hostId: 'local',
+          conversationId: 'thread-1',
+          cwd: '/workspace/project',
+        },
+      },
+      {
+        type: 'broadcast',
+        method: 'query-cache-invalidate',
+        sourceClientId: 'web-client-id',
+        version: 0,
+        params: { queryKey: ['archived-threads'] },
+      },
+    ]);
   } finally {
     client.close();
     await fixture.close();

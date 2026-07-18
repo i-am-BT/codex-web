@@ -39,6 +39,8 @@ export class NativeSessionStore extends EventEmitter {
     this.runningWindowMs = positiveNumber(options.runningWindowMs, DEFAULT_RUNNING_WINDOW_MS);
     this.watchChanges = options.watchChanges !== false;
     this.entries = new Map();
+    this.subagentEntries = new Map();
+    this.subagentThreads = new Map();
     this.titles = new Map();
     this.details = new Map();
     this.indexStamp = '';
@@ -46,6 +48,7 @@ export class NativeSessionStore extends EventEmitter {
     this.stateDb = null;
     this.stateDbIno = 0;
     this.stateThreadQuery = null;
+    this.stateSubagentThreadQuery = null;
     this.version = 0;
     this.cacheGeneration = 0;
     this.watcher = null;
@@ -107,11 +110,18 @@ export class NativeSessionStore extends EventEmitter {
     this.refreshTitles();
     this.refreshAppThreads();
     const nextEntries = scanSessionFiles(this.sessionsDir, this.titles, this.appThreads);
-    const changedIds = changedSessionIds(this.entries, nextEntries);
+    const nextSubagentEntries = scanSessionFiles(this.sessionsDir, this.titles, this.subagentThreads);
+    const changedIds = [
+      ...new Set([
+        ...changedSessionIds(this.entries, nextEntries),
+        ...changedSessionIds(this.subagentEntries, nextSubagentEntries),
+      ]),
+    ];
     this.entries = nextEntries;
+    this.subagentEntries = nextSubagentEntries;
 
     for (const id of [...this.details.keys()]) {
-      if (!this.entries.has(id)) this.details.delete(id);
+      if (!this.entries.has(id) && !this.subagentEntries.has(id)) this.details.delete(id);
     }
 
     if (changedIds.length) {
@@ -128,6 +138,7 @@ export class NativeSessionStore extends EventEmitter {
     } catch {
       this.closeStateDb();
       this.appThreads = null;
+      this.subagentThreads = new Map();
       return;
     }
 
@@ -137,6 +148,7 @@ export class NativeSessionStore extends EventEmitter {
         this.stateDb = new DatabaseSync(this.stateDbFile, { readOnly: true, timeout: 500 });
         this.stateDbIno = stat.ino;
         this.stateThreadQuery = prepareAppThreadQuery(this.stateDb);
+        this.stateSubagentThreadQuery = prepareSubagentThreadQuery(this.stateDb);
       }
 
       const next = new Map();
@@ -156,9 +168,28 @@ export class NativeSessionStore extends EventEmitter {
         });
       }
       this.appThreads = next;
+
+      const nextSubagents = new Map();
+      for (const row of this.stateSubagentThreadQuery?.all() || []) {
+        const id = String(row.id || '').trim().toLowerCase();
+        const rolloutPath = String(row.rollout_path || '').trim();
+        const spawn = parseSubagentThreadSource(row.source);
+        if (!SESSION_ID_PATTERN.test(`${id}.jsonl`) || !rolloutPath || !spawn) continue;
+        nextSubagents.set(id, {
+          rolloutPath: path.resolve(rolloutPath),
+          cwd: String(row.cwd || '').trim(),
+          title: cleanTitle(row.title) || agentPathLabel(spawn.agentPath),
+          createdAtMs: timestampMs(row.created_at_ms),
+          updatedAtMs: timestampMs(row.updated_at_ms),
+          recencyAtMs: timestampMs(row.recency_at_ms),
+          ...spawn,
+        });
+      }
+      this.subagentThreads = nextSubagents;
     } catch {
       this.closeStateDb();
       if (this.appThreads === null) this.appThreads = new Map();
+      this.subagentThreads = new Map();
     }
   }
 
@@ -169,6 +200,7 @@ export class NativeSessionStore extends EventEmitter {
     this.stateDb = null;
     this.stateDbIno = 0;
     this.stateThreadQuery = null;
+    this.stateSubagentThreadQuery = null;
   }
 
   refreshTitles() {
@@ -214,10 +246,45 @@ export class NativeSessionStore extends EventEmitter {
   }
 
   get(id, options = {}) {
-    let entry = this.entries.get(id);
+    return this.getConversationFromEntries(id, options, false);
+  }
+
+  getSubagent(parentId, agentRef, options = {}) {
+    let entry = findSubagentEntry(this.subagentEntries, parentId, agentRef);
     if (!entry) {
       this.refresh();
-      entry = this.entries.get(id);
+      entry = findSubagentEntry(this.subagentEntries, parentId, agentRef);
+    }
+    if (!entry) return null;
+    const conversation = this.getConversationFromEntries(entry.id, options, true);
+    if (!conversation) return null;
+    const cache = this.details.get(entry.id);
+    const ownTurns = cache?.subagentTurnIds || new Set();
+    const fallbackTurnId = conversation.latestTurnId;
+    const messages = conversation.messages.filter((message) => (
+      ownTurns.size ? ownTurns.has(message.turnId) : message.turnId === fallbackTurnId
+    ));
+    return {
+      ...conversation,
+      source: 'subagent',
+      title: agentPathLabel(entry.agentPath),
+      metadata: {
+        ...conversation.metadata,
+        parentThreadId: entry.parentThreadId,
+        agentPath: entry.agentPath,
+        agentNickname: entry.agentNickname,
+        depth: entry.depth,
+      },
+      messages,
+    };
+  }
+
+  getConversationFromEntries(id, options = {}, subagent = false) {
+    const entries = () => (subagent ? this.subagentEntries : this.entries);
+    let entry = entries().get(id);
+    if (!entry) {
+      this.refresh();
+      entry = entries().get(id);
     }
     if (!entry) return null;
 
@@ -225,11 +292,11 @@ export class NativeSessionStore extends EventEmitter {
       const stat = statSync(entry.filePath);
       if (stat.size !== entry.size || stat.mtimeMs !== entry.mtimeMs || stat.ino !== entry.ino) {
         this.refresh();
-        entry = this.entries.get(id);
+        entry = entries().get(id);
       }
     } catch {
       this.refresh();
-      entry = this.entries.get(id);
+      entry = entries().get(id);
     }
     if (!entry) return null;
 
@@ -299,6 +366,58 @@ function prepareAppThreadQuery(db) {
         )
       )
   `);
+}
+
+function prepareSubagentThreadQuery(db) {
+  const columns = new Set(db.prepare('PRAGMA table_info(threads)').all().map((column) => String(column.name || '')));
+  if (!columns.has('thread_source')) return null;
+  const recencyColumn = columns.has('recency_at_ms') ? 'recency_at_ms' : 'updated_at_ms';
+  return db.prepare(`
+    SELECT id, rollout_path, source, cwd, title, created_at_ms, updated_at_ms, ${recencyColumn} AS recency_at_ms
+    FROM threads
+    WHERE archived = 0
+      AND thread_source = 'subagent'
+      AND rollout_path <> ''
+  `);
+}
+
+function parseSubagentThreadSource(value) {
+  try {
+    const source = typeof value === 'string' ? JSON.parse(value) : value;
+    const spawn = source?.subagent?.thread_spawn;
+    const parentThreadId = String(spawn?.parent_thread_id || '').trim().toLowerCase();
+    const agentPath = String(spawn?.agent_path || '').trim();
+    if (!SESSION_ID_PATTERN.test(`${parentThreadId}.jsonl`) || !/^\/[A-Za-z0-9_.\/-]+$/.test(agentPath)) return null;
+    return {
+      parentThreadId,
+      agentPath,
+      agentNickname: String(spawn?.agent_nickname || '').trim(),
+      depth: Number.isInteger(spawn?.depth) ? spawn.depth : Number(spawn?.depth) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function agentPathLabel(value) {
+  const name = String(value || '').split('/').filter(Boolean).at(-1) || 'agent';
+  const clean = name.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return clean ? clean.charAt(0).toUpperCase() + clean.slice(1) : 'Agent';
+}
+
+function findSubagentEntry(entries, parentId, agentRef) {
+  const parent = String(parentId || '').trim().toLowerCase();
+  const ref = String(agentRef || '').trim();
+  if (!SESSION_ID_PATTERN.test(`${parent}.jsonl`) || !ref) return null;
+  const leaf = ref.split('/').filter(Boolean).at(-1) || ref;
+  return [...entries.values()]
+    .filter((entry) => entry.parentThreadId === parent)
+    .sort((left, right) => right.recencyMs - left.recencyMs)
+    .find((entry) => (
+      entry.id === ref.toLowerCase()
+      || entry.agentPath === ref
+      || entry.agentPath.split('/').filter(Boolean).at(-1) === leaf
+    )) || null;
 }
 
 export function readSessionIndex(file) {
@@ -371,6 +490,10 @@ function scanSessionFiles(root, titles, appThreads = null) {
           recencyMs,
           createdAt: new Date(createdAtMs).toISOString(),
           updatedAt: new Date(recencyMs).toISOString(),
+          parentThreadId: appThread?.parentThreadId || '',
+          agentPath: appThread?.agentPath || '',
+          agentNickname: appThread?.agentNickname || '',
+          depth: appThread?.depth || 0,
         };
         const previous = entries.get(id);
         if (!previous || entry.recencyMs > previous.recencyMs) entries.set(id, entry);
@@ -394,7 +517,7 @@ function changedSessionIds(previous, next) {
 }
 
 function entrySignature(entry) {
-  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}`;
+  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
 }
 
 function sessionSummary(entry, status) {
@@ -433,6 +556,7 @@ function createDetailCache(entry, options) {
     latestTurnId: '',
     displayUserMessagesInTurn: 0,
     lastTimestamp: '',
+    subagentTurnIds: new Set(),
   };
 
   const firstRecord = readFirstRecord(entry.filePath);
@@ -536,6 +660,11 @@ function applyNativeRecord(cache, record, maxMessages) {
     return;
   }
 
+  if (record.type === 'inter_agent_communication_metadata') {
+    if (record.payload?.trigger_turn && cache.currentTurnId) cache.subagentTurnIds.add(cache.currentTurnId);
+    return;
+  }
+
   const payload = record.payload || {};
   if (record.type === 'event_msg') {
     applyEventRecord(cache, record, payload, maxMessages);
@@ -547,10 +676,11 @@ function applyNativeRecord(cache, record, maxMessages) {
     case 'message':
       applyMessageRecord(cache, record, payload, maxMessages);
       break;
-    case 'reasoning':
-      // Codex App presents user-facing commentary as progress. Raw reasoning
-      // summaries are model internals and are commonly emitted in English.
+    case 'reasoning': {
+      const summary = reasoningSummaryText(payload);
+      if (summary) appendNativeMessage(cache, 'process', summary, record, maxMessages, 'reasoning_summary');
       break;
+    }
     case 'function_call':
     case 'custom_tool_call': {
       const name = String(payload.name || payload.type || 'tool');
@@ -886,6 +1016,19 @@ function cleanImageUrl(value) {
   if (/^data:image\/(?:png|jpe?g|webp|gif|avif);base64,[A-Za-z0-9+/=]+$/i.test(image)) return image;
   if (/^https?:\/\/[^\s]+$/i.test(image)) return image;
   return '';
+}
+
+function reasoningSummaryText(payload) {
+  const summaries = Array.isArray(payload?.summary) ? payload.summary : [];
+  const text = [...summaries]
+    .reverse()
+    .find((item) => item?.type === 'summary_text' && String(item.text || '').trim())?.text;
+  return String(text || '')
+    .trim()
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/^\*{1,3}\s*/, '')
+    .replace(/\s*\*{1,3}$/, '')
+    .trim();
 }
 
 function formatToolText(name, value) {

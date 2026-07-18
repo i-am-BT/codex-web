@@ -18,6 +18,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const fakeCodex = path.join(temporary, 'fake-codex.mjs');
   const traceFile = path.join(temporary, 'codex-trace.json');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
+  const appServerControlFile = path.join(temporary, 'app-server-control.json');
   const webEnv = path.join(temporary, 'web.env');
   const toolImagePath = path.join(temporary, 'tool-preview.png');
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
@@ -27,6 +28,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const createdNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa799';
   const archivedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa730';
   const automationNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa731';
+  const subagentNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa732';
   let child;
   let desktopIpc;
   let providerServer;
@@ -72,6 +74,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     customProviderBaseUrl = `http://127.0.0.1:${customProviderServer.address().port}`;
     await mkdir(runtime, { recursive: true });
     await mkdir(codexHome, { recursive: true });
+    await writeFile(appServerControlFile, '{}');
     await writeFile(
       toolImagePath,
       Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
@@ -200,6 +203,70 @@ experimental_bearer_token = "test-token"
       nativeSessionDir,
       `rollout-2026-07-11T12-52-19-${archivedNativeSessionId}.jsonl`,
     );
+    const subagentNativeSessionFile = path.join(
+      nativeSessionDir,
+      `rollout-2026-07-11T12-52-21-${subagentNativeSessionId}.jsonl`,
+    );
+    await writeFile(
+      subagentNativeSessionFile,
+      [
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.000Z',
+          type: 'session_meta',
+          payload: {
+            id: subagentNativeSessionId,
+            cwd: temporary,
+            source: { subagent: { thread_spawn: {
+              parent_thread_id: nativeSessionId,
+              depth: 1,
+              agent_path: '/root/ui_trace',
+              agent_nickname: 'Russell',
+            } } },
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.001Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'subagent-turn' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.002Z',
+          type: 'inter_agent_communication_metadata',
+          payload: { trigger_turn: true },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.003Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: '子代理正在检查界面' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.004Z',
+          type: 'response_item',
+          payload: { type: 'function_call', call_id: 'subagent-call', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:36.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: '子代理检查完成' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:36.001Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'subagent-turn', duration_ms: 1000 },
+        }),
+        '',
+      ].join('\n'),
+    );
     await writeFile(
       archivedNativeSessionFile,
       `${JSON.stringify({
@@ -270,6 +337,7 @@ experimental_bearer_token = "test-token"
       archivedNativeSessionFile,
       'vscode',
       temporary,
+      'Archived fixture',
       1,
       'archived fixture message',
       'test',
@@ -283,6 +351,7 @@ experimental_bearer_token = "test-token"
       automationNativeSessionFile,
       'vscode',
       temporary,
+      'Automation fixture',
       0,
       'Automation: Fixture\nAutomation ID: fixture\nAutomation memory: $CODEX_HOME/automations/fixture/memory.md',
       'test',
@@ -291,9 +360,28 @@ experimental_bearer_token = "test-token"
       1783745554000,
       1783745554000,
     );
+    insertThread.run(
+      subagentNativeSessionId,
+      subagentNativeSessionFile,
+      JSON.stringify({ subagent: { thread_spawn: {
+        parent_thread_id: nativeSessionId,
+        depth: 1,
+        agent_path: '/root/ui_trace',
+        agent_nickname: 'Russell',
+      } } }),
+      temporary,
+      'UI trace',
+      0,
+      'subagent fixture',
+      'test',
+      'subagent',
+      1783745555000,
+      1783745556001,
+      1783745556001,
+    );
     stateDb.close();
     await writeFile(fakeCodex, `#!/usr/bin/env node
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args.includes('--version')) {
   console.log('codex-cli test');
@@ -303,6 +391,16 @@ if (args[0] === 'app-server') {
   const createdThreadId = '${createdNativeSessionId}';
   const forkedThreadId = '${forkedNativeSessionId}';
   const fixtureThreadId = '${nativeSessionId}';
+  const archivedThreadId = '${archivedNativeSessionId}';
+  const archivedThreadIds = new Set([archivedThreadId]);
+  const archiveListCounters = new Map();
+  const archiveControl = () => {
+    try {
+      return JSON.parse(readFileSync(process.env.FAKE_APP_SERVER_CONTROL, 'utf8'));
+    } catch {
+      return {};
+    }
+  };
   const thread = (id) => ({
     id,
     sessionId: id,
@@ -333,6 +431,20 @@ if (args[0] === 'app-server') {
       appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify(message) + '\\n');
       if (!Object.hasOwn(message, 'id') || !message.method) continue;
       if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake' } });
+      else if (message.method === 'thread/list') {
+        const control = archiveControl();
+        const raceToken = String(control.unarchiveAfterFirstListToken || '');
+        const raceId = String(control.unarchiveAfterFirstListId || '');
+        if (message.params.archived === true && raceToken && raceId) {
+          const seen = archiveListCounters.get(raceToken) || 0;
+          if (seen >= 1) archivedThreadIds.delete(raceId);
+          archiveListCounters.set(raceToken, seen + 1);
+        }
+        const data = message.params.archived === true
+          ? [...archivedThreadIds].map((id) => thread(id))
+          : [];
+        send({ id: message.id, result: { data, nextCursor: null, backwardsCursor: null } });
+      }
       else if (message.method === 'thread/start') send({ id: message.id, result: { thread: thread(createdThreadId) } });
       else if (message.method === 'thread/fork') send({ id: message.id, result: { thread: thread(forkedThreadId) } });
       else if (message.method === 'thread/resume') send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
@@ -369,7 +481,19 @@ if (args[0] === 'app-server') {
       else if (message.method === 'turn/steer') {
         send({ id: message.id, result: { turnId: message.params.expectedTurnId } });
       }
-      else if (['thread/name/set', 'thread/archive', 'turn/interrupt'].includes(message.method)) {
+      else if (message.method === 'thread/archive') {
+        archivedThreadIds.add(message.params.threadId);
+        send({ id: message.id, result: {} });
+      }
+      else if (message.method === 'thread/unarchive') {
+        archivedThreadIds.delete(message.params.threadId);
+        send({ id: message.id, result: { thread: thread(message.params.threadId) } });
+      }
+      else if (message.method === 'thread/delete') {
+        archivedThreadIds.delete(message.params.threadId);
+        send({ id: message.id, result: {} });
+      }
+      else if (['thread/name/set', 'turn/interrupt'].includes(message.method)) {
         send({ id: message.id, result: {} });
       }
       else send({ id: message.id, error: { code: -32601, message: 'unsupported fake method' } });
@@ -397,6 +521,7 @@ if (args[0] === 'app-server') {
       fakeCodex,
       traceFile,
       appServerTraceFile,
+      appServerControlFile,
       desktopIpcEnabled: 'true',
       desktopIpcSocket: desktopIpc.socketPath,
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
@@ -463,7 +588,13 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.activityClusterText\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /\.activityCluster\[open\] > summary \.activityClusterChevron/);
+    assert.match(uiStyles, /\.activityCluster\.titled \.activityClusterText/);
+    assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
+    assert.match(uiStyles, /\.agentActivityItem\[open\] > \.agentActivityRow \.agentActivityChevron/);
+    assert.match(uiStyles, /\.subagentTraceTimeline\s*\{/);
+    assert.match(uiStyles, /\.subagentTraceMessage\.final\s*\{/);
+    assert.match(uiStyles, /\.subagentTraceNotice\.loading::before/);
     assert.match(uiStyles, /\.activityImageGallery\s*\{/);
     assert.match(uiStyles, /\.activityImagePreview\s*\{[^}]*display:\s*grid;[^}]*border:\s*0;[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /\.activityImagePreview\.loaded\s*\{[^}]*aspect-ratio:\s*auto/s);
@@ -473,6 +604,13 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary:last-child \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming:last-child > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
+    assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 36px 36px/s);
+    assert.match(uiStyles, /\.archiveView\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*auto/s);
+    assert.match(uiStyles, /\.archiveTaskRestore,[^}]*\.archiveTaskDelete\s*\{/s);
+    assert.match(uiStyles, /body\[data-theme\] \.archiveProjectFilter select\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.turnResultArtifacts\s*\{/);
+    assert.match(uiStyles, /\.editedFilesResult/);
+    assert.match(uiStyles, /\.webPreviewResult\s*\{/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgBody > :not\(\.memoryCitations\)\s*\{[^}]*max-width:\s*min\(780px, 100%\)/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*fit-content;[^}]*opacity:\s*0/s);
@@ -534,6 +672,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedImagePromptSync.status, 401);
     const unauthorizedDreamSkin = await fetch(`${baseUrl}/api/dream-skin/prompt`, { method: 'POST' });
     assert.equal(unauthorizedDreamSkin.status, 401);
+    const unauthorizedArchivedTasks = await fetch(`${baseUrl}/api/native-archived-sessions`);
+    assert.equal(unauthorizedArchivedTasks.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
@@ -544,6 +684,45 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    const archivedTasks = await fetch(`${baseUrl}/api/native-archived-sessions`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(archivedTasks.status, 200);
+    assert.match(archivedTasks.headers.get('cache-control'), /private, no-store/);
+    const archivedTasksPayload = await archivedTasks.json();
+    assert.equal(archivedTasksPayload.count, 1);
+    assert.equal(archivedTasksPayload.sessions[0].id, archivedNativeSessionId);
+    assert.equal(archivedTasksPayload.sessions[0].source, 'codex');
+    assert.equal(archivedTasksPayload.sessions[0].cwd, temporary);
+
+    const rejectedUnarchivedDelete = await fetch(
+      `${baseUrl}/api/native-archived-sessions/${nativeSessionId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(rejectedUnarchivedDelete.status, 404);
+    assert.match((await rejectedUnarchivedDelete.json()).error, /不在已归档列表/);
+
+    const unarchivedTask = await fetch(
+      `${baseUrl}/api/native-archived-sessions/${archivedNativeSessionId}/unarchive`,
+      { method: 'POST', headers: { Cookie: cookie } },
+    );
+    assert.equal(unarchivedTask.status, 200);
+    assert.equal((await unarchivedTask.json()).id, archivedNativeSessionId);
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.type === 'broadcast'
+      && message.method === 'thread-unarchived'
+      && message.version === 1
+      && message.params?.hostId === 'local'
+      && message.params?.conversationId === archivedNativeSessionId
+      && message.params?.cwd === temporary
+    )));
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.type === 'broadcast'
+      && message.method === 'query-cache-invalidate'
+      && message.version === 0
+      && JSON.stringify(message.params?.queryKey) === JSON.stringify(['archived-threads'])
+    )));
 
     const playgroundResponse = await fetch(`${baseUrl}/playground/`, {
       headers: { Cookie: cookie },
@@ -795,6 +974,11 @@ if (args[0] === 'app-server') {
     assert.match(page, /image_view_activity/);
     assert.match(page, /function nativeToolImageUrls/);
     assert.match(page, /function createActivityImageGallery/);
+    assert.match(page, /function loadSubagentTrace/);
+    assert.match(page, /function appendSubagentTraceMessage/);
+    assert.match(page, /function markSubagentTraceFinal/);
+    assert.match(page, /if\(kind==='reasoning_summary'\)return false/);
+    assert.match(page, /\/api\/native-sessions\/'\+encodeURIComponent\(state\.parentThreadId\)\+'\/subagents/);
     assert.match(page, /row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(item\.status==='running'\)[\s\S]*row\.appendChild\(running\);\s*}\s*if\(source==='codex'\)/s);
     assert.match(page, /galleryOnly:true/);
     assert.doesNotMatch(page, /base\+\(index\+1\)\+generation/);
@@ -850,6 +1034,16 @@ if (args[0] === 'app-server') {
     assert.match(page, /function steerQueuedPrompt/);
     assert.match(page, /function showNativeSteerOptimistically/);
     assert.match(page, /kind:'steering_user'/);
+    assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><\/div><button id="settingsToggle"/);
+    assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
+    assert.match(page, /function openArchivedView/);
+    assert.match(page, /function renderArchivedTasks/);
+    assert.match(page, /永久删除全部已归档任务/);
+    assert.match(page, /function createTurnResultArtifacts/);
+    assert.match(page, /function createEditedFilesResultCard/);
+    assert.match(page, /function createWebPreviewResultCard/);
+    assert.match(page, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
+    assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
@@ -929,35 +1123,49 @@ if (args[0] === 'app-server') {
     });
     const activityHelpers = inlineScript.match(/(function decodeEmbeddedToolString[\s\S]*?)(?=function toolMessageTitle)/)?.[1];
     assert.ok(activityHelpers);
-    const parseToolActivity = new Function(`${activityHelpers}; return toolActivityPresentations;`)();
+    const activityApi = new Function(`${activityHelpers}; return { toolActivityPresentations, activityClusterPresentation };`)();
+    const parseToolActivity = activityApi.toolActivityPresentations;
+    assert.deepEqual(activityApi.activityClusterPresentation({
+      dataset: { activityTitle: 'Opening browser skill for execution' },
+    }), {
+      icon: 'wrench',
+      text: 'Opening browser skill for execution',
+    });
     assert.deepEqual(parseToolActivity("exec_command\nsed -n '1,40p' server.mjs\nworkdir=/workspace"), [{
       verb: '已读取',
       target: 'server.mjs',
       icon: 'book-open',
+      targetType: 'file',
     }]);
     assert.deepEqual(parseToolActivity('exec\nconst result = await tools.exec_command({cmd:"sed -n \'1,40p\' server.mjs", workdir:"/workspace"});'), [{
       verb: '已读取',
       target: 'server.mjs',
       icon: 'book-open',
+      targetType: 'file',
+      expandable: false,
     }]);
     assert.deepEqual(parseToolActivity('exec_command\nrg -n "menuBtn|toggleMenu" server.mjs ui.css'), [{
-      verb: '已搜索',
-      target: 'server.mjs、ui.css · “menuBtn|toggleMenu”',
+      verb: '已在',
+      target: 'server.mjs',
+      suffix: '中搜索“menuBtn|toggleMenu”',
       icon: 'search',
+      targetType: 'file',
     }]);
     assert.deepEqual(parseToolActivity('spawn_agent\n{\n  "task_name": "ui_trace",\n  "fork_turns": "all"\n}'), [{
       variant: 'agent',
+      agentKey: 'ui_trace',
       label: 'Ui trace',
       status: '已开始工作',
       icon: 'flower-2',
-      expandable: false,
+      expandable: true,
     }]);
     assert.deepEqual(parseToolActivity('调用工具: spawn_agent\ncall_id=call-1\n{"task_name":"ui_trace"}'), [{
       variant: 'agent',
+      agentKey: 'ui_trace',
       label: 'Ui trace',
       status: '已开始工作',
       icon: 'flower-2',
-      expandable: false,
+      expandable: true,
     }]);
     const orchestratedCall = [
       'exec',
@@ -969,17 +1177,137 @@ if (args[0] === 'app-server') {
     ].join('\n');
     assert.deepEqual(parseToolActivity(orchestratedCall), [
       { verb: '已查看', target: '1 张图像', icon: 'images' },
-      { verb: '已读取文件并运行了多个命令', icon: 'search' },
+      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
+      { verb: '已在', target: 'ui.css', suffix: '中搜索“composer”', icon: 'search', targetType: 'file', expandable: false },
     ]);
+    const archiveProtocolCall = [
+      'exec',
+      'const results = await Promise.all([',
+      ...[
+        "rg -n -C 6 'archive|archived|归档|unarchive' server.mjs native-sessions.mjs desktop-ipc-client.mjs",
+        "sed -n '430,670p' desktop-ipc-client.mjs",
+        "sed -n '4300,4660p' server.mjs",
+        "sed -n '2500,2825p' server.mjs",
+        "rg -n -i 'thread.*archive|archive.*thread|conversation.*archive|archived' /Applications/Codex.app/Contents/Resources | head",
+      ].map((command) => '  tools.exec_command({cmd:'+JSON.stringify(command)+'}),'),
+      ']);',
+    ].join('\n');
+    const archiveProtocolActivity = parseToolActivity(archiveProtocolCall);
+    assert.deepEqual(archiveProtocolActivity.slice(0, 4), [
+      { verb: '已读取', target: 'desktop-ipc-client.mjs', icon: 'book-open', targetType: 'file', expandable: false },
+      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
+      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
+      {
+        verb: '已在',
+        target: 'server.mjs',
+        suffix: '中搜索“archive|archived|归档|unarchive”',
+        icon: 'search',
+        targetType: 'file',
+        expandable: false,
+      },
+    ]);
+    assert.equal(archiveProtocolActivity[4].verb, 'Ran');
+    assert.equal(archiveProtocolActivity[4].icon, 'square-terminal');
+    assert.equal(archiveProtocolActivity[4].expandable, false);
+    assert.match(archiveProtocolActivity[4].target, /^rg -n -i/);
     const patchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/server.mjs\\n-old\\n+new\\n*** Update File: /workspace/ui.css\\n+added\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
     assert.deepEqual(parseToolActivity(patchCall), [
-      { verb: '已编辑', icon: 'pencil', target: 'server.mjs', added: 1, removed: 1, meta: '+1 -1' },
-      { verb: '已编辑', icon: 'pencil', target: 'ui.css', added: 1, removed: 0, meta: '+1 -0' },
+      {
+        verb: '已编辑',
+        icon: 'pencil',
+        target: 'server.mjs',
+        filePath: '/workspace/server.mjs',
+        added: 1,
+        removed: 1,
+        meta: '+1 -1',
+      },
+      {
+        verb: '已编辑',
+        icon: 'pencil',
+        target: 'ui.css',
+        filePath: '/workspace/ui.css',
+        added: 1,
+        removed: 0,
+        meta: '+1 -0',
+      },
     ]);
     const falseImagePatchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/fake-ui.js\\n+tools.view_image({path:\\"/tmp/not-a-real-image.png\\"})\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
     assert.deepEqual(parseToolActivity(falseImagePatchCall), [
-      { verb: '已编辑', icon: 'pencil', target: 'fake-ui.js', added: 1, removed: 0, meta: '+1 -0' },
+      {
+        verb: '已编辑',
+        icon: 'pencil',
+        target: 'fake-ui.js',
+        filePath: '/workspace/fake-ui.js',
+        added: 1,
+        removed: 0,
+        meta: '+1 -0',
+      },
     ]);
+
+    const editedFilesHelper = inlineScript.match(
+      /(function editedFilesFromTurnArtifacts[\s\S]*?)(?=function browserPreviewFromTurnArtifacts)/,
+    )?.[1];
+    assert.ok(editedFilesHelper);
+    const editedFilesFromTurnArtifacts = new Function(
+      editedFilesHelper + '; return editedFilesFromTurnArtifacts;',
+    )();
+    const editedItem = {
+      dataset: { filePath: '/workspace/server.mjs' },
+      querySelector(selector) {
+        if (selector === '.activityVerb') return { dataset: { completedVerb: '已编辑' } };
+        if (selector === '.activityTarget') return { textContent: 'server.mjs' };
+        if (selector === '.activityMeta') return { textContent: '+12 -3' };
+        return null;
+      },
+    };
+    assert.deepEqual(editedFilesFromTurnArtifacts([{
+      matches: () => false,
+      querySelectorAll: () => [editedItem],
+    }]), [{ name: '/workspace/server.mjs', verb: '已编辑', added: 12, removed: 3 }]);
+    const sameBasenameItem = {
+      dataset: { filePath: '/workspace/test/server.mjs' },
+      querySelector(selector) {
+        if (selector === '.activityVerb') return { dataset: { completedVerb: '已编辑' } };
+        if (selector === '.activityTarget') return { textContent: 'server.mjs' };
+        if (selector === '.activityMeta') return { textContent: '+4 -1' };
+        return null;
+      },
+    };
+    assert.deepEqual(editedFilesFromTurnArtifacts([{
+      matches: () => false,
+      querySelectorAll: () => [editedItem, sameBasenameItem],
+    }]), [
+      { name: '/workspace/server.mjs', verb: '已编辑', added: 12, removed: 3 },
+      { name: '/workspace/test/server.mjs', verb: '已编辑', added: 4, removed: 1 },
+    ]);
+
+    const browserPreviewHelper = inlineScript.match(
+      /(function browserPreviewFromTurnArtifacts[\s\S]*?)(?=function createResultCardButton)/,
+    )?.[1];
+    assert.ok(browserPreviewHelper);
+    const browserPreviewFromTurnArtifacts = new Function(
+      browserPreviewHelper + '; return browserPreviewFromTurnArtifacts;',
+    )();
+    assert.deepEqual(browserPreviewFromTurnArtifacts([{
+      dataset: {
+        messageText: [
+          'mcp__node_repl__js',
+          'await tab.goto("http://127.0.0.1:36354/demo")',
+          'await tab.playwright.domSnapshot()',
+          'const docs = "https://example.com/unrelated"',
+        ].join('\n'),
+      },
+      querySelectorAll: () => [],
+    }]), {
+      url: 'http://127.0.0.1:36354/demo',
+      label: '127.0.0.1:36354/demo',
+    });
+    assert.equal(browserPreviewFromTurnArtifacts([{
+      dataset: {
+        messageText: 'mcp__node_repl__js\nawait browser.documentation()\nconst docs = "https://example.com/docs"',
+      },
+      querySelectorAll: () => [],
+    }]), null);
 
     class FixtureElement {
       constructor(tagName) {
@@ -1038,17 +1366,36 @@ if (args[0] === 'app-server') {
 
     const agentActivity = createToolActivityItem({
       variant: 'agent',
+      agentKey: 'ui_trace',
       label: 'Ui trace',
       status: '已开始工作',
       icon: 'flower-2',
-      expandable: false,
-    }, 'spawn_agent\n{"task_name":"ui_trace"}', true);
+      expandable: true,
+    }, 'spawn_agent\n{"task_name":"ui_trace"}', true, { parentThreadId: nativeSessionId });
     const agentActivityNodes = activityNodes(agentActivity);
-    assert.equal(agentActivity.tagName, 'DIV');
-    assert.equal(agentActivity.className, 'activityItem agentActivityItem static');
+    assert.equal(agentActivity.tagName, 'DETAILS');
+    assert.equal(agentActivity.open, false);
+    assert.equal(agentActivity.className, 'activityItem agentActivityItem');
+    assert.equal(agentActivity.dataset.agentKey, 'ui_trace');
+    assert.equal(agentActivity.dataset.parentThreadId, nativeSessionId);
     assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityLabel').textContent, 'Ui trace');
-    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityStatus').textContent, '已开始工作');
+    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityStatus').textContent, '正在启动');
     assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityIcon').children[0].attributes.get('data-lucide'), 'flower-2');
+    assert.equal(agentActivityNodes.filter((node) => node.className.includes('subagentTraceTimeline')).length, 1);
+    assert.equal(agentActivityNodes.filter((node) => node.className.includes('agentActivityChevron')).length, 1);
+
+    const searchActivity = createToolActivityItem({
+      verb: '已在',
+      target: 'server.mjs',
+      suffix: '中搜索“archive”',
+      icon: 'search',
+      targetType: 'file',
+      expandable: false,
+    }, 'exec\nsearch archive');
+    const searchActivityNodes = activityNodes(searchActivity);
+    assert.equal(searchActivity.className, 'activityItem static fileTarget');
+    assert.equal(searchActivityNodes.find((node) => node.className === 'activityTarget').textContent, 'server.mjs');
+    assert.equal(searchActivityNodes.find((node) => node.className === 'activitySuffix').textContent, '中搜索“archive”');
 
     const configResponse = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
     assert.equal(configResponse.status, 200);
@@ -1214,6 +1561,38 @@ if (args[0] === 'app-server') {
     assert.ok(nativeConversation.messages.some((message) => (
       message.role === 'user' && message.content === 'native fixture message'
     )));
+
+    const unauthorizedSubagent = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=ui_trace`,
+    );
+    assert.equal(unauthorizedSubagent.status, 401);
+    const subagentResponse = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=ui_trace&limit=100`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(subagentResponse.status, 200);
+    const subagentConversation = (await subagentResponse.json()).subagent;
+    assert.equal(subagentConversation.id, subagentNativeSessionId);
+    assert.equal(subagentConversation.source, 'subagent');
+    assert.equal(subagentConversation.status, 'done');
+    assert.equal(subagentConversation.metadata.parentThreadId, nativeSessionId);
+    assert.equal(subagentConversation.metadata.agentPath, '/root/ui_trace');
+    assert.ok(subagentConversation.messages.some((message) => message.content === '子代理正在检查界面'));
+    assert.ok(subagentConversation.messages.some((message) => message.content.includes('exec_command')));
+    assert.ok(subagentConversation.messages.some((message) => message.content === '子代理检查完成'));
+    const incrementalSubagentResponse = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=%2Froot%2Fui_trace&after=${subagentConversation.cursor}&generation=${subagentConversation.generation}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(incrementalSubagentResponse.status, 200);
+    const incrementalSubagent = (await incrementalSubagentResponse.json()).subagent;
+    assert.equal(incrementalSubagent.reset, false);
+    assert.deepEqual(incrementalSubagent.messages, []);
+    const missingSubagent = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=missing_agent`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(missingSubagent.status, 404);
     const nativeTargetMessage = nativeConversation.messages.find((message) => (
       message.role === 'user' && message.content === 'native fixture message'
     ));
@@ -1663,6 +2042,13 @@ if (args[0] === 'app-server') {
       && message.params?.cwd === temporary
     )));
 
+    const deletedArchivedTask = await fetch(
+      `${baseUrl}/api/native-archived-sessions/${createdNativeSessionId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(deletedArchivedTask.status, 200);
+    assert.equal((await deletedArchivedTask.json()).id, createdNativeSessionId);
+
     const continued = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -1731,12 +2117,107 @@ if (args[0] === 'app-server') {
       && message.params?.cwd === temporary
     )));
 
+    const rejectedDeleteAll = await fetch(`${baseUrl}/api/native-archived-sessions`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: 'delete' }),
+    });
+    assert.equal(rejectedDeleteAll.status, 400);
+
+    const deletedAllArchived = await fetch(`${baseUrl}/api/native-archived-sessions`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: '永久删除全部已归档任务' }),
+    });
+    assert.equal(deletedAllArchived.status, 200);
+    const deletedAllArchivedPayload = await deletedAllArchived.json();
+    assert.deepEqual(deletedAllArchivedPayload.deleted, [nativeSessionId]);
+    assert.deepEqual(deletedAllArchivedPayload.skipped, []);
+    assert.deepEqual(deletedAllArchivedPayload.failed, []);
+
     const protocolMessages = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
+    assert.ok(protocolMessages.some((message) => (
+      message.method === 'thread/list'
+      && message.params.archived === true
+      && message.params.useStateDbOnly === true
+    )));
+    assert.ok(protocolMessages.some((message) => (
+      message.method === 'thread/unarchive'
+      && message.params.threadId === archivedNativeSessionId
+    )));
+    assert.deepEqual(
+      protocolMessages.filter((message) => message.method === 'thread/delete').map((message) => message.params.threadId),
+      [createdNativeSessionId, nativeSessionId],
+    );
+
+    const archivedForRace = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(archivedForRace.status, 200);
+    const deleteCountBeforeRace = protocolMessages
+      .filter((message) => message.method === 'thread/delete' && message.params.threadId === nativeSessionId)
+      .length;
+    await writeFile(appServerControlFile, JSON.stringify({
+      unarchiveAfterFirstListToken: 'single-delete-race',
+      unarchiveAfterFirstListId: nativeSessionId,
+    }));
+    const racedArchivedDelete = await fetch(`${baseUrl}/api/native-archived-sessions/${nativeSessionId}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(racedArchivedDelete.status, 409);
+    assert.deepEqual((await racedArchivedDelete.json()).skipped, [nativeSessionId]);
+    const protocolMessagesAfterRace = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(
+      protocolMessagesAfterRace
+        .filter((message) => message.method === 'thread/delete' && message.params.threadId === nativeSessionId)
+        .length,
+      deleteCountBeforeRace,
+    );
+
+    for (const threadId of [nativeSessionId, createdNativeSessionId]) {
+      const archivedForBulkRace = await fetch(`${baseUrl}/api/native-sessions/${threadId}`, {
+        method: 'DELETE',
+        headers: { Cookie: cookie },
+      });
+      assert.equal(archivedForBulkRace.status, 200);
+    }
+    const createdDeleteCountBeforeBulkRace = protocolMessagesAfterRace
+      .filter((message) => message.method === 'thread/delete' && message.params.threadId === createdNativeSessionId)
+      .length;
+    await writeFile(appServerControlFile, JSON.stringify({
+      unarchiveAfterFirstListToken: 'bulk-delete-race',
+      unarchiveAfterFirstListId: createdNativeSessionId,
+    }));
+    const bulkRaceDelete = await fetch(`${baseUrl}/api/native-archived-sessions`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: '永久删除全部已归档任务' }),
+    });
+    assert.equal(bulkRaceDelete.status, 200);
+    const bulkRaceDeletePayload = await bulkRaceDelete.json();
+    assert.deepEqual(bulkRaceDeletePayload.deleted, [nativeSessionId]);
+    assert.deepEqual(bulkRaceDeletePayload.skipped, [createdNativeSessionId]);
+    assert.deepEqual(bulkRaceDeletePayload.failed, []);
+    const protocolMessagesAfterBulkRace = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(
+      protocolMessagesAfterBulkRace
+        .filter((message) => message.method === 'thread/delete' && message.params.threadId === createdNativeSessionId)
+        .length,
+      createdDeleteCountBeforeBulkRace,
+    );
     assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 1);
     assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 2);
     const restartFromFirstMessage = protocolMessages.find((message) => (
@@ -1952,6 +2433,7 @@ function startServer({
   fakeCodex,
   traceFile,
   appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl'),
+  appServerControlFile = path.join(temporary, 'app-server-control.json'),
   webEnv = path.join(temporary, 'web.env'),
   configWritable = 'false',
   desktopIpcEnabled = 'false',
@@ -1986,6 +2468,7 @@ function startServer({
       FORCE_FULL_ACCESS: 'false',
       FAKE_CODEX_TRACE: traceFile,
       FAKE_APP_SERVER_TRACE: appServerTraceFile,
+      FAKE_APP_SERVER_CONTROL: appServerControlFile,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

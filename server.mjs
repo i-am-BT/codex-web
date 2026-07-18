@@ -501,6 +501,106 @@ app.get('/api/native-sessions', requireAuth, (_req, res) => {
   res.json({ sessions: nativeSessionSummaries(), version: nativeSessions.version });
 });
 
+app.get('/api/native-archived-sessions', requireAuth, async (_req, res) => {
+  try {
+    const sessions = await listArchivedNativeThreads();
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ sessions, count: sessions.length });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `读取已归档任务失败: ${err.message}` });
+  }
+});
+
+app.post('/api/native-archived-sessions/:id/unarchive', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  try {
+    const archivedSession = await findArchivedNativeThread(threadId);
+    const result = await appServerClient.request('thread/unarchive', { threadId });
+    const session = nativeArchivedThreadSummary(result?.thread) || archivedSession || { id: threadId, cwd: '' };
+    await notifyDesktopThreadUnarchived(threadId, session.cwd);
+    nativeSessions.scheduleRefresh();
+    res.json({
+      ok: true,
+      id: threadId,
+      session,
+    });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `取消归档 Codex App 会话失败: ${err.message}` });
+  }
+});
+
+app.delete('/api/native-archived-sessions', requireAuth, async (req, res) => {
+  if (String(req.body?.confirm || '') !== '永久删除全部已归档任务') {
+    return res.status(400).json({ error: '删除全部已归档任务需要再次确认' });
+  }
+
+  try {
+    const sessions = await listArchivedNativeThreads();
+    const deleted = [];
+    const skipped = [];
+    const failed = [];
+    for (const session of sessions) {
+      let archived;
+      try {
+        archived = await findArchivedNativeThread(session.id);
+      } catch (err) {
+        failed.push({ id: session.id, error: `删除前复核失败: ${err.message}` });
+        continue;
+      }
+      if (!archived) {
+        skipped.push(session.id);
+        continue;
+      }
+      try {
+        await appServerClient.request('thread/delete', { threadId: session.id });
+        deleted.push(session.id);
+      } catch (err) {
+        failed.push({ id: session.id, error: err.message });
+      }
+    }
+    await notifyDesktopArchivedThreadsChanged();
+    nativeSessions.scheduleRefresh();
+    if (failed.length) {
+      return res.status(502).json({
+        error: `已永久删除 ${deleted.length} 个任务，跳过 ${skipped.length} 个，${failed.length} 个失败`,
+        deleted,
+        skipped,
+        failed,
+      });
+    }
+    res.json({ ok: true, deleted, skipped, failed: [] });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `永久删除全部已归档任务失败: ${err.message}` });
+  }
+});
+
+app.delete('/api/native-archived-sessions/:id', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  try {
+    if (!await findArchivedNativeThread(threadId)) {
+      return res.status(404).json({ error: '该任务不在已归档列表中，未执行删除' });
+    }
+    if (!await findArchivedNativeThread(threadId)) {
+      await notifyDesktopArchivedThreadsChanged();
+      nativeSessions.scheduleRefresh();
+      return res.status(409).json({
+        error: '归档状态已变化，已跳过永久删除',
+        skipped: [threadId],
+      });
+    }
+    await appServerClient.request('thread/delete', { threadId });
+    await notifyDesktopArchivedThreadsChanged();
+    nativeSessions.scheduleRefresh();
+    res.json({ ok: true, id: threadId });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `永久删除已归档任务失败: ${err.message}` });
+  }
+});
+
 app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
   try {
     const limit = positiveInteger(req.query.limit);
@@ -515,6 +615,23 @@ app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
     res.json({ conversation: decorateNativeConversation(conversation, { externalizeImages }) });
   } catch (err) {
     res.status(500).json({ error: `读取 Codex App 会话失败: ${err.message}` });
+  }
+});
+
+app.get('/api/native-sessions/:id/subagents', requireAuth, (req, res) => {
+  try {
+    const parentThreadId = cleanNativeThreadId(req.params.id);
+    const agentRef = cleanSubagentRef(req.query.agent);
+    if (!parentThreadId || !agentRef) return res.status(400).json({ error: '子代理参数无效' });
+    const subagent = nativeSessions.getSubagent(parentThreadId, agentRef, {
+      after: req.query.after,
+      generation: req.query.generation,
+      limit: positiveInteger(req.query.limit),
+    });
+    if (!subagent) return res.status(404).json({ error: '子代理尚未创建或已不可用' });
+    res.json({ subagent });
+  } catch (err) {
+    res.status(500).json({ error: `读取子代理进度失败: ${err.message}` });
   }
 });
 
@@ -2295,6 +2412,84 @@ function nativeSessionSummaries() {
   });
 }
 
+async function listArchivedNativeThreads() {
+  const sessions = [];
+  const seenIds = new Set();
+  const seenCursors = new Set();
+  let cursor = null;
+  for (let page = 0; page < 100; page += 1) {
+    const result = await appServerClient.request('thread/list', compactObject({
+      archived: true,
+      cursor,
+      limit: 200,
+      sortKey: 'recency_at',
+      sortDirection: 'desc',
+      useStateDbOnly: true,
+    }));
+    for (const thread of result?.data || []) {
+      const session = nativeArchivedThreadSummary(thread);
+      if (!session || seenIds.has(session.id)) continue;
+      seenIds.add(session.id);
+      sessions.push(session);
+    }
+    const nextCursor = String(result?.nextCursor || '');
+    if (!nextCursor) return sessions;
+    if (seenCursors.has(nextCursor)) throw new Error('Codex app-server 返回了重复的归档分页游标');
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  throw new Error('已归档任务数量超过安全分页上限');
+}
+
+async function findArchivedNativeThread(threadId) {
+  const targetId = cleanNativeThreadId(threadId);
+  if (!targetId) return null;
+  const seenCursors = new Set();
+  let cursor = null;
+  for (let page = 0; page < 100; page += 1) {
+    const result = await appServerClient.request('thread/list', compactObject({
+      archived: true,
+      cursor,
+      limit: 200,
+      sortKey: 'recency_at',
+      sortDirection: 'desc',
+      useStateDbOnly: true,
+    }));
+    for (const thread of result?.data || []) {
+      const session = nativeArchivedThreadSummary(thread);
+      if (session?.id === targetId) return session;
+    }
+    const nextCursor = String(result?.nextCursor || '');
+    if (!nextCursor) return null;
+    if (seenCursors.has(nextCursor)) throw new Error('Codex app-server 返回了重复的归档分页游标');
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  throw new Error('已归档任务数量超过安全分页上限');
+}
+
+function nativeArchivedThreadSummary(thread) {
+  const id = cleanNativeThreadId(thread?.id);
+  if (!id) return null;
+  const title = String(thread?.name || thread?.preview || '未命名任务')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, 120) || '未命名任务';
+  const createdAt = unixSecondsToIso(thread?.createdAt);
+  const updatedAt = unixSecondsToIso(thread?.updatedAt) || createdAt;
+  const recencyAt = unixSecondsToIso(thread?.recencyAt) || updatedAt;
+  return {
+    id,
+    source: 'codex',
+    title,
+    preview: String(thread?.preview || '').trim().replace(/\s+/g, ' ').slice(0, 240),
+    cwd: String(thread?.cwd || '').trim(),
+    createdAt,
+    updatedAt,
+    recencyAt,
+  };
+}
+
 function normalizeNativeProjectPath(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -2572,6 +2767,24 @@ async function notifyDesktopThreadArchived(threadId, cwd) {
   } catch (error) {
     console.warn(`Codex Desktop IPC 归档同步失败: ${error.message}`);
   }
+  await notifyDesktopArchivedThreadsChanged();
+}
+
+async function notifyDesktopThreadUnarchived(threadId, cwd) {
+  try {
+    await desktopIpcClient.threadUnarchived(threadId, cwd);
+  } catch (error) {
+    console.warn(`Codex Desktop IPC 取消归档同步失败: ${error.message}`);
+  }
+  await notifyDesktopArchivedThreadsChanged();
+}
+
+async function notifyDesktopArchivedThreadsChanged() {
+  try {
+    await desktopIpcClient.invalidateQueryCache(['archived-threads']);
+  } catch (error) {
+    console.warn(`Codex Desktop IPC 归档列表刷新失败: ${error.message}`);
+  }
 }
 
 async function startNativeTurn(threadId, turn) {
@@ -2731,6 +2944,13 @@ function findInProgressTurnId(thread) {
 function cleanNativeThreadId(value) {
   const id = String(value || '').trim().toLowerCase();
   return NATIVE_THREAD_ID_PATTERN.test(id) ? id : '';
+}
+
+function cleanSubagentRef(value) {
+  const ref = String(value || '').trim();
+  if (!ref || ref.length > 240 || !/^\/?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(ref)) return '';
+  if (ref.split('/').includes('..')) return '';
+  return ref;
 }
 
 function positiveInteger(value) {
@@ -3373,17 +3593,18 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
 <div id="nativeRequestModal" class="requestOverlay hidden" role="presentation"><div class="requestPanel" role="dialog" aria-modal="true" aria-labelledby="nativeRequestTitle"><div class="requestHead"><div><div id="nativeRequestTitle" class="requestTitle">Codex 请求确认</div><div id="nativeRequestMeta" class="requestMeta"></div></div></div><pre id="nativeRequestDetail" class="requestDetail"></pre><form id="nativeRequestForm"><div id="nativeRequestFields" class="requestFields"></div><div id="nativeRequestActions" class="requestActions"></div></form></div></div>
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
 <script src="/vendor/lucide.js"></script>
 <script>
 const login = document.getElementById('login'), app = document.getElementById('app'), loginForm = document.getElementById('loginForm'), loginError = document.getElementById('loginError');
-const chat = document.getElementById('chat'), input = document.getElementById('input'), sendBtn = document.getElementById('send'), cancelBtn = document.getElementById('cancelRun'), statusEl = document.getElementById('status');
+const chat = document.getElementById('chat'), composer = document.querySelector('.composer'), input = document.getElementById('input'), sendBtn = document.getElementById('send'), cancelBtn = document.getElementById('cancelRun'), statusEl = document.getElementById('status');
 const dropZone = document.getElementById('dropZone'), attachFile = document.getElementById('attachFile'), fileInput = document.getElementById('fileInput'), attachmentTray = document.getElementById('attachmentTray');
 const provider = document.getElementById('provider'), model = document.getElementById('model'), reasoningEffort = document.getElementById('reasoningEffort'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
+const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
 const menuBtn = document.getElementById('menuBtn');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
 const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
@@ -3392,6 +3613,10 @@ const nativeRequestModal = document.getElementById('nativeRequestModal'), native
 const titleEl = document.querySelector('.top .title');
 let currentConversationId = '';
 let currentConversationSource = 'codex';
+let activeMainView = 'chat';
+let archivedItems = [];
+let archivedLoading = false;
+let archiveNotice = '';
 let conversationLoadSeq = 0;
 let nativeCursor = 0;
 let nativeGeneration = 0;
@@ -3407,12 +3632,14 @@ let nativeRunningElement = null;
 let nativeOptimisticElements = [];
 let nativeOptimisticSteering = new Map();
 let nativeLiveItems = new Map();
+let subagentTraceStates = new Set();
 let latestToolElement = null;
 let latestAssistantElement = null;
 let latestFinalAssistantElement = null;
 let latestUserElement = null;
 let turnProcessElements = [];
 let currentActivityCluster = null;
+let pendingActivityClusterTitle = '';
 let collectingTurnProcess = false;
 let turnProcessHeader = null;
 let turnProcessTimeline = null;
@@ -3772,6 +3999,7 @@ function showNativeSteerOptimistically(item){
   const element=addMsg('user',item.message||'请分析上传的附件。',{
     kind:'steering_user',
     at:new Date().toISOString(),
+    turnId:activeNativeTurnId,
     optimisticQueueId:item.id,
   });
   if(!element)return null;
@@ -4418,6 +4646,11 @@ function enhanceInterface(){
   if(sideActions&&settingsToggle)sideActions.appendChild(settingsToggle);
   enhanceSettingsModal();
   setIconLabel(document.getElementById('newChat'),'plus','新建任务');
+  setIconLabel(archiveToggle,'archive','已归档任务',false);
+  archiveToggle?.setAttribute('title','已归档任务');
+  archiveToggle?.setAttribute('aria-pressed','false');
+  setIconLabel(archiveRefresh,'refresh-cw','刷新');
+  setIconLabel(archiveDeleteAll,'trash-2','永久删除全部');
   setIconLabel(settingsToggle,'settings','设置',false);
   settingsToggle?.setAttribute('title','设置');
   settingsToggle?.setAttribute('aria-expanded','false');
@@ -4475,6 +4708,11 @@ applyAppearance();
 loginForm?.addEventListener('submit', async (e)=>{e.preventDefault();loginError.textContent='';const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});if(res.ok){login.classList.add('hidden');app.classList.remove('hidden');await boot(true);input.focus()}else{loginError.textContent=(await res.json()).error||'登录失败'}});
 document.getElementById('logout')?.addEventListener('click', async()=>{await fetch('/api/logout',{method:'POST'});location.reload()});
 document.getElementById('newChat')?.addEventListener('click', newChat);
+archiveToggle?.addEventListener('click',openArchivedView);
+archiveSearch?.addEventListener('input',renderArchivedTasks);
+archiveProjectFilter?.addEventListener('change',renderArchivedTasks);
+archiveRefresh?.addEventListener('click',()=>loadArchivedTasks({force:true}));
+archiveDeleteAll?.addEventListener('click',deleteAllArchivedTasks);
 document.getElementById('refreshProviderModels')?.addEventListener('click', refreshProviderModels);
 document.getElementById('saveDefault')?.addEventListener('click', saveDefaultModel);
 document.getElementById('deleteProvider')?.addEventListener('click', deleteSelectedProvider);
@@ -4633,6 +4871,278 @@ function conversationKey(source,id){return (source==='codex'?'codex':'web')+':'+
 function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown__'}
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
 function projectNameFromPath(value){const clean=String(value||'').replace(/\\\\/g,'/').replace(/\\/+$/,'');const parts=clean.split('/').filter(Boolean);return parts.length?parts[parts.length-1]:'未指定项目'}
+function setMainView(view){
+  const archived=view==='archive';
+  activeMainView=archived?'archive':'chat';
+  archiveView?.classList.toggle('hidden',!archived);
+  chat?.classList.toggle('hidden',archived);
+  composer?.classList.toggle('hidden',archived);
+  archiveToggle?.setAttribute('aria-pressed',String(archived));
+  archiveToggle?.classList.toggle('active',archived);
+  if(archived){
+    closeComposerPopovers();
+    if(titleEl)titleEl.textContent='已归档任务';
+    statusEl.textContent=archivedLoading?'正在读取归档列表...':'Codex App · 已归档';
+    setIconLabel(modeLabel,'archive','已归档');
+  }else applyConversationMode();
+}
+function showChatView(){if(activeMainView!=='chat')setMainView('chat')}
+async function openArchivedView(){
+  closeSettings();
+  setMainView('archive');
+  closeMenu();
+  await loadArchivedTasks({force:true});
+  archiveSearch?.focus();
+}
+function archivedTaskTimestamp(item){
+  const value=item?.recencyAt||item?.updatedAt||item?.createdAt;
+  const date=new Date(value||0);
+  if(Number.isNaN(date.getTime()))return'';
+  return date.toLocaleString([],{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+function syncArchivedProjectOptions(){
+  if(!archiveProjectFilter)return;
+  const selected=archiveProjectFilter.value;
+  const projects=[...new Set(archivedItems.map((item)=>normalizeProjectPath(item.cwd)))].sort((left,right)=>historyProjectName(left).localeCompare(historyProjectName(right),'zh-CN'));
+  archiveProjectFilter.replaceChildren();
+  const all=document.createElement('option');
+  all.value='';
+  all.textContent='所有项目';
+  archiveProjectFilter.appendChild(all);
+  for(const projectPath of projects){
+    const option=document.createElement('option');
+    option.value=projectPath||'__unknown__';
+    const count=archivedItems.filter((item)=>normalizeProjectPath(item.cwd)===projectPath).length;
+    option.textContent=historyProjectName(projectPath)+' ('+count+')';
+    archiveProjectFilter.appendChild(option);
+  }
+  archiveProjectFilter.value=[...archiveProjectFilter.options].some((option)=>option.value===selected)?selected:'';
+}
+async function loadArchivedTasks({force=false}={}){
+  if(archivedLoading)return;
+  archivedLoading=true;
+  archiveNotice='正在读取已归档任务...';
+  archiveRefresh.disabled=true;
+  archiveDeleteAll.disabled=true;
+  renderArchivedTasks();
+  try{
+    const res=await fetch('/api/native-archived-sessions',{headers:{Accept:'application/json'}});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'读取已归档任务失败');
+    archivedItems=Array.isArray(data.sessions)?data.sessions:[];
+    archiveNotice='';
+    syncArchivedProjectOptions();
+  }catch(error){
+    archiveNotice=error.message;
+  }finally{
+    archivedLoading=false;
+    archiveRefresh.disabled=false;
+    archiveDeleteAll.disabled=!archivedItems.length;
+    renderArchivedTasks();
+    if(activeMainView==='archive')statusEl.textContent=archiveNotice||'Codex App · '+archivedItems.length+' 个已归档任务';
+  }
+}
+function createArchivedAction(iconName,label,className,handler){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className=className;
+  button.title=label;
+  button.setAttribute('aria-label',label);
+  setIconLabel(button,iconName,label,false);
+  button.addEventListener('click',handler);
+  return button;
+}
+function createArchivedTaskRow(item){
+  const row=document.createElement('article');
+  row.className='archiveTask';
+  row.dataset.threadId=item.id;
+  const main=document.createElement('div');
+  main.className='archiveTaskMain';
+  const title=document.createElement('h3');
+  title.className='archiveTaskTitle';
+  title.textContent=item.title||'未命名任务';
+  const preview=document.createElement('p');
+  preview.className='archiveTaskPreview';
+  preview.textContent=item.preview&&item.preview!==item.title?item.preview:'';
+  preview.hidden=!preview.textContent;
+  const meta=document.createElement('div');
+  meta.className='archiveTaskMeta';
+  const pathNode=document.createElement('span');
+  pathNode.className='archiveTaskPath';
+  const pathIcon=document.createElement('i');
+  pathIcon.setAttribute('data-lucide','folder');
+  pathIcon.setAttribute('aria-hidden','true');
+  const pathText=document.createElement('span');
+  pathText.textContent=item.cwd||'路径未知';
+  pathText.title=item.cwd||'路径未知';
+  pathNode.appendChild(pathIcon);
+  pathNode.appendChild(pathText);
+  const time=document.createElement('time');
+  time.className='archiveTaskTime';
+  time.dateTime=String(item.recencyAt||item.updatedAt||item.createdAt||'');
+  time.textContent=archivedTaskTimestamp(item);
+  meta.appendChild(pathNode);
+  if(time.textContent)meta.appendChild(time);
+  main.appendChild(title);
+  main.appendChild(preview);
+  main.appendChild(meta);
+  const actions=document.createElement('div');
+  actions.className='archiveTaskActions';
+  const unarchive=createArchivedAction('archive-restore','取消归档','archiveTaskRestore',()=>unarchiveTask(item,row));
+  const remove=createArchivedAction('trash-2','永久删除','archiveTaskDelete',()=>deleteArchivedTask(item,row));
+  actions.appendChild(unarchive);
+  actions.appendChild(remove);
+  row.appendChild(main);
+  row.appendChild(actions);
+  refreshIcons(row);
+  return row;
+}
+function renderArchivedTasks(){
+  if(!archiveList)return;
+  const query=String(archiveSearch?.value||'').trim().toLocaleLowerCase();
+  const project=String(archiveProjectFilter?.value||'');
+  const visible=archivedItems.filter((item)=>{
+    const projectPath=normalizeProjectPath(item.cwd);
+    if(project&&projectPath!==(project==='__unknown__'?'':project))return false;
+    if(!query)return true;
+    return (String(item.title||'')+' '+String(item.preview||'')+' '+String(item.cwd||'')+' '+historyProjectName(item.cwd)).toLocaleLowerCase().includes(query);
+  });
+  archiveList.replaceChildren();
+  if(archivedLoading&&!archivedItems.length){
+    const loading=document.createElement('div');
+    loading.className='archiveEmpty loading';
+    loading.textContent='正在读取已归档任务…';
+    archiveList.appendChild(loading);
+  }else if(!visible.length){
+    const empty=document.createElement('div');
+    empty.className='archiveEmpty';
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide',archivedItems.length?'search-x':'archive');
+    icon.setAttribute('aria-hidden','true');
+    const title=document.createElement('strong');
+    title.textContent=archivedItems.length?'没有匹配的已归档任务':'没有已归档任务';
+    const detail=document.createElement('span');
+    detail.textContent=archivedItems.length?'调整搜索词或项目筛选后重试。':'归档的任务会显示在这里。';
+    empty.appendChild(icon);
+    empty.appendChild(title);
+    empty.appendChild(detail);
+    archiveList.appendChild(empty);
+  }else{
+    const groups=new Map();
+    for(const item of visible){
+      const projectPath=normalizeProjectPath(item.cwd);
+      if(!groups.has(projectPath))groups.set(projectPath,[]);
+      groups.get(projectPath).push(item);
+    }
+    for(const [projectPath,items] of groups){
+      const group=document.createElement('section');
+      group.className='archiveProject';
+      const head=document.createElement('div');
+      head.className='archiveProjectHead';
+      const identity=document.createElement('div');
+      identity.className='archiveProjectIdentity';
+      const folder=document.createElement('i');
+      folder.setAttribute('data-lucide','folder');
+      folder.setAttribute('aria-hidden','true');
+      const copy=document.createElement('div');
+      const name=document.createElement('h2');
+      name.textContent=historyProjectName(projectPath);
+      const pathText=document.createElement('p');
+      pathText.textContent=projectPath||'路径未知';
+      pathText.title=pathText.textContent;
+      copy.appendChild(name);
+      copy.appendChild(pathText);
+      identity.appendChild(folder);
+      identity.appendChild(copy);
+      const count=document.createElement('span');
+      count.className='archiveProjectCount';
+      count.textContent=items.length+' 个任务';
+      head.appendChild(identity);
+      head.appendChild(count);
+      const rows=document.createElement('div');
+      rows.className='archiveProjectTasks';
+      for(const item of items)rows.appendChild(createArchivedTaskRow(item));
+      group.appendChild(head);
+      group.appendChild(rows);
+      archiveList.appendChild(group);
+    }
+  }
+  const countText=visible.length===archivedItems.length?archivedItems.length+' 个已归档任务':visible.length+' / '+archivedItems.length+' 个已归档任务';
+  archiveStatus.textContent=[archiveNotice,countText].filter(Boolean).join(' · ');
+  archiveDeleteAll.disabled=archivedLoading||!archivedItems.length;
+  refreshIcons(archiveList);
+}
+async function unarchiveTask(item,row){
+  const buttons=[...row.querySelectorAll('button')];
+  buttons.forEach((button)=>{button.disabled=true});
+  row.classList.add('working');
+  archiveNotice='正在恢复「'+item.title+'」...';
+  archiveStatus.textContent=archiveNotice;
+  try{
+    const res=await fetch('/api/native-archived-sessions/'+encodeURIComponent(item.id)+'/unarchive',{method:'POST'});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'取消归档失败');
+    archivedItems=archivedItems.filter((entry)=>entry.id!==item.id);
+    archiveNotice='已恢复「'+item.title+'」';
+    syncArchivedProjectOptions();
+    renderArchivedTasks();
+    await refreshHistory();
+  }catch(error){
+    const message=error.message;
+    await loadArchivedTasks({force:true});
+    archiveNotice=message;
+    renderArchivedTasks();
+  }
+}
+async function deleteArchivedTask(item,row){
+  if(!confirm('永久删除已归档任务「'+item.title+'」？\\n\\n此操作无法撤销。'))return;
+  const buttons=[...row.querySelectorAll('button')];
+  buttons.forEach((button)=>{button.disabled=true});
+  row.classList.add('working');
+  archiveNotice='正在永久删除「'+item.title+'」...';
+  archiveStatus.textContent=archiveNotice;
+  try{
+    const res=await fetch('/api/native-archived-sessions/'+encodeURIComponent(item.id),{method:'DELETE'});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'永久删除失败');
+    archivedItems=archivedItems.filter((entry)=>entry.id!==item.id);
+    archiveNotice='已永久删除「'+item.title+'」';
+    syncArchivedProjectOptions();
+    renderArchivedTasks();
+  }catch(error){
+    const message=error.message;
+    await loadArchivedTasks({force:true});
+    archiveNotice=message;
+    renderArchivedTasks();
+  }
+}
+async function deleteAllArchivedTasks(){
+  if(!archivedItems.length||archivedLoading)return;
+  if(!confirm('永久删除全部 '+archivedItems.length+' 个已归档任务？\\n\\n此操作无法撤销。'))return;
+  const phrase=prompt('为防止误删，请输入：永久删除全部已归档任务');
+  if(phrase!=='永久删除全部已归档任务'){
+    archiveNotice=phrase===null?'已取消永久删除':'确认文字不匹配，未执行删除';
+    renderArchivedTasks();
+    return;
+  }
+  archivedLoading=true;
+  archiveNotice='正在永久删除全部已归档任务...';
+  renderArchivedTasks();
+  let resultNotice='';
+  try{
+    const res=await fetch('/api/native-archived-sessions',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:phrase})});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'永久删除全部任务失败');
+    resultNotice='已永久删除 '+(data.deleted||[]).length+' 个已归档任务'+((data.skipped||[]).length?'，跳过 '+data.skipped.length+' 个':'');
+  }catch(error){
+    resultNotice=error.message;
+  }finally{
+    archivedLoading=false;
+    await loadArchivedTasks({force:true});
+    archiveNotice=resultNotice;
+    renderArchivedTasks();
+  }
+}
 function readRenamedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECT_NAMES_STORAGE_KEY)||'{}');if(!saved||Array.isArray(saved)||typeof saved!=='object')return new Map();return new Map(Object.entries(saved).filter(([key,value])=>key&&typeof value==='string'&&value.trim()).map(([key,value])=>[key,value.trim().replace(/\s+/g,' ').slice(0,80)]))}catch{return new Map()}}
 function storeRenamedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECT_NAMES_STORAGE_KEY,JSON.stringify(Object.fromEntries([...renamedHistoryProjects.entries()].sort(([left],[right])=>left.localeCompare(right)))))}catch{}}
 function historyProjectName(value){return renamedHistoryProjects.get(historyProjectKey(value))||projectNameFromPath(value)}
@@ -5012,12 +5522,19 @@ function applyConversationMode(){
   if(webRunActive)closeComposerPopovers();
   syncComposerChrome();
   renderPromptQueue();
+  if(activeMainView==='archive'){
+    statusEl.classList.remove('running');
+    statusEl.textContent=archiveNotice||'Codex App · '+archivedItems.length+' 个已归档任务';
+    setIconLabel(modeLabel,'archive','已归档');
+  }
 }
-function newChat(){closeComposerPopovers();clearNativeCompletionSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
+function newChat(){showChatView();closeComposerPopovers();clearNativeCompletionSync();clearSubagentTraceStates();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
 async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
+  showChatView();
   clearNativeCompletionSync();
+  clearSubagentTraceStates();
   const seq=++conversationLoadSeq;
   nativeOptimisticElements=[];
   nativeOptimisticSteering=new Map();
@@ -5133,6 +5650,7 @@ function connectSessionEvents(){
   sessionEvents.addEventListener('sessions',(event)=>{
     let changedIds=[];
     try{changedIds=JSON.parse(event.data||'{}').changedIds||[]}catch(e){}
+    refreshOpenSubagentTraces(changedIds);
     if(nativeSyncTimer)clearTimeout(nativeSyncTimer);
     nativeSyncTimer=setTimeout(async()=>{
       nativeSyncTimer=null;
@@ -5542,21 +6060,74 @@ function executableOrchestratedToolCallOffsets(source,toolName){
   return offsets;
 }
 function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim().replace(/^调用工具:\\s*/,'');let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
-function activityFileLabel(file){const clean=String(file||'').trim().replace(/^["']|["',;)]$/g,'');const parts=clean.split('/').filter(Boolean);return parts[parts.length-1]||clean||'文件'}
+function activityFilePath(file){return String(file||'').trim().replace(/^["']+|["',;)\]]+$/g,'')}
+function activityFileLabel(file){const clean=activityFilePath(file);const parts=clean.split('/').filter(Boolean);return parts[parts.length-1]||clean||'文件'}
 function extractActivityFiles(source){const matches=String(source||'').match(/[A-Za-z0-9_@.+-]+\\.(?:mjs|cjs|js|css|jsonl?|md|toml|ya?ml|py|sh|html|tsx?|jsx?|go|rs|java|cpp|hpp|c|h)/g)||[];return[...new Set(matches.map(activityFileLabel))].slice(0,4)}
 function shortActivityText(value,max=100){const clean=String(value||'').replace(/\\s+/g,' ').trim();return clean.length>max?clean.slice(0,max-3)+'...':clean}
+function readJsToolString(source,start){
+  const quote=source[start];
+  if(quote!=='"'&&quote!=="'"&&quote?.charCodeAt(0)!==96)return null;
+  let value='';
+  for(let index=start+1;index<source.length;index++){
+    const char=source[index];
+    if(char===quote)return{value,end:index+1};
+    if(quote?.charCodeAt(0)===96&&char==='$'&&source[index+1]==='{')return null;
+    if(char!=='\\\\'){value+=char;continue}
+    const escaped=source[++index];
+    if(escaped===undefined)return null;
+    if(escaped==='n'){value+='\\n';continue}
+    if(escaped==='r'){value+='\\r';continue}
+    if(escaped==='t'){value+='\\t';continue}
+    if(escaped==='b'){value+='\\b';continue}
+    if(escaped==='f'){value+='\\f';continue}
+    if(escaped==='v'){value+='\\v';continue}
+    if(escaped==='0'){value+=String.fromCharCode(0);continue}
+    if(escaped==='\\n'||escaped==='\\r'){continue}
+    if(escaped==='x'){
+      const hex=source.slice(index+1,index+3);
+      if(/^[0-9a-f]{2}$/i.test(hex)){value+=String.fromCharCode(Number.parseInt(hex,16));index+=2;continue}
+    }
+    if(escaped==='u'){
+      const braced=source[index+1]==='{';
+      const end=braced?source.indexOf('}',index+2):index+5;
+      const hex=braced?source.slice(index+2,end):source.slice(index+1,end);
+      if(end>index&&/^[0-9a-f]{4,6}$/i.test(hex)){value+=String.fromCodePoint(Number.parseInt(hex,16));index=end-(braced?0:1);continue}
+    }
+    value+=escaped;
+  }
+  return null;
+}
+function orchestratedExecCommands(source){
+  const commands=[];
+  for(const offset of executableOrchestratedToolCallOffsets(source,'exec_command')){
+    const head=source.slice(offset).match(/^tools\\.exec_command\\(\\s*\\{\\s*cmd\\s*:\\s*/);
+    if(!head)continue;
+    const parsed=readJsToolString(source,offset+head[0].length);
+    if(parsed?.value)commands.push(parsed.value);
+  }
+  return commands;
+}
+function activityPresentationRank(presentation){if(presentation.icon==='book-open')return 0;if(presentation.icon==='search')return 1;return 2}
 function embeddedToolObject(detail){const source=String(detail||'').split('\\n').filter((line)=>!/^call_id=/.test(line.trim())).join('\\n').trim();const candidates=[source];const start=source.indexOf('{');const end=source.lastIndexOf('}');if(start>=0&&end>start)candidates.push(source.slice(start,end+1));for(const candidate of candidates){try{const parsed=JSON.parse(candidate);if(parsed&&typeof parsed==='object')return parsed}catch(e){}}return{}}
 function agentActivityLabel(value){const pathParts=String(value||'').trim().split('/').filter(Boolean);const clean=(pathParts.at(-1)||'Agent').replace(/[_-]+/g,' ').replace(/\\s+/g,' ').trim();return clean?clean.charAt(0).toUpperCase()+clean.slice(1):'Agent'}
-function agentSpawnActivityPresentation(detail){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?task_name["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];return{variant:'agent',label:agentActivityLabel(payload.task_name||fallback),status:'已开始工作',icon:'flower-2',expandable:false}}
+function agentSpawnActivityPresentation(detail){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?task_name["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];const agentKey=String(payload.task_name||fallback||'').trim();return{variant:'agent',agentKey,label:agentActivityLabel(agentKey),status:'已开始工作',icon:'flower-2',expandable:true}}
 function orchestratedActivityPresentations(text){
   const source=String(text||'');
   if(!source.startsWith('exec\\n'))return[];
   const detail=source.slice(source.indexOf('\\n')+1);
   const imageCount=executableOrchestratedToolCallOffsets(detail,'view_image').length;
   const commandCount=executableOrchestratedToolCallOffsets(detail,'exec_command').length;
+  const commands=orchestratedExecCommands(detail);
   const items=[];
   if(imageCount)items.push({verb:'已查看',target:imageCount+' 张图像',icon:'images'});
-  if(commandCount>1)items.push({verb:'已读取文件并运行了多个命令',icon:'search'});
+  const commandItems=commands.map((command,index)=>({
+    ...commandActivityPresentation(command),
+    expandable:false,
+    _sourceOrder:index,
+  }));
+  commandItems.sort((left,right)=>activityPresentationRank(left)-activityPresentationRank(right)||left._sourceOrder-right._sourceOrder);
+  items.push(...commandItems.map(({_sourceOrder,...item})=>item));
+  if(commandCount>commands.length)items.push({verb:'Ran',target:(commandCount-commands.length)+' commands',icon:'square-terminal',expandable:false});
   return items;
 }
 function runningActivityVerb(verb){
@@ -5571,12 +6142,27 @@ function runningActivityVerb(verb){
     '已新增':'正在新增',
     '已删除':'正在删除',
     '已调用':'正在调用',
+    'Ran':'Running',
     '已读取文件并运行了多个命令':'正在读取文件并运行多个命令',
   };
   return exact[verb]||verb.replace(/^已/,'正在');
 }
-function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){current={verb:match[1],icon:match[2],target:activityFileLabel(line.slice(match[0].length)),added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
-function commandActivityPresentation(command){const source=String(command||'');const clean=shortActivityText(source,120);const files=extractActivityFiles(source);if(/(?:^|\\s)(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files.join('、')||clean,icon:'book-open'};if(/\\brg\\b/.test(source)){const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';return{verb:'已搜索',target:(files.join('、')||'内容')+(query?' · “'+shortActivityText(query,48)+'”':''),icon:'search'}}if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files.join('、')||shortActivityText(source.split('\\n')[0],84),icon:'circle-check'};if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};return{verb:'已运行',target:files.join('、')||clean||'工具调用',icon:'terminal'}}
+function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){const filePath=activityFilePath(line.slice(match[0].length));current={verb:match[1],icon:match[2],target:activityFileLabel(filePath),filePath,added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
+function commandActivityPresentation(command){
+  const source=String(command||'');
+  const clean=shortActivityText(source,120);
+  const files=extractActivityFiles(source);
+  if(/^\\s*(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files[0]||clean,icon:'book-open',targetType:files.length?'file':''};
+  if(/\\brg\\b/.test(source)&&files.length){
+    const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';
+    return{verb:'已在',target:files[0],suffix:query?'中搜索“'+shortActivityText(query,48)+'”':'中搜索',icon:'search',targetType:'file'};
+  }
+  if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files[0]||shortActivityText(source.split('\\n')[0],84),icon:'circle-check',targetType:files.length?'file':''};
+  if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};
+  if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};
+  if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};
+  return{verb:'Ran',target:clean||'command',icon:'square-terminal'};
+}
 function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(toolName==='spawn_agent')return[agentSpawnActivityPresentation(descriptor.detail)];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
 function isImageViewActivityPresentation(presentation){return presentation?.verb==='已查看'&&/\\d+ 张图像$/.test(String(presentation.target||''))&&['image','images'].includes(presentation.icon)}
 function nativeToolImageUrls(presentations,messageSeq){
@@ -5620,13 +6206,17 @@ function createActivityImageGallery(urls){
   });
   return gallery;
 }
-function createToolActivityItem(presentation,rawText,running=false){
+function createToolActivityItem(presentation,rawText,running=false,options={}){
   if(presentation.variant==='agent'){
-    const item=document.createElement('div');
-    item.className='activityItem agentActivityItem static';
+    const item=document.createElement('details');
+    item.className='activityItem agentActivityItem';
+    item.open=false;
     item.dataset.messageText=String(rawText||'');
-    const row=document.createElement('div');
+    item.dataset.agentKey=String(presentation.agentKey||'');
+    item.dataset.parentThreadId=String(options.parentThreadId||'');
+    const row=document.createElement('summary');
     row.className='agentActivityRow';
+    row.setAttribute('aria-label','查看 '+(presentation.label||'Agent')+' 子代理运行过程');
     const identity=document.createElement('span');
     identity.className='agentActivityIdentity';
     const iconWrap=document.createElement('span');
@@ -5640,21 +6230,54 @@ function createToolActivityItem(presentation,rawText,running=false){
     label.textContent=presentation.label||'Agent';
     const status=document.createElement('span');
     status.className='agentActivityStatus';
-    status.textContent=presentation.status||'已开始工作';
+    status.dataset.traceState=running?'starting':'ready';
+    status.textContent=running?'正在启动':presentation.status||'已开始工作';
+    const chevron=document.createElement('i');
+    chevron.className='activityItemChevron agentActivityChevron';
+    chevron.setAttribute('data-lucide','chevron-right');
+    chevron.setAttribute('aria-hidden','true');
     identity.appendChild(iconWrap);
     identity.appendChild(label);
     row.appendChild(identity);
     row.appendChild(status);
+    row.appendChild(chevron);
+    const content=document.createElement('div');
+    content.className='subagentTraceContent';
+    const meta=document.createElement('div');
+    meta.className='subagentTraceMeta';
+    meta.hidden=true;
+    const notice=document.createElement('div');
+    notice.className='subagentTraceNotice';
+    notice.setAttribute('role','status');
+    notice.textContent='展开后载入真实运行记录';
+    const timeline=document.createElement('div');
+    timeline.className='subagentTraceTimeline';
+    timeline.setAttribute('aria-live','polite');
+    const retry=document.createElement('button');
+    retry.type='button';
+    retry.className='subagentTraceRetry';
+    retry.textContent='重试';
+    retry.hidden=true;
+    content.appendChild(meta);
+    content.appendChild(notice);
+    content.appendChild(timeline);
+    content.appendChild(retry);
     item.appendChild(row);
+    item.appendChild(content);
+    const state={item,status,meta,notice,timeline,retry,parentThreadId:item.dataset.parentThreadId,agentRef:item.dataset.agentKey,subagentId:'',cursor:0,generation:0,messageSeqs:new Set(),loaded:false,loading:false,terminal:false,timer:null,controller:null,notFoundAttempts:0,failureCount:0};
+    item._subagentTrace=state;
+    retry.addEventListener('click',(event)=>{event.preventDefault();event.stopPropagation();state.terminal=false;state.notFoundAttempts=0;state.failureCount=0;loadSubagentTrace(state,{force:true})});
+    item.addEventListener('toggle',()=>{if(item.open)loadSubagentTrace(state);else stopSubagentTracePolling(state,true)});
     return item;
   }
   const expandable=presentation.expandable!==false;
   const galleryOnly=Boolean(presentation.galleryOnly);
   const imageUrls=Array.isArray(presentation.imageUrls)?presentation.imageUrls.filter(Boolean):[];
   const item=document.createElement(expandable?'details':'div');
-  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'');
+  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'')+(presentation.targetType==='file'?' fileTarget':'');
   if(expandable)item.open=false;
   item.dataset.messageText=String(rawText||'');
+  if(presentation.filePath)item.dataset.filePath=String(presentation.filePath);
   const summary=document.createElement(expandable?'summary':'div');
   summary.className='activityItemSummary'+(presentation.target?'':' standalone');
   const iconWrap=document.createElement('span');
@@ -5670,11 +6293,20 @@ function createToolActivityItem(presentation,rawText,running=false){
   summary.appendChild(iconWrap);
   summary.appendChild(verb);
   if(presentation.target){
+    const targetLine=document.createElement('span');
+    targetLine.className='activityTargetLine';
     const target=document.createElement('span');
     target.className='activityTarget';
     target.textContent=presentation.target;
-    target.title=target.textContent;
-    summary.appendChild(target);
+    target.title=String(presentation.filePath||target.textContent);
+    targetLine.appendChild(target);
+    if(presentation.suffix){
+      const suffix=document.createElement('span');
+      suffix.className='activitySuffix';
+      suffix.textContent=presentation.suffix;
+      targetLine.appendChild(suffix);
+    }
+    summary.appendChild(targetLine);
   }
   if(presentation.meta){
     const meta=document.createElement('span');
@@ -5710,19 +6342,241 @@ function createToolActivityItem(presentation,rawText,running=false){
   }
   return item;
 }
-function createActivityBatch(presentations,rawText,kind,running=false){
+function createActivityBatch(presentations,rawText,kind,running=false,options={}){
   const batch=document.createElement('div');
   batch.className='msg activityBatch'+(running?' streaming':'');
   batch.dataset.messageKind=kind||'activity';
   batch.dataset.messageText=String(rawText||'');
-  for(const presentation of presentations)batch.appendChild(createToolActivityItem(presentation,rawText,running));
+  for(const presentation of presentations)batch.appendChild(createToolActivityItem(presentation,rawText,running,options));
   return batch;
+}
+const SUBAGENT_TRACE_POLL_MS=1600;
+function setSubagentTraceSummaryStatus(state,label,kind){
+  if(!state?.status)return;
+  state.status.textContent=label;
+  state.status.dataset.traceState=kind||'';
+  state.item.dataset.traceState=kind||'';
+}
+function setSubagentTraceNotice(state,text,kind='',retry=false){
+  state.notice.textContent=String(text||'');
+  state.notice.className='subagentTraceNotice'+(kind?' '+kind:'');
+  state.notice.hidden=!text;
+  state.retry.hidden=!retry;
+}
+function stopSubagentTracePolling(state,abort=false){
+  if(!state)return;
+  if(state.timer)clearTimeout(state.timer);
+  state.timer=null;
+  if(abort&&state.controller){
+    const controller=state.controller;
+    state.requestId=(state.requestId||0)+1;
+    state.controller=null;
+    state.loading=false;
+    controller.abort();
+  }
+}
+function clearSubagentTraceStates(){
+  for(const state of subagentTraceStates)stopSubagentTracePolling(state,true);
+  subagentTraceStates.clear();
+}
+function scheduleSubagentTracePoll(state,delay=SUBAGENT_TRACE_POLL_MS){
+  stopSubagentTracePolling(state);
+  if(!state.item.open||state.terminal||state.item.isConnected===false)return;
+  state.timer=setTimeout(()=>{state.timer=null;loadSubagentTrace(state)},delay);
+}
+function refreshOpenSubagentTraces(changedIds=[]){
+  const changed=new Set((changedIds||[]).map((id)=>String(id)));
+  for(const state of subagentTraceStates){
+    if(!state.item.open||state.terminal||state.loading)continue;
+    if(changed.size&&state.subagentId&&!changed.has(state.subagentId))continue;
+    if(state.timer)clearTimeout(state.timer);
+    state.timer=null;
+    loadSubagentTrace(state);
+  }
+}
+function subagentTraceEvent(message,label,icon,kind=''){
+  const event=document.createElement('div');
+  event.className='subagentTraceEvent'+(kind?' '+kind:'');
+  const iconWrap=document.createElement('span');
+  iconWrap.className='subagentTraceEventIcon';
+  const iconNode=document.createElement('i');
+  iconNode.setAttribute('data-lucide',icon);
+  iconNode.setAttribute('aria-hidden','true');
+  iconWrap.appendChild(iconNode);
+  const text=document.createElement('span');
+  text.className='subagentTraceEventText';
+  text.textContent=label;
+  event.appendChild(iconWrap);
+  event.appendChild(text);
+  if(message?.at){
+    const time=document.createElement('time');
+    time.className='subagentTraceTime';
+    time.dateTime=String(message.at);
+    time.textContent=formatMessageTime(message.at);
+    event.appendChild(time);
+  }
+  return event;
+}
+function markSubagentTraceFinal(state){
+  const node=state.lastAssistantNode;
+  if(!node)return;
+  node.classList.add('final');
+  if(node._subagentTraceLabel)node._subagentTraceLabel.textContent='最终结果';
+}
+function appendSubagentTraceMessage(state,message,conversation){
+  const sequence=String(message?.seq||'');
+  if(sequence&&state.messageSeqs.has(sequence))return false;
+  if(sequence)state.messageSeqs.add(sequence);
+  const role=String(message?.role||'');
+  const kind=String(message?.kind||'');
+  let node=null;
+  if(role==='assistant'){
+    const final=kind==='final_answer';
+    node=document.createElement('article');
+    node.className='subagentTraceMessage'+(final?' final':'');
+    const head=document.createElement('div');
+    head.className='subagentTraceMessageHead';
+    const label=document.createElement('span');
+    label.textContent=final?'最终结果':'进度';
+    head.appendChild(label);
+    if(message.at){
+      const time=document.createElement('time');
+      time.className='subagentTraceTime';
+      time.dateTime=String(message.at);
+      time.textContent=formatMessageTime(message.at);
+      head.appendChild(time);
+    }
+    const body=document.createElement('div');
+    body.className='subagentTraceMarkdown';
+    renderAssistantMarkdown(body,message.content);
+    node.appendChild(head);
+    node.appendChild(body);
+    node._subagentTraceLabel=label;
+    state.lastAssistantNode=node;
+  }else if(role==='tool'){
+    if(['function_call_output','custom_tool_call_output','tool_search_output'].includes(kind))return false;
+    const presentations=toolActivityPresentations(message.content);
+    node=createActivityBatch(presentations,message.content,'subagent_tool',false,{parentThreadId:conversation.id});
+    node.classList.add('subagentTraceTool');
+  }else if(role==='process'){
+    if(kind==='reasoning_summary')return false;
+    if(kind==='task_started')node=subagentTraceEvent(message,'开始执行','play','started');
+    else if(kind==='task_complete'){
+      state.terminalKind='done';
+      markSubagentTraceFinal(state);
+      node=subagentTraceEvent(message,message.content||'任务完成','circle-check-big','success');
+    }else if(kind==='turn_aborted'){
+      state.terminalKind='interrupted';
+      node=subagentTraceEvent(message,message.content||'任务已中断','circle-stop','interrupted');
+    }else if(['task_error','error'].includes(kind)){
+      state.terminalKind='error';
+      node=subagentTraceEvent(message,message.content||'任务失败','circle-x','error');
+    }else if(kind==='context_compacted')node=subagentTraceEvent(message,message.content||'上下文已压缩','scan-text','phase');
+  }
+  if(!node)return false;
+  state.timeline.appendChild(node);
+  refreshIcons(node);
+  return true;
+}
+function resetSubagentTrace(state){
+  state.timeline.replaceChildren();
+  state.messageSeqs.clear();
+  state.cursor=0;
+  state.terminalKind='';
+  state.lastAssistantNode=null;
+}
+function updateSubagentTraceStatus(state,conversation){
+  const status=String(conversation.status||'');
+  if(status==='running'){
+    state.terminal=false;
+    setSubagentTraceSummaryStatus(state,(conversation.messages||[]).length?'正在工作':'正在启动','running');
+    return true;
+  }
+  state.terminal=true;
+  if(status==='interrupted'||state.terminalKind==='interrupted')setSubagentTraceSummaryStatus(state,'已中断','interrupted');
+  else if(status==='error'||state.terminalKind==='error')setSubagentTraceSummaryStatus(state,'失败','error');
+  else setSubagentTraceSummaryStatus(state,'已完成','done');
+  return false;
+}
+async function loadSubagentTrace(state,{force=false}={}){
+  if(!state||state.item.isConnected===false||state.loading||state.terminal&&!force)return;
+  subagentTraceStates.add(state);
+  if(!state.parentThreadId||!state.agentRef){
+    state.terminal=true;
+    setSubagentTraceSummaryStatus(state,'无法查看','error');
+    setSubagentTraceNotice(state,'这条记录缺少可关联的子代理标识。','error');
+    return;
+  }
+  if(force){state.terminal=false;state.retry.hidden=true}
+  state.loading=true;
+  const requestId=(state.requestId||0)+1;
+  state.requestId=requestId;
+  const controller=new AbortController();
+  state.controller=controller;
+  if(!state.loaded)setSubagentTraceNotice(state,'正在读取子代理运行记录…','loading');
+  let nextPoll=0;
+  try{
+    const query='?agent='+encodeURIComponent(state.agentRef)+'&after='+state.cursor+'&generation='+state.generation+'&limit=240';
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(state.parentThreadId)+'/subagents'+query,{signal:controller.signal});
+    if(requestId!==state.requestId)return;
+    if(res.status===404){
+      state.notFoundAttempts+=1;
+      setSubagentTraceSummaryStatus(state,'正在启动','starting');
+      if(state.notFoundAttempts<12){
+        setSubagentTraceNotice(state,'正在等待子代理创建运行记录…','loading');
+        nextPoll=SUBAGENT_TRACE_POLL_MS;
+      }else{
+        state.terminal=true;
+        setSubagentTraceSummaryStatus(state,'暂不可用','error');
+        setSubagentTraceNotice(state,'暂时找不到这个子代理的运行记录。','error',true);
+      }
+      return;
+    }
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'读取子代理进度失败');
+    const conversation=data.subagent;
+    if(!conversation)throw new Error('子代理返回为空');
+    state.notFoundAttempts=0;
+    state.failureCount=0;
+    state.subagentId=String(conversation.id||'');
+    state.item.dataset.subagentThreadId=state.subagentId;
+    if(conversation.reset)resetSubagentTrace(state);
+    let appended=false;
+    for(const message of conversation.messages||[])appended=appendSubagentTraceMessage(state,message,conversation)||appended;
+    state.cursor=Number(conversation.cursor||state.cursor);
+    state.generation=Number(conversation.generation||state.generation);
+    state.loaded=true;
+    const metadata=conversation.metadata||{};
+    const meta=[metadata.agentNickname,metadata.agentPath,Number(metadata.depth)>1?'深度 '+metadata.depth:''].filter(Boolean);
+    state.meta.textContent=meta.join(' · ');
+    state.meta.hidden=!meta.length;
+    const running=updateSubagentTraceStatus(state,conversation);
+    if(state.timeline.children.length)setSubagentTraceNotice(state,'');
+    else setSubagentTraceNotice(state,running?'正在等待第一条进度…':'没有可显示的运行记录',running?'loading':'empty');
+    if(appended)requestAnimationFrame(()=>{state.timeline.scrollTop=running?state.timeline.scrollHeight:0});
+    if(running)nextPoll=SUBAGENT_TRACE_POLL_MS;
+  }catch(error){
+    if(error?.name==='AbortError'||requestId!==state.requestId)return;
+    state.failureCount+=1;
+    setSubagentTraceSummaryStatus(state,state.loaded?'同步中断':'加载失败','error');
+    const autoRetry=state.loaded&&state.failureCount<4;
+    setSubagentTraceNotice(state,error?.message||'读取子代理进度失败','error',!autoRetry);
+    if(autoRetry)nextPoll=3000;else state.terminal=true;
+  }finally{
+    if(requestId===state.requestId){
+      state.loading=false;
+      state.controller=null;
+      if(nextPoll)scheduleSubagentTracePoll(state,nextPoll);
+    }
+  }
 }
 function joinActivityActions(actions){
   if(actions.length<2)return actions[0]||'';
   return actions.length===2?actions[0]+'并'+actions[1]:actions.slice(0,-1).join('、')+'并'+actions.at(-1);
 }
 function activityClusterPresentation(cluster){
+  const fixedTitle=String(cluster?.dataset?.activityTitle||'').trim();
+  if(fixedTitle)return{icon:'wrench',text:fixedTitle};
   const batches=[...cluster.querySelectorAll(':scope > .activityClusterItems > .activityBatch')];
   const items=[...cluster.querySelectorAll('.activityItem')];
   const running=batches.some((batch)=>batch.classList.contains('streaming'));
@@ -5739,9 +6593,9 @@ function activityClusterPresentation(cluster){
     return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'工具调用'};
   }
   const edited=records.some((record)=>['已编辑','已新增','已删除'].includes(record.verb));
-  const read=records.some((record)=>['已读取','已搜索','已查看'].includes(record.verb));
+  const read=records.some((record)=>['已读取','已搜索','已在','已查看'].includes(record.verb));
   const ran=batches.length>1||records.some((record)=>[
-    '已运行','已检查','已请求','已调用','已使用','已读取文件并运行了多个命令',
+    '已运行','已检查','已请求','已调用','已使用','Ran','已读取文件并运行了多个命令',
   ].includes(record.verb));
   const actions=[];
   if(edited)actions.push(running?'编辑文件':'编辑了文件');
@@ -5753,10 +6607,12 @@ function activityClusterPresentation(cluster){
     text:running&&!text.startsWith('正在')?'正在'+text:text,
   };
 }
-function createActivityCluster(){
+function createActivityCluster(title=''){
   const cluster=document.createElement('details');
-  cluster.className='msg activityCluster';
+  const cleanTitle=String(title||'').trim();
+  cluster.className='msg activityCluster'+(cleanTitle?' titled':'');
   cluster.dataset.messageKind='activity_cluster';
+  if(cleanTitle)cluster.dataset.activityTitle=cleanTitle;
   cluster.open=false;
   const summary=document.createElement('summary');
   summary.className='activityClusterSummary';
@@ -5782,10 +6638,14 @@ function updateActivityCluster(cluster){
   const presentation=activityClusterPresentation(cluster);
   const iconWrap=cluster.querySelector(':scope > summary .activityClusterIcon');
   const label=cluster.querySelector(':scope > summary .activityClusterText');
-  const icon=document.createElement('i');
-  icon.setAttribute('data-lucide',presentation.icon);
-  icon.setAttribute('aria-hidden','true');
-  iconWrap?.replaceChildren(icon);
+  if(iconWrap){
+    if(presentation.icon){
+      const icon=document.createElement('i');
+      icon.setAttribute('data-lucide',presentation.icon);
+      icon.setAttribute('aria-hidden','true');
+      iconWrap.replaceChildren(icon);
+    }else iconWrap.replaceChildren();
+  }
   if(label){label.textContent=presentation.text;label.title=presentation.text}
   cluster.dataset.messageText=presentation.text;
   cluster.classList.toggle('streaming',Boolean(cluster.querySelector('.activityBatch.streaming')));
@@ -5805,15 +6665,16 @@ function appendTurnTool(text,options={}){
   const imageViews=presentations.filter(isImageViewActivityPresentation);
   const folded=presentations.filter((presentation)=>!isImageViewActivityPresentation(presentation));
   const imageUrls=nativeToolImageUrls(imageViews,options.nativeMessageSeq);
+  const activityOptions={parentThreadId:currentConversationSource==='codex'?currentConversationId:''};
   let visibleBatch=null;
   if(imageViews.length){
-    visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true);
+    visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true,activityOptions);
     activateTurnProcessElement(visibleBatch);
     refreshIcons(visibleBatch);
   }
   if(!folded.length)return visibleBatch;
   const activityKind=folded.some((presentation)=>presentation.variant==='agent')?'agent_activity':'tool_activity';
-  const batch=createActivityBatch(folded,text,activityKind,true);
+  const batch=createActivityBatch(folded,text,activityKind,true,activityOptions);
   if(visibleBatch)batch._relatedActivityBatches=[visibleBatch];
   activateTurnProcessElement(batch);
   refreshIcons(batch);
@@ -5824,6 +6685,10 @@ function settleTurnTool(batch){
   for(const item of [batch,...(batch._relatedActivityBatches||[])]){
     item.classList.remove('streaming');
     for(const verb of item.querySelectorAll('.activityVerb[data-completed-verb]'))verb.textContent=verb.dataset.completedVerb;
+    for(const agent of item.querySelectorAll('.agentActivityItem')){
+      const state=agent._subagentTrace;
+      if(state&&!state.loaded&&!state.loading)setSubagentTraceSummaryStatus(state,'已开始工作','ready');
+    }
     const cluster=item.closest('.activityCluster');
     if(cluster)updateActivityCluster(cluster);
   }
@@ -5874,7 +6739,7 @@ function resetTurnProcessCollection(){
   clearTurnProcessHeader();
   turnProcessElements=[];
   currentActivityCluster=null;
-  nativeOptimisticSteering.clear();
+  pendingActivityClusterTitle='';
   collectingTurnProcess=false;
 }
 function beginTurnProcessCollection(){
@@ -5882,7 +6747,7 @@ function beginTurnProcessCollection(){
   clearTurnProcessHeader();
   turnProcessElements=[];
   currentActivityCluster=null;
-  nativeOptimisticSteering.clear();
+  pendingActivityClusterTitle='';
   collectingTurnProcess=true;
 }
 function activateTurnProcessElement(element){
@@ -5890,7 +6755,8 @@ function activateTurnProcessElement(element){
   ensureTurnProcessHeader();
   if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='tool_activity'){
     if(!currentActivityCluster?.isConnected){
-      currentActivityCluster=createActivityCluster();
+      currentActivityCluster=createActivityCluster(pendingActivityClusterTitle);
+      pendingActivityClusterTitle='';
       turnProcessElements.push(currentActivityCluster);
       turnProcessTimeline.appendChild(currentActivityCluster);
     }
@@ -5929,10 +6795,11 @@ function collectTurnArtifactsFromDom(anchor,elements){
   }
   return collected;
 }
-function createCompletionMessage(text,processElements=[]){
+function createCompletionMessage(text,processElements=[],turnId=''){
   const el=document.createElement('details');
   el.className='msg process completionSummary';
   el.dataset.messageText=String(text||'');
+  el.dataset.turnId=String(turnId||'');
   const summary=document.createElement('summary');
   const label=document.createElement('span');
   label.textContent=completionMessageTitle(text);
@@ -5961,6 +6828,181 @@ function createCompletionMessage(text,processElements=[]){
   el.appendChild(summary);
   el.appendChild(content);
   return el;
+}
+function editedFilesFromTurnArtifacts(elements){
+  const files=new Map();
+  for(const element of elements){
+    const items=element.matches?.('.activityItem')?[element]:[...(element.querySelectorAll?.('.activityItem')||[])];
+    for(const item of items){
+      const verb=String(item.querySelector?.('.activityVerb')?.dataset?.completedVerb||'');
+      if(!['已编辑','已新增','已删除'].includes(verb))continue;
+      const name=String(item.dataset?.filePath||item.querySelector?.('.activityTarget')?.textContent||'').trim();
+      if(!name)continue;
+      const meta=String(item.querySelector?.('.activityMeta')?.textContent||'');
+      const added=Number(meta.match(/\\+(\\d+)/)?.[1])||0;
+      const removed=Number(meta.match(/-(\\d+)/)?.[1])||0;
+      const current=files.get(name)||{name,verb,added:0,removed:0};
+      current.added+=added;
+      current.removed+=removed;
+      if(current.verb!==verb)current.verb='已编辑';
+      files.set(name,current);
+    }
+  }
+  return[...files.values()];
+}
+function browserPreviewFromTurnArtifacts(elements){
+  const raw=[];
+  let inspected=false;
+  for(const element of elements){
+    const elementText=String(element.dataset?.messageText||'');
+    raw.push(elementText);
+    if(/(?:\\.goto\\s*\\(|\\.reload\\s*\\(|\\.screenshot\\s*\\(|\\.playwright\\.(?:domSnapshot|evaluate)\\s*\\(|\\.dev\\.logs\\s*\\()/i.test(elementText))inspected=true;
+    for(const item of element.querySelectorAll?.('.activityItem')||[]){
+      const itemText=String(item.dataset?.messageText||'');
+      raw.push(itemText);
+      const icon=item.querySelector?.('.activityItemIcon [data-lucide]')?.getAttribute('data-lucide');
+      if(icon==='panel-top'&&/(?:\\.goto\\s*\\(|\\.reload\\s*\\(|\\.screenshot\\s*\\(|\\.playwright\\.(?:domSnapshot|evaluate)\\s*\\(|\\.dev\\.logs\\s*\\()/i.test(itemText))inspected=true;
+    }
+  }
+  const source=raw.join('\\n');
+  if(!inspected)return null;
+  const urls=[];
+  const patterns=[
+    /(?:getForUrl|goto)\\s*\\(\\s*["'](https?:\\/\\/[^"'\\s]+)/gi,
+    /(?:url\\s*===|startsWith\\s*\\()\\s*["'](https?:\\/\\/[^"'\\s]+)/gi,
+  ];
+  for(const pattern of patterns){for(const match of source.matchAll(pattern))urls.push(match[1])}
+  const url=urls.map((value)=>value.replace(/[.,;:!?]+$/,'')).reverse().find((value)=>{
+    try{return['http:','https:'].includes(new URL(value).protocol)}catch(e){return false}
+  })||'';
+  let label='浏览器页面已完成检查';
+  if(url){try{const parsed=new URL(url);label=parsed.hostname+(parsed.port?':'+parsed.port:'')+parsed.pathname}catch(e){label=url}}
+  return{url,label};
+}
+function createResultCardButton(iconName,label,handler,{danger=false}={}){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='turnResultAction'+(danger?' danger':'');
+  setIconLabel(button,iconName,label);
+  button.addEventListener('click',handler);
+  return button;
+}
+function reviewTurnArtifacts(turnId){
+  const id=String(turnId||'');
+  const completion=[...chat.querySelectorAll('.completionSummary')].reverse().find((item)=>!id||item.dataset.turnId===id);
+  if(!completion)return;
+  completion.open=true;
+  completion.scrollIntoView({block:'center',behavior:'smooth'});
+  requestAnimationFrame(()=>completion.querySelector('summary')?.focus());
+}
+function prepareUndoEditedFiles(files){
+  const names=files.map((file)=>file.name);
+  if(!names.length)return;
+  if(!confirm('准备撤销上一轮对 '+names.length+' 个文件的修改？\\n\\n系统会把撤销要求放入输入框，发送前仍可检查。'))return;
+  showChatView();
+  const request='请撤销上一轮仅对以下文件所做的修改，并保留其他改动：\\n'+names.map((name)=>'- '+name).join('\\n');
+  input.value=request;
+  input.style.height='auto';
+  input.style.height=Math.min(input.scrollHeight,180)+'px';
+  applyConversationMode();
+  statusEl.textContent='撤销请求已准备，请检查后发送';
+  input.focus();
+}
+function createEditedFilesResultCard(files,turnId){
+  const card=document.createElement('section');
+  card.className='turnResultCard editedFilesResult';
+  card.setAttribute('aria-label','已编辑 '+files.length+' 个文件');
+  const head=document.createElement('div');
+  head.className='turnResultHead';
+  const identity=document.createElement('div');
+  identity.className='turnResultIdentity';
+  const iconWrap=document.createElement('span');
+  iconWrap.className='turnResultIcon';
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','files');
+  icon.setAttribute('aria-hidden','true');
+  iconWrap.appendChild(icon);
+  const copy=document.createElement('div');
+  const title=document.createElement('strong');
+  title.textContent='已编辑 '+files.length+' 个文件';
+  const added=files.reduce((total,file)=>total+file.added,0);
+  const removed=files.reduce((total,file)=>total+file.removed,0);
+  const stats=document.createElement('span');
+  stats.className='turnResultStats';
+  stats.textContent=[added?'+'+added:'',removed?'-'+removed:''].filter(Boolean).join('  ')||'文件修改已完成';
+  copy.appendChild(title);
+  copy.appendChild(stats);
+  identity.appendChild(iconWrap);
+  identity.appendChild(copy);
+  const actions=document.createElement('div');
+  actions.className='turnResultActions';
+  actions.appendChild(createResultCardButton('undo-2','撤销',()=>prepareUndoEditedFiles(files)));
+  actions.appendChild(createResultCardButton('list-tree','审查更改',()=>reviewTurnArtifacts(turnId)));
+  head.appendChild(identity);
+  head.appendChild(actions);
+  const list=document.createElement('div');
+  list.className='editedFilesList';
+  for(const file of files){
+    const row=document.createElement('div');
+    row.className='editedFileRow';
+    const statusIcon=document.createElement('i');
+    statusIcon.setAttribute('data-lucide',file.verb==='已新增'?'file-plus-2':file.verb==='已删除'?'file-x-2':'file-pen-line');
+    statusIcon.setAttribute('aria-hidden','true');
+    const name=document.createElement('span');
+    name.className='editedFileName';
+    name.textContent=file.name;
+    name.title=file.name;
+    const meta=document.createElement('span');
+    meta.className='editedFileMeta';
+    meta.textContent=[file.added?'+'+file.added:'',file.removed?'-'+file.removed:''].filter(Boolean).join(' ');
+    row.appendChild(statusIcon);
+    row.appendChild(name);
+    row.appendChild(meta);
+    list.appendChild(row);
+  }
+  card.appendChild(head);
+  card.appendChild(list);
+  return card;
+}
+function createWebPreviewResultCard(preview,turnId){
+  const card=document.createElement('section');
+  card.className='turnResultCard webPreviewResult';
+  card.setAttribute('aria-label','网页预览');
+  const iconWrap=document.createElement('span');
+  iconWrap.className='turnResultIcon preview';
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','panel-top');
+  icon.setAttribute('aria-hidden','true');
+  iconWrap.appendChild(icon);
+  const copy=document.createElement('div');
+  copy.className='webPreviewCopy';
+  const title=document.createElement('strong');
+  title.textContent='网页预览';
+  const detail=document.createElement('span');
+  detail.textContent=preview.label;
+  detail.title=preview.url||preview.label;
+  copy.appendChild(title);
+  copy.appendChild(detail);
+  const action=createResultCardButton(preview.url?'external-link':'list-tree',preview.url?'打开':'查看',()=>{
+    if(preview.url)window.open(preview.url,'_blank','noopener,noreferrer');
+    else reviewTurnArtifacts(turnId);
+  });
+  card.appendChild(iconWrap);
+  card.appendChild(copy);
+  card.appendChild(action);
+  return card;
+}
+function createTurnResultArtifacts(elements,turnId){
+  const files=editedFilesFromTurnArtifacts(elements);
+  const preview=browserPreviewFromTurnArtifacts(elements);
+  if(!files.length&&!preview)return null;
+  const container=document.createElement('div');
+  container.className='turnResultArtifacts';
+  container.dataset.turnId=String(turnId||'');
+  if(preview)container.appendChild(createWebPreviewResultCard(preview,turnId));
+  if(files.length)container.appendChild(createEditedFilesResultCard(files,turnId));
+  refreshIcons(container);
+  return container;
 }
 function appendInputImageToUser(userElement,source,at){
   if(!userElement?.isConnected||!userElement._messageBody)return null;
@@ -5992,15 +7034,34 @@ function appendInputImageToUser(userElement,source,at){
   userElement.classList.add('hasInputImage');
   return item;
 }
-function consumeNativeOptimisticSteering(text,at){
+function completionTimelineForTurn(turnId){
+  const id=String(turnId||'');
+  if(!id)return null;
+  const completion=[...chat.querySelectorAll('.completionSummary')].reverse().find((item)=>item.dataset.turnId===id);
+  if(!completion)return null;
+  let timeline=completion.querySelector(':scope > .completionContent > .completionTimeline');
+  if(!timeline){
+    timeline=document.createElement('div');
+    timeline.className='completionTimeline';
+    const content=completion.querySelector(':scope > .completionContent');
+    if(content){content.textContent='';content.appendChild(timeline)}
+  }
+  return timeline;
+}
+function consumeNativeOptimisticSteering(text,at,turnId){
   const expected=String(text||'').trim();
+  const expectedTurnId=String(turnId||'');
   for(const [id,element] of nativeOptimisticSteering){
     if(!element?.isConnected){nativeOptimisticSteering.delete(id);continue}
     if(String(element.dataset.messageText||'').trim()!==expected)continue;
+    if(expectedTurnId&&element.dataset.turnId&&element.dataset.turnId!==expectedTurnId)continue;
     nativeOptimisticSteering.delete(id);
     element.classList.remove('optimistic');
     delete element.dataset.optimisticQueueId;
     element.dataset.messageAt=String(at||element.dataset.messageAt||'');
+    if(expectedTurnId)element.dataset.turnId=expectedTurnId;
+    const completedTimeline=completionTimelineForTurn(expectedTurnId);
+    if(completedTimeline&&!completedTimeline.contains(element))completedTimeline.appendChild(element);
     latestUserElement=element;
     return element;
   }
@@ -6009,9 +7070,16 @@ function consumeNativeOptimisticSteering(text,at){
 function addMsg(role,text,options={}){
   const kind=String(options.kind||'');
   const steeringUser=role==='user'&&kind==='steering_user';
+  const completedSteeringTimeline=steeringUser?completionTimelineForTurn(options.turnId):null;
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   if(role!=='user'&&!inputImage)latestUserElement=null;
   if(role==='thinking')return null;
+  if(role==='process'&&kind==='reasoning_summary'){
+    if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
+    pendingActivityClusterTitle=shortActivityText(text,120);
+    currentActivityCluster=null;
+    return null;
+  }
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
     settleTurnTool(latestToolElement);
     return null;
@@ -6032,7 +7100,7 @@ function addMsg(role,text,options={}){
   }
   if(role==='user'){
     if(steeringUser){
-      if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
+      if(!completedSteeringTimeline&&!collectingTurnProcess)beginTurnProcessCollection(options.at);
     }else{
       if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
       latestToolElement=null;
@@ -6043,7 +7111,7 @@ function addMsg(role,text,options={}){
   const empty=chat.querySelector('.empty');
   if(empty)empty.remove();
   if(steeringUser&&!options.optimisticQueueId){
-    const optimistic=consumeNativeOptimisticSteering(text,options.at);
+    const optimistic=consumeNativeOptimisticSteering(text,options.at,options.turnId);
     if(optimistic){
       if(options.autoScroll!==false)scrollChatToLatest();
       return optimistic;
@@ -6054,14 +7122,17 @@ function addMsg(role,text,options={}){
     const artifacts=collectTurnArtifactsFromDom(anchor,takeTurnProcessElements());
     const visibleActivities=artifacts.filter((item)=>item.dataset?.messageKind==='image_view_activity');
     const foldedActivities=artifacts.filter((item)=>item.dataset?.messageKind!=='image_view_activity');
+    const resultArtifacts=createTurnResultArtifacts(artifacts,options.turnId);
     for(const item of visibleActivities)settleTurnTool(item);
-    const completion=createCompletionMessage(text,foldedActivities);
+    const completion=createCompletionMessage(text,foldedActivities,options.turnId);
     if(anchor){
       chat.insertBefore(completion,anchor);
       for(const item of visibleActivities)chat.insertBefore(item,anchor);
+      if(resultArtifacts)chat.insertBefore(resultArtifacts,anchor.nextSibling);
     }else{
       chat.appendChild(completion);
       for(const item of visibleActivities)chat.appendChild(item);
+      if(resultArtifacts)chat.appendChild(resultArtifacts);
     }
     latestToolElement=null;
     refreshIcons(chat);
@@ -6090,6 +7161,7 @@ function addMsg(role,text,options={}){
   el.dataset.messageText=String(text||'');
   el.dataset.messageKind=kind;
   el.dataset.messageAt=String(options.at||'');
+  el.dataset.turnId=String(options.turnId||'');
   if(steeringUser){
     el.classList.add('steeringUser');
     if(options.optimisticQueueId){
@@ -6221,7 +7293,8 @@ function addMsg(role,text,options={}){
   }
   if(role==='tool'&&latestToolElement?.parentNode)latestToolElement.remove();
   chat.appendChild(el);
-  if(steeringUser||isTurnProcessMessage(role,kind))activateTurnProcessElement(el);
+  if(steeringUser&&completedSteeringTimeline)completedSteeringTimeline.appendChild(el);
+  else if(steeringUser||isTurnProcessMessage(role,kind))activateTurnProcessElement(el);
   refreshIcons(el);
   if(role==='tool')latestToolElement=el;
   if(role==='assistant'){
