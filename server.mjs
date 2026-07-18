@@ -3943,15 +3943,15 @@ function renderPromptQueue(){
       if(queueFailures.has(item.id))dispatchNextQueuedPrompt(threadId,{force:true});else steerQueuedPrompt(threadId,item.id);
     },true);
     guide.disabled=busy||(!webRunActive&&!queueFailures.has(item.id));
-    const edit=queueActionButton('pencil','编辑',()=>restoreQueuedPrompt(threadId,item.id));
-    edit.disabled=busy;
     const remove=queueActionButton('trash-2','删除',()=>deleteQueuedPrompt(threadId,item.id));
     remove.disabled=busy;
+    const more=queueActionButton('ellipsis','编辑',()=>restoreQueuedPrompt(threadId,item.id));
+    more.disabled=busy;
     row.appendChild(lead);
     row.appendChild(body);
     row.appendChild(guide);
-    row.appendChild(edit);
     row.appendChild(remove);
+    row.appendChild(more);
     const error=queueFailures.get(item.id);
     if(error){
       const errorText=document.createElement('div');
@@ -7543,7 +7543,8 @@ function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
 }
 function moveLiveEditedFilesResultToEnd(){
   if(!liveEditedFilesResult?.isConnected||!composer||!dropZone)return;
-  if(liveEditedFilesResult.parentNode!==composer||liveEditedFilesResult.nextSibling!==dropZone)composer.insertBefore(liveEditedFilesResult,dropZone);
+  const anchor=promptQueuePanel?.parentNode===composer?promptQueuePanel:dropZone;
+  if(liveEditedFilesResult.parentNode!==composer||liveEditedFilesResult.nextSibling!==anchor)composer.insertBefore(liveEditedFilesResult,anchor);
 }
 function refreshLiveEditedFilesResult(){
   if(!turnProcessTimeline)return null;

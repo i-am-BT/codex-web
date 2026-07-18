@@ -4657,6 +4657,7 @@ body[data-theme] .composerProjectCustom input {
 
 body .box {
   position: relative;
+  z-index: 2;
   display: grid;
   grid-template-rows: minmax(54px, auto) 34px;
   grid-template-columns: 34px 34px minmax(0, 1fr) auto 36px;
@@ -4887,30 +4888,21 @@ body .cancelButton .lucide {
 }
 
 .promptQueue {
-  width: min(880px, calc(100% - 24px));
+  position: relative;
+  z-index: 1;
+  width: min(calc(var(--conversation-width) - 24px), calc(100% - 24px));
   max-height: min(30vh, 230px);
-  margin-bottom: 7px;
+  margin-bottom: -18px;
   overflow: hidden auto;
   border: 1px solid var(--border);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--surface) 96%, var(--canvas));
-  box-shadow: 0 7px 20px rgba(0, 0, 0, 0.07);
+  border-radius: 18px 18px 0 0;
+  background: var(--surface);
+  padding-bottom: 18px;
+  box-shadow: none;
 }
 
 .promptQueueHead {
-  position: sticky;
-  z-index: 1;
-  top: 0;
-  display: flex;
-  min-height: 28px;
-  align-items: center;
-  gap: 6px;
-  border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--surface) 96%, var(--canvas));
-  color: var(--text-subtle);
-  padding: 4px 10px;
-  font-size: 10px;
-  font-weight: 650;
+  display: none;
 }
 
 .promptQueueCount {
@@ -5049,6 +5041,12 @@ body .cancelButton .lucide {
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.promptQueue:has(+ .attachmentTray:not(.hidden)) {
+  margin-bottom: 7px;
+  border-radius: 18px;
+  padding-bottom: 0;
 }
 
 .attachmentTray {
@@ -5306,6 +5304,7 @@ body[data-chat-bg="skin"] .top {
 }
 
 body[data-chat-bg="skin"] .box,
+body[data-chat-bg="skin"] .promptQueue,
 body[data-chat-bg="skin"] .composerPopover,
 body[data-chat-bg="skin"] .composerProjectPanel {
   background: var(--skin-surface-strong);
@@ -5704,10 +5703,6 @@ body[data-chat-bg="skin"] .hist.active {
 
   body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
     grid-template-columns: 30px 30px minmax(0, 1fr) auto 34px 34px;
-  }
-
-  .promptQueue {
-    width: calc(100% - 12px);
   }
 
   .promptQueueRow {

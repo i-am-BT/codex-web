@@ -313,13 +313,15 @@ test('the live progress pill stays out of completion artifacts', () => {
       this.children.splice(index, 1, next);
     },
   };
+  const promptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
+  const hiddenAttachmentTray = { kind: 'hidden-attachment-tray', parentNode: null, isConnected: true };
   const dropZone = { kind: 'drop-zone', parentNode: null, isConnected: true };
   let composerInsertCalls = 0;
   const composer = {
-    children: [dropZone],
+    children: [promptQueuePanel, hiddenAttachmentTray, dropZone],
     insertBefore(node, reference) {
       composerInsertCalls += 1;
-      assert.strictEqual(reference, dropZone);
+      assert.strictEqual(reference, promptQueuePanel);
       detachNode(node);
       const index = this.children.indexOf(reference);
       assert.notEqual(index, -1);
@@ -339,6 +341,8 @@ test('the live progress pill stays out of completion artifacts', () => {
       return previous;
     },
   };
+  promptQueuePanel.parentNode = composer;
+  hiddenAttachmentTray.parentNode = composer;
   dropZone.parentNode = composer;
   const toolArtifact = { kind: 'tool-artifact' };
   const processElements = [toolArtifact];
@@ -367,6 +371,7 @@ test('the live progress pill stays out of completion artifacts', () => {
     'initialPlan',
     'composer',
     'dropZone',
+    'promptQueuePanel',
     `
       let liveEditedFilesResult = null;
       let liveTurnPlan = initialPlan;
@@ -388,14 +393,16 @@ test('the live progress pill stays out of completion artifacts', () => {
     referencePlan,
     composer,
     dropZone,
+    promptQueuePanel,
   );
 
   const first = api.refresh();
   const second = api.refresh();
   assert.notStrictEqual(first, second);
   assert.deepEqual(timeline.children, []);
-  assert.deepEqual(composer.children, [second, dropZone]);
+  assert.deepEqual(composer.children, [second, promptQueuePanel, hiddenAttachmentTray, dropZone]);
   assert.strictEqual(second.parentNode, composer);
+  assert.strictEqual(second.nextSibling, promptQueuePanel);
   assert.strictEqual(composer.children.at(-1), dropZone);
   assert.equal(composerInsertCalls, 1);
   assert.deepEqual(api.state().turnProcessElements, [toolArtifact]);
@@ -427,6 +434,55 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
   assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
   assert.equal((inlineScript.match(/fileChanges:msg\.fileChanges/g) || []).length, 2);
+});
+
+test('the prompt queue forms the inset overlapping boundary above the composer', () => {
+  const ruleBody = (selector) => {
+    const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const body = uiStyles.match(new RegExp(`(?:^|\\n)\\s*${escapedSelector}\\s*\\{([^}]*)\\}`, 'm'))?.[1];
+    assert.ok(body, `missing CSS rule: ${selector}`);
+    return body;
+  };
+  const pixelValue = (body, property, { negative = false } = {}) => {
+    const sign = negative ? '-' : '';
+    const value = body.match(new RegExp(`${property}:\\s*${sign}(\\d+(?:\\.\\d+)?)px(?:;|$)`))?.[1];
+    assert.ok(value, `missing ${negative ? 'negative ' : ''}${property} pixel value`);
+    return Number(value);
+  };
+
+  const queueRule = ruleBody('.promptQueue');
+  const queueWidth = queueRule.match(
+    /width:\s*min\(calc\(var\(--conversation-width\)\s*-\s*(\d+(?:\.\d+)?)px\),\s*calc\(100%\s*-\s*(\d+(?:\.\d+)?)px\)\)/,
+  );
+  assert.ok(queueWidth, 'the queue width must stay inset from both the desktop and fluid composer widths');
+  assert.equal(Number(queueWidth[1]), Number(queueWidth[2]));
+  assert.ok(Number(queueWidth[1]) > 12, 'the queue must be narrower than the former six-pixels-per-side mobile inset');
+
+  const overlap = pixelValue(queueRule, 'margin-bottom', { negative: true });
+  const overlapPadding = pixelValue(queueRule, 'padding-bottom');
+  assert.ok(overlap > 0, 'the queue must overlap the composer');
+  assert.equal(overlapPadding, overlap, 'bottom padding must protect the final queue row from the overlap');
+
+  const queueLayer = Number(queueRule.match(/z-index:\s*(-?\d+)(?:;|$)/)?.[1]);
+  const composerRule = ruleBody('body .box');
+  const composerLayer = Number(composerRule.match(/z-index:\s*(-?\d+)(?:;|$)/)?.[1]);
+  assert.ok(Number.isFinite(queueLayer), 'the queue must declare its stacking layer');
+  assert.ok(Number.isFinite(composerLayer), 'the composer box must declare its stacking layer');
+  assert.ok(composerLayer > queueLayer, 'the rounded composer must paint over the queue boundary');
+
+  assert.match(ruleBody('.promptQueueHead'), /display:\s*none(?:;|$)/);
+  assert.doesNotMatch(uiStyles, /\.promptQueue\s*\{[^}]*width:\s*calc\(100%\s*-\s*12px\)/s);
+
+  const queueStart = inlineScript.indexOf('function renderPromptQueue(){');
+  const queueEnd = inlineScript.indexOf('function enqueuePrompt', queueStart);
+  assert.ok(queueStart >= 0 && queueEnd > queueStart, 'missing prompt queue renderer source');
+  const queueRenderer = inlineScript.slice(queueStart, queueEnd);
+  assert.doesNotMatch(queueRenderer, /queueActionButton\('pencil'/);
+  assert.match(queueRenderer, /queueActionButton\('ellipsis','编辑'/);
+  assert.deepEqual(
+    [...queueRenderer.matchAll(/row\.appendChild\((guide|remove|more)\)/g)].map((match) => match[1]),
+    ['guide', 'remove', 'more'],
+  );
 });
 
 test('persisted active commentary renders progressively and deduplicates by sequence', () => {
