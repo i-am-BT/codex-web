@@ -4554,6 +4554,10 @@ body .box {
 }
 
 body .box.runActive {
+  grid-template-columns: 34px 34px minmax(0, 1fr) auto 36px;
+}
+
+body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
   grid-template-columns: 34px 34px minmax(0, 1fr) auto 36px 36px;
 }
 
@@ -4674,17 +4678,23 @@ body .attachBtn:hover {
   opacity: 0.45;
 }
 
+.composerModelToggle.running:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
 .composerModelState {
-  width: 12px;
-  height: 12px;
-  flex: 0 0 12px;
-  border: 1.5px solid var(--border-strong);
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  border: 2px solid var(--border-strong);
   border-top-color: var(--text-muted);
   border-radius: 50%;
 }
 
 .composerModelToggle.running .composerModelState {
-  border-top-color: var(--primary);
+  border-color: var(--text-muted);
+  border-right-color: transparent;
   animation: spin 900ms linear infinite;
 }
 
@@ -4734,14 +4744,29 @@ body .send:disabled {
   transform: none;
 }
 
+body .box.runActive > .send:not(.cancelButton):disabled {
+  display: none;
+}
+
 body .cancelButton {
-  grid-column: 6;
+  grid-column: 5;
   background: var(--text) !important;
   color: var(--canvas) !important;
 }
 
+body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) .cancelButton {
+  grid-column: 6;
+}
+
 body .cancelButton:hover {
   background: var(--text) !important;
+}
+
+body .cancelButton .lucide {
+  width: 13px;
+  height: 13px;
+  fill: currentColor;
+  stroke: none;
 }
 
 .promptQueue {
@@ -5423,6 +5448,10 @@ body[data-chat-bg="skin"] .hist.active {
   }
 
   body .box.runActive {
+    grid-template-columns: 34px 34px minmax(0, 1fr) auto 36px;
+  }
+
+  body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
     grid-template-columns: 34px 34px minmax(0, 1fr) auto 36px 36px;
   }
 
@@ -5553,6 +5582,10 @@ body[data-chat-bg="skin"] .hist.active {
   }
 
   body .box.runActive {
+    grid-template-columns: 30px 30px minmax(0, 1fr) auto 34px;
+  }
+
+  body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
     grid-template-columns: 30px 30px minmax(0, 1fr) auto 34px 34px;
   }
 

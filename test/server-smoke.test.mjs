@@ -581,6 +581,10 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.composerProjectPicker:not\(\.hidden\) \+ \.box/);
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
+    assert.match(uiStyles, /\.composerModelToggle\.running:disabled\s*\{[^}]*opacity:\s*1/s);
+    assert.match(uiStyles, /\.composerModelToggle\.running \.composerModelState\s*\{[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/s);
+    assert.match(uiStyles, /body \.box\.runActive > \.send:not\(\.cancelButton\):disabled\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /body \.cancelButton \.lucide\s*\{[^}]*fill:\s*currentColor;[^}]*stroke:\s*none/s);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
     assert.match(uiStyles, /\.msg\.user::after\s*\{[^}]*width:\s*min\(124px, 100%\);[^}]*height:\s*6px/s);
     assert.match(uiStyles, /\.msg\.user \.msgActions\s*\{[^}]*top:\s*calc\(100% - 1px\);[^}]*padding:\s*5px 0 0 8px/s);
