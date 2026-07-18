@@ -723,9 +723,11 @@ app.delete('/api/native-sessions/:id', requireAuth, async (req, res) => {
   if (activeNativeTurns.get(threadId)?.status === 'running') {
     return res.status(409).json({ error: '会话任务正在运行，请先取消' });
   }
+  const threadCwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
 
   try {
     await appServerClient.request('thread/archive', { threadId });
+    await notifyDesktopThreadArchived(threadId, threadCwd);
     nativeSessions.scheduleRefresh();
     res.json({ ok: true, id: threadId });
   } catch (err) {
@@ -758,6 +760,7 @@ app.post('/api/native-projects/archive', requireAuth, async (req, res) => {
   for (const session of targets) {
     try {
       await appServerClient.request('thread/archive', { threadId: session.id });
+      await notifyDesktopThreadArchived(session.id, session.cwd);
       archived.push(session.id);
     } catch (err) {
       failed.push({ id: session.id, error: err.message });
@@ -2546,6 +2549,14 @@ async function interruptNativeTurn(threadId, expectedTurnId) {
   if (!turnId) throw new Error('该会话没有可取消的任务');
   await appServerClient.request('turn/interrupt', { threadId, turnId });
   return { interruptedTurnId: turnId, ok: true, transport: 'app-server' };
+}
+
+async function notifyDesktopThreadArchived(threadId, cwd) {
+  try {
+    await desktopIpcClient.threadArchived(threadId, cwd);
+  } catch (error) {
+    console.warn(`Codex Desktop IPC 归档同步失败: ${error.message}`);
+  }
 }
 
 async function startNativeTurn(threadId, turn) {

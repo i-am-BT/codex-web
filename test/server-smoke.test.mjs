@@ -1539,6 +1539,14 @@ if (args[0] === 'app-server') {
       headers: { Cookie: cookie },
     });
     assert.equal(archived.status, 200);
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.type === 'broadcast'
+      && message.method === 'thread-archived'
+      && message.version === 2
+      && message.params?.hostId === 'local'
+      && message.params?.conversationId === createdNativeSessionId
+      && message.params?.cwd === temporary
+    )));
 
     const continued = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
       method: 'POST',
@@ -1599,6 +1607,14 @@ if (args[0] === 'app-server') {
     assert.equal(archivedProject.status, 200);
     const archivedProjectPayload = await archivedProject.json();
     assert.deepEqual(archivedProjectPayload.archived, [nativeSessionId]);
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.type === 'broadcast'
+      && message.method === 'thread-archived'
+      && message.version === 2
+      && message.params?.hostId === 'local'
+      && message.params?.conversationId === nativeSessionId
+      && message.params?.cwd === temporary
+    )));
 
     const protocolMessages = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
@@ -1885,6 +1901,7 @@ async function createDesktopIpcFixture(temporary) {
         });
         return;
       }
+      if (message.type === 'broadcast') return;
       if (!fixture.ownerAvailable) {
         writeDesktopFrame(socket, {
           type: 'response',

@@ -12,8 +12,12 @@ import {
 test('routes a turn through the Codex Desktop owner IPC client', async () => {
   const fixture = await createRouterFixture();
   let discoveryResponse;
+  let archivedBroadcast;
   const discoveryHandled = new Promise((resolve) => {
     discoveryResponse = resolve;
+  });
+  const archivedBroadcastHandled = new Promise((resolve) => {
+    archivedBroadcast = resolve;
   });
 
   fixture.onMessage = (socket, message) => {
@@ -41,6 +45,11 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
 
     if (message.type === 'client-discovery-response') {
       discoveryResponse(message);
+      return;
+    }
+
+    if (message.type === 'broadcast') {
+      archivedBroadcast(message);
       return;
     }
 
@@ -93,6 +102,7 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
       targetClientId: 'desktop-owner-id',
     });
     assert.deepEqual(approval, { ok: true });
+    await client.threadArchived('thread-1', '/workspace/project');
     assert.deepEqual(await discoveryHandled, {
       type: 'client-discovery-response',
       requestId: 'discovery-1',
@@ -103,6 +113,17 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
       method: 'thread-stream-state-changed',
       sourceClientId: 'desktop-owner-id',
       params: { conversationId: 'thread-1' },
+    });
+    assert.deepEqual(await archivedBroadcastHandled, {
+      type: 'broadcast',
+      method: 'thread-archived',
+      sourceClientId: 'web-client-id',
+      version: 2,
+      params: {
+        hostId: 'local',
+        conversationId: 'thread-1',
+        cwd: '/workspace/project',
+      },
     });
   } finally {
     client.close();

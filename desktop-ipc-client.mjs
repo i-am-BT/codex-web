@@ -21,6 +21,9 @@ const METHOD_VERSIONS = new Map([
   ['thread-follower-submit-user-input', 1],
   ['thread-follower-submit-mcp-server-elicitation-response', 1],
 ]);
+const BROADCAST_VERSIONS = new Map([
+  ['thread-archived', 2],
+]);
 const SAFE_FALLBACK_ERRORS = new Set([
   'disabled',
   'no-client-found',
@@ -92,6 +95,19 @@ export class CodexDesktopIpcClient extends EventEmitter {
     });
   }
 
+  async broadcast(method, params = {}) {
+    await this.start();
+    const version = BROADCAST_VERSIONS.get(method);
+    if (!Number.isInteger(version)) throw new Error(`Codex Desktop IPC 广播版本未知: ${method}`);
+    this.writeMessage({
+      type: 'broadcast',
+      method,
+      sourceClientId: this.clientId,
+      version,
+      params,
+    });
+  }
+
   async startTurn(conversationId, turnStartParams, options = {}) {
     const response = await this.request('thread-follower-start-turn', {
       conversationId,
@@ -124,6 +140,14 @@ export class CodexDesktopIpcClient extends EventEmitter {
 
   async interruptTurn(conversationId, options = {}) {
     return this.request('thread-follower-interrupt-turn', { conversationId }, options);
+  }
+
+  async threadArchived(conversationId, cwd) {
+    return this.broadcast('thread-archived', {
+      hostId: 'local',
+      conversationId,
+      cwd: String(cwd || ''),
+    });
   }
 
   async commandApprovalDecision(conversationId, requestId, decision, options = {}) {
