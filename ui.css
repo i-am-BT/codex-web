@@ -845,6 +845,7 @@ body[data-theme] .archiveProjectFilter select {
 }
 
 .automationView {
+  position: relative;
   min-height: 0;
   flex: 1 1 auto;
   overflow: auto;
@@ -1207,153 +1208,258 @@ body[data-theme] .automationSearch input {
   line-height: 1.45;
 }
 
+.automationView.editorOpen {
+  overflow: hidden;
+}
+
+.automationView.editorOpen > .automationViewInner {
+  display: none;
+}
+
 .automationEditor {
-  position: fixed;
-  z-index: 90;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  background: rgba(20, 24, 31, 0.46);
-  padding: 20px;
-  backdrop-filter: blur(5px);
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  background: var(--surface);
+  overscroll-behavior: contain;
 }
 
 .automationForm {
-  width: min(680px, calc(100vw - 32px));
-  max-height: min(90vh, 820px);
-  overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  min-height: 100%;
   background: var(--surface);
-  box-shadow: 0 24px 74px rgba(0, 0, 0, 0.28);
-  padding: 20px;
+  padding: 0 0 48px;
 }
 
-.automationFormHead {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 20px;
+.automationEditorBack,
+.automationEditorSave {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border-radius: 9px;
+  padding: 7px 11px;
+  font-size: 13px;
+  font-weight: 590;
 }
 
-.automationFormEyebrow {
-  margin-bottom: 5px;
-  color: var(--primary);
-  font-size: 10px;
-  font-weight: 720;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.automationFormHead h2 {
-  margin: 0;
-  color: var(--text);
-  font-size: 20px;
-  letter-spacing: -0.02em;
-}
-
-.automationFormHead p {
-  margin: 6px 0 0;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.automationIconButton {
-  display: grid;
-  width: 34px;
-  height: 34px;
-  flex: 0 0 34px;
-  place-items: center;
+.automationEditorBack {
   border: 0;
-  border-radius: 50%;
   background: transparent;
   color: var(--text-muted);
-  padding: 0;
 }
 
-.automationIconButton:hover {
+.automationEditorBack:hover,
+.automationEditorBack:focus-visible {
   background: var(--surface-hover);
   color: var(--text);
 }
 
-.automationIconButton .lucide {
-  width: 17px;
-  height: 17px;
+.automationEditorSave {
+  border: 1px solid var(--text);
+  background: var(--text);
+  color: var(--surface);
 }
 
-.automationFormGrid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+.automationEditorSave:hover:not(:disabled),
+.automationEditorSave:focus-visible:not(:disabled) {
+  opacity: 0.84;
 }
 
-.automationField {
-  display: grid;
-  min-width: 0;
-  gap: 6px;
-  color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 650;
+.automationEditorSave:disabled {
+  cursor: wait;
+  opacity: 0.56;
 }
 
-.automationFieldWide {
-  grid-column: 1 / -1;
-}
-
-body[data-theme] .automationField input,
-body[data-theme] .automationField select,
-body[data-theme] .automationField textarea {
-  width: 100%;
-  min-height: 40px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-raised);
-  color: var(--text);
-  padding: 9px 10px;
-  font-size: 13px;
-  font-weight: 450;
-}
-
-body[data-theme] .automationField textarea {
-  min-height: 112px;
-  resize: vertical;
-  line-height: 1.5;
-}
-
-body[data-theme] .automationField input:focus,
-body[data-theme] .automationField select:focus,
-body[data-theme] .automationField textarea:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-soft);
-}
-
-.automationCheckbox {
-  grid-column: 1 / -1;
-  display: flex;
-  min-height: 34px;
-  align-items: center;
-  gap: 8px;
-  font-weight: 550;
-}
-
-.automationCheckbox input {
-  width: 16px !important;
-  min-height: 16px !important;
+.automationEditorBack .lucide,
+.automationEditorSave .lucide {
+  width: 15px;
+  height: 15px;
 }
 
 .automationFormMessage {
-  min-height: 20px;
-  margin-top: 10px;
+  max-width: min(44vw, 520px);
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automationFormMessage:empty {
+  display: none;
+}
+
+.automationFormMessage.error {
   color: var(--danger);
-  font-size: 11px;
+}
+
+.automationFormBody {
+  width: calc(100% - 32px);
+  margin: 0 auto;
+  padding-top: 7px;
+}
+
+.automationTitleField,
+.automationPromptField {
+  display: block;
+}
+
+body[data-theme] .automationTitleField input {
+  width: 100%;
+  min-height: 34px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 2px 4px;
+  box-shadow: none;
+  font-size: 18px;
+  font-weight: 480;
+  line-height: 1.45;
+}
+
+body[data-theme] .automationTitleField input::placeholder,
+body[data-theme] .automationPromptField textarea::placeholder {
+  color: var(--text-subtle);
+  opacity: 0.76;
+}
+
+body[data-theme] .automationTitleField input:focus {
+  outline: 0;
+  box-shadow: inset 0 -1px 0 var(--primary);
+}
+
+.automationPromptField {
+  margin-top: 14px;
+}
+
+body[data-theme] .automationPromptField textarea {
+  width: 100%;
+  min-height: 66px;
+  height: 66px;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: transparent;
+  color: var(--text);
+  padding: 14px 16px;
+  box-shadow: none;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+body[data-theme] .automationPromptField textarea:focus {
+  border-color: var(--primary);
+  outline: 0;
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.automationFormSection {
+  margin-top: 31px;
+}
+
+.automationFormSection h3 {
+  margin: 0 4px 8px;
+  color: var(--text-subtle);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+}
+
+.automationSettingsGroup {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: transparent;
+}
+
+.automationSettingRow {
+  position: relative;
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: minmax(96px, 0.28fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 18px;
+  margin: 0 16px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 520;
+  cursor: pointer;
+  transition: background 150ms var(--ease), box-shadow 150ms var(--ease);
+}
+
+.automationSettingRow:not(:last-child)::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: color-mix(in srgb, var(--border) 76%, transparent);
+  content: '';
+}
+
+.automationSettingRow:hover {
+  margin-right: 0;
+  margin-left: 0;
+  padding-right: 16px;
+  padding-left: 16px;
+  background: color-mix(in srgb, var(--surface-hover) 54%, transparent);
+}
+
+.automationSettingRow:focus-within {
+  box-shadow: inset 0 0 0 2px var(--primary-soft);
+}
+
+body[data-theme] .automationSettingRow select,
+body[data-theme] .automationSettingRow input {
+  width: min(100%, 560px);
+  min-height: 42px;
+  justify-self: end;
+  border: 0;
+  background-color: transparent;
+  color: var(--text);
+  padding: 7px 2px 7px 12px;
+  box-shadow: none;
+  font-size: 14px;
+  font-weight: 460;
+  text-align: right;
+}
+
+body[data-theme] .automationSettingRow input[type="time"] {
+  max-width: 112px;
+}
+
+body[data-theme] .automationSettingRow input[type="time"]::-webkit-calendar-picker-indicator {
+  margin-left: 8px;
+  opacity: 0.56;
+}
+
+body[data-theme] .automationSettingRow select {
+  cursor: pointer;
+  text-align-last: right;
+}
+
+body[data-theme] .automationSettingRow input:focus,
+body[data-theme] .automationSettingRow select:focus {
+  outline: 0;
+}
+
+.automationSettingRow.hidden {
+  display: none;
 }
 
 .automationFormActions {
+  min-height: 58px;
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
-  margin-top: 4px;
+  padding-top: 12px;
+}
+
+.automationFormActions .automationFormMessage {
+  margin-right: auto;
 }
 
 body .settingsPanel {
@@ -6271,13 +6377,58 @@ body[data-chat-bg="skin"] .hist.active {
     height: 14px;
   }
 
-  .automationFormGrid {
-    grid-template-columns: 1fr;
+  .automationFormBody {
+    width: calc(100% - 24px);
   }
 
-  .automationFieldWide,
-  .automationCheckbox {
-    grid-column: auto;
+  .automationForm {
+    padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 40px);
+  }
+
+  body[data-theme] .automationTitleField input {
+    min-height: 38px;
+    font-size: 18px;
+  }
+
+  body[data-theme] .automationPromptField textarea {
+    min-height: 96px;
+    height: 96px;
+    border-radius: 14px;
+  }
+
+  .automationFormSection {
+    margin-top: 28px;
+  }
+
+  .automationSettingsGroup {
+    border-radius: 14px;
+  }
+
+  .automationSettingRow {
+    min-height: 48px;
+    grid-template-columns: minmax(72px, 0.3fr) minmax(0, 1fr);
+    gap: 10px;
+    margin: 0 14px;
+  }
+
+  .automationSettingRow:hover {
+    margin-right: 0;
+    margin-left: 0;
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+
+  body[data-theme] .automationSettingRow select,
+  body[data-theme] .automationSettingRow input {
+    max-width: 100%;
+    min-height: 46px;
+    overflow: hidden;
+    font-size: 13px;
+    text-overflow: ellipsis;
+  }
+
+  .automationFormMessage {
+    max-width: 44vw;
   }
 
   .turnResultAction {

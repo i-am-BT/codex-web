@@ -757,7 +757,9 @@ updated_at = 1784422800000
         prompt: 'Summarize the latest project work.',
         cwd: temporary,
         model: 'test-model',
-        reasoningEffort: 'max',
+        reasoningEffort: 'xhigh',
+        notificationPolicy: 'always',
+        status: 'PAUSED',
         schedule: { frequency: 'weekdays', time: '08:00' },
       }),
     });
@@ -765,22 +767,30 @@ updated_at = 1784422800000
     const createdAutomationPayload = await createdAutomation.json();
     assert.equal(createdAutomationPayload.automation.id, 'daily-project-brief');
     assert.equal(createdAutomationPayload.automation.scheduleLabel, '工作日 08:00');
+    assert.equal(createdAutomationPayload.automation.model, 'test-model');
+    assert.equal(createdAutomationPayload.automation.reasoningEffort, 'xhigh');
+    assert.equal(createdAutomationPayload.automation.notificationPolicy, 'always');
+    assert.equal(createdAutomationPayload.automation.status, 'PAUSED');
     const automationToml = await readFile(
       path.join(codexHome, 'automations', 'daily-project-brief', 'automation.toml'),
       'utf8',
     );
     assert.match(automationToml, /cwds = \[".+"\]/);
+    assert.match(automationToml, /model = "test-model"/);
+    assert.match(automationToml, /reasoning_effort = "xhigh"/);
+    assert.match(automationToml, /notification_policy = "always"/);
+    assert.match(automationToml, /status = "PAUSED"/);
     assert.doesNotMatch(automationToml, /target =/);
-    const pausedAutomation = await fetch(
+    const activatedAutomation = await fetch(
       `${baseUrl}/api/automations/daily-project-brief/status`,
       {
         method: 'PATCH',
         headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: 'PAUSED' }),
+        body: JSON.stringify({ status: 'ACTIVE' }),
       },
     );
-    assert.equal(pausedAutomation.status, 200);
-    assert.equal((await pausedAutomation.json()).automation.status, 'PAUSED');
+    assert.equal(activatedAutomation.status, 200);
+    assert.equal((await activatedAutomation.json()).automation.status, 'ACTIVE');
 
     const archivedTasks = await fetch(`${baseUrl}/api/native-archived-sessions`, {
       headers: { Cookie: cookie },
@@ -1166,6 +1176,20 @@ updated_at = 1784422800000
     assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
     assert.match(page, /id="automationView"[^>]*aria-labelledby="automationViewTitle"/);
     assert.match(page, /让 ChatGPT 安排任务、设置提醒或监测更新/);
+    assert.match(page, /class="automationFormBody"/);
+    assert.match(page, /id="automationName"[^>]*placeholder="已安排任务标题"/);
+    assert.match(page, /id="automationPrompt"[^>]*placeholder="描述 ChatGPT 应该做什么"/);
+    assert.match(page, /id="automationRunAt"[^>]*><option value="new-task">新任务/);
+    assert.match(page, /id="automationCwd"[^>]*><option value="">无/);
+    assert.match(page, /id="automationModel"[^>]*><option value="">默认模型/);
+    assert.match(page, /id="automationReasoning"[^>]*>.*<option value="ultra">极高/s);
+    assert.match(page, /id="automationFrequency"[^>]*>.*<option value="hourly">每隔数小时/s);
+    assert.match(page, /id="automationDayField" class="automationSettingRow hidden"/);
+    assert.match(page, /id="automationIntervalField" class="automationSettingRow hidden"/);
+    assert.match(page, /id="automationTime" type="time" value="09:00"/);
+    assert.match(page, /id="automationNotification"[^>]*><option value="always">所有运行/);
+    assert.match(page, /automationFrequency\?\.addEventListener\('change',syncAutomationScheduleFields\)/);
+    assert.match(page, /notificationPolicy:document\.getElementById\('automationNotification'\)\?\.value\|\|'always'/);
     assert.match(page, /className='automationTabs'/);
     assert.match(page, /\{value:'',label:'全部'\}/);
     assert.match(page, /\{value:'ACTIVE',label:'已开启'\}/);
