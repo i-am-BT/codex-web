@@ -4427,12 +4427,13 @@ body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-
 body .liveProcessTimeline > .activityCluster.streaming > summary .activityClusterText {
   background: linear-gradient(90deg, var(--text-muted) 0%, var(--text-muted) 36%, var(--text) 50%, var(--text-muted) 64%, var(--text-muted) 100%);
   background-position: 100% 50%;
-  background-size: 240% 100%;
+  background-size: 190% 100%;
   background-clip: text;
   color: transparent;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: liveProcessFlow 2.1s linear infinite;
+  animation: liveProcessFlow 1.8s linear infinite;
+  will-change: background-position;
 }
 
 body[data-theme] .msg.process.reasoningStatus {
@@ -5036,8 +5037,11 @@ body[data-theme] .activityCluster {
 }
 
 .activityClusterText {
+  width: fit-content;
+  max-width: 100%;
   min-width: 0;
   overflow: hidden;
+  justify-self: start;
   color: var(--text-muted);
   font-size: 14px;
   line-height: 1.4;

@@ -57,6 +57,10 @@ test('composer project row and queued prompts share the native visual surface', 
     uiStyles,
     /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s,
   );
+  assert.match(
+    uiStyles,
+    /\.activityClusterText\s*\{[^}]*width:\s*fit-content;[^}]*max-width:\s*100%;[^}]*justify-self:\s*start/s,
+  );
 });
 
 test('running history dots stay before App without changing the row grid', () => {
