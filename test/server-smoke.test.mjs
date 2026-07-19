@@ -1078,6 +1078,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /function showHistoryProjectPreview/);
     assert.match(page, /itemCount\+' 个对话串 · '\+runningCount\+' 个已开启'/);
     assert.match(page, /codexWeb\.historyProjectsCollapsed/);
+    assert.match(page, /codexWeb\.historyTasksCollapsed/);
     assert.match(page, /codexWeb\.historyProjectsHidden/);
     assert.match(page, /function createHistoryProjectMenu/);
     assert.match(page, /function archiveHistoryProject/);

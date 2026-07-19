@@ -3735,12 +3735,14 @@ let sidebarPreferredWidth=SIDEBAR_WIDTH_DEFAULT;
 let sidebarRenderedWidth=SIDEBAR_WIDTH_DEFAULT;
 let sidebarResizePointerId=null;
 const HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsCollapsed';
+const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb.historyTasksCollapsed';
 const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 const NATIVE_INITIAL_MESSAGE_LIMIT=60;
 const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
+let historyTasksCollapsed=readHistoryTasksCollapsed();
 let hiddenHistoryProjects=readHiddenHistoryProjects();
 let renamedHistoryProjects=readRenamedHistoryProjects();
 let activeHistoryProjectMenu=null;
@@ -5296,6 +5298,8 @@ function hideHistoryProjectPreview(anchor){
 }
 function readCollapsedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
 function storeCollapsedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...collapsedHistoryProjects].sort()))}catch{}}
+function readHistoryTasksCollapsed(){try{return localStorage.getItem(HISTORY_TASKS_COLLAPSED_STORAGE_KEY)==='1'}catch{return false}}
+function storeHistoryTasksCollapsed(){try{localStorage.setItem(HISTORY_TASKS_COLLAPSED_STORAGE_KEY,historyTasksCollapsed?'1':'0')}catch{}}
 function readHiddenHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
 function storeHiddenHistoryProjects(){try{localStorage.setItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...hiddenHistoryProjects].sort()))}catch{}}
 function closeHistoryProjectMenu(restoreFocus=false){
@@ -5405,21 +5409,55 @@ function setHistoryProjectExpanded(group,expanded){
   head.title=(expanded?'收起':'展开')+' '+projectName+'\\n'+projectPath;
   rows.hidden=!expanded;
 }
-function appendStandaloneHistoryTasks(items){
+function setHistoryTasksExpanded(section,expanded){
+  const head=section?.querySelector('.historyTasksHead');
+  const rows=section?.querySelector('.historyTasksItems');
+  if(!head||!rows)return;
+  const itemCount=section.dataset.taskCount||'0';
+  const runningCount=section.dataset.taskRunningCount||'0';
+  section.classList.toggle('collapsed',!expanded);
+  head.setAttribute('aria-expanded',String(expanded));
+  head.setAttribute('aria-label',(expanded?'收起':'展开')+'任务，'+itemCount+' 个对话串，'+runningCount+' 个已开启');
+  head.title=(expanded?'收起':'展开')+'任务';
+  rows.hidden=!expanded;
+}
+function appendStandaloneHistoryTasks(items,{query=false}={}){
   if(!items.length)return;
   const section=document.createElement('section');
   section.className='historyTasks';
   const runningCount=items.filter((item)=>item.status==='running').length;
+  section.dataset.taskCount=String(items.length);
+  section.dataset.taskRunningCount=String(runningCount);
   section.setAttribute('aria-label','任务，'+items.length+' 个对话串，'+runningCount+' 个已开启');
-  const title=document.createElement('h2');
+  const head=document.createElement('button');
+  head.type='button';
+  head.className='historyTasksHead';
+  head.setAttribute('aria-controls','history-tasks-items');
+  const title=document.createElement('span');
   title.className='historyTasksTitle';
   title.textContent='任务';
+  const chevron=document.createElement('span');
+  chevron.className='historyTasksChevron';
+  setIconLabel(chevron,'chevron-right','',false);
+  head.appendChild(title);
+  head.appendChild(chevron);
   const rows=document.createElement('div');
   rows.className='historyTasksItems';
+  rows.id='history-tasks-items';
   for(const item of items)rows.appendChild(createHistoryRow(item,''));
-  section.appendChild(title);
+  section.appendChild(head);
   section.appendChild(rows);
   history.appendChild(section);
+  const currentKey=conversationKey(currentConversationSource,currentConversationId);
+  const containsCurrent=Boolean(currentConversationId)&&items.some((item)=>conversationKey(item.source,item.id)===currentKey);
+  setHistoryTasksExpanded(section,Boolean(query)||containsCurrent||!historyTasksCollapsed);
+  head.addEventListener('click',()=>{
+    const expanded=head.getAttribute('aria-expanded')==='true';
+    setHistoryTasksExpanded(section,!expanded);
+    if(query)return;
+    historyTasksCollapsed=expanded;
+    storeHistoryTasksCollapsed();
+  });
 }
 function renderHistory(items){
   if(Array.isArray(items))historyItems=items;
@@ -5441,7 +5479,7 @@ function renderHistory(items){
     return;
   }
   const {tasks:standaloneTasks,projects:groups}=partitionHistoryItems(visibleItems);
-  appendStandaloneHistoryTasks(standaloneTasks);
+  appendStandaloneHistoryTasks(standaloneTasks,{query:Boolean(query)});
   let groupIndex=0;
   for(const [groupKey,groupData] of groups){
     const group=document.createElement('section');

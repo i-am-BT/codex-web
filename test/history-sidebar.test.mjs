@@ -57,16 +57,24 @@ test('projectless working directories do not pollute the composer project picker
   assert.deepEqual(composerProjectPaths(), [explicitProjectPath]);
 });
 
-test('the task section is rendered before project groups without project controls', () => {
+test('the task section is rendered before project groups and can collapse independently', () => {
   const taskRenderSource = sourceBetween('function appendStandaloneHistoryTasks', 'function renderHistory');
   assert.match(taskRenderSource, /section\.className='historyTasks'/);
+  assert.match(taskRenderSource, /head\.className='historyTasksHead'/);
   assert.match(taskRenderSource, /title\.textContent='任务'/);
+  assert.match(taskRenderSource, /setIconLabel\(chevron,'chevron-right','',false\)/);
   assert.match(taskRenderSource, /rows\.className='historyTasksItems'/);
   assert.match(taskRenderSource, /createHistoryRow\(item,''\)/);
   assert.doesNotMatch(taskRenderSource, /createHistoryProjectMenu|historyProjectHead|historyProjectFolder/);
-  assert.match(inlineScript, /const \{tasks:standaloneTasks,projects:groups\}=partitionHistoryItems\(visibleItems\);\s*appendStandaloneHistoryTasks\(standaloneTasks\);/);
+  assert.match(taskRenderSource, /setHistoryTasksExpanded\(section,Boolean\(query\)\|\|containsCurrent\|\|!historyTasksCollapsed\)/);
+  assert.match(taskRenderSource, /historyTasksCollapsed=expanded;\s*storeHistoryTasksCollapsed\(\)/);
+  assert.match(inlineScript, /const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb\.historyTasksCollapsed'/);
+  assert.match(inlineScript, /const \{tasks:standaloneTasks,projects:groups\}=partitionHistoryItems\(visibleItems\);\s*appendStandaloneHistoryTasks\(standaloneTasks,\{query:Boolean\(query\)\}\);/);
+  assert.match(uiStyles, /\.historyTasksHead\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 14px/s);
   assert.match(uiStyles, /\.historyTasksTitle\s*\{[^}]*color:\s*var\(--text-muted\);[^}]*font-size:\s*12px/s);
   assert.match(uiStyles, /\.historyTasksItems\s*\{[^}]*display:\s*grid;[^}]*gap:\s*1px/s);
+  assert.match(uiStyles, /\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
+  assert.match(uiStyles, /\.historyTasksHead\[aria-expanded="true"\] \.historyTasksChevron\s*\{[^}]*transform:\s*rotate\(90deg\)/s);
 });
 
 test('workspace-kind changes are watched and included in session signatures', () => {
