@@ -23,7 +23,11 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /\.promptQueue\s*\{[^}]*border-bottom-color:\s*transparent;[^}]*background:\s*var\(--surface-raised\)/s,
+    /\.promptQueue\s*\{[^}]*border-bottom-color:\s*transparent;[^}]*background:\s*transparent/s,
+  );
+  assert.match(
+    uiStyles,
+    /body\[data-theme="dark"\] \.promptQueue\s*\{[^}]*border-bottom-color:\s*transparent;[^}]*background:\s*transparent/s,
   );
   assert.match(
     uiStyles,
@@ -40,6 +44,18 @@ test('composer project row and queued prompts share the native visual surface', 
   assert.match(
     uiStyles,
     /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*background:\s*transparent;[^}]*backdrop-filter:\s*none/s,
+  );
+  assert.match(
+    uiStyles,
+    /body \.composer > \.box,[^}]*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s,
+  );
+  assert.match(
+    uiStyles,
+    /body\[data-theme="light"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s,
+  );
+  assert.match(
+    uiStyles,
+    /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s,
   );
 });
 

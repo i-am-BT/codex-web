@@ -703,7 +703,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) - 22px\), calc\(100% - 60px\)\);[^}]*border-radius:\s*24px;[^}]*padding:\s*6px 7px 5px/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\.runActive\s*\{[^}]*grid-template-columns:\s*32px max-content minmax\(0, 1fr\) max-content 30px/s);
-    assert.match(uiStyles, /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#454545;[^}]*background:\s*#2b2b2b;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body\[data-theme="light"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#e1e3e6;[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#454545;[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\)\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) \+ 3px\), calc\(100% - 34px\)\);[^}]*border-radius:\s*12px;[^}]*padding:\s*20px 12px 12px/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.composerProjectPicker\s*\{[^}]*width:\s*calc\(100% - 29px\)/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.box\s*\{[^}]*width:\s*100%/s);
@@ -728,6 +729,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer\s*\{[^}]*border-top:\s*0;[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /body\[data-theme="light"\] \.composer\s*\{[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /body\[data-theme="light"\] \.box,\s*body\[data-theme="light"\] \.box:focus-within\s*\{[^}]*background:\s*#ffffff/s);
+    assert.match(uiStyles, /body \.composer > \.box,\s*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /--composer-width:\s*var\(--conversation-width\)/);
     assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 60px\)\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);

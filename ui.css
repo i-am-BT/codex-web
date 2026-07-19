@@ -6499,7 +6499,7 @@ body .cancelButton .lucide {
   border: 1px solid var(--border);
   border-bottom-color: transparent;
   border-radius: 18px 18px 0 0;
-  background: var(--surface-raised);
+  background: transparent;
   padding-bottom: 18px;
   box-shadow: none;
 }
@@ -6556,7 +6556,7 @@ body .cancelButton .lucide {
 body[data-theme="dark"] .promptQueue {
   border-color: #454545;
   border-bottom-color: transparent;
-  background: #2b2b2b;
+  background: transparent;
 }
 
 .promptQueueLead {
@@ -7342,6 +7342,13 @@ body[data-chat-bg="skin"] .hist.active {
   box-shadow: inset 3px 0 0 var(--primary);
 }
 
+/* Keep the composer surface visually continuous with the conversation canvas. */
+body .composer > .box,
+body .composer > .box:focus-within {
+  background: transparent;
+  box-shadow: none;
+}
+
 @keyframes statusPulse {
   0%,
   100% {
@@ -7524,13 +7531,13 @@ body[data-chat-bg="skin"] .hist.active {
 
   body[data-theme="light"] .composer:has(> .composerProjectPicker.hidden) > .box {
     border-color: #e1e3e6;
-    background: var(--surface-raised);
-    box-shadow: 0 2px 8px rgba(31, 35, 41, 0.05);
+    background: transparent;
+    box-shadow: none;
   }
 
   body[data-theme="dark"] .composer:has(> .composerProjectPicker.hidden) > .box {
     border-color: #454545;
-    background: #2b2b2b;
+    background: transparent;
     box-shadow: none;
   }
 }
