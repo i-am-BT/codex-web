@@ -21,6 +21,37 @@ const referencePlan = [
   { step: '运行回归测试', status: 'pending' },
 ];
 
+test('a user question stays before an already-mounted live response panel', () => {
+  const appendSource = sourceBetween('function appendConversationElement', 'function addMsg');
+  const chat = {
+    children: [],
+    appendChild(element) {
+      this.children.push(element);
+      element.parentNode = this;
+    },
+    insertBefore(element, reference) {
+      const index = this.children.indexOf(reference);
+      assert.notEqual(index, -1);
+      this.children.splice(index, 0, element);
+      element.parentNode = this;
+    },
+  };
+  const livePanel = { kind: 'live-panel', parentNode: chat };
+  chat.children.push(livePanel);
+  const appendConversationElement = new Function(
+    'chat',
+    'turnProcessHeader',
+    `${appendSource}; return appendConversationElement;`,
+  )(chat, livePanel);
+  const question = { kind: 'user-question' };
+  const answer = { kind: 'assistant-answer' };
+
+  appendConversationElement(question, 'user');
+  appendConversationElement(answer, 'assistant');
+
+  assert.deepEqual(chat.children, [question, livePanel, answer]);
+});
+
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
   const activitySource = sourceBetween('function decodeEmbeddedToolString', 'function toolMessageTitle');
   const activityApi = new Function(`${activitySource}; return { toolActivityPresentations, nativeFileChangePresentations };`)();

@@ -392,7 +392,7 @@ body .pill {
 
 .sideActions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 36px 36px;
+  grid-template-columns: minmax(0, 1fr) repeat(3, 36px);
   gap: 8px;
 }
 
@@ -409,6 +409,7 @@ body .pill {
 }
 
 body .archiveToggle,
+body .automationToggle,
 body .settingsToggle {
   display: inline-grid;
   width: 36px;
@@ -424,6 +425,8 @@ body .settingsToggle {
 
 body .archiveToggle:hover,
 body .archiveToggle.active,
+body .automationToggle:hover,
+body .automationToggle.active,
 body .settingsToggle:hover,
 body .settingsToggle[aria-expanded="true"] {
   border-color: var(--border-strong);
@@ -432,11 +435,13 @@ body .settingsToggle[aria-expanded="true"] {
 }
 
 .archiveToggle .buttonLabel,
+.automationToggle .buttonLabel,
 .settingsToggle .buttonLabel {
   display: none;
 }
 
 .archiveToggle .lucide,
+.automationToggle .lucide,
 .settingsToggle .lucide {
   width: 16px;
   height: 16px;
@@ -828,6 +833,510 @@ body[data-theme] .archiveProjectFilter select {
 .archiveEmpty span,
 .archiveEmpty.loading {
   font-size: 12px;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.automationView {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  overflow-x: hidden;
+  background: var(--canvas);
+  overscroll-behavior: contain;
+}
+
+.automationViewInner {
+  width: min(980px, calc(100% - 56px));
+  margin: 0 auto;
+  padding: clamp(34px, 5vw, 66px) 0 72px;
+}
+
+.automationViewHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 22px;
+}
+
+.automationViewHeader h1 {
+  margin: 0;
+  color: var(--text);
+  font-size: clamp(28px, 3vw, 38px);
+  font-weight: 720;
+  letter-spacing: -0.045em;
+  line-height: 1.12;
+}
+
+.automationViewHeader p {
+  margin: 9px 0 0;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.automationCreate,
+.automationRefresh,
+.automationPrimary,
+.automationSecondary {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.automationCreate,
+.automationPrimary {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--canvas);
+}
+
+.automationCreate:hover,
+.automationPrimary:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.automationRefresh,
+.automationSecondary {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.automationRefresh:hover:not(:disabled),
+.automationSecondary:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.automationCreate .lucide,
+.automationRefresh .lucide,
+.automationPrimary .lucide {
+  width: 15px;
+  height: 15px;
+}
+
+.automationToolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(130px, 180px) auto;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.automationSearch {
+  display: grid;
+  min-height: 40px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-subtle);
+  padding: 0 13px;
+}
+
+.automationSearch:focus-within {
+  border-color: var(--primary-line);
+  box-shadow: 0 0 0 2px var(--primary-soft);
+}
+
+.automationSearch .lucide {
+  width: 15px;
+  height: 15px;
+}
+
+body[data-theme] .automationSearch input {
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 9px 0;
+  box-shadow: none;
+  font-size: 13px;
+}
+
+body[data-theme] .automationFilter select {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 7px 30px 7px 10px;
+  font-size: 12px;
+}
+
+.automationStatus {
+  min-height: 22px;
+  margin-bottom: 10px;
+  color: var(--text-subtle);
+  font-size: 11px;
+}
+
+.automationList,
+.automationRows,
+.automationSuggestions {
+  display: grid;
+}
+
+.automationRows {
+  margin-bottom: 30px;
+}
+
+.automationRow {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+  padding: 16px 6px;
+  transition: background 150ms var(--ease);
+}
+
+.automationRow:hover {
+  background: color-mix(in srgb, var(--surface-hover) 52%, transparent);
+}
+
+.automationRowIcon {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  color: var(--primary);
+}
+
+.automationRowIcon .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.automationRowContent {
+  min-width: 0;
+}
+
+.automationRowHeading {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.automationRowHeading strong {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.automationRowHeading span {
+  color: var(--text-subtle);
+  font-size: 12px;
+}
+
+.automationRowContent p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.automationRowMeta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin-top: 7px;
+  color: var(--text-subtle);
+  font-size: 10px;
+}
+
+.automationRowMeta span:first-child {
+  overflow: hidden;
+  max-width: 520px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automationStateToggle {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  margin-top: 1px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--border-strong);
+  padding: 0;
+  transition: background 160ms var(--ease);
+}
+
+.automationStateToggle::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--surface-raised);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.24);
+  content: '';
+  transition: transform 160ms var(--ease);
+}
+
+.automationStateToggle.active {
+  background: var(--primary);
+}
+
+.automationStateToggle.active::after {
+  transform: translateX(14px);
+}
+
+.automationEmpty {
+  min-height: 96px;
+  display: grid;
+  place-items: center;
+  color: var(--text-subtle);
+  font-size: 12px;
+}
+
+.automationSuggestions {
+  gap: 0;
+  padding-top: 12px;
+}
+
+.automationSuggestions h2 {
+  margin: 0 0 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.automationSuggestion {
+  display: grid;
+  width: 100%;
+  min-height: 70px;
+  grid-template-columns: 22px minmax(0, 1fr) 18px;
+  align-items: start;
+  gap: 10px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 13px 6px;
+  text-align: left;
+}
+
+.automationSuggestion:hover {
+  background: color-mix(in srgb, var(--surface-hover) 54%, transparent);
+}
+
+.automationSuggestion > .lucide:first-child {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--primary);
+}
+
+.automationSuggestion > .lucide:last-child {
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  color: var(--text-subtle);
+}
+
+.automationSuggestion > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.automationSuggestion strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 690;
+}
+
+.automationSuggestion strong small {
+  margin-left: 8px;
+  color: var(--text-subtle);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.automationSuggestion span span {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.automationEditor {
+  position: fixed;
+  z-index: 90;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(20, 24, 31, 0.46);
+  padding: 20px;
+  backdrop-filter: blur(5px);
+}
+
+.automationForm {
+  width: min(680px, calc(100vw - 32px));
+  max-height: min(90vh, 820px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 24px 74px rgba(0, 0, 0, 0.28);
+  padding: 20px;
+}
+
+.automationFormHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.automationFormEyebrow {
+  margin-bottom: 5px;
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.automationFormHead h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 20px;
+  letter-spacing: -0.02em;
+}
+
+.automationFormHead p {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.automationIconButton {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0;
+}
+
+.automationIconButton:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.automationIconButton .lucide {
+  width: 17px;
+  height: 17px;
+}
+
+.automationFormGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.automationField {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.automationFieldWide {
+  grid-column: 1 / -1;
+}
+
+body[data-theme] .automationField input,
+body[data-theme] .automationField select,
+body[data-theme] .automationField textarea {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 9px 10px;
+  font-size: 13px;
+  font-weight: 450;
+}
+
+body[data-theme] .automationField textarea {
+  min-height: 112px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+body[data-theme] .automationField input:focus,
+body[data-theme] .automationField select:focus,
+body[data-theme] .automationField textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.automationCheckbox {
+  grid-column: 1 / -1;
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  font-weight: 550;
+}
+
+.automationCheckbox input {
+  width: 16px !important;
+  min-height: 16px !important;
+}
+
+.automationFormMessage {
+  min-height: 20px;
+  margin-top: 10px;
+  color: var(--danger);
+  font-size: 11px;
+}
+
+.automationFormActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 body .settingsPanel {
@@ -5400,6 +5909,7 @@ body[data-chat-bg="skin"] .send:hover:not(:disabled) {
 
 body[data-chat-bg="skin"] .logoMark,
 body[data-chat-bg="skin"] .archiveToggle,
+body[data-chat-bg="skin"] .automationToggle,
 body[data-chat-bg="skin"] .settingsToggle,
 body[data-chat-bg="skin"] .themeToggle,
 body[data-chat-bg="skin"] .attachBtn,
@@ -5643,6 +6153,53 @@ body[data-chat-bg="skin"] .hist.active {
   .archiveTaskDelete {
     width: 44px;
     height: 44px;
+  }
+
+  .automationViewInner {
+    width: min(100% - 26px, 760px);
+    padding: 26px 0 44px;
+  }
+
+  .automationViewHeader {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 15px;
+  }
+
+  .automationCreate {
+    align-self: flex-start;
+  }
+
+  .automationToolbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .automationFilter {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .automationStateToggle {
+    width: 44px;
+    height: 26px;
+  }
+
+  .automationStateToggle::after {
+    width: 20px;
+    height: 20px;
+  }
+
+  .automationStateToggle.active::after {
+    transform: translateX(18px);
+  }
+
+  .automationFormGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .automationFieldWide,
+  .automationCheckbox {
+    grid-column: auto;
   }
 
   .turnResultAction {
