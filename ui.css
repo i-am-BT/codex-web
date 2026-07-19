@@ -678,16 +678,6 @@ body .subQuotaClose:hover {
   line-height: 1.5;
 }
 
-.subQuotaEndpoint {
-  min-width: 0;
-  overflow: hidden;
-  margin-bottom: 10px;
-  color: var(--text-subtle);
-  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .subQuotaSettingsForm {
   display: grid;
   gap: 10px;
@@ -695,6 +685,12 @@ body .subQuotaClose:hover {
 
 .subQuotaSettingsForm .field {
   margin: 0;
+}
+
+.subQuotaCredentialHint {
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .subQuotaSettingsSubmit {
@@ -734,13 +730,6 @@ body .subQuotaClose:hover {
 
 .subQuotaSettingsBody .subQuotaSettingsDescription {
   margin: 0;
-}
-
-.subQuotaSettingsBody .subQuotaEndpoint {
-  margin: 0;
-  border-radius: 8px;
-  background: var(--surface-raised);
-  padding: 8px 10px;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -3113,6 +3102,7 @@ body .history {
 }
 
 body .hist {
+  position: relative;
   grid-template-columns: minmax(0, 1fr) auto auto auto;
   min-height: 34px;
   gap: 2px;
@@ -3130,7 +3120,7 @@ body .hist.native {
 }
 
 body .hist.native.running {
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
 }
 
 body .hist:hover {
@@ -3216,14 +3206,19 @@ body .histDelete .lucide {
 }
 
 .histRunning {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: -4px;
   display: block;
   width: 9px;
   height: 9px;
-  flex: 0 0 9px;
   border: 1.5px solid var(--success);
   border-radius: 50%;
   background: var(--surface);
   box-shadow: 0 0 0 2px var(--success-soft);
+  pointer-events: none;
+  transform: translateY(-50%);
 }
 
 body .histSource {
@@ -4432,12 +4427,13 @@ body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-
 body .liveProcessTimeline > .activityCluster.streaming > summary .activityClusterText {
   background: linear-gradient(90deg, var(--text-muted) 0%, var(--text-muted) 36%, var(--text) 50%, var(--text-muted) 64%, var(--text-muted) 100%);
   background-position: 100% 50%;
-  background-size: 240% 100%;
+  background-size: 190% 100%;
   background-clip: text;
   color: transparent;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: liveProcessFlow 2.1s linear infinite;
+  animation: liveProcessFlow 1.8s linear infinite;
+  will-change: background-position;
 }
 
 body[data-theme] .msg.process.reasoningStatus {
@@ -5041,8 +5037,11 @@ body[data-theme] .activityCluster {
 }
 
 .activityClusterText {
+  width: fit-content;
+  max-width: 100%;
   min-width: 0;
   overflow: hidden;
+  justify-self: start;
   color: var(--text-muted);
   font-size: 14px;
   line-height: 1.4;
@@ -5948,13 +5947,13 @@ body .composer {
 }
 
 body .composer:has(> .composerProjectPicker:not(.hidden)) {
-  width: min(calc(var(--composer-width) + 3px), calc(100% - 34px));
+  width: min(var(--composer-width), calc(100% - 34px));
   margin: 0 auto 18px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface);
-  padding: 20px 12px 12px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.025);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  box-shadow: none;
 }
 
 body[data-theme="light"] .composer {
@@ -5962,18 +5961,24 @@ body[data-theme="light"] .composer {
 }
 
 body[data-theme="light"] .composer:has(> .composerProjectPicker:not(.hidden)) {
-  border-color: #eceef1;
-  background: #ffffff;
+  border-color: transparent;
+  background: transparent;
 }
 
 body[data-theme="light"] .composerProjectToggle {
-  border-color: #e2e4e8;
-  background: #f5f6f7;
+  border-color: transparent;
+  background: #f6f6f6;
+  box-shadow: none;
+}
+
+body[data-theme="light"] .composerProjectToggle:hover,
+body[data-theme="light"] .composerProjectToggle[aria-expanded="true"] {
+  background: #f6f6f6;
 }
 
 body[data-theme="light"] .box,
 body[data-theme="light"] .box:focus-within {
-  border-color: #e1e3e6;
+  border-color: #e2e2e2;
   background: #ffffff;
   box-shadow: 0 4px 14px rgba(31, 35, 41, 0.06);
 }
@@ -6276,7 +6281,7 @@ body[data-theme="dark"] .composerProjectToggle {
 }
 
 body[data-theme="light"] .composerProjectToggle {
-  background: #f5f6f7;
+  background: #f6f6f6;
 }
 
 body[data-theme] .box textarea:focus {
@@ -6335,11 +6340,7 @@ body[data-theme] .box .attachBtn {
   background: var(--surface-hover);
 }
 
-.composerPermissionToggle[data-mode="workspace-write"] {
-  color: var(--warning);
-}
-
-.composerPermissionToggle[data-mode="danger-full-access"] {
+.composerPermissionToggle[data-mode="full"] {
   color: #f2773d;
 }
 
@@ -6496,8 +6497,9 @@ body .cancelButton .lucide {
   margin-bottom: -18px;
   overflow: hidden auto;
   border: 1px solid var(--border);
+  border-bottom-color: transparent;
   border-radius: 18px 18px 0 0;
-  background: var(--surface);
+  background: transparent;
   padding-bottom: 18px;
   box-shadow: none;
 }
@@ -6529,7 +6531,8 @@ body .cancelButton .lucide {
   grid-template-columns: 18px minmax(0, 1fr) auto 30px 30px;
   align-items: center;
   gap: 4px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 42%, transparent);
+  background: transparent;
   padding: 5px 7px 5px 10px;
   transition: background 140ms var(--ease), opacity 140ms var(--ease);
 }
@@ -6539,15 +6542,21 @@ body .cancelButton .lucide {
 }
 
 .promptQueueRow:hover {
-  background: var(--surface-hover);
+  background: transparent;
 }
 
 .promptQueueRow.sending {
-  background: var(--primary-soft);
+  background: transparent;
 }
 
 .promptQueueRow.failed {
-  background: var(--danger-soft);
+  background: transparent;
+}
+
+body[data-theme="dark"] .promptQueue {
+  border-color: #454545;
+  border-bottom-color: transparent;
+  background: transparent;
 }
 
 .promptQueueLead {
@@ -6697,7 +6706,147 @@ body .attachmentChip button {
 }
 
 .composerPermissionPanel {
-  left: 0;
+  left: 38px;
+  display: block;
+  width: min(360px, calc(100vw - 24px));
+  max-height: min(410px, calc(100dvh - 96px));
+  overflow: auto;
+  border-radius: 14px;
+  padding: 8px;
+  overscroll-behavior: contain;
+}
+
+.composerPermissionLegacyControl,
+.composerPermissionPanel > .field,
+.composerPermissionPanel > .safety {
+  display: none !important;
+}
+
+.composerPermissionHead {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 7px 10px 6px;
+}
+
+.composerPermissionHead strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.25;
+}
+
+.composerPermissionHead a {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 55%, transparent);
+  text-underline-offset: 2px;
+}
+
+.composerPermissionHead a:hover,
+.composerPermissionHead a:focus-visible {
+  color: var(--text);
+}
+
+.composerPermissionOptions {
+  display: grid;
+  gap: 2px;
+}
+
+.composerPermissionOption {
+  position: relative;
+  width: 100%;
+  min-height: 58px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 20px;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  padding: 8px 10px;
+  text-align: left;
+  transition: background 150ms var(--ease), color 150ms var(--ease);
+}
+
+.composerPermissionOption:hover,
+.composerPermissionOption:focus-visible {
+  background: var(--surface-hover);
+}
+
+.composerPermissionOption:focus-visible {
+  outline: 0;
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+.composerPermissionOption[data-permission-mode="custom"] {
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 10px 10px;
+}
+
+.composerPermissionOptionIcon,
+.composerPermissionCheck {
+  width: 19px;
+  height: 19px;
+  color: var(--text-muted);
+}
+
+.composerPermissionCopy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.composerPermissionCopy strong {
+  font-size: 14px;
+  font-weight: 610;
+  line-height: 1.25;
+}
+
+.composerPermissionCopy small {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.35;
+  white-space: normal;
+}
+
+.composerPermissionCheck {
+  justify-self: end;
+  opacity: 0;
+  transition: opacity 140ms var(--ease);
+}
+
+.composerPermissionOption[aria-checked="true"] .composerPermissionCheck {
+  opacity: 1;
+}
+
+.composerPermissionOption[data-permission-mode="full"][aria-checked="true"] :is(.composerPermissionOptionIcon, .composerPermissionCheck),
+.composerPermissionOption[data-permission-mode="full"][aria-checked="true"] .composerPermissionCopy strong,
+.composerPermissionOption[data-permission-mode="full"][aria-checked="true"] .composerPermissionCopy small {
+  color: #f2773d;
+}
+
+.composerPermissionRunHint {
+  margin: 5px 10px 4px;
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+@media (max-width: 520px) {
+  .composerPermissionPanel {
+    left: 50%;
+    width: min(360px, calc(100vw - 20px));
+    max-height: min(70dvh, 380px);
+    transform: translateX(-50%);
+  }
 }
 
 .composerModelPanel {
@@ -6850,6 +6999,165 @@ body .attachmentChip button {
   max-height: min(350px, calc(100vh - 160px));
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+.composerReasoningSlider {
+  display: grid;
+  gap: 8px;
+  padding: 7px 10px 12px;
+}
+
+.composerReasoningDefault {
+  display: grid;
+  width: 100%;
+  min-height: 36px;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 7px 8px;
+  font-size: 12px;
+  text-align: left;
+}
+
+.composerReasoningDefault:hover,
+.composerReasoningDefault:focus-visible,
+.composerReasoningDefault[aria-checked="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.composerReasoningDefault .lucide {
+  width: 16px;
+  height: 16px;
+  opacity: 0;
+}
+
+.composerReasoningDefault[aria-checked="true"] .lucide {
+  opacity: 1;
+}
+
+.composerReasoningCurrent {
+  min-height: 20px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 20px;
+  text-align: center;
+}
+
+.composerReasoningRangeWrap {
+  position: relative;
+  display: grid;
+  height: 34px;
+  align-items: center;
+  padding-inline: 7px;
+}
+
+.composerReasoningRange {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  height: 34px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.composerReasoningRange::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--text) 0 var(--reasoning-progress), var(--border-strong) var(--reasoning-progress) 100%);
+}
+
+.composerReasoningRange::-webkit-slider-thumb {
+  width: 15px;
+  height: 15px;
+  margin-top: -6px;
+  border: 2px solid var(--text);
+  border-radius: 50%;
+  appearance: none;
+  background: var(--surface);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.composerReasoningRange::-moz-range-track {
+  height: 3px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--border-strong);
+}
+
+.composerReasoningRange::-moz-range-progress {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--text);
+}
+
+.composerReasoningRange::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--text);
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.composerReasoningRange:focus-visible {
+  box-shadow: none;
+}
+
+.composerReasoningRange:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 5px var(--primary-soft);
+}
+
+.composerReasoningMarks {
+  position: absolute;
+  z-index: 1;
+  right: 7px;
+  left: 7px;
+  display: grid;
+  grid-template-columns: repeat(var(--reasoning-step-count), 1fr);
+  align-items: center;
+  pointer-events: none;
+}
+
+.composerReasoningMark {
+  width: 4px;
+  height: 4px;
+  justify-self: center;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+
+.composerReasoningMark:first-child {
+  justify-self: start;
+}
+
+.composerReasoningMark:last-child {
+  justify-self: end;
+}
+
+.composerReasoningMark.active {
+  background: var(--text);
+}
+
+.composerReasoningSlider.default .composerReasoningRange,
+.composerReasoningSlider.default .composerReasoningMarks {
+  opacity: 0.62;
+}
+
+.composerReasoningEndpoints {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-subtle);
+  padding-inline: 6px;
+  font-size: 10px;
+  line-height: 1.2;
 }
 
 .composerModelOption {
@@ -7101,13 +7409,24 @@ body[data-chat-bg="skin"] .top {
   backdrop-filter: blur(16px) saturate(1.08);
 }
 
-body[data-chat-bg="skin"] .box,
-body[data-chat-bg="skin"] .promptQueue,
 body[data-chat-bg="skin"] .composerPopover,
 body[data-chat-bg="skin"] .composerProjectPanel {
   background: var(--skin-surface-strong);
   border-color: var(--primary-line);
   backdrop-filter: blur(18px) saturate(1.08);
+}
+
+body[data-chat-bg="skin"] .box {
+  border-color: var(--primary-line);
+  background: transparent;
+  backdrop-filter: none;
+}
+
+body[data-chat-bg="skin"] .promptQueue {
+  border-color: var(--primary-line);
+  border-bottom-color: transparent;
+  background: transparent;
+  backdrop-filter: none;
 }
 
 body[data-chat-bg="skin"] .msg.image,
@@ -7161,6 +7480,13 @@ body[data-chat-bg="skin"] .subQuotaPopover {
 body[data-chat-bg="skin"] .hist.active {
   background: color-mix(in srgb, var(--primary) 16%, transparent);
   box-shadow: inset 3px 0 0 var(--primary);
+}
+
+/* Keep the composer surface visually continuous with the conversation canvas. */
+body .composer > .box,
+body .composer > .box:focus-within {
+  background: transparent;
+  box-shadow: none;
 }
 
 @keyframes statusPulse {
@@ -7345,13 +7671,13 @@ body[data-chat-bg="skin"] .hist.active {
 
   body[data-theme="light"] .composer:has(> .composerProjectPicker.hidden) > .box {
     border-color: #e1e3e6;
-    background: var(--surface-raised);
-    box-shadow: 0 2px 8px rgba(31, 35, 41, 0.05);
+    background: transparent;
+    box-shadow: none;
   }
 
   body[data-theme="dark"] .composer:has(> .composerProjectPicker.hidden) > .box {
     border-color: #454545;
-    background: #2b2b2b;
+    background: transparent;
     box-shadow: none;
   }
 }
@@ -7788,6 +8114,13 @@ body[data-chat-bg="skin"] .hist.active {
 
   .composerPopover {
     width: min(290px, calc(100vw - 36px));
+  }
+
+  .composerPermissionPanel {
+    left: 50%;
+    width: min(360px, calc(100vw - 20px));
+    max-height: min(70dvh, 380px);
+    transform: translateX(-50%);
   }
 
   .composerModelPanel {

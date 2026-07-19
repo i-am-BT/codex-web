@@ -1019,6 +1019,7 @@ function applyMetadataRecord(cache, record) {
       model: payload.model || cache.metadata.model || '',
       reasoningEffort: payload.effort || cache.metadata.reasoningEffort || '',
       approvalPolicy: payload.approval_policy || cache.metadata.approvalPolicy || '',
+      approvalsReviewer: payload.approvals_reviewer || cache.metadata.approvalsReviewer || '',
       sandboxPolicy: normalizeSandboxPolicy(payload.sandbox_policy) || cache.metadata.sandboxPolicy || '',
       timezone: payload.timezone || cache.metadata.timezone || '',
     };

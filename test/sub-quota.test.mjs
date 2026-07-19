@@ -2,9 +2,22 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   normalizeSubQuota,
+  normalizeSubQuotaBaseUrl,
   parseSubQuotaSources,
   SubQuotaService,
 } from '../sub-quota.mjs';
+
+test('normalizes editable Sub2API URLs and rejects unsafe values', () => {
+  assert.equal(normalizeSubQuotaBaseUrl(' https://sub.example.test/ '), 'https://sub.example.test');
+  assert.equal(normalizeSubQuotaBaseUrl('https://sub.example.test/v1'), 'https://sub.example.test');
+  assert.equal(normalizeSubQuotaBaseUrl('https://sub.example.test/v1/usage/'), 'https://sub.example.test');
+  assert.equal(normalizeSubQuotaBaseUrl('https://sub.example.test/api/v1/usage?token=hidden#fragment'), 'https://sub.example.test/api');
+  assert.throws(() => normalizeSubQuotaBaseUrl(''), /不能为空/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('file:///tmp/sub2api'), /http\/https/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('https://user:pass@sub.example.test'), /无凭据/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('https://sub.example.test/\ninvalid'), /无效字符/);
+  assert.throws(() => normalizeSubQuotaBaseUrl(`https://sub.example.test/${'a'.repeat(2048)}`), /过长/);
+});
 
 test('parses server-side Sub quota sources without embedding credentials', () => {
   const sources = parseSubQuotaSources(JSON.stringify([{
@@ -21,6 +34,13 @@ test('parses server-side Sub quota sources without embedding credentials', () =>
     apiKey: 'secret-key',
     usageUrl: 'https://sub.example.test/v1/usage',
   }]);
+  const fullUsageUrl = parseSubQuotaSources(JSON.stringify([{
+    id: 'full-url',
+    name: 'Full URL',
+    baseUrl: 'https://sub.example.test/v1/usage',
+    apiKeyEnv: 'SUB_MAIN_API_KEY',
+  }]), { SUB_MAIN_API_KEY: 'secret-key' });
+  assert.equal(fullUsageUrl[0].usageUrl, 'https://sub.example.test/v1/usage');
   assert.throws(() => parseSubQuotaSources('[{"baseUrl":"file:///tmp/key"}]'), /apiKeyEnv/);
 });
 

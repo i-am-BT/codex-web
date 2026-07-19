@@ -276,6 +276,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
           model: 'gpt-test',
           effort: 'high',
           approval_policy: 'never',
+          approvals_reviewer: 'guardian_subagent',
           sandbox_policy: { type: 'workspace-write' },
         },
       },
@@ -324,6 +325,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
     const conversation = store.get(id);
     assert.equal(conversation.metadata.cwd, '/workspace');
     assert.equal(conversation.metadata.model, 'gpt-test');
+    assert.equal(conversation.metadata.approvalsReviewer, 'guardian_subagent');
     assert.equal(conversation.metadata.cliVersion, '0.144.0-alpha.4');
     assert.equal(conversation.status, 'done');
     assert.equal(conversation.latestTurnId, 'turn-2');

@@ -32,7 +32,7 @@ import {
   buildAutomationRrule,
   decorateAutomation,
 } from './automation-store.mjs';
-import { SubQuotaService } from './sub-quota.mjs';
+import { normalizeSubQuotaBaseUrl, SubQuotaService } from './sub-quota.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -543,16 +543,23 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
 
 app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
+  let candidateBaseUrl;
+  try {
+    candidateBaseUrl = normalizeSubQuotaBaseUrl(
+      req.body?.baseUrl === undefined ? subQuotaBaseUrl : req.body.baseUrl,
+    );
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
   const suppliedApiKey = String(req.body?.apiKey || '').trim();
-  const apiKey = suppliedApiKey;
-  if (!isHttpUrl(subQuotaBaseUrl)) return res.status(503).json({ error: 'Sub2API 地址尚未配置' });
+  const apiKey = suppliedApiKey || getSubQuotaApiKey();
   if (!apiKey) return res.status(400).json({ error: 'Sub2API API Key 不能为空' });
   if (apiKey.length > 4096 || /[\r\n\0]/.test(apiKey)) {
     return res.status(400).json({ error: 'Sub2API API Key 包含无效字符' });
   }
 
   try {
-    const candidate = createSubQuotaService(subQuotaBaseUrl, apiKey);
+    const candidate = createSubQuotaService(candidateBaseUrl, apiKey);
     const result = await candidate.list({ refresh: true });
     const quota = result.quotas[0];
     if (!quota || quota.error) {
@@ -560,11 +567,15 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
     }
     if (quota.valid === false) return res.status(422).json({ error: 'Sub2API API Key 已失效' });
 
-    updateEnvVar(ENV_FILE, 'SUB2API_API_KEY', apiKey);
+    updateEnvVars(ENV_FILE, {
+      SUB2API_BASE_URL: candidateBaseUrl,
+      ...(suppliedApiKey ? { SUB2API_API_KEY: apiKey } : {}),
+    });
+    subQuotaBaseUrl = candidateBaseUrl;
     subQuotaService = candidate;
     res.json({
       ok: true,
-      baseUrl: subQuotaBaseUrl,
+      baseUrl: candidateBaseUrl,
       keyConfigured: true,
       configured: true,
       quota: {
@@ -852,6 +863,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
         modelProvider: settings.provider,
         sandbox: settings.sandbox,
         approvalPolicy: settings.approval,
+        approvalsReviewer: settings.approvalsReviewer,
         threadSource: 'user',
       }))
       : await appServerClient.request('thread/start', compactObject({
@@ -860,6 +872,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
         modelProvider: settings.provider,
         sandbox: settings.sandbox,
         approvalPolicy: settings.approval,
+        approvalsReviewer: settings.approvalsReviewer,
         threadSource: 'user',
       }));
     const forkedThreadId = cleanNativeThreadId(result?.thread?.id);
@@ -892,6 +905,7 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       modelProvider: turn.provider,
       sandbox: turn.sandbox,
       approvalPolicy: turn.approval,
+      approvalsReviewer: turn.approvalsReviewer,
       threadSource: 'user',
     }));
     const threadId = cleanNativeThreadId(started?.thread?.id);
@@ -1254,8 +1268,7 @@ app.post('/api/chat', requireAuth, (req, res) => {
   const model = cleanValue(req.body?.model) || DEFAULT_MODEL;
   const provider = cleanValue(req.body?.provider) || DEFAULT_PROVIDER;
   const cwd = normalizeCwd(req.body?.cwd || DEFAULT_CWD);
-  const sandbox = cleanSandbox(req.body?.sandbox || DEFAULT_SANDBOX);
-  const approval = cleanApproval(req.body?.approval || DEFAULT_APPROVAL);
+  const { permissionMode, sandbox, approval } = permissionSettingsFromRequest(req.body || {});
   const reasoningEffort = cleanReasoningEffort(req.body?.reasoningEffort);
 
   if (!message && !uploadedAttachments.length) return res.status(400).json({ error: 'message is required' });
@@ -1303,21 +1316,25 @@ app.post('/api/chat', requireAuth, (req, res) => {
     return;
   }
 
-  const args = [
-    '-a', approval,
+  const args = [];
+  if (approval) args.push('-a', approval);
+  args.push(
     'exec',
     '--skip-git-repo-check',
     '--color', 'never',
     '--json',
     '-C', cwd,
-    '-s', sandbox,
     '-m', model,
-  ];
+  );
+  if (sandbox) args.push('-s', sandbox);
   if (provider) args.push('-c', `model_provider="${provider}"`);
   if (reasoningEffort) args.push('-c', `model_reasoning_effort="${reasoningEffort}"`);
   args.push('-');
 
-  const startContent = `任务开始\nprovider=${provider || 'default'} model=${model} reasoning=${reasoningEffort || 'default'} sandbox=${sandbox} approval=${approval} cwd=${cwd}`;
+  const permissionSummary = permissionMode === 'custom'
+    ? 'config.toml'
+    : `sandbox=${sandbox} approval=${approval}`;
+  const startContent = `任务开始\nprovider=${provider || 'default'} model=${model} reasoning=${reasoningEffort || 'default'} permission=${permissionSummary} cwd=${cwd}`;
   appendMessage(convo, 'process', startContent, 'task_started');
   appendMessage(convo, 'tool', `执行 codex\n${redactArgs(args).join(' ')}`, 'codex_exec');
   writeEvent(res, { type: 'start', id: convo.id, conversationId: convo.id, args: redactArgs(args), cwd, model, provider, sandbox, approval });
@@ -2842,6 +2859,7 @@ async function resumeNativeTurn(threadId, turn) {
     modelProvider: turn.provider,
     sandbox: turn.sandbox,
     approvalPolicy: turn.approval,
+    approvalsReviewer: turn.approvalsReviewer,
     excludeTurns: true,
   }));
   return startNativeTurn(threadId, turn);
@@ -2901,14 +2919,16 @@ function recoverDesktopNativeTurn(threadId, conversation, turn = {}) {
 async function steerNativeTurn(threadId, steer, expectedTurnId) {
   const cwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
   const clientUserMessageId = randomBytes(16).toString('hex');
+  const restoreMessageId = randomBytes(16).toString('hex');
+  const targetClientId = String(desktopThreadStates.get(threadId)?.ownerClientId || '');
   try {
     const result = await desktopIpcClient.steerTurn(threadId, {
       input: buildDesktopTurnInput(steer.input),
-      restoreMessage: buildDesktopRestoreMessage(steer, cwd, clientUserMessageId),
+      restoreMessage: buildDesktopRestoreMessage(steer, cwd, restoreMessageId),
       serviceTier: null,
       attachments: [],
       clientUserMessageId,
-    });
+    }, targetClientId ? { targetClientId } : {});
     return { ...result, transport: 'desktop-ipc' };
   } catch (error) {
     if (!isCodexDesktopIpcUnavailableError(error) && !isNativeThreadNotFoundError(error)) throw error;
@@ -2989,7 +3009,9 @@ async function startNativeTurn(threadId, turn) {
     model: turn.model,
     effort: turn.reasoningEffort,
     approvalPolicy: turn.approval,
-    sandboxPolicy: nativeSandboxPolicy(turn.sandbox, turn.cwd),
+    approvalsReviewer: turn.approvalsReviewer,
+    sandboxPolicy: turn.sandbox ? nativeSandboxPolicy(turn.sandbox, turn.cwd) : undefined,
+    useAppServerPermissionDefault: turn.permissionMode === 'custom' ? true : undefined,
   }));
   const turnId = String(result?.turn?.id || '');
   if (!turnId) throw new Error('Codex app-server 未返回有效 turn id');
@@ -3011,8 +3033,10 @@ function buildDesktopTurnStartParams(turn) {
     modelProvider: turn.provider,
     effort: turn.reasoningEffort,
     approvalPolicy: turn.approval,
-    sandboxPolicy: desktopSandboxPolicy(turn.sandbox, turn.cwd),
-    runtimeWorkspaceRoots: workspaceWrite ? [turn.cwd] : undefined,
+    approvalsReviewer: turn.approvalsReviewer,
+    sandboxPolicy: turn.sandbox ? desktopSandboxPolicy(turn.sandbox, turn.cwd, !['ask', 'auto'].includes(turn.permissionMode)) : undefined,
+    runtimeWorkspaceRoots: turn.sandbox ? (workspaceWrite ? [turn.cwd] : undefined) : undefined,
+    useAppServerPermissionDefault: turn.permissionMode === 'custom' ? true : undefined,
     attachments: [],
   });
 }
@@ -3023,18 +3047,18 @@ function buildDesktopTurnInput(input) {
   ));
 }
 
-function desktopSandboxPolicy(sandbox, cwd) {
+function desktopSandboxPolicy(sandbox, cwd, networkAccess = true) {
   if (sandbox === 'danger-full-access') return { type: 'dangerFullAccess' };
   if (sandbox === 'workspace-write') {
     return {
       type: 'workspaceWrite',
       writableRoots: [cwd],
-      networkAccess: true,
+      networkAccess,
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false,
     };
   }
-  return { type: 'readOnly', networkAccess: true };
+  return { type: 'readOnly', networkAccess };
 }
 
 function buildDesktopRestoreMessage(steer, cwd, id) {
@@ -3050,6 +3074,7 @@ function buildDesktopRestoreMessage(steer, cwd, id) {
       fileAttachments: [],
       ideContext: null,
       imageAttachments: [],
+      commentAttachments: [],
       workspaceRoots: [cwd],
     },
     cwd,
@@ -3075,15 +3100,16 @@ function parseNativeThreadSettings(body) {
   if (!cwd) throw new Error('工作目录不存在');
   const model = cleanValue(body.model) || DEFAULT_MODEL;
   const provider = cleanValue(body.provider) || DEFAULT_PROVIDER;
-  const sandbox = cleanSandbox(body.sandbox || DEFAULT_SANDBOX);
-  const approval = cleanApproval(body.approval || DEFAULT_APPROVAL);
+  const permissions = permissionSettingsFromRequest(body);
   const reasoningEffort = cleanReasoningEffort(body.reasoningEffort);
   return {
     cwd,
     model,
     provider,
-    sandbox,
-    approval,
+    permissionMode: permissions.permissionMode,
+    sandbox: permissions.sandbox,
+    approval: permissions.approval,
+    approvalsReviewer: permissions.approvalsReviewer,
     reasoningEffort,
   };
 }
@@ -3391,6 +3417,34 @@ function cleanApproval(value) {
   return ['untrusted', 'on-request', 'never'].includes(value) ? value : DEFAULT_APPROVAL;
 }
 
+function cleanPermissionMode(value) {
+  return ['ask', 'auto', 'full', 'custom'].includes(value) ? value : '';
+}
+
+function permissionSettingsFromRequest(body = {}) {
+  if (FORCE_FULL_ACCESS) {
+    return { permissionMode: 'full', sandbox: 'danger-full-access', approval: 'never', approvalsReviewer: 'user' };
+  }
+
+  const requestedMode = cleanPermissionMode(body.permissionMode);
+  if (requestedMode === 'custom') {
+    return { permissionMode: 'custom', sandbox: undefined, approval: undefined, approvalsReviewer: undefined };
+  }
+  if (requestedMode === 'ask') {
+    return { permissionMode: 'ask', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'user' };
+  }
+  if (requestedMode === 'auto') {
+    return { permissionMode: 'auto', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'guardian_subagent' };
+  }
+  if (requestedMode === 'full') {
+    return { permissionMode: 'full', sandbox: 'danger-full-access', approval: 'never', approvalsReviewer: 'user' };
+  }
+
+  const sandbox = cleanSandbox(body.sandbox || DEFAULT_SANDBOX);
+  const approval = cleanApproval(body.approval || DEFAULT_APPROVAL);
+  return { permissionMode: 'legacy', sandbox, approval, approvalsReviewer: undefined };
+}
+
 function nativeSandboxPolicy(value, cwd) {
   const sandbox = cleanSandbox(value);
   if (sandbox === 'danger-full-access') return { type: 'dangerFullAccess' };
@@ -3669,20 +3723,28 @@ function removeTopLevelTomlValue(content, key) {
   return content.replace(new RegExp(`^${key}\\s*=.*(?:\\r?\\n|$)`, 'm'), '');
 }
 
-function updateEnvVar(file, key, value) {
+function updateEnvVars(file, values) {
   mkdirSync(path.dirname(file), { recursive: true });
   const lines = existsSync(file) ? readFileSync(file, 'utf8').split(/\r?\n/) : [];
-  const nextLine = `${key}=${JSON.stringify(String(value))}`;
-  let found = false;
+  const entries = new Map(Object.entries(values).map(([key, value]) => [key, JSON.stringify(String(value))]));
+  const found = new Set();
   const next = lines.map((line) => {
-    if (line.startsWith(`${key}=`)) {
-      found = true;
-      return nextLine;
+    const separator = line.indexOf('=');
+    const key = separator > 0 ? line.slice(0, separator) : '';
+    if (entries.has(key)) {
+      found.add(key);
+      return `${key}=${entries.get(key)}`;
     }
     return line;
   });
-  if (!found) next.push(nextLine);
+  for (const [key, value] of entries) {
+    if (!found.has(key)) next.push(`${key}=${value}`);
+  }
   atomicWriteFile(file, next.filter((line, index, arr) => line || index < arr.length - 1).join('\n') + '\n');
+}
+
+function updateEnvVar(file, key, value) {
+  updateEnvVars(file, { [key]: value });
 }
 
 function deleteEnvVar(file, key) {
@@ -3860,7 +3922,7 @@ const settingsToggle = document.getElementById('settingsToggle'), settingsPanel 
 const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
 const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
 let subQuotaToggle = null, subQuotaPopover = null, subQuotaStatus = null, subQuotaContent = null;
-let subQuotaSettingsForm = null, subQuotaApiKeyInput = null, subQuotaEndpoint = null, subQuotaSettingsStatus = null;
+let subQuotaSettingsForm = null, subQuotaBaseUrlInput = null, subQuotaApiKeyInput = null, subQuotaCredentialHint = null, subQuotaSettingsStatus = null;
 let subQuotaSettingsOverlay = null, subQuotaSettingsDialog = null, subQuotaSettingsClose = null, subQuotaSettingsReturnFocus = null;
 const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
@@ -3934,6 +3996,9 @@ let composerProjectName = null;
 let composerProjectPathInput = null;
 let composerProjectOptions = null;
 let composerPermissionPanel = null;
+let composerPermissionOptions = [];
+let composerPermissionRunHint = null;
+let composerPermissionMode = 'legacy';
 let composerModelPanel = null;
 let composerProviderSelect = null;
 let composerModelSelect = null;
@@ -4085,6 +4150,85 @@ function renderComposerModelMenuState(){
   }
   composerModelRunHint?.classList.toggle('hidden',!webRunActive||currentConversationSource!=='codex');
 }
+function renderComposerReasoningSlider(source){
+  const entries=[...source.options]
+    .filter((option)=>!option.disabled)
+    .map((option)=>({value:option.value,label:composerEffortLabel(option.value)}));
+  const defaultEntry=entries.find((entry)=>entry.value==='');
+  const levels=entries.filter((entry)=>entry.value);
+  if(!levels.length)return;
+  const container=document.createElement('div');
+  container.className='composerReasoningSlider';
+  const defaultButton=document.createElement('button');
+  defaultButton.type='button';
+  defaultButton.className='composerReasoningDefault';
+  defaultButton.setAttribute('role','radio');
+  const defaultLabel=document.createElement('span');
+  defaultLabel.textContent='使用模型默认';
+  const defaultCheck=document.createElement('i');
+  defaultCheck.setAttribute('data-lucide','check');
+  defaultCheck.setAttribute('aria-hidden','true');
+  defaultButton.append(defaultLabel,defaultCheck);
+  const current=document.createElement('strong');
+  current.className='composerReasoningCurrent';
+  const rangeWrap=document.createElement('div');
+  rangeWrap.className='composerReasoningRangeWrap';
+  const range=document.createElement('input');
+  range.type='range';
+  range.className='composerReasoningRange';
+  range.min='0';
+  range.max=String(levels.length-1);
+  range.step='1';
+  range.setAttribute('aria-label','推理强度');
+  const marks=document.createElement('div');
+  marks.className='composerReasoningMarks';
+  marks.style.setProperty('--reasoning-step-count',String(levels.length));
+  for(const entry of levels){
+    const mark=document.createElement('span');
+    mark.className='composerReasoningMark';
+    mark.dataset.value=entry.value;
+    mark.title=entry.label;
+    marks.appendChild(mark);
+  }
+  const endpoints=document.createElement('div');
+  endpoints.className='composerReasoningEndpoints';
+  const low=document.createElement('span');
+  low.textContent=levels[0].label;
+  const high=document.createElement('span');
+  high.textContent=levels.at(-1).label;
+  endpoints.append(low,high);
+  rangeWrap.append(range,marks);
+  container.append(defaultButton,current,rangeWrap,endpoints);
+  composerModelSubmenuOptions.appendChild(container);
+  let sliderIndex=levels.findIndex((entry)=>entry.value===source.value);
+  if(sliderIndex<0)sliderIndex=Math.max(0,levels.findIndex((entry)=>entry.value==='medium'));
+  const sync=()=>{
+    const explicitIndex=levels.findIndex((entry)=>entry.value===source.value);
+    if(explicitIndex>=0)sliderIndex=explicitIndex;
+    range.value=String(sliderIndex);
+    const label=source.value===''?(defaultEntry?.label||'默认'):composerEffortLabel(source.value);
+    current.textContent=label;
+    defaultButton.setAttribute('aria-checked',String(source.value===''));
+    container.classList.toggle('default',source.value==='');
+    range.setAttribute('aria-valuetext',label);
+    const progress=levels.length>1?(sliderIndex/(levels.length-1))*100:100;
+    range.style.setProperty('--reasoning-progress',progress.toFixed(2)+'%');
+    [...marks.children].forEach((mark,index)=>mark.classList.toggle('active',source.value!==''&&index===sliderIndex));
+  };
+  const selectValue=(value)=>{
+    source.value=value;
+    source.dispatchEvent(new Event('change',{bubbles:true}));
+    sync();
+  };
+  defaultButton.addEventListener('click',()=>selectValue(''));
+  range.addEventListener('input',()=>{
+    sliderIndex=Math.max(0,Math.min(levels.length-1,Number(range.value)||0));
+    selectValue(levels[sliderIndex].value);
+  });
+  sync();
+  refreshIcons(container);
+  range.focus();
+}
 function openComposerModelSubmenu(kind){
   const source=composerModelMenuSource(kind);
   if(!source||source.disabled||!composerModelSubmenuOptions)return;
@@ -4094,6 +4238,10 @@ function openComposerModelSubmenu(kind){
   renderComposerModelMenuState();
   composerModelSubmenuTitle.textContent=kind==='model'?'模型':kind==='reasoning'?'推理强度':'高级';
   composerModelSubmenuOptions.replaceChildren();
+  if(kind==='reasoning'){
+    renderComposerReasoningSlider(source);
+    return;
+  }
   for(const option of source.options){
     if(option.disabled)continue;
     const button=document.createElement('button');
@@ -4162,6 +4310,7 @@ function normalizeQueuedPrompt(item){
     filePath:String(attachment?.filePath||''),
   })).filter((attachment)=>attachment.filePath):[];
   if(!message&&!attachments.length)return null;
+  const permissionMode=['ask','auto','full','custom'].includes(item.permissionMode)?item.permissionMode:'legacy';
   return{
     id:String(item.id||makePromptQueueId()),
     message,
@@ -4170,8 +4319,9 @@ function normalizeQueuedPrompt(item){
     model:String(item.model||''),
     reasoningEffort:String(item.reasoningEffort||''),
     cwd:String(item.cwd||''),
-    sandbox:String(item.sandbox||'read-only'),
-    approval:String(item.approval||'on-request'),
+    permissionMode,
+    sandbox:String(item.sandbox||(permissionMode==='custom'?'':'read-only')),
+    approval:String(item.approval||(permissionMode==='custom'?'':'on-request')),
     createdAt:String(item.createdAt||new Date().toISOString()),
   };
 }
@@ -4186,12 +4336,12 @@ function setPromptQueue(threadId,items){
 }
 function createQueuedPrompt(message,attachments){return normalizeQueuedPrompt({
   id:makePromptQueueId(),message,attachments,provider:provider.value,model:model.value,
-  reasoningEffort:reasoningEffort.value,cwd:cwd.value,sandbox:sandbox.value,
+  reasoningEffort:reasoningEffort.value,cwd:cwd.value,permissionMode:composerPermissionMode,sandbox:sandbox.value,
   approval:approval.value,createdAt:new Date().toISOString(),
 })}
 function queuedPromptPayload(item){return{
   message:item.message,attachments:item.attachments,provider:item.provider,model:item.model,
-  reasoningEffort:item.reasoningEffort,cwd:item.cwd,sandbox:item.sandbox,approval:item.approval,
+  reasoningEffort:item.reasoningEffort,cwd:item.cwd,...composerPermissionPayload(item.permissionMode,item.sandbox,item.approval),
 }}
 function queuedPromptLabel(item){
   const text=String(item.message||'').replace(/\\s+/g,' ').trim();
@@ -4356,8 +4506,9 @@ async function restoreQueuedPrompt(threadId,itemId){
   if([...provider.options].some((option)=>option.value===item.provider))provider.value=item.provider;
   await loadModels(provider.value,item.model);
   if(['low','medium','high','xhigh','max','ultra',''].includes(item.reasoningEffort))reasoningEffort.value=item.reasoningEffort;
-  if(['read-only','workspace-write','danger-full-access'].includes(item.sandbox))sandbox.value=item.sandbox;
-  if(['never','on-request','untrusted'].includes(item.approval))approval.value=item.approval;
+  composerPermissionMode=['ask','auto','full','custom'].includes(item.permissionMode)?item.permissionMode:'legacy';
+  if(composerPermissionMode!=='custom'&&['read-only','workspace-write','danger-full-access'].includes(item.sandbox))sandbox.value=item.sandbox;
+  if(composerPermissionMode!=='custom'&&['never','on-request','untrusted'].includes(item.approval))approval.value=item.approval;
   if(item.cwd)cwd.value=item.cwd;
   renderAttachmentTray();
   updateSafetyHint();
@@ -4467,7 +4618,7 @@ async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
     }
     setPromptQueue(threadId,promptQueueFor(threadId).filter((entry)=>entry.id!==item.id));
     if(currentConversationSource==='codex'&&currentConversationId===threadId){
-      setNativeComposerOverride(threadId,item.provider,item.model,item.reasoningEffort);
+      setNativeComposerOverride(threadId,item.provider,item.model,item.reasoningEffort,item.permissionMode,item.sandbox,item.approval);
       showNativePromptOptimistically(item);
       activeNativeTurnId=data.turnId||'';
       webRunActive=true;
@@ -4497,8 +4648,9 @@ function closeComposerPopovers(){
     button?.setAttribute('aria-expanded','false');
   }
 }
-function closeLockedComposerPopovers({includeModel=false}={}){
-  const pairs=[[composerProjectPanel,composerProjectToggle],[composerPermissionPanel,composerPermissionToggle]];
+function closeLockedComposerPopovers({includePermission=true,includeModel=false}={}){
+  const pairs=[[composerProjectPanel,composerProjectToggle]];
+  if(includePermission)pairs.push([composerPermissionPanel,composerPermissionToggle]);
   if(includeModel)pairs.push([composerModelPanel,composerModelToggle]);
   for(const [panel,button] of pairs){
     panel?.classList.add('hidden');
@@ -4514,7 +4666,104 @@ function toggleComposerPopover(panel,button){
   if(panel===composerModelPanel)showComposerModelMainMenu();
   panel.classList.remove('hidden');
   button.setAttribute('aria-expanded','true');
-  panel.querySelector('button:not(:disabled),select:not(:disabled),input:not(:disabled)')?.focus();
+  const preferred=panel===composerPermissionPanel
+    ?panel.querySelector('.composerPermissionOption[aria-checked="true"]')
+    :null;
+  (preferred||panel.querySelector('button:not(:disabled),select:not(:disabled),input:not(:disabled)'))?.focus();
+}
+const COMPOSER_PERMISSION_PROFILES={
+  ask:{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'},
+  auto:{sandbox:'workspace-write',approval:'on-request',label:'替我审批',icon:'shield-check'},
+  full:{sandbox:'danger-full-access',approval:'never',label:'完全访问',icon:'shield-alert'},
+  custom:{sandbox:'',approval:'',label:'自定义',icon:'settings'},
+};
+function composerPermissionModeFromValues(sandboxValue,approvalValue){
+  const matched=Object.entries(COMPOSER_PERMISSION_PROFILES).find(([,profile])=>profile.sandbox===sandboxValue&&profile.approval===approvalValue);
+  return matched?.[0]||'legacy';
+}
+function composerPermissionDisplayMode(){return composerPermissionMode}
+function composerPermissionPayload(mode=composerPermissionMode,sandboxValue=sandbox.value,approvalValue=approval.value){
+  if(mode==='custom')return{permissionMode:'custom'};
+  if(COMPOSER_PERMISSION_PROFILES[mode])return{permissionMode:mode,sandbox:sandboxValue,approval:approvalValue};
+  return{sandbox:sandboxValue,approval:approvalValue};
+}
+function renderComposerPermissionState(){
+  const displayMode=composerPermissionDisplayMode();
+  for(const option of composerPermissionOptions){
+    const selected=option.dataset.permissionMode===displayMode;
+    option.setAttribute('aria-checked',String(selected));
+    option.classList.toggle('active',selected);
+    option.tabIndex=selected?0:-1;
+  }
+  composerPermissionRunHint?.classList.toggle('hidden',!webRunActive||currentConversationSource!=='codex');
+}
+function selectComposerPermissionMode(mode,{close=true,focus=true}={}){
+  if(forceFullAccess)mode='full';
+  const profile=COMPOSER_PERMISSION_PROFILES[mode];
+  if(!profile)return;
+  composerPermissionMode=mode;
+  if(mode!=='custom'){
+    sandbox.value=profile.sandbox;
+    approval.value=profile.approval;
+  }
+  dangerConfirmed=false;
+  updateSafetyHint();
+  rememberNativeComposerOverride();
+  syncComposerChrome();
+  if(close){
+    composerPermissionPanel?.classList.add('hidden');
+    composerPermissionToggle?.setAttribute('aria-expanded','false');
+    if(focus)composerPermissionToggle?.focus();
+  }
+}
+function createComposerPermissionOption(mode,title,description,iconName){
+  const option=document.createElement('button');
+  option.type='button';
+  option.className='composerPermissionOption';
+  option.dataset.permissionMode=mode;
+  option.setAttribute('role','radio');
+  option.setAttribute('aria-checked','false');
+  const icon=document.createElement('i');
+  icon.className='composerPermissionOptionIcon';
+  icon.setAttribute('data-lucide',iconName);
+  icon.setAttribute('aria-hidden','true');
+  const copy=document.createElement('span');
+  copy.className='composerPermissionCopy';
+  const heading=document.createElement('strong');
+  heading.textContent=title;
+  const detail=document.createElement('small');
+  detail.textContent=description;
+  copy.append(heading,detail);
+  const check=document.createElement('i');
+  check.className='composerPermissionCheck';
+  check.setAttribute('data-lucide','check');
+  check.setAttribute('aria-hidden','true');
+  option.append(icon,copy,check);
+  option.addEventListener('click',()=>selectComposerPermissionMode(mode));
+  return option;
+}
+function handleComposerPermissionKeys(event){
+  const current=event.target.closest('.composerPermissionOption');
+  if(!current)return;
+  if(event.key==='Escape'){
+    event.preventDefault();
+    composerPermissionPanel?.classList.add('hidden');
+    composerPermissionToggle?.setAttribute('aria-expanded','false');
+    composerPermissionToggle?.focus();
+    return;
+  }
+  const enabled=composerPermissionOptions.filter((option)=>!option.disabled);
+  const index=enabled.indexOf(current);
+  let next=-1;
+  if(event.key==='ArrowDown'||event.key==='ArrowRight')next=(index+1)%enabled.length;
+  else if(event.key==='ArrowUp'||event.key==='ArrowLeft')next=(index-1+enabled.length)%enabled.length;
+  else if(event.key==='Home')next=0;
+  else if(event.key==='End')next=enabled.length-1;
+  if(next<0)return;
+  event.preventDefault();
+  const nextOption=enabled[next];
+  selectComposerPermissionMode(nextOption?.dataset.permissionMode,{close:false,focus:false});
+  nextOption?.focus();
 }
 function syncComposerChrome(){
   syncComposerSelect(provider,composerProviderSelect);
@@ -4547,16 +4796,18 @@ function syncComposerChrome(){
     composerModelToggle.setAttribute('aria-label',composerModelToggle.title);
   }
   renderComposerModelMenuState();
-  const mode=sandbox.value;
+  const mode=composerPermissionDisplayMode();
   if(composerPermissionToggle){
-    const label=mode==='read-only'?'只读权限':mode==='workspace-write'?'工作区写入':'高危全权限';
-    const icon=mode==='read-only'?'shield-check':mode==='workspace-write'?'shield-alert':'shield-off';
-    setIconLabel(composerPermissionToggle,icon,label,false);
+    const profile=COMPOSER_PERMISSION_PROFILES[mode]||{label:'当前配置',icon:'sliders-horizontal'};
+    const label=profile.label;
+    const icon=profile.icon;
+    setIconLabel(composerPermissionToggle,icon,label,true);
     composerPermissionToggle.dataset.mode=mode;
-    composerPermissionToggle.title=label;
-    composerPermissionToggle.setAttribute('aria-label',label);
-    composerPermissionToggle.disabled=webRunActive;
+    composerPermissionToggle.title='更改权限 · '+label;
+    composerPermissionToggle.setAttribute('aria-label','更改权限，当前为'+label);
+    composerPermissionToggle.disabled=forceFullAccess||(webRunActive&&currentConversationSource!=='codex');
   }
+  renderComposerPermissionState();
 }
 function enhanceComposer(){
   if(!dropZone||!attachFile||!sendBtn)return;
@@ -4636,6 +4887,7 @@ function enhanceComposer(){
   composerPermissionToggle.className='composerPermissionToggle';
   composerPermissionToggle.setAttribute('aria-expanded','false');
   composerPermissionToggle.setAttribute('aria-controls','composerPermissionPanel');
+  composerPermissionToggle.setAttribute('aria-haspopup','dialog');
   attachFile.after(composerPermissionToggle);
   composerModelToggle=document.createElement('button');
   composerModelToggle.type='button';
@@ -4661,10 +4913,39 @@ function enhanceComposer(){
   if(composerPermissionPanel){
     composerPermissionPanel.id='composerPermissionPanel';
     composerPermissionPanel.classList.add('composerPopover','composerPermissionPanel','hidden');
-    const title=document.createElement('div');
-    title.className='composerPopoverTitle';
-    title.textContent='运行权限';
-    composerPermissionPanel.prepend(title);
+    composerPermissionPanel.setAttribute('role','dialog');
+    composerPermissionPanel.setAttribute('aria-labelledby','composerPermissionTitle');
+    for(const child of [...composerPermissionPanel.children]){
+      child.classList.add('composerPermissionLegacyControl');
+      child.setAttribute('aria-hidden','true');
+    }
+    const head=document.createElement('div');
+    head.className='composerPermissionHead';
+    const title=document.createElement('strong');
+    title.id='composerPermissionTitle';
+    title.textContent='应如何批准 ChatGPT 操作？';
+    const learnMore=document.createElement('a');
+    learnMore.href='https://developers.openai.com/codex/concepts/sandboxing#how-you-control-it';
+    learnMore.target='_blank';
+    learnMore.rel='noopener noreferrer';
+    learnMore.textContent='了解更多';
+    head.append(title,learnMore);
+    const options=document.createElement('div');
+    options.className='composerPermissionOptions';
+    options.setAttribute('role','radiogroup');
+    options.setAttribute('aria-label','运行权限');
+    composerPermissionOptions=[
+      createComposerPermissionOption('ask','请求批准','编辑外部文件和使用互联网时始终询问','hand'),
+      createComposerPermissionOption('auto','替我审批','仅对检测到的风险操作请求批准','shield-check'),
+      createComposerPermissionOption('full','完全访问权限','可不受限制地访问互联网和您电脑上的任何文件','shield-alert'),
+      createComposerPermissionOption('custom','自定义 (config.toml)','使用 config.toml 中定义的权限','settings'),
+    ];
+    options.append(...composerPermissionOptions);
+    options.addEventListener('keydown',handleComposerPermissionKeys);
+    composerPermissionRunHint=document.createElement('div');
+    composerPermissionRunHint.className='composerPermissionRunHint hidden';
+    composerPermissionRunHint.textContent='运行中修改将用于下一条消息';
+    composerPermissionPanel.prepend(head,options,composerPermissionRunHint);
     dropZone.appendChild(composerPermissionPanel);
   }
   composerModelPanel=document.createElement('div');
@@ -4901,13 +5182,26 @@ function ensureSubQuotaSettingsDialog(){
   body.className='subQuotaSettingsBody';
   const subQuotaDescription=document.createElement('p');
   subQuotaDescription.className='subQuotaSettingsDescription';
-  subQuotaDescription.textContent='更新 API Key 后会立即检测，仅用于 Sub2API 额度监控。';
-  subQuotaEndpoint=document.createElement('div');
-  subQuotaEndpoint.className='subQuotaEndpoint';
-  subQuotaEndpoint.textContent='正在读取服务地址…';
+  subQuotaDescription.textContent='填写 API URL 与 API Key，保存后会立即检测，仅用于 Sub2API 额度监控。';
   subQuotaSettingsForm=document.createElement('form');
   subQuotaSettingsForm.id='subQuotaSettingsForm';
   subQuotaSettingsForm.className='subQuotaSettingsForm';
+  const subQuotaUrlField=document.createElement('label');
+  subQuotaUrlField.className='field';
+  const subQuotaUrlLabel=document.createElement('span');
+  subQuotaUrlLabel.textContent='API URL';
+  subQuotaBaseUrlInput=document.createElement('input');
+  subQuotaBaseUrlInput.id='subQuotaBaseUrl';
+  subQuotaBaseUrlInput.name='baseUrl';
+  subQuotaBaseUrlInput.type='url';
+  subQuotaBaseUrlInput.required=true;
+  subQuotaBaseUrlInput.maxLength=2048;
+  subQuotaBaseUrlInput.autocomplete='url';
+  subQuotaBaseUrlInput.inputMode='url';
+  subQuotaBaseUrlInput.spellcheck=false;
+  subQuotaBaseUrlInput.placeholder='https://sub2api.example.com';
+  subQuotaUrlField.appendChild(subQuotaUrlLabel);
+  subQuotaUrlField.appendChild(subQuotaBaseUrlInput);
   const subQuotaKeyField=document.createElement('label');
   subQuotaKeyField.className='field';
   const subQuotaKeyLabel=document.createElement('span');
@@ -4921,6 +5215,10 @@ function ensureSubQuotaSettingsDialog(){
   subQuotaApiKeyInput.placeholder='输入 Sub2API API Key';
   subQuotaKeyField.appendChild(subQuotaKeyLabel);
   subQuotaKeyField.appendChild(subQuotaApiKeyInput);
+  subQuotaCredentialHint=document.createElement('small');
+  subQuotaCredentialHint.className='subQuotaCredentialHint';
+  subQuotaCredentialHint.textContent='Key 未配置';
+  subQuotaKeyField.appendChild(subQuotaCredentialHint);
   const subQuotaSave=document.createElement('button');
   subQuotaSave.type='submit';
   subQuotaSave.className='miniPrimary subQuotaSettingsSubmit';
@@ -4928,11 +5226,11 @@ function ensureSubQuotaSettingsDialog(){
   subQuotaSettingsStatus=document.createElement('div');
   subQuotaSettingsStatus.className='errorText subQuotaSettingsStatus';
   subQuotaSettingsStatus.setAttribute('role','status');
+  subQuotaSettingsForm.appendChild(subQuotaUrlField);
   subQuotaSettingsForm.appendChild(subQuotaKeyField);
   subQuotaSettingsForm.appendChild(subQuotaSave);
   subQuotaSettingsForm.appendChild(subQuotaSettingsStatus);
   body.appendChild(subQuotaDescription);
-  body.appendChild(subQuotaEndpoint);
   body.appendChild(subQuotaSettingsForm);
   subQuotaSettingsDialog.appendChild(head);
   subQuotaSettingsDialog.appendChild(body);
@@ -5029,31 +5327,33 @@ function enhanceSettingsModal(){
   passwordForm.addEventListener('submit',submitPasswordChange);
 }
 async function syncSubQuotaSettings(){
-  if(!subQuotaEndpoint||!subQuotaSettingsStatus)return;
+  if(!subQuotaBaseUrlInput||!subQuotaApiKeyInput||!subQuotaSettingsStatus)return;
   subQuotaSettingsStatus.textContent='';
   subQuotaSettingsStatus.classList.remove('success');
   try{
     const response=await fetch('/api/sub-quota-config',{headers:{Accept:'application/json'}});
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'读取设置失败');
-    subQuotaEndpoint.textContent=(data.baseUrl||'未配置服务地址')+' · '+(data.keyConfigured?'Key 已配置':'Key 未配置');
-  }catch(error){subQuotaEndpoint.textContent=String(error?.message||'读取设置失败')}
+    subQuotaBaseUrlInput.value=data.baseUrl||'';
+    subQuotaApiKeyInput.placeholder=data.keyConfigured?'Key 已配置，留空保留':'输入 Sub2API API Key';
+    if(subQuotaCredentialHint)subQuotaCredentialHint.textContent=data.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，首次保存时必须填写';
+  }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'读取设置失败')}
 }
 async function submitSubQuotaSettings(event){
   event.preventDefault();
-  if(!subQuotaSettingsForm||!subQuotaApiKeyInput||!subQuotaSettingsStatus)return;
+  if(!subQuotaSettingsForm||!subQuotaBaseUrlInput||!subQuotaApiKeyInput||!subQuotaSettingsStatus)return;
   const submit=subQuotaSettingsForm.querySelector('[type="submit"]');
   submit.disabled=true;
   subQuotaSettingsStatus.classList.remove('success');
   subQuotaSettingsStatus.textContent='正在检测 Sub2API…';
   try{
-    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({apiKey:subQuotaApiKeyInput.value})});
+    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({baseUrl:subQuotaBaseUrlInput.value,apiKey:subQuotaApiKeyInput.value})});
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'检测失败');
     subQuotaApiKeyInput.value='';
+    await syncSubQuotaSettings();
     subQuotaSettingsStatus.classList.add('success');
     subQuotaSettingsStatus.textContent='检测通过，已启用 '+(data.quota?.planName||'Sub2API 额度监控');
-    await syncSubQuotaSettings();
     await loadSubQuota({refresh:true});
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'检测失败')}
   finally{submit.disabled=false}
@@ -5069,7 +5369,7 @@ function openSubQuotaSettings(){
   subQuotaToggle?.setAttribute('aria-expanded','true');
   syncModalOpenState();
   syncSubQuotaSettings();
-  requestAnimationFrame(()=>subQuotaApiKeyInput?.focus());
+  requestAnimationFrame(()=>subQuotaBaseUrlInput?.focus());
 }
 function closeSubQuotaSettings(){
   if(!subQuotaSettingsOverlay||subQuotaSettingsOverlay.classList.contains('hidden'))return;
@@ -5236,8 +5536,8 @@ function enhanceSubQuota(sideActions){
   subQuotaToggle.id='subQuotaToggle';
   subQuotaToggle.className='subQuotaToggle';
   subQuotaToggle.type='button';
-  subQuotaToggle.title='悬停查看 Sub2API 额度，点击设置 Key';
-  subQuotaToggle.setAttribute('aria-label','悬停查看 Sub2API 额度，点击设置 Key');
+  subQuotaToggle.title='悬停查看 Sub2API 额度，点击设置 API URL 与 Key';
+  subQuotaToggle.setAttribute('aria-label','悬停查看 Sub2API 额度，点击设置 API URL 与 Key');
   subQuotaToggle.setAttribute('aria-haspopup','dialog');
   subQuotaToggle.setAttribute('aria-controls','subQuotaSettingsDialog');
   subQuotaToggle.setAttribute('aria-describedby','subQuotaPopover');
@@ -5537,8 +5837,8 @@ document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{p
 provider?.addEventListener('change',async()=>{rememberNativeComposerOverride();await loadModels(provider.value);rememberNativeComposerOverride();syncComposerChrome()});
 model?.addEventListener('change',()=>{rememberNativeComposerOverride();syncComposerChrome()});
 reasoningEffort?.addEventListener('change',()=>{rememberNativeComposerOverride();syncComposerChrome()});
-sandbox?.addEventListener('change',()=>{dangerConfirmed=false;updateSafetyHint();syncComposerChrome()});
-approval?.addEventListener('change',syncComposerChrome);
+sandbox?.addEventListener('change',()=>{composerPermissionMode=composerPermissionModeFromValues(sandbox.value,approval.value);dangerConfirmed=false;rememberNativeComposerOverride();updateSafetyHint();syncComposerChrome()});
+approval?.addEventListener('change',()=>{composerPermissionMode=composerPermissionModeFromValues(sandbox.value,approval.value);dangerConfirmed=false;rememberNativeComposerOverride();updateSafetyHint();syncComposerChrome()});
 themeToggle?.addEventListener('click',toggleTheme);
 chatBackground?.addEventListener('change',handleChatBackgroundChange);
 chatBackgroundFile?.addEventListener('change',()=>handleCustomBackground(chatBackgroundFile.files?.[0]));
@@ -5669,7 +5969,7 @@ async function handleChatBackgroundChange(){const value=chatBackground.value;if(
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
 async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');cwd.value=defaultComposerCwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');cwd.value=defaultComposerCwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
 function flushPendingHistoryRefresh(){
   if(!historyRefreshPending||activeHistoryProjectMenu||historyProjectPreviewAnchor)return;
   historyRefreshPending=false;
@@ -7113,8 +7413,8 @@ function applyConversationMode(){
   fileInput.disabled=legacyLocked||steerSubmitting||queueStarting;
   sendBtn.disabled=legacyLocked||steerSubmitting||queueStarting||(!input.value.trim()&&!pendingAttachments.length);
   for(const control of [provider,model,reasoningEffort])control.disabled=legacyLocked;
-  sandbox.disabled=webRunActive||forceFullAccess;
-  approval.disabled=webRunActive||forceFullAccess;
+  sandbox.disabled=legacyLocked||forceFullAccess;
+  approval.disabled=legacyLocked||forceFullAccess;
   nativeNotice.classList.toggle('hidden',!native);
   setIconLabel(modeLabel,native?'app-window':'globe-2',native?'Codex App':'Web');
   statusEl.classList.toggle('running',webRunActive);
@@ -7124,7 +7424,7 @@ function applyConversationMode(){
   cancelBtn.classList.toggle('hidden',!webRunActive||!native);
   cancelBtn.disabled=!webRunActive;
   dropZone?.classList.toggle('runActive',webRunActive&&native);
-  if(webRunActive)closeLockedComposerPopovers({includeModel:legacyLocked});
+  if(webRunActive)closeLockedComposerPopovers({includePermission:legacyLocked,includeModel:legacyLocked});
   syncComposerChrome();
   renderPromptQueue();
   if(activeMainView==='archive'){
@@ -7144,11 +7444,11 @@ function resetStandaloneComposerCwd(){
 function clearNativeComposerOverride(){nativeComposerOverride=null}
 function rememberNativeComposerOverride(){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
-  nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||'')};
+  nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||''),permissionMode:composerPermissionMode,sandbox:String(sandbox.value||''),approval:String(approval.value||'')};
 }
-function setNativeComposerOverride(threadId,selectedProvider,selectedModel,selectedReasoningEffort){
+function setNativeComposerOverride(threadId,selectedProvider,selectedModel,selectedReasoningEffort,selectedPermissionMode=composerPermissionMode,selectedSandbox=sandbox.value,selectedApproval=approval.value){
   if(!threadId)return;
-  nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||'')};
+  nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||''),permissionMode:String(selectedPermissionMode||'legacy'),sandbox:String(selectedSandbox||''),approval:String(selectedApproval||'')};
 }
 function nativeComposerOverrideApplies(threadId){return Boolean(nativeComposerOverride?.threadId&&nativeComposerOverride.threadId===threadId)}
 function newChat(){showChatView();closeComposerPopovers();resetStandaloneComposerCwd();clearNativeCompletionSync();clearNativeComposerOverride();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
@@ -7235,7 +7535,34 @@ function updateConversationStatus(conversation){
     statusEl.textContent='Loaded '+stamp;
   }
 }
-function applyNativeConversationMetadata(metadata,{preserveProviderModel=false}={}){currentNativeWorkspaceKind=String(metadata.workspaceKind||currentNativeWorkspaceKind||'');if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(!preserveProviderModel&&['low','medium','high','xhigh','max','ultra'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(!preserveProviderModel&&metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(!preserveProviderModel&&metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
+function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,preservePermissions=preserveProviderModel}={}){
+  currentNativeWorkspaceKind=String(metadata.workspaceKind||currentNativeWorkspaceKind||'');
+  if(metadata.cwd)cwd.value=metadata.cwd;
+  if(!forceFullAccess&&!preservePermissions){
+    if(['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;
+    if(['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;
+    composerPermissionMode=metadata.approvalsReviewer==='guardian_subagent'
+      ?'auto'
+      :composerPermissionModeFromValues(sandbox.value,approval.value);
+  }
+  if(!preserveProviderModel&&['low','medium','high','xhigh','max','ultra'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;
+  if(!preserveProviderModel&&metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;
+  if(!preserveProviderModel&&metadata.model){
+    if(![...model.options].some((opt)=>opt.value===metadata.model)){
+      const opt=document.createElement('option');
+      opt.value=metadata.model;
+      opt.textContent=metadata.model;
+      model.appendChild(opt);
+    }
+    model.value=metadata.model;
+  }
+  if(forceFullAccess){
+    sandbox.value='danger-full-access';
+    approval.value='never';
+    composerPermissionMode='full';
+  }
+  updateSafetyHint();
+}
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
 async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
   if(!currentConversationId||currentConversationSource!=='codex')return;
@@ -7247,7 +7574,7 @@ async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
   const sourceThreadId=currentConversationId;
   statusEl.textContent='正在创建历史分支...';
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,sandbox:sandbox.value,approval:approval.value})});
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||'创建历史分支失败');
     clearPendingAttachments();
@@ -9677,7 +10004,16 @@ function addRequestAction(label,kind,handler){const button=document.createElemen
 async function submitQuestionAnswers(request){const answers={};for(const input of nativeRequestFields.querySelectorAll('[data-question-id]'))answers[input.dataset.questionId]=input.value;await respondNativeRequest({answers})}
 async function submitMcpResponse(request,action){let content={};const json=nativeRequestFields.querySelector('[data-mcp-json]');if(json){try{content=JSON.parse(json.value||'{}')}catch(e){statusEl.textContent='MCP 返回内容必须是有效 JSON';return}}else{for(const control of nativeRequestFields.querySelectorAll('[data-mcp-key]')){let value=control.value;if(control.dataset.mcpType==='boolean')value=value==='true';else if(['number','integer'].includes(control.dataset.mcpType))value=Number(value);content[control.dataset.mcpKey]=value}}await respondNativeRequest({action,content})}
 async function respondNativeRequest(payload){if(!currentNativeRequest)return;for(const button of nativeRequestActions.querySelectorAll('button'))button.disabled=true;statusEl.textContent='提交确认...';try{const res=await fetch('/api/native-requests/'+encodeURIComponent(currentNativeRequest.id)+'/respond',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok)throw new Error(data.error||'提交失败');currentNativeRequest=null;nativeRequestModal.classList.add('hidden');statusEl.textContent='确认已提交';await refreshNativeRequests()}catch(e){statusEl.textContent=e.message;for(const button of nativeRequestActions.querySelectorAll('button'))button.disabled=false}}
-function updateSafetyHint(){const mode=sandbox.value;safetyHint.className='safety '+(mode==='read-only'?'safe':mode==='workspace-write'?'warn':'danger');safetyHint.textContent=mode==='read-only'?'只读 · 不写入文件':mode==='workspace-write'?'工作区写入 · 当前目录':'高危全权限 · 首次发送需确认'}
+function updateSafetyHint(){
+  if(composerPermissionMode==='custom'){
+    safetyHint.className='safety warn';
+    safetyHint.textContent='使用 config.toml 中定义的权限';
+    return;
+  }
+  const mode=sandbox.value;
+  safetyHint.className='safety '+(mode==='read-only'?'safe':mode==='workspace-write'?'warn':'danger');
+  safetyHint.textContent=mode==='read-only'?'只读 · 不写入文件':mode==='workspace-write'?'工作区写入 · 当前目录':'高危全权限 · 首次发送需确认';
+}
 let completeAudioCtx;
 function playTaskCompleteSound(){try{const AudioContext=window.AudioContext||window.webkitAudioContext;if(!AudioContext)return;if(!completeAudioCtx)completeAudioCtx=new AudioContext();completeAudioCtx.resume?.();const now=completeAudioCtx.currentTime;const master=completeAudioCtx.createGain();master.gain.setValueAtTime(1.15,now);master.connect(completeAudioCtx.destination);[[660,0,.12],[880,.13,.22]].forEach(([freq,offset,duration])=>{const osc=completeAudioCtx.createOscillator();const gain=completeAudioCtx.createGain();osc.type='triangle';osc.frequency.value=freq;gain.gain.setValueAtTime(0.0001,now+offset);gain.gain.exponentialRampToValueAtTime(0.55,now+offset+0.006);gain.gain.exponentialRampToValueAtTime(0.0001,now+offset+duration);osc.connect(gain);gain.connect(master);osc.start(now+offset);osc.stop(now+offset+duration+.02)})}catch(e){}}
 async function cancelRun(){closeComposerPopovers();if(currentConversationSource!=='codex'||!currentConversationId)return;cancelBtn.disabled=true;statusEl.textContent='正在取消...';try{const res=await fetch('/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/interrupt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({turnId:activeNativeTurnId})});const data=await res.json();if(!res.ok)throw new Error(data.error||'取消失败');addMsg('log','已请求取消当前任务。');freezeTurnProcessElapsed('',activeNativeTurnId);clearLiveTurnProgress();webRunActive=false;activeNativeTurnId='';removeNativeRunningElement();statusEl.textContent='Cancelled';applyConversationMode();setTimeout(syncCurrentNativeConversation,180);refreshHistory()}catch(e){statusEl.textContent=e.message;cancelBtn.disabled=false}}
@@ -9691,7 +10027,7 @@ async function send(){
     enqueuePrompt(text,attachments);
     return;
   }
-  if(sandbox.value==='danger-full-access'&&!dangerConfirmed){
+  if(composerPermissionMode==='full'&&!dangerConfirmed){
     if(!confirm('当前是高危全权限。本任务可能修改系统文件、运行高危命令或跨目录操作。本会话确认一次后，除非切换权限模式，否则不再提示。确认继续？'))return;
     dangerConfirmed=true;
   }
@@ -9708,13 +10044,16 @@ async function send(){
     const requestedProvider=provider.value;
     const requestedModel=model.value;
     const requestedReasoningEffort=reasoningEffort.value;
-    setNativeComposerOverride(existingId,requestedProvider,requestedModel,requestedReasoningEffort);
-    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,attachments,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,sandbox:sandbox.value,approval:approval.value})});
+    const requestedPermissionMode=composerPermissionMode;
+    const requestedSandbox=sandbox.value;
+    const requestedApproval=approval.value;
+    setNativeComposerOverride(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval);
+    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,attachments,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||res.statusText);
     currentConversationSource='codex';
     currentConversationId=data.threadId;
-    setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort);
+    setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval);
     activeNativeTurnId=data.turnId||'';
     if(!existingId||data.threadId!==existingId){
       nativeCursor=0;

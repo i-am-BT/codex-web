@@ -44,6 +44,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
       providerRequests.push({
         method: req.method,
         url: req.url,
+        host: req.headers.host || '',
         authorization: req.headers.authorization || '',
         contentType: req.headers['content-type'] || '',
         body,
@@ -610,7 +611,8 @@ if (args[0] === 'app-server') {
     assert.doesNotMatch(uiStyles, /data-chat-bg="dream-skin"|portal-hero\.png/);
     assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
     assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
-    assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto auto minmax\(0, 1fr\) auto auto/s);
+    assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
+    assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-4px;[^}]*pointer-events:\s*none/s);
     assert.match(uiStyles, /\.historyProjectFolder\s*\{/);
     assert.match(uiStyles, /\.historyProjectPreview\.visible\s*\{/);
     assert.match(uiStyles, /\.historyProjectItems\s*\{[^}]*padding-left:\s*22px/s);
@@ -676,7 +678,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body\[data-theme="dark"\] \.liveProcessElapsed\s*\{[^}]*border-bottom-color:\s*#303030;[^}]*color:\s*#acacac/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
     assert.doesNotMatch(uiStyles, /\.turnPlanPanel|\.turnPlanList|\.turnPlanStep/);
-    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary\.streaming \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary\.streaming \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 1\.8s linear infinite/s);
     assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
@@ -701,8 +703,9 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) - 22px\), calc\(100% - 60px\)\);[^}]*border-radius:\s*24px;[^}]*padding:\s*6px 7px 5px/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\.runActive\s*\{[^}]*grid-template-columns:\s*32px max-content minmax\(0, 1fr\) max-content 30px/s);
-    assert.match(uiStyles, /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#454545;[^}]*background:\s*#2b2b2b;[^}]*box-shadow:\s*none/s);
-    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\)\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) \+ 3px\), calc\(100% - 34px\)\);[^}]*border-radius:\s*12px;[^}]*padding:\s*20px 12px 12px/s);
+    assert.match(uiStyles, /body\[data-theme="light"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#e1e3e6;[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#454545;[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\)\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 34px\)\);[^}]*border:\s*0;[^}]*background:\s*transparent;[^}]*padding:\s*0;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.composerProjectPicker\s*\{[^}]*width:\s*calc\(100% - 29px\)/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.box\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /body \.box\s*\{[^}]*grid-template-rows:\s*minmax\(50px, auto\) 34px;[^}]*gap:\s*2px;[^}]*border-radius:\s*20px/s);
@@ -726,6 +729,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer\s*\{[^}]*border-top:\s*0;[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /body\[data-theme="light"\] \.composer\s*\{[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /body\[data-theme="light"\] \.box,\s*body\[data-theme="light"\] \.box:focus-within\s*\{[^}]*background:\s*#ffffff/s);
+    assert.match(uiStyles, /body \.composer > \.box,\s*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /--composer-width:\s*var\(--conversation-width\)/);
     assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 60px\)\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
@@ -808,24 +812,60 @@ if (args[0] === 'app-server') {
     assert.equal(subQuotaConfigPayload.keyConfigured, true);
     assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
 
+    const rejectedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl: 'file:///tmp/sub2api', apiKey: 'new-sub-key' }),
+    });
+    assert.equal(rejectedSubQuotaUrl.status, 400);
+    assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /SUB2API_BASE_URL/);
+
     const rejectedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiKey: 'bad-sub-key' }),
+      body: JSON.stringify({ baseUrl: `${customProviderBaseUrl}/`, apiKey: 'bad-sub-key' }),
     });
     assert.equal(rejectedSubQuotaKey.status, 422);
     assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /bad-sub-key/);
+    assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), new RegExp(customProviderBaseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 
     const updatedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiKey: 'new-sub-key' }),
+      body: JSON.stringify({ baseUrl: `${customProviderBaseUrl}/`, apiKey: 'new-sub-key' }),
     });
     assert.equal(updatedSubQuotaKey.status, 200);
-    assert.doesNotMatch(await updatedSubQuotaKey.text(), /new-sub-key/);
-    assert.match(await readFile(webEnv, 'utf8'), /^SUB2API_API_KEY="new-sub-key"$/m);
+    const updatedSubQuotaPayload = await updatedSubQuotaKey.json();
+    assert.equal(updatedSubQuotaPayload.baseUrl, customProviderBaseUrl);
+    assert.doesNotMatch(JSON.stringify(updatedSubQuotaPayload), /new-sub-key/);
+    let persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
+    assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(customProviderBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+    assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
     assert.equal((await stat(webEnv)).mode & 0o777, 0o600);
     assert.equal(providerRequests.at(-1).authorization, 'Bearer new-sub-key');
+    assert.equal(providerRequests.at(-1).host, new URL(customProviderBaseUrl).host);
+
+    const updatedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl: `${providerBaseUrl}/v1/usage`, apiKey: '' }),
+    });
+    assert.equal(updatedSubQuotaUrl.status, 200);
+    assert.equal((await updatedSubQuotaUrl.json()).baseUrl, providerBaseUrl);
+    persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
+    assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(providerBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+    assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
+    assert.equal(providerRequests.at(-1).authorization, 'Bearer new-sub-key');
+    assert.equal(providerRequests.at(-1).host, new URL(providerBaseUrl).host);
+
+    const refreshedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(refreshedSubQuotaConfig.status, 200);
+    const refreshedSubQuotaConfigPayload = await refreshedSubQuotaConfig.json();
+    assert.equal(refreshedSubQuotaConfigPayload.baseUrl, providerBaseUrl);
+    assert.equal(refreshedSubQuotaConfigPayload.keyConfigured, true);
+    assert.doesNotMatch(JSON.stringify(refreshedSubQuotaConfigPayload), /new-sub-key/);
 
     const subQuotas = await fetch(`${baseUrl}/api/sub-quotas`, {
       headers: { Cookie: cookie },
@@ -1323,6 +1363,12 @@ updated_at = 1784422800000
     assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
     assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
     assert.match(page, /subQuotaSettingsDialog\.setAttribute\('aria-modal','true'\)/);
+    assert.match(page, /subQuotaBaseUrlInput\.type='url'/);
+    assert.match(page, /subQuotaBaseUrlInput\.required=true/);
+    assert.match(page, /subQuotaBaseUrlInput\.autocomplete='url'/);
+    assert.match(page, /subQuotaBaseUrlInput\.value=data\.baseUrl\|\|''/);
+    assert.match(page, /data\.keyConfigured\?'Key 已配置，留空保留':'输入 Sub2API API Key'/);
+    assert.match(page, /JSON\.stringify\(\{baseUrl:subQuotaBaseUrlInput\.value,apiKey:subQuotaApiKeyInput\.value\}\)/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);
     assert.match(page, /subQuotaSettingsClose\.addEventListener\('click',closeSubQuotaSettings\)/);
@@ -1365,6 +1411,16 @@ updated_at = 1784422800000
     assert.match(page, /function openAutomationView/);
     assert.match(page, /function renderAutomations/);
     assert.match(page, /function openArchivedView/);
+    assert.match(page, /ask:\{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'\}/);
+    assert.match(page, /auto:\{sandbox:'workspace-write',approval:'on-request',label:'替我审批',icon:'shield-check'\}/);
+    assert.match(page, /full:\{sandbox:'danger-full-access',approval:'never',label:'完全访问',icon:'shield-alert'\}/);
+    assert.match(page, /createComposerPermissionOption\('custom','自定义 \(config\.toml\)','使用 config\.toml 中定义的权限','settings'\)/);
+    assert.match(page, /options\.setAttribute\('role','radiogroup'\)/);
+    assert.match(page, /option\.setAttribute\('role','radio'\)/);
+    assert.match(page, /option\.setAttribute\('aria-checked',String\(selected\)\)/);
+    assert.match(page, /option\.tabIndex=selected\?0:-1/);
+    assert.match(page, /function composerPermissionPayload/);
+    assert.match(page, /if\(mode==='custom'\)return\{permissionMode:'custom'\}/);
     assert.match(page, /function renderArchivedTasks/);
     assert.match(page, /永久删除全部已归档任务/);
     assert.match(page, /function createTurnResultArtifacts/);
@@ -1388,14 +1444,17 @@ updated_at = 1784422800000
     assert.match(page, /function rememberNativeComposerOverride\(\)/);
     assert.match(page, /provider\?\.addEventListener\('change',async\(\)=>\{rememberNativeComposerOverride\(\);await loadModels\(provider\.value\);rememberNativeComposerOverride\(\);syncComposerChrome\(\)\}\)/);
     assert.match(page, /reasoningEffort\?\.addEventListener\('change',\(\)=>\{rememberNativeComposerOverride\(\);syncComposerChrome\(\)\}\)/);
-    assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*reasoningEffort:/);
+    assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*permissionMode:composerPermissionMode,sandbox:/);
     assert.match(page, /if\(!preserveProviderModel&&\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&metadata\.modelProvider/);
-    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort\);\s*const res=await fetch\(endpoint/);
-    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort\)/);
-    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort\);/);
+    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval\)/);
+    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval\)/);
+    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort,item\.permissionMode,item\.sandbox,item\.approval\);/);
+    assert.match(page, /permissionMode:\s*composerPermissionMode/);
+    assert.match(page, /\.\.\.composerPermissionPayload\(item\.permissionMode,item\.sandbox,item\.approval\)/);
+    assert.match(page, /\.\.\.composerPermissionPayload\(\)/);
     assert.match(page, /for\(const control of \[provider,model,reasoningEffort\]\)control\.disabled=legacyLocked/);
-    assert.match(page, /if\(webRunActive\)closeLockedComposerPopovers\(\{includeModel:legacyLocked\}\)/);
+    assert.match(page, /if\(webRunActive\)closeLockedComposerPopovers\(\{includePermission:legacyLocked,includeModel:legacyLocked\}\)/);
     assert.doesNotMatch(page, /if\(webRunActive\)closeComposerPopovers\(\)/);
     assert.match(page, /createComposerModelMenuRow\('model','模型'\)/);
     assert.match(page, /createComposerModelMenuRow\('reasoning','推理强度'\)/);
@@ -3053,7 +3112,23 @@ updated_at = 1784422800000
     assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
     assert.equal(desktopStart.params.turnStartParams.model, 'test-model');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
-    assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
+    const desktopSteer = desktopIpc.messages.find((message) => message.method === 'thread-follower-steer-turn');
+    assert.equal(desktopSteer.params.conversationId, nativeSessionId);
+    assert.deepEqual(desktopSteer.params.input, [{
+      type: 'text',
+      text: 'steer through desktop owner',
+      text_elements: [],
+    }]);
+    assert.match(desktopSteer.params.clientUserMessageId, /^[a-f0-9]{32}$/);
+    assert.match(desktopSteer.params.restoreMessage.id, /^[a-f0-9]{32}$/);
+    assert.notEqual(desktopSteer.params.restoreMessage.id, desktopSteer.params.clientUserMessageId);
+    assert.equal(desktopSteer.params.restoreMessage.text, 'steer through desktop owner');
+    assert.equal(desktopSteer.params.restoreMessage.cwd, temporary);
+    assert.deepEqual(desktopSteer.params.restoreMessage.context.prompt, 'steer through desktop owner');
+    assert.deepEqual(desktopSteer.params.restoreMessage.context.workspaceRoots, [temporary]);
+    assert.deepEqual(desktopSteer.params.restoreMessage.context.commentAttachments, []);
+    assert.equal(desktopSteer.params.serviceTier, null);
+    assert.deepEqual(desktopSteer.params.attachments, []);
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
     desktopIpc.ownerAvailable = false;
 
@@ -3086,6 +3161,24 @@ updated_at = 1784422800000
     assert.equal(trace.codexHome, codexHome);
     assert.equal(trace.home, temporary);
     assert.equal(trace.sub2ApiKey, undefined);
+
+    const customPermissionChat = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'use config permissions',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        permissionMode: 'custom',
+      }),
+    });
+    assert.equal(customPermissionChat.status, 200);
+    assert.match(await customPermissionChat.text(), /FAKE_OK/);
+    const customPermissionTrace = JSON.parse(await readFile(traceFile, 'utf8'));
+    assert.equal(customPermissionTrace.args.includes('-a'), false);
+    assert.equal(customPermissionTrace.args.includes('-s'), false);
+    assert.equal(customPermissionTrace.args[0], 'exec');
 
     const created = await fetch(`${baseUrl}/api/native-sessions`, {
       method: 'POST',
@@ -3449,7 +3542,9 @@ updated_at = 1784422800000
     assert.equal(restored.status, 200);
     const restoredSubQuotaConfig = await fetch(`http://127.0.0.1:${port}/api/sub-quota-config`, { headers: { Cookie: cookie } });
     assert.equal(restoredSubQuotaConfig.status, 200);
-    assert.equal((await restoredSubQuotaConfig.json()).keyConfigured, true);
+    const restoredSubQuotaConfigPayload = await restoredSubQuotaConfig.json();
+    assert.equal(restoredSubQuotaConfigPayload.baseUrl, providerBaseUrl);
+    assert.equal(restoredSubQuotaConfigPayload.keyConfigured, true);
   } finally {
     if (child) await stopServer(child);
     if (desktopIpc) await desktopIpc.close();
