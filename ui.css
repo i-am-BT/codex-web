@@ -30,6 +30,7 @@
   --sidebar-width: 316px;
   --header-height: 60px;
   --conversation-width: 760px;
+  --composer-width: var(--conversation-width);
   --conversation-gutter: clamp(16px, 4vw, 48px);
   --radius: 8px;
   --radius-sm: 6px;
@@ -5867,19 +5868,87 @@ body .chat > :is(.msg.user, .msg.image.inputImage) {
   margin-right: max(0px, calc((100% - var(--conversation-width)) / 2));
 }
 
+/* Keep the conversation artifacts and the composer on the same content rail. */
+body .chat {
+  padding-right: 30px;
+  padding-left: 30px;
+}
+
+body .chat > :is(
+  .msg:not(.user):not(.inputImage),
+  .activityCluster,
+  .liveProcessPanel,
+  .turnResultArtifacts
+) {
+  width: min(var(--composer-width), 100%);
+  max-width: var(--composer-width);
+  align-self: center;
+}
+
+body .chat > :is(.msg.user, .msg.image.inputImage) {
+  margin-right: max(0px, calc((100% - var(--conversation-width)) / 2));
+}
+
+body .msg.assistant > .msgBody > :not(.memoryCitations),
+body[data-theme] .msg.process,
+body[data-theme] .activityBatch,
+body[data-theme] .activityCluster,
+.turnResultArtifacts {
+  max-width: 100%;
+}
+
+body[data-theme] .activityBatch,
+body[data-theme] .activityCluster,
+.turnResultArtifacts {
+  width: 100%;
+}
+
+.editedFilesResult[open] {
+  width: 100%;
+}
+
 body .composer {
+  position: relative;
+  z-index: 10;
   flex: 0 0 auto;
   border-top: 0;
   background: transparent;
-  padding: 10px var(--conversation-gutter) 14px;
+  padding: 0 0 18px;
+}
+
+body .composer:has(> .composerProjectPicker:not(.hidden)) {
+  width: min(calc(var(--composer-width) + 3px), calc(100% - 34px));
+  margin: 0 auto 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  padding: 20px 12px 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.025);
 }
 
 body[data-theme="light"] .composer {
   background: transparent;
 }
 
+body[data-theme="light"] .composer:has(> .composerProjectPicker:not(.hidden)) {
+  border-color: #eceef1;
+  background: #ffffff;
+}
+
+body[data-theme="light"] .composerProjectToggle {
+  border-color: #e2e4e8;
+  background: #f5f6f7;
+}
+
+body[data-theme="light"] .box,
+body[data-theme="light"] .box:focus-within {
+  border-color: #e1e3e6;
+  background: #ffffff;
+  box-shadow: 0 4px 14px rgba(31, 35, 41, 0.06);
+}
+
 .composer > * {
-  width: min(var(--conversation-width), 100%);
+  width: min(var(--composer-width), calc(100% - 60px));
   margin-inline: auto;
 }
 
@@ -5931,24 +6000,33 @@ body .nativeHistoryLoad:hover {
 
 .composerProjectPicker {
   position: relative;
-  z-index: 4;
-  margin-bottom: -1px;
+  z-index: 1;
+  width: min(var(--composer-width), calc(100% - 60px));
+  margin-bottom: -7px;
+}
+
+body .composer:has(> .composerProjectPicker:not(.hidden)) > .composerProjectPicker {
+  width: calc(100% - 29px);
+}
+
+body .composer:has(> .composerProjectPicker:not(.hidden)) > .box {
+  width: 100%;
 }
 
 .composerProjectToggle {
   display: flex;
   width: 100%;
-  height: 38px;
+  height: 46px;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   border: 1px solid var(--border);
-  border-bottom: 0;
-  border-radius: 14px 14px 0 0;
+  border-radius: 20px 20px 10px 10px;
   background: var(--surface-hover);
   color: var(--text-muted);
-  padding: 0 14px;
+  padding: 0 16px 7px;
   font-size: 12px;
   text-align: left;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
 }
 
 .composerProjectToggle:hover,
@@ -5963,23 +6041,22 @@ body .nativeHistoryLoad:hover {
 }
 
 .composerProjectToggle .lucide {
-  width: 15px;
-  height: 15px;
-  flex: 0 0 15px;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
 }
 
 .composerProjectName {
   min-width: 0;
   overflow: hidden;
   color: var(--text);
-  font-weight: 600;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .composerProjectChevron {
-  margin-left: auto;
-  color: var(--text-subtle);
+  display: none;
 }
 
 .composerProjectToggle:disabled .composerProjectChevron {
@@ -6092,37 +6169,42 @@ body[data-theme] .composerProjectCustom input {
 }
 
 .composerProjectPicker:not(.hidden) + .box {
-  border-top-left-radius: 0;
-  border-top-right-radius: 0;
+  border-top-left-radius: 20px;
+  border-top-right-radius: 20px;
+}
+
+body .composerProjectPicker.hidden + .box {
+  border-top-left-radius: 20px;
+  border-top-right-radius: 20px;
 }
 
 body .box {
   position: relative;
   z-index: 2;
   display: grid;
-  grid-template-rows: minmax(54px, auto) 34px;
-  grid-template-columns: 34px 34px minmax(0, 1fr) auto 36px;
+  grid-template-rows: minmax(50px, auto) 34px;
+  grid-template-columns: 34px max-content minmax(0, 1fr) max-content 34px;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
   border: 1px solid var(--border);
-  border-radius: 18px;
+  border-radius: 20px;
   background: var(--surface);
-  padding: 10px 9px 8px;
+  padding: 6px 10px 5px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.09);
   transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease), background 160ms var(--ease);
 }
 
 body .box.runActive {
-  grid-template-columns: 34px 34px minmax(0, 1fr) auto 36px;
+  grid-template-columns: 34px max-content minmax(0, 1fr) max-content 34px;
 }
 
 body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-  grid-template-columns: 34px 34px minmax(0, 1fr) auto 36px 36px;
+  grid-template-columns: 34px max-content minmax(0, 1fr) max-content 34px 34px;
 }
 
 body .box:focus-within {
   border-color: var(--border-strong);
-  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.12), 0 0 0 2px var(--primary-soft);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.13);
 }
 
 body .box.drag {
@@ -6135,16 +6217,35 @@ body[data-theme] .box textarea {
   grid-column: 1 / -1;
   align-self: stretch;
   width: 100%;
-  min-height: 54px;
+  min-height: 50px;
   max-height: 180px;
   border: 0;
   border-radius: 0;
   background: transparent;
   color: var(--text);
-  padding: 4px 4px 8px;
+  padding: 4px 4px 6px;
   font-size: 14px;
   line-height: 1.5;
   box-shadow: none;
+}
+
+body[data-theme] .box textarea::placeholder {
+  color: var(--text-subtle);
+  opacity: 0.78;
+}
+
+body[data-theme="dark"] .box {
+  border-color: #3b3b3b;
+  background: var(--surface);
+}
+
+body[data-theme="dark"] .composerProjectToggle {
+  border-color: #343434;
+  background: #222222;
+}
+
+body[data-theme="light"] .composerProjectToggle {
+  background: #f5f6f7;
 }
 
 body[data-theme] .box textarea:focus {
@@ -6174,18 +6275,28 @@ body .attachBtn:hover {
   color: var(--text);
 }
 
+body[data-theme] .box .attachBtn {
+  background: transparent;
+}
+
 .composerPermissionToggle {
-  display: grid;
+  display: inline-flex;
   grid-row: 2;
   grid-column: 2;
-  width: 32px;
-  height: 32px;
-  place-items: center;
+  width: auto;
+  min-width: 0;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
   border: 0;
-  border-radius: 50%;
+  border-radius: 12px;
   background: transparent;
   color: var(--success);
-  padding: 0;
+  padding: 0 8px 0 4px;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .composerPermissionToggle:hover,
@@ -6198,32 +6309,36 @@ body .attachBtn:hover {
 }
 
 .composerPermissionToggle[data-mode="danger-full-access"] {
-  color: var(--danger);
+  color: #f2773d;
 }
 
 .composerPermissionToggle .lucide,
 .attachBtn .lucide {
-  width: 17px;
-  height: 17px;
+  width: 18px;
+  height: 18px;
+}
+
+.composerPermissionToggle .buttonLabel {
+  line-height: 1;
 }
 
 .composerModelToggle {
   display: inline-flex;
   grid-row: 2;
   grid-column: 4;
-  min-width: 176px;
-  max-width: 240px;
-  height: 36px;
+  min-width: 0;
+  max-width: 190px;
+  height: 32px;
   align-items: center;
   justify-content: center;
   justify-self: end;
   gap: 6px;
   border: 0;
   border-radius: 999px;
-  background: var(--surface-hover);
+  background: transparent;
   color: var(--text);
-  padding: 0 12px;
-  font-size: 14px;
+  padding: 0 6px;
+  font-size: 13px;
 }
 
 .composerModelToggle:hover,
@@ -6238,9 +6353,9 @@ body .attachBtn:hover {
 }
 
 .composerPermissionToggle:disabled {
-  cursor: not-allowed;
+  cursor: default;
   background: transparent;
-  opacity: 0.45;
+  opacity: 1;
 }
 
 .composerModelToggle.running:disabled {
@@ -6253,6 +6368,7 @@ body .attachBtn:hover {
 }
 
 .composerModelState {
+  display: none;
   width: 18px;
   height: 18px;
   flex: 0 0 18px;
@@ -6262,6 +6378,7 @@ body .attachBtn:hover {
 }
 
 .composerModelToggle.running .composerModelState {
+  display: block;
   border-color: var(--text-muted);
   border-right-color: transparent;
   animation: spin 900ms linear infinite;
@@ -6270,15 +6387,15 @@ body .attachBtn:hover {
 .composerModelName {
   min-width: 0;
   overflow: hidden;
-  font-weight: 560;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .composerEffortName {
   flex: 0 0 auto;
-  color: var(--thinking);
-  font-weight: 600;
+  color: var(--text-muted);
+  font-weight: 500;
 }
 
 .composerModelToggle .lucide {
@@ -6309,7 +6426,9 @@ body .send:hover {
 }
 
 body .send:disabled {
-  opacity: 0.45;
+  background: #a4a7ab;
+  color: #ffffff;
+  opacity: 1;
   transform: none;
 }
 

@@ -698,6 +698,11 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\)\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) \+ 3px\), calc\(100% - 34px\)\);[^}]*border-radius:\s*12px;[^}]*padding:\s*20px 12px 12px/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.composerProjectPicker\s*\{[^}]*width:\s*calc\(100% - 29px\)/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.box\s*\{[^}]*width:\s*100%/s);
+    assert.match(uiStyles, /body \.box\s*\{[^}]*grid-template-rows:\s*minmax\(50px, auto\) 34px;[^}]*gap:\s*2px;[^}]*border-radius:\s*20px/s);
+    assert.match(uiStyles, /body\[data-theme\] \.box textarea\s*\{[^}]*min-height:\s*50px;[^}]*max-height:\s*180px;[^}]*font-size:\s*14px/s);
     assert.match(uiStyles, /\.turnResultStatus\s*\{[^}]*color:\s*var\(--success\)/s);
     assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult:not\(\[open\]\)\s*\{[^}]*border-color:\s*#383838;[^}]*background:\s*#272727/s);
@@ -716,7 +721,9 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.chat > :is\(\.msg\.user, \.msg\.image\.inputImage\)\s*\{[^}]*margin-right:\s*max\(0px, calc\(\(100% - var\(--conversation-width\)\) \/ 2\)\)/s);
     assert.match(uiStyles, /body \.composer\s*\{[^}]*border-top:\s*0;[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /body\[data-theme="light"\] \.composer\s*\{[^}]*background:\s*transparent/s);
-    assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\)/s);
+    assert.match(uiStyles, /body\[data-theme="light"\] \.box,\s*body\[data-theme="light"\] \.box:focus-within\s*\{[^}]*background:\s*#ffffff/s);
+    assert.match(uiStyles, /--composer-width:\s*var\(--conversation-width\)/);
+    assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 60px\)\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
