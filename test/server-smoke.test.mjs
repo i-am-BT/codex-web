@@ -1165,6 +1165,17 @@ updated_at = 1784422800000
     assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><button id="automationToggle"[^>]*>自动化安排<\/button><\/div><button id="settingsToggle"/);
     assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
     assert.match(page, /id="automationView"[^>]*aria-labelledby="automationViewTitle"/);
+    assert.match(page, /让 ChatGPT 安排任务、设置提醒或监测更新/);
+    assert.match(page, /className='automationTabs'/);
+    assert.match(page, /\{value:'',label:'全部'\}/);
+    assert.match(page, /\{value:'ACTIVE',label:'已开启'\}/);
+    assert.match(page, /\{value:'PAUSED',label:'已暂停'\}/);
+    assert.match(page, /button\.setAttribute\('role','tab'\)/);
+    assert.match(page, /toggle\.className='automationStateToggle '\+\(item\.status==='ACTIVE'\?'active':'paused'\)/);
+    assert.match(page, /schedule\.textContent=scheduleLabel\+\(item\.status==='ACTIVE'&&item\.nextRunAt\?' · 下次运行 '/);
+    assert.match(page, /button\.dataset\.accent=template\.accent/);
+    assert.match(page, /icon:'file-search-2',accent:'green'/);
+    assert.doesNotMatch(page, /add\.setAttribute\('data-lucide','plus'\)/);
     assert.match(page, /function openAutomationView/);
     assert.match(page, /function renderAutomations/);
     assert.match(page, /function openArchivedView/);

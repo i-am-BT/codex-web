@@ -105,7 +105,7 @@ test('the pinned section renders above tasks, collapses independently, and marks
   assert.match(uiStyles, /\.historyPinned,\s*\.historySidebarTasks,\s*\.historyTasks\s*\{[^}]*display:\s*grid/s);
   assert.match(uiStyles, /\.historyPinnedItems\[hidden\],\s*\.historySidebarItems\[hidden\],\s*\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
   assert.match(uiStyles, /\.historyPinnedHead\[aria-expanded="true"\] \.historyPinnedChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);
-  assert.match(uiStyles, /\.histOpen\.hasAutomation\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 15px/s);
+  assert.match(uiStyles, /\.histOpen\.hasAutomation\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 16px/s);
 });
 
 test('the browser sidepanel section renders between pinned and regular tasks', () => {

@@ -4758,6 +4758,45 @@ async function submitPasswordChange(event){
     submit.disabled=false;
   }
 }
+function syncAutomationFilterTabs(){
+  const selected=automationFilter?.value||'';
+  automationView?.querySelectorAll('.automationTab').forEach((button)=>{
+    const active=button.dataset.status===selected;
+    button.classList.toggle('active',active);
+    button.setAttribute('aria-selected',String(active));
+    button.tabIndex=active?0:-1;
+  });
+}
+function enhanceAutomationView(){
+  const subtitle=automationView?.querySelector('.automationViewHeader p');
+  if(subtitle)subtitle.textContent='让 ChatGPT 安排任务、设置提醒或监测更新';
+  const toolbar=automationView?.querySelector('.automationToolbar');
+  if(!toolbar||toolbar.nextElementSibling?.classList.contains('automationTabs'))return;
+  const tabs=document.createElement('div');
+  tabs.className='automationTabs';
+  tabs.setAttribute('role','tablist');
+  tabs.setAttribute('aria-label','筛选自动化状态');
+  for(const option of [
+    {value:'',label:'全部'},
+    {value:'ACTIVE',label:'已开启'},
+    {value:'PAUSED',label:'已暂停'},
+  ]){
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='automationTab';
+    button.dataset.status=option.value;
+    button.setAttribute('role','tab');
+    button.textContent=option.label;
+    button.addEventListener('click',()=>{
+      if(automationFilter)automationFilter.value=option.value;
+      syncAutomationFilterTabs();
+      renderAutomations();
+    });
+    tabs.appendChild(button);
+  }
+  toolbar.after(tabs);
+  syncAutomationFilterTabs();
+}
 function enhanceInterface(){
   const sideBrand=document.querySelector('.side > div:first-child');
   sideBrand?.classList.add('sideBrand');
@@ -4791,6 +4830,7 @@ function enhanceInterface(){
   automationToggle?.setAttribute('aria-pressed','false');
   setIconLabel(archiveRefresh,'refresh-cw','刷新');
   setIconLabel(archiveDeleteAll,'trash-2','永久删除全部');
+  enhanceAutomationView();
   setIconLabel(settingsToggle,'settings','设置',false);
   settingsToggle?.setAttribute('title','设置');
   settingsToggle?.setAttribute('aria-expanded','false');
@@ -5197,36 +5237,36 @@ function automationRelativeTime(value){
   const difference=timestamp-Date.now();
   if(difference<=0)return'即将运行';
   const minutes=Math.round(difference/60000);
-  if(minutes<60)return minutes+' 分钟后';
+  if(minutes<60)return minutes+'分钟后';
   const hours=Math.round(minutes/60);
-  if(hours<24)return hours+' 小时后';
+  if(hours<18)return hours+'小时后';
+  const days=Math.max(1,Math.round(hours/24));
+  if(days<14)return days+'天后';
   return new Date(timestamp).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
-}
-function automationIconName(item){
-  const prompt=(item?.name+' '+item?.prompt).toLowerCase();
-  if(/监控|监测|monitor|watch/.test(prompt))return'radar';
-  if(/简报|brief|总结|summary/.test(prompt))return'notebook-text';
-  return'calendar-clock';
 }
 function createAutomationRow(item){
   const row=document.createElement('article');
   row.className='automationRow';
   row.dataset.automationId=item.id;
-  const icon=document.createElement('span');
-  icon.className='automationRowIcon';
-  const iconNode=document.createElement('i');
-  iconNode.setAttribute('data-lucide',automationIconName(item));
-  iconNode.setAttribute('aria-hidden','true');
-  icon.appendChild(iconNode);
+  const toggle=document.createElement('button');
+  toggle.type='button';
+  toggle.className='automationStateToggle '+(item.status==='ACTIVE'?'active':'paused');
+  toggle.setAttribute('role','switch');
+  toggle.setAttribute('aria-checked',String(item.status==='ACTIVE'));
+  toggle.setAttribute('aria-label',(item.status==='ACTIVE'?'暂停':'启用')+item.name);
+  toggle.title=item.status==='ACTIVE'?'暂停':'启用';
+  toggle.addEventListener('click',()=>setAutomationStatus(item,toggle));
   const content=document.createElement('div');
   content.className='automationRowContent';
   const heading=document.createElement('div');
   heading.className='automationRowHeading';
   const name=document.createElement('strong');
   name.textContent=item.name;
-  const schedule=document.createElement('span');
-  schedule.textContent=item.scheduleLabel||item.rrule;
-  heading.append(name,schedule);
+  heading.appendChild(name);
+  const schedule=document.createElement('div');
+  schedule.className='automationRowSchedule';
+  const scheduleLabel=String(item.scheduleLabel||item.rrule||'').replace(/\\b0(\\d):/g,'$1:');
+  schedule.textContent=scheduleLabel+(item.status==='ACTIVE'&&item.nextRunAt?' · 下次运行 '+automationRelativeTime(item.nextRunAt):'');
   const description=document.createElement('p');
   description.textContent=item.prompt;
   const meta=document.createElement('div');
@@ -5239,16 +5279,8 @@ function createAutomationRow(item){
     next.textContent='下次 '+automationRelativeTime(item.nextRunAt);
     meta.appendChild(next);
   }
-  content.append(heading,description,meta);
-  const toggle=document.createElement('button');
-  toggle.type='button';
-  toggle.className='automationStateToggle '+(item.status==='ACTIVE'?'active':'');
-  toggle.setAttribute('role','switch');
-  toggle.setAttribute('aria-checked',String(item.status==='ACTIVE'));
-  toggle.setAttribute('aria-label',(item.status==='ACTIVE'?'暂停':'启用')+item.name);
-  toggle.title=item.status==='ACTIVE'?'暂停':'启用';
-  toggle.addEventListener('click',()=>setAutomationStatus(item,toggle));
-  row.append(icon,content,toggle);
+  content.append(heading,schedule,description,meta);
+  row.append(toggle,content);
   return row;
 }
 async function setAutomationStatus(item,button){
@@ -5275,14 +5307,15 @@ function createAutomationSuggestions(){
   title.textContent='建议';
   section.appendChild(title);
   const templates=[
-    {icon:'bell',name:'每日简报',schedule:'工作日 08:00',description:'汇总项目最新进展、待办和需要关注的事项',frequency:'weekdays',time:'08:00',prompt:'检查这个项目的最新进展和待办事项，生成一份简洁的每日工作简报。'},
-    {icon:'notebook-text',name:'每周回顾',schedule:'周五 16:00',description:'总结本周完成的工作并整理成简短状态更新',frequency:'weekly',day:'FR',time:'16:00',prompt:'回顾我本周完成的工作，整理关键成果、未完成事项和下周重点。'},
-    {icon:'radar',name:'跟进监控',schedule:'工作日 09:00',description:'定期检查项目状态，并标记需要关注的变化',frequency:'weekdays',time:'09:00',prompt:'检查项目中的最新变化、失败任务和待跟进事项，只汇报需要我关注的内容。'},
+    {icon:'bell',accent:'blue',name:'每日简报',schedule:'工作日 8:00',description:'以日历、未读电子邮件和优先事项摘要开启每个工作日',frequency:'weekdays',time:'08:00',prompt:'检查这个项目的最新进展和待办事项，生成一份简洁的每日工作简报。'},
+    {icon:'notebook-text',accent:'purple',name:'每周回顾',schedule:'星期五（时间：16:00）',description:'每周五将你最近的工作整理成简明的状态更新',frequency:'weekly',day:'FR',time:'16:00',prompt:'回顾我本周完成的工作，整理关键成果、未完成事项和下周重点。'},
+    {icon:'file-search-2',accent:'green',name:'跟进监控',schedule:'工作日 9:00',description:'查看最近的电子邮箱和日历活动，并标记需要你关注的事项',frequency:'weekdays',time:'09:00',prompt:'检查项目中的最新变化、失败任务和待跟进事项，只汇报需要我关注的内容。'},
   ];
   for(const template of templates){
     const button=document.createElement('button');
     button.type='button';
     button.className='automationSuggestion';
+    button.dataset.accent=template.accent;
     const icon=document.createElement('i');
     icon.setAttribute('data-lucide',template.icon);
     icon.setAttribute('aria-hidden','true');
@@ -5295,10 +5328,7 @@ function createAutomationSuggestions(){
     const description=document.createElement('span');
     description.textContent=template.description;
     copy.append(heading,description);
-    const add=document.createElement('i');
-    add.setAttribute('data-lucide','plus');
-    add.setAttribute('aria-hidden','true');
-    button.append(icon,copy,add);
+    button.append(icon,copy);
     button.addEventListener('click',()=>openAutomationEditor(template));
     section.appendChild(button);
   }
@@ -5307,6 +5337,7 @@ function createAutomationSuggestions(){
 function renderAutomations(){
   if(!automationList)return;
   automationList.replaceChildren();
+  syncAutomationFilterTabs();
   const query=(automationSearch?.value||'').trim().toLowerCase();
   const status=automationFilter?.value||'';
   const visible=automationItems.filter((item)=>{
