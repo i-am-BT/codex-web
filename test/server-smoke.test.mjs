@@ -863,16 +863,40 @@ updated_at = 1784422800000
     assert.equal(createdAutomationPayload.automation.reasoningEffort, 'xhigh');
     assert.equal(createdAutomationPayload.automation.notificationPolicy, 'always');
     assert.equal(createdAutomationPayload.automation.status, 'PAUSED');
+    const editedAutomation = await fetch(`${baseUrl}/api/automations/daily-project-brief`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Weekly project brief',
+        prompt: 'Summarize the latest project work every Friday.',
+        cwd: '',
+        model: 'test-model',
+        reasoningEffort: 'ultra',
+        notificationPolicy: 'failed_runs_only',
+        status: 'PAUSED',
+        schedule: { frequency: 'weekly', day: 'FR', time: '09:30' },
+      }),
+    });
+    assert.equal(editedAutomation.status, 200);
+    const editedAutomationPayload = await editedAutomation.json();
+    assert.equal(editedAutomationPayload.automation.id, 'daily-project-brief');
+    assert.equal(editedAutomationPayload.automation.name, 'Weekly project brief');
+    assert.equal(editedAutomationPayload.automation.scheduleLabel, '周五 09:30');
+    assert.deepEqual(editedAutomationPayload.automation.cwds, []);
+    assert.equal(editedAutomationPayload.automation.reasoningEffort, 'ultra');
+    assert.equal(editedAutomationPayload.automation.notificationPolicy, 'failed_runs_only');
     const automationToml = await readFile(
       path.join(codexHome, 'automations', 'daily-project-brief', 'automation.toml'),
       'utf8',
     );
-    assert.match(automationToml, /cwds = \[".+"\]/);
+    assert.match(automationToml, /name = "Weekly project brief"/);
+    assert.match(automationToml, /rrule = "FREQ=WEEKLY;BYDAY=FR;BYHOUR=9;BYMINUTE=30"/);
+    assert.match(automationToml, /cwds = \[\]/);
     assert.match(automationToml, /model = "test-model"/);
-    assert.match(automationToml, /reasoning_effort = "xhigh"/);
-    assert.match(automationToml, /notification_policy = "always"/);
+    assert.match(automationToml, /reasoning_effort = "ultra"/);
+    assert.match(automationToml, /notification_policy = "failed_runs_only"/);
     assert.match(automationToml, /status = "PAUSED"/);
-    assert.doesNotMatch(automationToml, /target =/);
+    assert.match(automationToml, /target = \{ type = "projectless" \}/);
     const activatedAutomation = await fetch(
       `${baseUrl}/api/automations/daily-project-brief/status`,
       {

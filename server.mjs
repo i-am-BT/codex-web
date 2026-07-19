@@ -598,6 +598,28 @@ app.post('/api/automations', requireAuth, async (req, res) => {
   }
 });
 
+app.patch('/api/automations/:id', requireAuth, async (req, res) => {
+  try {
+    const schedule = req.body?.schedule;
+    const automation = automationStore.update(String(req.params.id || ''), {
+      name: req.body?.name,
+      prompt: req.body?.prompt,
+      rrule: schedule?.frequency === 'custom' ? schedule.rrule : buildAutomationRrule(schedule),
+      cwd: req.body?.cwd,
+      preserveTarget: req.body?.preserveTarget === true,
+      model: req.body?.model,
+      reasoningEffort: req.body?.reasoningEffort,
+      notificationPolicy: req.body?.notificationPolicy,
+      status: req.body?.status,
+    });
+    if (!automation) return res.status(404).json({ error: '自动化安排不存在' });
+    await notifyDesktopAutomationsChanged();
+    res.json({ ok: true, automation: decorateAutomation(automation) });
+  } catch (err) {
+    res.status(400).json({ error: `更新自动化安排失败: ${err.message}` });
+  }
+});
+
 app.patch('/api/automations/:id/status', requireAuth, async (req, res) => {
   try {
     const automation = automationStore.setStatus(String(req.params.id || ''), String(req.body?.status || ''));
@@ -3812,6 +3834,8 @@ let archiveNotice = '';
 let automationItems = [];
 let automationLoading = false;
 let automationNotice = '';
+let selectedAutomationId = '';
+let automationEditingId = '';
 let subQuotaRequestSeq = 0;
 let conversationLoadSeq = 0;
 let nativeCursor = 0;
@@ -5554,20 +5578,55 @@ function syncAutomationTimeDisplay(){
   if(display)display.textContent=String(Number(hour))+':'+minute;
 }
 function openAutomationEditor(template={}){
+  automationEditingId=String(template.id||'');
   const name=document.getElementById('automationName');
   const prompt=document.getElementById('automationPrompt');
+  const runAt=document.getElementById('automationRunAt');
+  const cwd=document.getElementById('automationCwd');
+  const cwdRow=cwd?.closest('.automationSettingRow');
+  const cwdLabel=cwdRow?.querySelector('span');
   const frequency=document.getElementById('automationFrequency');
-  const time=document.getElementById('automationTime');
   const day=document.getElementById('automationDay');
   const interval=document.getElementById('automationInterval');
   if(name)name.value=template.name||'';
   if(prompt)prompt.value=template.prompt||'';
-  if(frequency)frequency.value=template.frequency||'daily';
+  if(frequency){
+    frequency.querySelectorAll('option[data-custom]').forEach((option)=>option.remove());
+    if(template.frequency==='custom'){
+      const option=document.createElement('option');
+      option.value='custom';
+      option.dataset.custom='true';
+      option.textContent=template.scheduleLabel||'自定义计划';
+      frequency.appendChild(option);
+    }
+    frequency.value=template.frequency||'daily';
+  }
+  if(automationForm){
+    automationForm.dataset.originalRrule=template.rrule||'';
+    automationForm.dataset.preserveTarget=template.preserveTarget?'true':'false';
+  }
+  const time=document.getElementById('automationTime');
   if(time)time.value=template.time||'09:00';
   syncAutomationTimeDisplay();
   if(day)day.value=template.day||'MO';
   if(interval)interval.value=String(template.interval||3);
-  syncAutomationProjectOptions(template.cwd||'');
+  if(template.kind==='heartbeat'){
+    fillAutomationSelect(runAt,[{value:'existing-task',label:'现有任务'}],'existing-task');
+    fillAutomationSelect(cwd,[{value:template.targetThreadId||'',label:template.targetTitle||'现有任务'}],template.targetThreadId||'');
+    if(cwdLabel)cwdLabel.textContent='任务';
+    if(cwd)cwd.disabled=true;
+  }else if(template.preserveTarget){
+    fillAutomationSelect(runAt,[{value:'new-task',label:'新任务'}],'new-task');
+    fillAutomationSelect(cwd,[{value:'',label:'保留现有项目'}],'');
+    if(cwdLabel)cwdLabel.textContent='项目';
+    if(cwd)cwd.disabled=true;
+  }else{
+    fillAutomationSelect(runAt,[{value:'new-task',label:'新任务'}],'new-task');
+    if(cwdLabel)cwdLabel.textContent='项目';
+    if(cwd)cwd.disabled=false;
+    syncAutomationProjectOptions(template.cwd||'');
+  }
+  if(runAt)runAt.disabled=Boolean(automationEditingId);
   syncAutomationModelOptions(template.model??model?.value??'');
   const automationReasoning=document.getElementById('automationReasoning');
   if(automationReasoning)automationReasoning.value=template.reasoningEffort??reasoningEffort?.value??'';
@@ -5575,6 +5634,9 @@ function openAutomationEditor(template={}){
   if(notification)notification.value=template.notificationPolicy||'always';
   const startPaused=document.getElementById('automationStartPaused');
   if(startPaused)startPaused.checked=template.status==='PAUSED';
+  const submitLabel=document.querySelector('#automationFormSubmit span');
+  if(submitLabel)submitLabel.textContent=automationEditingId?'保存更改':'创建自动化';
+  automationForm?.setAttribute('aria-label',automationEditingId?'编辑自动化安排':'新建自动化安排');
   automationFormMessage.classList.remove('error');
   automationFormMessage.textContent='';
   syncAutomationScheduleFields();
@@ -5584,6 +5646,15 @@ function openAutomationEditor(template={}){
   requestAnimationFrame(()=>name?.focus());
 }
 function closeAutomationEditor(restoreFocus=true){
+  automationEditingId='';
+  const runAt=document.getElementById('automationRunAt');
+  const cwd=document.getElementById('automationCwd');
+  if(runAt)runAt.disabled=false;
+  if(cwd)cwd.disabled=false;
+  if(automationForm){
+    delete automationForm.dataset.originalRrule;
+    delete automationForm.dataset.preserveTarget;
+  }
   automationEditor?.classList.add('hidden');
   automationView?.classList.remove('editorOpen');
   automationFormMessage.classList.remove('error');
@@ -5592,39 +5663,45 @@ function closeAutomationEditor(restoreFocus=true){
 }
 function syncAutomationScheduleFields(){
   const value=automationFrequency?.value||'daily';
-  document.getElementById('automationTimeField')?.classList.toggle('hidden',value==='hourly');
+  document.getElementById('automationTimeField')?.classList.toggle('hidden',value==='hourly'||value==='custom');
   document.getElementById('automationDayField')?.classList.toggle('hidden',value!=='weekly');
   document.getElementById('automationIntervalField')?.classList.toggle('hidden',value!=='hourly');
 }
 async function createAutomation(event){
   event.preventDefault();
   const submit=document.getElementById('automationFormSubmit');
+  const editing=Boolean(automationEditingId);
   submit.disabled=true;
-  automationFormMessage.textContent='正在创建...';
+  automationFormMessage.classList.remove('error');
+  automationFormMessage.textContent=editing?'正在保存更改...':'正在创建...';
   const frequency=automationFrequency?.value||'daily';
   const payload={
     name:document.getElementById('automationName')?.value||'',
     prompt:document.getElementById('automationPrompt')?.value||'',
     schedule:{
       frequency,
+      rrule:frequency==='custom'?automationForm?.dataset.originalRrule||'':'',
       time:document.getElementById('automationTime')?.value||'09:00',
       day:document.getElementById('automationDay')?.value||'MO',
       interval:Number(document.getElementById('automationInterval')?.value||3),
     },
     cwd:document.getElementById('automationCwd')?.value||'',
+    preserveTarget:automationForm?.dataset.preserveTarget==='true',
     model:document.getElementById('automationModel')?.value||'',
     reasoningEffort:document.getElementById('automationReasoning')?.value||'',
     notificationPolicy:document.getElementById('automationNotification')?.value||'always',
     status:document.getElementById('automationStartPaused')?.checked?'PAUSED':'ACTIVE',
   };
   try{
-    const res=await fetch('/api/automations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const endpoint=editing?'/api/automations/'+encodeURIComponent(automationEditingId):'/api/automations';
+    const res=await fetch(endpoint,{method:editing?'PATCH':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const data=await res.json().catch(()=>({}));
-    if(!res.ok)throw new Error(data.error||'创建自动化失败');
+    if(!res.ok)throw new Error(data.error||(editing?'保存自动化更改失败':'创建自动化失败'));
     closeAutomationEditor();
-    automationNotice='已创建「'+data.automation.name+'」';
+    automationNotice=(editing?'已更新「':'已创建「')+data.automation.name+'」';
     await loadAutomations({force:true});
   }catch(error){
+    automationFormMessage.classList.add('error');
     automationFormMessage.textContent=error.message;
   }finally{
     submit.disabled=false;
@@ -5664,10 +5741,162 @@ function automationRelativeTime(value){
   if(days<14)return days+'天后';
   return new Date(timestamp).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
 }
+function automationRruleParts(item){return Object.fromEntries(String(item?.rrule||'').replace(/^RRULE:/i,'').split(';').map((part)=>part.split('=',2)).filter((part)=>part.length===2))}
+function automationEditorTemplateFromItem(item){
+  const parts=automationRruleParts(item);
+  const days=String(parts.BYDAY||'').split(',').filter(Boolean);
+  let frequency='daily';
+  if(parts.FREQ==='HOURLY')frequency='hourly';
+  else if(parts.FREQ==='WEEKLY'){
+    if(new Set(days).size===7)frequency='daily';
+    else if(days.join(',')==='MO,TU,WE,TH,FR')frequency='weekdays';
+    else frequency=days.length===1?'weekly':'custom';
+  }else if(parts.FREQ!=='DAILY')frequency='custom';
+  const hour=String(Math.min(23,Math.max(0,Number(parts.BYHOUR??9)||0))).padStart(2,'0');
+  const minute=String(Math.min(59,Math.max(0,Number(parts.BYMINUTE??0)||0))).padStart(2,'0');
+  return{
+    id:item?.id||'',
+    kind:item?.kind||'cron',
+    targetThreadId:item?.targetThreadId||'',
+    targetTitle:automationTargetTitle(item),
+    preserveTarget:item?.kind==='cron'&&Boolean(item?.target)&&item.target.type!=='projectless'&&!(item?.cwds||[]).length,
+    name:item?.name||'',
+    prompt:item?.prompt||'',
+    frequency,
+    rrule:item?.rrule||'',
+    scheduleLabel:item?.scheduleLabel||'',
+    time:hour+':'+minute,
+    day:days[0]||'MO',
+    interval:Math.min(24,Math.max(1,Number(parts.INTERVAL||1)||1)),
+    cwd:item?.cwds?.[0]||'',
+    model:item?.model||'',
+    reasoningEffort:item?.reasoningEffort||'',
+    notificationPolicy:item?.notificationPolicy||'always',
+    status:item?.status||'ACTIVE',
+  };
+}
+function automationDetailRepeat(item){
+  const parts=automationRruleParts(item);
+  if(parts.FREQ==='DAILY')return'每天';
+  if(parts.FREQ==='HOURLY')return'每 '+(parts.INTERVAL||1)+' 小时';
+  if(parts.FREQ==='WEEKLY'){
+    const labels={MO:'周一',TU:'周二',WE:'周三',TH:'周四',FR:'周五',SA:'周六',SU:'周日'};
+    const days=String(parts.BYDAY||'').split(',').filter(Boolean);
+    if(new Set(days).size===7)return'每天';
+    if(days.join(',')==='MO,TU,WE,TH,FR')return'工作日';
+    return days.map((day)=>labels[day]||day).join('、')||'每周';
+  }
+  return item?.scheduleLabel||'按计划';
+}
+function automationDetailTime(item){
+  const parts=automationRruleParts(item);
+  if(parts.FREQ==='HOURLY')return'整点';
+  const hour=String(Number(parts.BYHOUR||0));
+  const minute=String(Number(parts.BYMINUTE||0)).padStart(2,'0');
+  return hour+':'+minute;
+}
+function automationTargetTitle(item){
+  const targetId=String(item?.targetThreadId||'');
+  return historyItems.find((entry)=>entry.id===targetId)?.title||item?.name||'现有任务';
+}
+function appendAutomationDetailRow(container,label,value){
+  const row=document.createElement('div');
+  row.className='automationDetailRow';
+  const key=document.createElement('span');
+  key.textContent=label;
+  const copy=document.createElement('strong');
+  copy.textContent=value;
+  row.append(key,copy);
+  container.appendChild(row);
+}
+function createAutomationDetail(item){
+  const panel=document.createElement('section');
+  panel.className='automationDetailPanel';
+  panel.setAttribute('aria-label','自动化详情：'+item.name);
+  const head=document.createElement('header');
+  head.className='automationDetailHead';
+  const identity=document.createElement('div');
+  const state=document.createElement('span');
+  state.className='automationDetailState '+(item.status==='ACTIVE'?'active':'paused');
+  state.textContent=item.status==='ACTIVE'?'活跃':'已暂停';
+  const title=document.createElement('h2');
+  title.textContent=item.name;
+  identity.append(state,title);
+  const actions=document.createElement('div');
+  actions.className='automationDetailActions';
+  const menuButton=document.createElement('button');
+  menuButton.type='button';
+  menuButton.className='automationDetailAction automationDetailMenuButton';
+  setIconLabel(menuButton,'ellipsis','任务操作',false);
+  menuButton.title='任务操作';
+  menuButton.setAttribute('aria-expanded','false');
+  const menu=document.createElement('div');
+  menu.className='automationDetailMenu hidden';
+  const statusButton=document.createElement('button');
+  statusButton.type='button';
+  statusButton.className='automationDetailMenuAction';
+  setIconLabel(statusButton,item.status==='ACTIVE'?'pause':'play',item.status==='ACTIVE'?'暂停':'启用');
+  statusButton.addEventListener('click',()=>setAutomationStatus(item,statusButton));
+  const editButton=document.createElement('button');
+  editButton.type='button';
+  editButton.className='automationDetailMenuAction';
+  setIconLabel(editButton,'pencil','编辑');
+  editButton.addEventListener('click',()=>{
+    menu.classList.add('hidden');
+    menuButton.setAttribute('aria-expanded','false');
+    openAutomationEditor(automationEditorTemplateFromItem(item));
+  });
+  menu.appendChild(editButton);
+  menu.appendChild(statusButton);
+  menuButton.addEventListener('click',()=>{
+    const open=menu.classList.toggle('hidden')===false;
+    menuButton.setAttribute('aria-expanded',String(open));
+  });
+  const close=document.createElement('button');
+  close.type='button';
+  close.className='automationDetailAction automationDetailClose';
+  setIconLabel(close,'arrow-left','返回列表',false);
+  close.title='返回列表';
+  close.addEventListener('click',()=>{selectedAutomationId='';renderAutomations()});
+  actions.append(close,menuButton,menu);
+  head.append(identity,actions);
+  const prompt=document.createElement('div');
+  prompt.className='automationDetailPrompt';
+  prompt.textContent=item.prompt||'暂无任务说明';
+  const details=document.createElement('section');
+  details.className='automationDetailSection';
+  const detailsTitle=document.createElement('h3');
+  detailsTitle.textContent='详情';
+  details.appendChild(detailsTitle);
+  appendAutomationDetailRow(details,'运行于',item.kind==='heartbeat'?'现有任务':item.cwds?.[0]||'无项目任务');
+  appendAutomationDetailRow(details,'任务',automationTargetTitle(item));
+  const frequency=document.createElement('section');
+  frequency.className='automationDetailSection';
+  const frequencyTitle=document.createElement('h3');
+  frequencyTitle.textContent='频率';
+  frequency.appendChild(frequencyTitle);
+  appendAutomationDetailRow(frequency,'重复',automationDetailRepeat(item));
+  appendAutomationDetailRow(frequency,'时间',automationDetailTime(item));
+  appendAutomationDetailRow(frequency,'通知',item.notificationPolicy==='failed_runs_only'?'仅失败时':'所有运行');
+  const footer=document.createElement('footer');
+  footer.className='automationDetailFooter';
+  const open=document.createElement('button');
+  open.type='button';
+  open.className='automationDetailOpen';
+  open.disabled=!item.targetThreadId;
+  setIconLabel(open,'external-link','打开任务');
+  open.addEventListener('click',()=>{if(item.targetThreadId)loadConversation(item.targetThreadId,'codex')});
+  footer.appendChild(open);
+  panel.append(head,prompt,details,frequency,footer);
+  refreshIcons(panel);
+  return panel;
+}
 function createAutomationRow(item){
   const row=document.createElement('article');
   row.className='automationRow';
   row.dataset.automationId=item.id;
+  row.classList.toggle('selected',item.id===selectedAutomationId);
+  row.setAttribute('aria-label','打开自动化详情：'+item.name);
   const toggle=document.createElement('button');
   toggle.type='button';
   toggle.className='automationStateToggle '+(item.status==='ACTIVE'?'active':'paused');
@@ -5675,7 +5904,7 @@ function createAutomationRow(item){
   toggle.setAttribute('aria-checked',String(item.status==='ACTIVE'));
   toggle.setAttribute('aria-label',(item.status==='ACTIVE'?'暂停':'启用')+item.name);
   toggle.title=item.status==='ACTIVE'?'暂停':'启用';
-  toggle.addEventListener('click',()=>setAutomationStatus(item,toggle));
+  toggle.addEventListener('click',(event)=>{event.stopPropagation();setAutomationStatus(item,toggle)});
   const content=document.createElement('div');
   content.className='automationRowContent';
   const heading=document.createElement('div');
@@ -5701,6 +5930,9 @@ function createAutomationRow(item){
   }
   content.append(heading,schedule,description,meta);
   row.append(toggle,content);
+  row.tabIndex=0;
+  row.addEventListener('click',()=>{selectedAutomationId=item.id;renderAutomations()});
+  row.addEventListener('keydown',(event)=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();selectedAutomationId=item.id;renderAutomations()}});
   return row;
 }
 async function setAutomationStatus(item,button){
@@ -5756,6 +5988,8 @@ function createAutomationSuggestions(){
 }
 function renderAutomations(){
   if(!automationList)return;
+  const inner=automationView?.querySelector('.automationViewInner');
+  inner?.querySelector('.automationDetailPanel')?.remove();
   automationList.replaceChildren();
   syncAutomationFilterTabs();
   const query=(automationSearch?.value||'').trim().toLowerCase();
@@ -5764,7 +5998,7 @@ function renderAutomations(){
     if(status&&item.status!==status)return false;
     return !query||[item.name,item.prompt,item.rrule,item.scheduleLabel,...(item.cwds||[])].join(' ').toLowerCase().includes(query);
   });
-  automationStatus.textContent=automationNotice||(!automationLoading?(visible.length===automationItems.length?automationItems.length+' 个自动化':visible.length+' / '+automationItems.length+' 个自动化'):'');
+  automationStatus.textContent=automationNotice||'';
   if(automationLoading&&!automationItems.length){
     const loading=document.createElement('div');
     loading.className='automationEmpty';
@@ -5782,6 +6016,9 @@ function renderAutomations(){
     automationList.appendChild(empty);
   }
   if(!query&&!status)automationList.appendChild(createAutomationSuggestions());
+  const selected=automationItems.find((item)=>item.id===selectedAutomationId);
+  inner?.classList.toggle('detailOpen',Boolean(selected));
+  if(selected&&inner)inner.appendChild(createAutomationDetail(selected));
   refreshIcons(automationList);
 }
 function archivedTaskTimestamp(item){
