@@ -895,6 +895,9 @@ test('native session store only exposes visible, non-archived Codex App threads'
         created_at_ms, updated_at_ms, recency_at_ms
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
+    if (process.platform === 'win32') {
+      sessionFiles.set(visibleNewer, `\\\\?\\${sessionFiles.get(visibleNewer)}`);
+    }
     const rows = [
       [visibleOlder, sessionFiles.get(visibleOlder), 'vscode', '/workspace/older', '[数据库回退标题](https://example.com/fallback)', 0, 'older', 'test', null, baseTime, baseTime + 10, baseTime + 10],
       [visibleNewer, sessionFiles.get(visibleNewer), 'vscode', '/workspace/newer', '[App 数据库标题](https://example.com/thread)', 0, 'newer', 'test', 'user', baseTime, baseTime + 20, baseTime + 20],
