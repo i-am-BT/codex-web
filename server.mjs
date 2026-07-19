@@ -3823,6 +3823,7 @@ let sidebarRenderedWidth=SIDEBAR_WIDTH_DEFAULT;
 let sidebarResizePointerId=null;
 const HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsCollapsed';
 const HISTORY_PINNED_COLLAPSED_STORAGE_KEY='codexWeb.historyPinnedCollapsed';
+const HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY='codexWeb.historySidebarCollapsed';
 const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb.historyTasksCollapsed';
 const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
@@ -3831,6 +3832,7 @@ const NATIVE_INITIAL_MESSAGE_LIMIT=60;
 const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
 let historyPinnedCollapsed=readHistoryPinnedCollapsed();
+let historySidebarCollapsed=readHistorySidebarCollapsed();
 let historyTasksCollapsed=readHistoryTasksCollapsed();
 let pinnedThreadIds=[];
 let hiddenHistoryProjects=readHiddenHistoryProjects();
@@ -5026,6 +5028,13 @@ function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
 function projectNameFromPath(value){const clean=String(value||'').replace(/\\\\/g,'/').replace(/\\/+$/,'');const parts=clean.split('/').filter(Boolean);return parts.length?parts[parts.length-1]:'未指定项目'}
 function isStandaloneHistoryItem(item){return String(item?.workspaceKind||'')==='projectless'}
+function isBrowserSidebarHistoryItem(item){return item?.source==='codex'&&String(item?.originator||'').trim().toLowerCase()==='codex-chrome-extension-sidepanel'}
+function partitionBrowserSidebarHistoryItems(items){
+  const sidebar=[];
+  const remaining=[];
+  for(const item of items||[])(isBrowserSidebarHistoryItem(item)?sidebar:remaining).push(item);
+  return{sidebar,remaining};
+}
 function partitionPinnedHistoryItems(items,pinnedIds=pinnedThreadIds){
   const byId=new Map();
   for(const item of items||[])if(item?.source==='codex'&&item.id&&!byId.has(item.id))byId.set(item.id,item);
@@ -5666,6 +5675,8 @@ function readCollapsedHistoryProjects(){try{const saved=JSON.parse(localStorage.
 function storeCollapsedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...collapsedHistoryProjects].sort()))}catch{}}
 function readHistoryPinnedCollapsed(){try{return localStorage.getItem(HISTORY_PINNED_COLLAPSED_STORAGE_KEY)==='1'}catch{return false}}
 function storeHistoryPinnedCollapsed(){try{localStorage.setItem(HISTORY_PINNED_COLLAPSED_STORAGE_KEY,historyPinnedCollapsed?'1':'0')}catch{}}
+function readHistorySidebarCollapsed(){try{return localStorage.getItem(HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY)==='1'}catch{return false}}
+function storeHistorySidebarCollapsed(){try{localStorage.setItem(HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY,historySidebarCollapsed?'1':'0')}catch{}}
 function readHistoryTasksCollapsed(){try{return localStorage.getItem(HISTORY_TASKS_COLLAPSED_STORAGE_KEY)==='1'}catch{return false}}
 function storeHistoryTasksCollapsed(){try{localStorage.setItem(HISTORY_TASKS_COLLAPSED_STORAGE_KEY,historyTasksCollapsed?'1':'0')}catch{}}
 function readHiddenHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
@@ -5827,6 +5838,56 @@ function appendPinnedHistoryTasks(items,{query=false}={}){
     storeHistoryPinnedCollapsed();
   });
 }
+function setHistorySidebarExpanded(section,expanded){
+  const head=section?.querySelector('.historySidebarHead');
+  const rows=section?.querySelector('.historySidebarItems');
+  if(!head||!rows)return;
+  const itemCount=section.dataset.sidebarCount||'0';
+  const runningCount=section.dataset.sidebarRunningCount||'0';
+  section.classList.toggle('collapsed',!expanded);
+  head.setAttribute('aria-expanded',String(expanded));
+  head.setAttribute('aria-label',(expanded?'收起':'展开')+'侧边栏，'+itemCount+' 个对话串，'+runningCount+' 个已开启');
+  head.title=(expanded?'收起':'展开')+'侧边栏';
+  rows.hidden=!expanded;
+}
+function appendBrowserSidebarHistoryTasks(items,{query=false}={}){
+  if(!items.length)return;
+  const section=document.createElement('section');
+  section.className='historySidebarTasks';
+  const runningCount=items.filter((item)=>item.status==='running').length;
+  section.dataset.sidebarCount=String(items.length);
+  section.dataset.sidebarRunningCount=String(runningCount);
+  section.setAttribute('aria-label','侧边栏，'+items.length+' 个对话串，'+runningCount+' 个已开启');
+  const head=document.createElement('button');
+  head.type='button';
+  head.className='historySidebarHead';
+  head.setAttribute('aria-controls','history-sidebar-items');
+  const title=document.createElement('span');
+  title.className='historySidebarTitle';
+  title.textContent='侧边栏';
+  const chevron=document.createElement('span');
+  chevron.className='historySidebarChevron';
+  setIconLabel(chevron,'chevron-right','',false);
+  head.appendChild(title);
+  head.appendChild(chevron);
+  const rows=document.createElement('div');
+  rows.className='historySidebarItems';
+  rows.id='history-sidebar-items';
+  for(const item of items)rows.appendChild(createHistoryRow(item,''));
+  section.appendChild(head);
+  section.appendChild(rows);
+  history.appendChild(section);
+  const currentKey=conversationKey(currentConversationSource,currentConversationId);
+  const containsCurrent=Boolean(currentConversationId)&&items.some((item)=>conversationKey(item.source,item.id)===currentKey);
+  setHistorySidebarExpanded(section,Boolean(query)||containsCurrent||!historySidebarCollapsed);
+  head.addEventListener('click',()=>{
+    const expanded=head.getAttribute('aria-expanded')==='true';
+    setHistorySidebarExpanded(section,!expanded);
+    if(query)return;
+    historySidebarCollapsed=expanded;
+    storeHistorySidebarCollapsed();
+  });
+}
 function setHistoryTasksExpanded(section,expanded){
   const head=section?.querySelector('.historyTasksHead');
   const rows=section?.querySelector('.historyTasksItems');
@@ -5896,8 +5957,10 @@ function renderHistory(items){
     history.appendChild(empty);
     return;
   }
-  const {pinned,remaining}=partitionPinnedHistoryItems(visibleItems);
+  const {pinned,remaining:pinnedRemaining}=partitionPinnedHistoryItems(visibleItems);
   appendPinnedHistoryTasks(pinned,{query:Boolean(query)});
+  const {sidebar,remaining}=partitionBrowserSidebarHistoryItems(pinnedRemaining);
+  appendBrowserSidebarHistoryTasks(sidebar,{query:Boolean(query)});
   const {tasks:standaloneTasks,projects:groups}=partitionHistoryItems(remaining);
   appendStandaloneHistoryTasks(standaloneTasks,{query:Boolean(query)});
   let groupIndex=0;
@@ -6049,7 +6112,7 @@ function createHistoryRow(item,projectPath){
   refreshIcons(row);
   return row;
 }
-function updateActiveHistory(){const key=conversationKey(currentConversationSource,currentConversationId);let activeRow=null;history.querySelectorAll('.hist').forEach((row)=>{const active=row.dataset.key===key;row.classList.toggle('active',active);if(active)activeRow=row});if(!activeRow)return;setHistoryPinnedExpanded(activeRow.closest('.historyPinned'),true);setHistoryTasksExpanded(activeRow.closest('.historyTasks'),true);setHistoryProjectExpanded(activeRow.closest('.historyProject'),true)}
+function updateActiveHistory(){const key=conversationKey(currentConversationSource,currentConversationId);let activeRow=null;history.querySelectorAll('.hist').forEach((row)=>{const active=row.dataset.key===key;row.classList.toggle('active',active);if(active)activeRow=row});if(!activeRow)return;setHistoryPinnedExpanded(activeRow.closest('.historyPinned'),true);setHistorySidebarExpanded(activeRow.closest('.historySidebarTasks'),true);setHistoryTasksExpanded(activeRow.closest('.historyTasks'),true);setHistoryProjectExpanded(activeRow.closest('.historyProject'),true)}
 async function renameConversation(id,title,source='codex'){const next=prompt('修改会话标题',title||'');if(next===null)return;const clean=next.trim().replace(/\s+/g,' ').slice(0,80);if(!clean){statusEl.textContent='标题不能为空';return}const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:clean})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'改名失败';return}await refreshHistory();statusEl.textContent='标题已更新'}
 async function deleteConversation(id,title,source='codex'){const verb=source==='codex'?'归档':'删除';if(!confirm(verb+'会话：'+title+'？'))return;const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});const data=await res.json().catch(()=>({}));if(!res.ok){statusEl.textContent=data.error||verb+'失败';return}if(currentConversationId===id)newChat();await refreshHistory();statusEl.textContent=verb+'完成'}
 function sidebarCollapsedPreference(){try{return localStorage.getItem(SIDEBAR_STORAGE_KEY)==='1'}catch{return false}}

@@ -125,7 +125,7 @@ experimental_bearer_token = "test-token"
             timestamp: '2026-07-11T04:52:31.928Z',
             cwd: temporary,
             model_provider: 'fake',
-            originator: 'Codex Desktop',
+            originator: 'codex-chrome-extension-sidepanel',
             source: 'vscode',
             cli_version: 'test',
           },
@@ -2366,6 +2366,7 @@ updated_at = 1784422800000
       && conversation.source === 'codex'
       && conversation.title === 'Codex App fixture'
       && conversation.cwd === temporary
+      && conversation.originator === 'codex-chrome-extension-sidepanel'
       && conversation.automation?.id === 'fixture-heartbeat'
       && conversation.automation?.kind === 'heartbeat'
       && conversation.automation?.name === 'Fixture heartbeat'

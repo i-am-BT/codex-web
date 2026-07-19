@@ -2042,6 +2042,7 @@ body .history {
 }
 
 .historyPinned,
+.historySidebarTasks,
 .historyTasks {
   display: grid;
   min-width: 0;
@@ -2050,6 +2051,7 @@ body .history {
 }
 
 .historyPinnedHead,
+.historySidebarHead,
 .historyTasksHead {
   display: grid;
   width: 100%;
@@ -2069,12 +2071,15 @@ body .history {
 
 .historyPinnedHead:hover,
 .historyPinnedHead:focus-visible,
+.historySidebarHead:hover,
+.historySidebarHead:focus-visible,
 .historyTasksHead:hover,
 .historyTasksHead:focus-visible {
   background: var(--surface-hover);
 }
 
 .historyPinnedTitle,
+.historySidebarTitle,
 .historyTasksTitle {
   margin: 0;
   color: var(--text-muted);
@@ -2085,6 +2090,7 @@ body .history {
 }
 
 .historyPinnedChevron,
+.historySidebarChevron,
 .historyTasksChevron {
   display: grid;
   width: 14px;
@@ -2097,33 +2103,39 @@ body .history {
 }
 
 .historyPinnedChevron .lucide,
+.historySidebarChevron .lucide,
 .historyTasksChevron .lucide {
   width: 12px;
   height: 12px;
 }
 
 .historyPinnedHead:hover .historyPinnedChevron,
+.historySidebarHead:hover .historySidebarChevron,
 .historyTasksHead:hover .historyTasksChevron {
   color: var(--text-muted);
 }
 
 .historyPinnedHead[aria-expanded="true"] .historyPinnedChevron,
+.historySidebarHead[aria-expanded="true"] .historySidebarChevron,
 .historyTasksHead[aria-expanded="true"] .historyTasksChevron {
   transform: rotate(90deg);
 }
 
 .historyPinnedItems,
+.historySidebarItems,
 .historyTasksItems {
   display: grid;
   gap: 1px;
 }
 
 .historyPinnedItems[hidden],
+.historySidebarItems[hidden],
 .historyTasksItems[hidden] {
   display: none;
 }
 
 .historyPinned.collapsed,
+.historySidebarTasks.collapsed,
 .historyTasks.collapsed {
   gap: 0;
 }

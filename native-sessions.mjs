@@ -52,6 +52,7 @@ export class NativeSessionStore extends EventEmitter {
     this.subagentThreads = new Map();
     this.titles = new Map();
     this.details = new Map();
+    this.sessionMetadataCache = new Map();
     this.indexStamp = '';
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
@@ -129,6 +130,7 @@ export class NativeSessionStore extends EventEmitter {
       this.titles,
       this.appThreads,
       (id) => this.workspaceKindForThread(id),
+      this.sessionMetadataCache,
     );
     const nextSubagentEntries = scanSessionFiles(this.sessionsDir, this.titles, this.subagentThreads);
     const changedIds = [
@@ -140,6 +142,7 @@ export class NativeSessionStore extends EventEmitter {
     ];
     this.entries = nextEntries;
     this.subagentEntries = nextSubagentEntries;
+    pruneSessionMetadataCache(this.sessionMetadataCache, nextEntries);
 
     for (const id of [...this.details.keys()]) {
       if (!this.entries.has(id) && !this.subagentEntries.has(id)) this.details.delete(id);
@@ -545,7 +548,13 @@ export function readSessionIndex(file) {
   return titles;
 }
 
-function scanSessionFiles(root, titles, appThreads = null, workspaceKindForThread = null) {
+function scanSessionFiles(
+  root,
+  titles,
+  appThreads = null,
+  workspaceKindForThread = null,
+  sessionMetadataCache = null,
+) {
   const entries = new Map();
   if (!existsSync(root)) return entries;
   const pending = [root];
@@ -577,11 +586,14 @@ function scanSessionFiles(root, titles, appThreads = null, workspaceKindForThrea
         const title = titles.get(id)?.title || appThread?.title || `Codex ${id.slice(0, 8)}`;
         const createdAtMs = appThread?.createdAtMs || stat.birthtimeMs || stat.ctimeMs || stat.mtimeMs;
         const recencyMs = appThread?.recencyAtMs || appThread?.updatedAtMs || stat.mtimeMs;
-        const firstRecord = appThread?.cwd ? null : readFirstRecord(filePath);
+        const sessionMetadata = sessionMetadataCache
+          ? cachedSessionMetadata(sessionMetadataCache, id, filePath, stat.ino)
+          : appThread?.cwd ? null : sessionMetadataFromFirstRecord(readFirstRecord(filePath));
         const entry = {
           id,
           title,
-          cwd: appThread?.cwd || String(firstRecord?.payload?.cwd || '').trim(),
+          cwd: appThread?.cwd || sessionMetadata?.cwd || '',
+          originator: sessionMetadata?.originator || '',
           workspaceKind: appThread?.workspaceKind || workspaceKindForThread?.(id) || '',
           filePath,
           size: stat.size,
@@ -617,7 +629,7 @@ function changedSessionIds(previous, next) {
 }
 
 function entrySignature(entry) {
-  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
+  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.originator || ''}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
 }
 
 function sessionSummary(entry, status) {
@@ -626,12 +638,38 @@ function sessionSummary(entry, status) {
     source: 'codex',
     title: entry.title,
     cwd: entry.cwd || '',
+    originator: entry.originator || '',
     workspaceKind: entry.workspaceKind || '',
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     status,
     readOnly: false,
   };
+}
+
+function cachedSessionMetadata(cache, id, filePath, ino) {
+  const previous = cache.get(id);
+  if (previous?.filePath === filePath && previous.ino === ino) return previous.metadata;
+
+  const metadata = sessionMetadataFromFirstRecord(readFirstRecord(filePath));
+  if (metadata) cache.set(id, { filePath, ino, metadata });
+  else cache.delete(id);
+  return metadata;
+}
+
+function sessionMetadataFromFirstRecord(record) {
+  if (record?.type !== 'session_meta' || !record.payload || typeof record.payload !== 'object') return null;
+  return {
+    cwd: String(record.payload.cwd || '').trim(),
+    originator: String(record.payload.originator || '').trim(),
+  };
+}
+
+function pruneSessionMetadataCache(cache, entries) {
+  for (const [id, cached] of cache) {
+    const entry = entries.get(id);
+    if (!entry || entry.filePath !== cached.filePath || entry.ino !== cached.ino) cache.delete(id);
+  }
 }
 
 function createDetailCache(entry, options) {
