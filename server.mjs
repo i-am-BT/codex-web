@@ -6480,7 +6480,7 @@ function createHistoryRow(item,projectPath){
   const source=item.source==='codex'?'codex':'web';
   const automationName=String(item.automation?.name||'').trim();
   const row=document.createElement('div');
-  row.className='hist'+(source==='codex'?' native':'');
+  row.className='hist'+(source==='codex'?' native':'')+(item.status==='running'?' running':'');
   row.dataset.key=conversationKey(source,item.id);
   if(row.dataset.key===conversationKey(currentConversationSource,currentConversationId))row.classList.add('active');
   row.title=item.title+(projectPath?'\\n'+projectPath:'')+(automationName?'\\n自动化任务：'+automationName:'');
@@ -6505,7 +6505,15 @@ function createHistoryRow(item,projectPath){
   }
   open.title=row.title;
   open.addEventListener('click',(e)=>{e.stopPropagation();loadConversation(item.id,source)});
+  let running=null;
+  if(item.status==='running'){
+    running=document.createElement('span');
+    running.className='histRunning';
+    running.title='运行中';
+    running.setAttribute('aria-label','运行中');
+  }
   if(source==='codex'){
+    if(running)row.appendChild(running);
     const badge=document.createElement('span');
     badge.className='histSource';
     badge.textContent='App';
@@ -6513,13 +6521,7 @@ function createHistoryRow(item,projectPath){
     row.appendChild(badge);
   }
   row.appendChild(open);
-  if(item.status==='running'){
-    const running=document.createElement('span');
-    running.className='histRunning';
-    running.title='运行中';
-    running.setAttribute('aria-label','运行中');
-    row.appendChild(running);
-  }
+  if(running&&source!=='codex')row.appendChild(running);
   if(source==='codex'){
     const rename=document.createElement('button');
     rename.type='button';

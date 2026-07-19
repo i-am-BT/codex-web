@@ -1203,7 +1203,7 @@ updated_at = 1784422800000
     assert.match(page, /function markSubagentTraceFinal/);
     assert.match(page, /if\(kind==='reasoning_summary'\)return false/);
     assert.match(page, /\/api\/native-sessions\/'\+encodeURIComponent\(state\.parentThreadId\)\+'\/subagents/);
-    assert.match(page, /row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(item\.status==='running'\)[\s\S]*row\.appendChild\(running\);\s*}\s*if\(source==='codex'\)/s);
+    assert.match(page, /if\(source==='codex'\)\{\s*if\(running\)row\.appendChild\(running\);[\s\S]*row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(running&&source!=='codex'\)row\.appendChild\(running\)/s);
     assert.match(page, /galleryOnly:true/);
     assert.doesNotMatch(page, /base\+\(index\+1\)\+generation/);
     assert.match(page, /continueMsg messageAction/);

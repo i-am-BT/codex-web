@@ -2782,7 +2782,11 @@ body .hist {
 }
 
 body .hist.native {
-  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+}
+
+body .hist.native.running {
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
 }
 
 body .hist:hover {
