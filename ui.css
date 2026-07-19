@@ -4393,6 +4393,14 @@ body .msg.user.browserCommentSteering::after {
   flex: 0 1 auto;
 }
 
+.turnResultStatus {
+  flex: 0 0 auto;
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
 .editedFilesResult[open] {
   width: min(520px, 100%);
   max-width: 100%;
@@ -5537,12 +5545,12 @@ body .chat > :is(.msg.user, .msg.image.inputImage) {
 body .composer {
   flex: 0 0 auto;
   border-top: 0;
-  background: var(--canvas);
+  background: transparent;
   padding: 10px var(--conversation-gutter) 14px;
 }
 
 body[data-theme="light"] .composer {
-  background: #ffffff;
+  background: transparent;
 }
 
 .composer > * {
@@ -5555,6 +5563,9 @@ body .composer > .editedFilesResult.live {
   align-self: center;
   justify-self: auto;
   margin: 0 auto 8px;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
 }
 
 body .composer > .editedFilesResult.live:not([open]) {

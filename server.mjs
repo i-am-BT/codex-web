@@ -918,7 +918,8 @@ app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
     nativeSessions.scheduleRefresh();
     res.status(202).json({ ok: true, threadId, turnId });
   } catch (err) {
-    res.status(nativeAppErrorStatus(err)).json({ error: `引导 Codex App 任务失败: ${err.message}` });
+    const status=isNativeThreadNotFoundError(err)?409:nativeAppErrorStatus(err);
+    res.status(status).json({ error: status===409?'当前任务已结束，消息将按新一轮发送':`引导 Codex App 任务失败: ${err.message}` });
   }
 });
 
@@ -2853,7 +2854,7 @@ async function steerNativeTurn(threadId, steer, expectedTurnId) {
     });
     return { ...result, transport: 'desktop-ipc' };
   } catch (error) {
-    if (!isCodexDesktopIpcUnavailableError(error)) throw error;
+    if (!isCodexDesktopIpcUnavailableError(error) && !isNativeThreadNotFoundError(error)) throw error;
   }
 
   let turnId = expectedTurnId;
@@ -3106,6 +3107,10 @@ function nativeAppErrorStatus(error) {
   if (message.includes('active') || message.includes('running') || message.includes('in progress')) return 409;
   if (error?.code === -32602) return 400;
   return 502;
+}
+function isNativeThreadNotFoundError(error) {
+  const message = String(error?.message || '').toLowerCase();
+  return /thread\s+not\s+found|thread.*不存在/.test(message);
 }
 
 function endStream(res) {
@@ -8075,7 +8080,7 @@ function updateActivityCluster(cluster){
   if(label){label.textContent=presentation.text;label.title=presentation.text}
   cluster.dataset.messageText=presentation.text;
   markCurrentActivityItem(cluster);
-  cluster.classList.toggle('streaming',cluster.dataset.reasoningActive==='true'||Boolean(cluster.querySelector('.activityBatch.streaming')));
+  cluster.classList.toggle('streaming',cluster.dataset.activityLive==='true'||cluster.dataset.reasoningActive==='true'||Boolean(cluster.querySelector('.activityBatch.streaming')));
   refreshIcons(cluster);
 }
 function appendActivityBatchToCluster(cluster,batch){
@@ -8086,6 +8091,7 @@ function appendActivityBatchToCluster(cluster,batch){
 function settleActivityCluster(cluster){
   for(const batch of cluster?.querySelectorAll('.activityBatch')||[])settleTurnTool(batch);
   clearActiveActivityReasoning(cluster,false);
+  if(cluster?.dataset)delete cluster.dataset.activityLive;
   cluster?.classList.remove('streaming');
   updateActivityCluster(cluster);
 }
@@ -8324,6 +8330,8 @@ function collapseCurrentActivityCluster(){
   if(currentActivityCluster?.isConnected){
     clearActiveActivityReasoning(currentActivityCluster);
     currentActivityCluster.open=false;
+    delete currentActivityCluster.dataset.activityLive;
+    currentActivityCluster.classList.remove('streaming');
   }
   currentActivityCluster=null;
 }
@@ -8348,6 +8356,7 @@ function activateTurnProcessElement(element){
   if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='tool_activity'){
     if(!currentActivityCluster?.isConnected){
       currentActivityCluster=createActivityCluster('tools',pendingActivityReasoning);
+      currentActivityCluster.dataset.activityLive='true';
       turnProcessElements.push(currentActivityCluster);
       turnProcessTimeline.appendChild(currentActivityCluster);
     }else mergeActivityClusterReasoning(currentActivityCluster,pendingActivityReasoning);
@@ -8586,7 +8595,16 @@ function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
     stats.appendChild(value);
   }
   if(!added&&!removed)stats.textContent='已完成';
-  if(hasFiles){head.appendChild(title);head.appendChild(stats)}
+  if(hasFiles){
+    head.appendChild(title);
+    head.appendChild(stats);
+    if(!live){
+      const status=document.createElement('span');
+      status.className='turnResultStatus';
+      status.textContent='已完成';
+      head.appendChild(status);
+    }
+  }
   card.appendChild(head);
   if(!hasFiles)return card;
   const content=document.createElement('div');
