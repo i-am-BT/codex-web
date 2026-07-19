@@ -102,6 +102,10 @@ test('the pinned section renders above tasks, collapses independently, and marks
   assert.match(rowSource, /automationIcon\.className='histAutomationIcon'/);
   assert.match(rowSource, /icon\.setAttribute\('data-lucide','calendar-clock'\)/);
   assert.match(rowSource, /automationIcon\.setAttribute\('aria-label','自动化任务：'\+automationName\)/);
+  assert.match(rowSource, /row\.className='hist'\+\(source==='codex'\?' native':''\)\+\(item\.status==='running'\?' running':''\)/);
+  assert.match(rowSource, /if\(source==='codex'\)\{\s*if\(running\)row\.appendChild\(running\);[\s\S]*row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\)/);
+  assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
+  assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto auto minmax\(0, 1fr\) auto auto/s);
   assert.match(uiStyles, /\.historyPinned,\s*\.historySidebarTasks,\s*\.historyTasks\s*\{[^}]*display:\s*grid/s);
   assert.match(uiStyles, /\.historyPinnedItems\[hidden\],\s*\.historySidebarItems\[hidden\],\s*\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
   assert.match(uiStyles, /\.historyPinnedHead\[aria-expanded="true"\] \.historyPinnedChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);

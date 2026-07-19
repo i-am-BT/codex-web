@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -49,6 +49,35 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
         body,
       });
       res.setHeader('Content-Type', 'application/json');
+      if (req.url === '/v1/usage') {
+        if (req.headers.authorization === 'Bearer bad-sub-key') {
+          res.end(JSON.stringify({ isValid: false, status: 'invalid_key' }));
+          return;
+        }
+        res.end(JSON.stringify({
+          isValid: true,
+          mode: 'unrestricted',
+          planName: 'GPT-20x-300',
+          unit: 'USD',
+          remaining: 70,
+          subscription: {
+            weekly_limit_usd: 100,
+            weekly_usage_usd: 30,
+            monthly_limit_usd: 400,
+            monthly_usage_usd: 50,
+            expires_at: '2026-08-01T00:00:00Z',
+          },
+          rate_limits: [{
+            window: '5h',
+            limit: 50,
+            used: 10,
+            remaining: 40,
+            reset_at: '2026-07-19T05:00:00Z',
+          }],
+          usage: { today: { requests: 4, actual_cost: 3 } },
+        }));
+        return;
+      }
       if (req.url === '/v1/models') {
         res.end(JSON.stringify({ data: [{ id: 'gpt-image-2' }] }));
         return;
@@ -128,14 +157,6 @@ experimental_bearer_token = "test-token"
             originator: 'codex-chrome-extension-sidepanel',
             source: 'vscode',
             cli_version: 'test',
-          },
-        }),
-        JSON.stringify({
-          timestamp: '2026-07-11T04:52:31.929Z',
-          type: 'turn_context',
-          payload: {
-            cwd: temporary,
-            model: 'test-model',
           },
         }),
         JSON.stringify({
@@ -401,6 +422,10 @@ if (args.includes('--version')) {
   process.exit(0);
 }
 if (args[0] === 'app-server') {
+  appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify({
+    type: 'process_env',
+    sub2ApiKey: process.env.SUB2API_API_KEY,
+  }) + '\\n');
   const createdThreadId = '${createdNativeSessionId}';
   const forkedThreadId = '${forkedNativeSessionId}';
   const fixtureThreadId = '${nativeSessionId}';
@@ -459,24 +484,6 @@ if (args[0] === 'app-server') {
         send({ id: message.id, result: { data, nextCursor: null, backwardsCursor: null } });
       }
       else if (message.method === 'thread/start') send({ id: message.id, result: { thread: thread(createdThreadId) } });
-      else if (message.method === 'thread/read') {
-        const control = archiveControl();
-        const result = thread(message.params.threadId || fixtureThreadId);
-        const inProgress = control.inProgressThreadId === result.id;
-        result.status = inProgress ? { type: 'active', activeFlags: [] } : { type: 'idle' };
-        result.turns = inProgress
-          ? [{ id: control.inProgressTurnId, status: 'inProgress', items: [] }]
-          : [
-            { id: '${nativeSecondTurnId}', status: 'completed', items: [] },
-            {
-              id: '019f4f84-ea9f-73c2-b997-deba7b4aa799',
-              status: 'interrupted',
-              completedAt: null,
-              items: [],
-            },
-          ];
-        send({ id: message.id, result: { thread: result } });
-      }
       else if (message.method === 'thread/fork') send({ id: message.id, result: { thread: thread(forkedThreadId) } });
       else if (message.method === 'thread/resume') send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
       else if (message.method === 'turn/start') {
@@ -537,7 +544,8 @@ if (args[0] === 'app-server') {
     args,
     input,
     home: process.env.HOME,
-    codexHome: process.env.CODEX_HOME
+    codexHome: process.env.CODEX_HOME,
+    sub2ApiKey: process.env.SUB2API_API_KEY
   }, null, 2));
   console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'FAKE_OK' } }));
 }
@@ -556,6 +564,8 @@ if (args[0] === 'app-server') {
       desktopIpcEnabled: 'true',
       desktopIpcSocket: desktopIpc.socketPath,
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
+      sub2ApiBaseUrl: providerBaseUrl,
+      sub2ApiKey: 'test-sub-key',
     });
     let port = await waitForServer(child, runtime);
     const baseUrl = `http://127.0.0.1:${port}`;
@@ -599,7 +609,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.generatedBackgroundApply/);
     assert.doesNotMatch(uiStyles, /data-chat-bg="dream-skin"|portal-hero\.png/);
     assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[^}]*body \.histRename,[^}]*opacity:\s*0;[\s\S]*body \.hist:hover \.histRename/s);
-    assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto auto/s);
+    assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
+    assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto auto minmax\(0, 1fr\) auto auto/s);
     assert.match(uiStyles, /\.historyProjectFolder\s*\{/);
     assert.match(uiStyles, /\.historyProjectPreview\.visible\s*\{/);
     assert.match(uiStyles, /\.historyProjectItems\s*\{[^}]*padding-left:\s*22px/s);
@@ -612,13 +623,21 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.composerProjectPicker:not\(\.hidden\) \+ \.box/);
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
-    assert.match(uiStyles, /\.composerModelToggle\.running:disabled\s*\{[^}]*opacity:\s*1/s);
+    assert.match(uiStyles, /\.composerModelToggle\.running:not\(:disabled\)\s*\{[^}]*cursor:\s*pointer/s);
     assert.match(uiStyles, /\.composerModelToggle\.running \.composerModelState\s*\{[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/s);
+    assert.match(uiStyles, /\.composerModelPanel\s*\{[^}]*width:\s*min\(244px,[^}]*border-radius:\s*18px/s);
+    assert.match(uiStyles, /\.composerModelMenuRow\s*\{[^}]*min-height:\s*44px;[^}]*grid-template-columns:/s);
+    assert.match(uiStyles, /\.composerModelMenuRow\.active\s*\{[^}]*background:\s*var\(--surface-hover\)/s);
+    assert.match(uiStyles, /\.composerModelSubmenu\s*\{[^}]*left:\s*calc\(100% \+ 8px\);[^}]*right:\s*auto;[^}]*max-height:/s);
+    assert.match(uiStyles, /\.composerModelPanel\[data-submenu\] \.composerModelMainMenu\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /body \.composer > \.box\s*\{[^}]*width:\s*min\(380px, calc\(100% - 20px\)\)/s);
+    assert.match(uiStyles, /\.composerModelOption\[aria-selected="true"\]/);
     assert.match(uiStyles, /body \.box\.runActive > \.send:not\(\.cancelButton\):disabled\s*\{[^}]*display:\s*none/s);
     assert.match(uiStyles, /body \.cancelButton \.lucide\s*\{[^}]*fill:\s*currentColor;[^}]*stroke:\s*none/s);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
     assert.match(uiStyles, /\.msg\.user::after\s*\{[^}]*width:\s*min\(124px, 100%\);[^}]*height:\s*6px/s);
     assert.match(uiStyles, /\.msg\.user \.msgActions\s*\{[^}]*top:\s*calc\(100% - 1px\);[^}]*padding:\s*5px 0 0 8px/s);
+    assert.match(uiStyles, /\.msg\.user\.hasInputImage > \.msgBody\s*\{[^}]*border-radius:\s*16px;[^}]*background:\s*color-mix\(in oklab, var\(--text\) 5%, transparent\);[^}]*padding:\s*8px 12px/s);
     assert.match(uiStyles, /\.completionTimeline > \.activityBatch \+ \.activityBatch/);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.completionTimeline\s*\{[^}]*--text:\s*#ffffff;[^}]*--text-muted:\s*#acacac;[^}]*--text-subtle:\s*#7b7b7b/s);
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
@@ -634,7 +653,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /--reasoning-flow-muted:\s*#b0b0b1/);
     assert.match(uiStyles, /\.reasoningStatus\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /> \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*var\(--reasoning-flow-muted\)[^}]*var\(--reasoning-flow-strong\)/s);
-    assert.match(uiStyles, /\.browserCommentChip\s*\{/);
+    assert.match(uiStyles, /\.browserCommentSteering > \.browserCommentSource\s*\{[^}]*display:\s*block;[^}]*background:\s*color-mix\(in oklab, var\(--text\) 5%, transparent\)/s);
     assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
     assert.match(uiStyles, /\.agentActivityItem\[open\] > \.agentActivityRow \.agentActivityChevron/);
@@ -661,17 +680,34 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
-    assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) repeat\(3, 36px\)/s);
+    assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(112px, 1fr\) repeat\(4, 36px\);[^}]*gap:\s*6px/s);
+    assert.match(uiStyles, /\.sideActions \.miniPrimary\s*\{[^}]*flex-wrap:\s*nowrap;[^}]*white-space:\s*nowrap/s);
+    assert.match(uiStyles, /\.sideActions \.miniPrimary \.buttonLabel\s*\{[^}]*flex:\s*0 0 auto;[^}]*word-break:\s*keep-all/s);
+    assert.match(uiStyles, /\.subQuotaPopover\s*\{/);
+    assert.match(uiStyles, /\.subQuotaSettingsDialog\s*\{[^}]*width:\s*min\(460px, calc\(100vw - 32px\)\);[^}]*background:\s*var\(--surface\);[^}]*box-shadow:/s);
+    assert.match(uiStyles, /@container sidebar \(max-width: 280px\)/);
     assert.match(uiStyles, /\.archiveView\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*auto/s);
     assert.match(uiStyles, /\.archiveTaskRestore,[^}]*\.archiveTaskDelete\s*\{/s);
     assert.match(uiStyles, /body\[data-theme\] \.archiveProjectFilter select\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.turnResultArtifacts\s*\{[^}]*align-self:\s*center/s);
     assert.match(uiStyles, /\.editedFilesResult\s*\{[^}]*width:\s*min\(160px, 100%\);[^}]*border-radius:\s*999px/s);
+    assert.match(uiStyles, /\.editedFilesResult:not\(\.live\):not\(\[open\]\)\s*\{[^}]*width:\s*max-content;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.editedFilesResult:not\(\.live\):not\(\[open\]\) > \.turnResultHead\s*\{[^}]*display:\s*inline-flex;[^}]*width:\s*max-content;[^}]*flex-wrap:\s*nowrap/s);
     assert.match(uiStyles, /\.editedFilesResult\.withPlan\s*\{[^}]*width:\s*max-content/s);
     assert.match(uiStyles, /\.editedFilesResult\.withPlan > \.turnResultHead\s*\{[^}]*min-height:\s*36px;[^}]*gap:\s*7px;[^}]*padding-inline:\s*12px/s);
     assert.match(uiStyles, /\.turnPlanProgressRing\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px;[^}]*flex:\s*0 0 12px;[^}]*conic-gradient\(var\(--info\) var\(--turn-plan-progress\)/s);
     assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
+    assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) - 22px\), calc\(100% - 60px\)\);[^}]*border-radius:\s*24px;[^}]*padding:\s*6px 7px 5px/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\.runActive\s*\{[^}]*grid-template-columns:\s*32px max-content minmax\(0, 1fr\) max-content 30px/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#454545;[^}]*background:\s*#2b2b2b;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\)\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) \+ 3px\), calc\(100% - 34px\)\);[^}]*border-radius:\s*12px;[^}]*padding:\s*20px 12px 12px/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.composerProjectPicker\s*\{[^}]*width:\s*calc\(100% - 29px\)/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.box\s*\{[^}]*width:\s*100%/s);
+    assert.match(uiStyles, /body \.box\s*\{[^}]*grid-template-rows:\s*minmax\(50px, auto\) 34px;[^}]*gap:\s*2px;[^}]*border-radius:\s*20px/s);
+    assert.match(uiStyles, /body\[data-theme\] \.box textarea\s*\{[^}]*min-height:\s*50px;[^}]*max-height:\s*180px;[^}]*font-size:\s*14px/s);
+    assert.match(uiStyles, /\.turnResultStatus\s*\{[^}]*color:\s*var\(--success\)/s);
     assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult:not\(\[open\]\)\s*\{[^}]*border-color:\s*#383838;[^}]*background:\s*#272727/s);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult\.withPlan \.turnPlanProgressRing\s*\{[^}]*conic-gradient\(#339cff var\(--turn-plan-progress\), #2b3c4f 0\)/s);
@@ -687,9 +723,11 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /--conversation-width:\s*760px/);
     assert.match(uiStyles, /body \.chat > :is\([^}]*\.msg:not\(\.user\):not\(\.inputImage\)[^}]*\.liveProcessPanel[^}]*\)\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\);[^}]*align-self:\s*center/s);
     assert.match(uiStyles, /body \.chat > :is\(\.msg\.user, \.msg\.image\.inputImage\)\s*\{[^}]*margin-right:\s*max\(0px, calc\(\(100% - var\(--conversation-width\)\) \/ 2\)\)/s);
-    assert.match(uiStyles, /body \.composer\s*\{[^}]*border-top:\s*0;[^}]*background:\s*var\(--canvas\)/s);
-    assert.match(uiStyles, /body\[data-theme="light"\] \.composer\s*\{[^}]*background:\s*#ffffff/s);
-    assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\)/s);
+    assert.match(uiStyles, /body \.composer\s*\{[^}]*border-top:\s*0;[^}]*background:\s*transparent/s);
+    assert.match(uiStyles, /body\[data-theme="light"\] \.composer\s*\{[^}]*background:\s*transparent/s);
+    assert.match(uiStyles, /body\[data-theme="light"\] \.box,\s*body\[data-theme="light"\] \.box:focus-within\s*\{[^}]*background:\s*#ffffff/s);
+    assert.match(uiStyles, /--composer-width:\s*var\(--conversation-width\)/);
+    assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 60px\)\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
@@ -746,6 +784,10 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedArchivedTasks.status, 401);
     const unauthorizedAutomations = await fetch(`${baseUrl}/api/automations`);
     assert.equal(unauthorizedAutomations.status, 401);
+    const unauthorizedSubQuotas = await fetch(`${baseUrl}/api/sub-quotas`);
+    assert.equal(unauthorizedSubQuotas.status, 401);
+    const unauthorizedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`);
+    assert.equal(unauthorizedSubQuotaConfig.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
@@ -756,6 +798,52 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    const subQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(subQuotaConfig.status, 200);
+    const subQuotaConfigPayload = await subQuotaConfig.json();
+    assert.equal(subQuotaConfigPayload.baseUrl, providerBaseUrl);
+    assert.equal(subQuotaConfigPayload.keyConfigured, true);
+    assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
+
+    const rejectedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: 'bad-sub-key' }),
+    });
+    assert.equal(rejectedSubQuotaKey.status, 422);
+    assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /bad-sub-key/);
+
+    const updatedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: 'new-sub-key' }),
+    });
+    assert.equal(updatedSubQuotaKey.status, 200);
+    assert.doesNotMatch(await updatedSubQuotaKey.text(), /new-sub-key/);
+    assert.match(await readFile(webEnv, 'utf8'), /^SUB2API_API_KEY="new-sub-key"$/m);
+    assert.equal((await stat(webEnv)).mode & 0o777, 0o600);
+    assert.equal(providerRequests.at(-1).authorization, 'Bearer new-sub-key');
+
+    const subQuotas = await fetch(`${baseUrl}/api/sub-quotas`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(subQuotas.status, 200);
+    assert.match(subQuotas.headers.get('cache-control'), /private, no-store/);
+    const subQuotaPayload = await subQuotas.json();
+    assert.equal(subQuotaPayload.configured, true);
+    assert.equal(subQuotaPayload.count, 1);
+    assert.equal(subQuotaPayload.quotas[0].planName, 'GPT-20x-300');
+    assert.equal(subQuotaPayload.quotas[0].subscription.weekly.remaining, 70);
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[0].window, '5h');
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[0].remaining, 40);
+    assert.doesNotMatch(JSON.stringify(subQuotaPayload), /test-sub-key/);
+    const refreshedSubQuotas = await fetch(`${baseUrl}/api/sub-quotas?refresh=1`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(refreshedSubQuotas.status, 200);
 
     const emptyAutomations = await fetch(`${baseUrl}/api/automations`, {
       headers: { Cookie: cookie },
@@ -797,16 +885,40 @@ updated_at = 1784422800000
     assert.equal(createdAutomationPayload.automation.reasoningEffort, 'xhigh');
     assert.equal(createdAutomationPayload.automation.notificationPolicy, 'always');
     assert.equal(createdAutomationPayload.automation.status, 'PAUSED');
+    const editedAutomation = await fetch(`${baseUrl}/api/automations/daily-project-brief`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Weekly project brief',
+        prompt: 'Summarize the latest project work every Friday.',
+        cwd: '',
+        model: 'test-model',
+        reasoningEffort: 'ultra',
+        notificationPolicy: 'failed_runs_only',
+        status: 'PAUSED',
+        schedule: { frequency: 'weekly', day: 'FR', time: '09:30' },
+      }),
+    });
+    assert.equal(editedAutomation.status, 200);
+    const editedAutomationPayload = await editedAutomation.json();
+    assert.equal(editedAutomationPayload.automation.id, 'daily-project-brief');
+    assert.equal(editedAutomationPayload.automation.name, 'Weekly project brief');
+    assert.equal(editedAutomationPayload.automation.scheduleLabel, '周五 09:30');
+    assert.deepEqual(editedAutomationPayload.automation.cwds, []);
+    assert.equal(editedAutomationPayload.automation.reasoningEffort, 'ultra');
+    assert.equal(editedAutomationPayload.automation.notificationPolicy, 'failed_runs_only');
     const automationToml = await readFile(
       path.join(codexHome, 'automations', 'daily-project-brief', 'automation.toml'),
       'utf8',
     );
-    assert.match(automationToml, /cwds = \[".+"\]/);
+    assert.match(automationToml, /name = "Weekly project brief"/);
+    assert.match(automationToml, /rrule = "FREQ=WEEKLY;BYDAY=FR;BYHOUR=9;BYMINUTE=30"/);
+    assert.match(automationToml, /cwds = \[\]/);
     assert.match(automationToml, /model = "test-model"/);
-    assert.match(automationToml, /reasoning_effort = "xhigh"/);
-    assert.match(automationToml, /notification_policy = "always"/);
+    assert.match(automationToml, /reasoning_effort = "ultra"/);
+    assert.match(automationToml, /notification_policy = "failed_runs_only"/);
     assert.match(automationToml, /status = "PAUSED"/);
-    assert.doesNotMatch(automationToml, /target =/);
+    assert.match(automationToml, /target = \{ type = "projectless" \}/);
     const activatedAutomation = await fetch(
       `${baseUrl}/api/automations/daily-project-brief/status`,
       {
@@ -1127,7 +1239,9 @@ updated_at = 1784422800000
     assert.match(page, /freezeTurnProcessElapsed\(conversation\.updatedAt,completingTurnId\)/);
     assert.match(page, /freezeTurnProcessElapsed\('',activeNativeTurnId\);clearLiveTurnProgress\(\);webRunActive=false/);
     assert.match(page, /function createActivityCluster/);
-    assert.match(page, /function createActivityCluster[\s\S]*?cluster\.open=true;/);
+    assert.match(page, /function createActivityCluster[\s\S]*?cluster\.open=false;/);
+    assert.match(page, /currentActivityCluster\.dataset\.activityLive='true'/);
+    assert.match(page, /cluster\.dataset\.activityLive==='true'/);
     assert.match(page, /function updateTurnReasoningStatus/);
     assert.match(page, /if\(!turnReasoningStatus\)\{[\s\S]*turnReasoningStatus\.textContent=clean;[\s\S]*turnProcessTimeline\.appendChild\(turnReasoningStatus\)/);
     assert.doesNotMatch(page, /pendingActivityClusterTitle/);
@@ -1140,7 +1254,7 @@ updated_at = 1784422800000
     assert.match(page, /function markSubagentTraceFinal/);
     assert.match(page, /if\(kind==='reasoning_summary'\)return false/);
     assert.match(page, /\/api\/native-sessions\/'\+encodeURIComponent\(state\.parentThreadId\)\+'\/subagents/);
-    assert.match(page, /row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(item\.status==='running'\)[\s\S]*row\.appendChild\(running\);\s*}\s*if\(source==='codex'\)/s);
+    assert.match(page, /if\(source==='codex'\)\{\s*if\(running\)row\.appendChild\(running\);[\s\S]*row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(running&&source!=='codex'\)row\.appendChild\(running\)/s);
     assert.match(page, /galleryOnly:true/);
     assert.doesNotMatch(page, /base\+\(index\+1\)\+generation/);
     assert.match(page, /continueMsg messageAction/);
@@ -1197,8 +1311,29 @@ updated_at = 1784422800000
     assert.match(page, /function showNativeSteerOptimistically/);
     assert.match(page, /kind:'steering_user'/);
     assert.match(page, /steering_browser_comment/);
-    assert.match(page, /function createBrowserCommentDetails/);
+    assert.doesNotMatch(page, /createBrowserCommentDetails/);
     assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><button id="automationToggle"[^>]*>自动化安排<\/button><\/div><button id="settingsToggle"/);
+    assert.match(page, /function enhanceSubQuota/);
+    assert.match(page, /subQuotaToggle\.id='subQuotaToggle'/);
+    assert.match(page, /setIconLabel\(subQuotaToggle,'gauge','Sub2API 额度',false\)/);
+    assert.match(page, /subQuotaToggle\.setAttribute\('aria-controls','subQuotaSettingsDialog'\)/);
+    assert.match(page, /subQuotaPopover\.id='subQuotaPopover'/);
+    assert.match(page, /pointerenter.*showSubQuotaPreview/);
+    assert.match(page, /subQuotaToggle\.addEventListener\('click',openSubQuotaSettings\)/);
+    assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
+    assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
+    assert.match(page, /subQuotaSettingsDialog\.setAttribute\('aria-modal','true'\)/);
+    assert.match(page, /function openSubQuotaSettings\(\)/);
+    assert.match(page, /function closeSubQuotaSettings\(\)/);
+    assert.match(page, /subQuotaSettingsClose\.addEventListener\('click',closeSubQuotaSettings\)/);
+    assert.match(page, /event\.target===subQuotaSettingsOverlay\)closeSubQuotaSettings\(\)/);
+    assert.match(page, /subQuotaSettingsOverlay[^;]*closeSubQuotaSettings\(\);return/);
+    assert.match(page, /subQuotaSettingsForm\.addEventListener\('submit',submitSubQuotaSettings\)/);
+    assert.doesNotMatch(page, /subQuotaToggle\.addEventListener\('click',\(\)=>openSettings/);
+    assert.doesNotMatch(page, /settingsPanel\.appendChild\(subQuotaSection\)/);
+    assert.match(page, /fetch\('\/api\/sub-quota-config'/);
+    assert.match(page, /fetch\('\/api\/sub-quotas'/);
+    assert.match(page, /!subQuotaToggle\?\.contains\(event\.target\)/);
     assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
     assert.match(page, /id="automationView"[^>]*aria-labelledby="automationViewTitle"/);
     assert.match(page, /让 ChatGPT 安排任务、设置提醒或监测更新/);
@@ -1234,6 +1369,7 @@ updated_at = 1784422800000
     assert.match(page, /永久删除全部已归档任务/);
     assert.match(page, /function createTurnResultArtifacts/);
     assert.match(page, /function createEditedFilesResultCard/);
+    assert.match(page, /status\.className='turnResultStatus';\s*status\.textContent='已完成'/);
     assert.match(page, /function createWebPreviewResultCard/);
     assert.match(page, /function refreshLiveEditedFilesResult/);
     assert.match(page, /createEditedFilesResultCard\(files,'',\{live:true,plan:liveTurnPlan\}\)/);
@@ -1249,7 +1385,25 @@ updated_at = 1784422800000
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
     assert.match(page, /<option value="ultra">ultra<\/option>/);
     assert.match(page, /\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)/);
-    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\s*\{ preserveProviderModel: true \}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
+    assert.match(page, /function rememberNativeComposerOverride\(\)/);
+    assert.match(page, /provider\?\.addEventListener\('change',async\(\)=>\{rememberNativeComposerOverride\(\);await loadModels\(provider\.value\);rememberNativeComposerOverride\(\);syncComposerChrome\(\)\}\)/);
+    assert.match(page, /reasoningEffort\?\.addEventListener\('change',\(\)=>\{rememberNativeComposerOverride\(\);syncComposerChrome\(\)\}\)/);
+    assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*reasoningEffort:/);
+    assert.match(page, /if\(!preserveProviderModel&&\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)\)/);
+    assert.match(page, /if\(!preserveProviderModel&&metadata\.modelProvider/);
+    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort\);\s*const res=await fetch\(endpoint/);
+    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort\)/);
+    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort\);/);
+    assert.match(page, /for\(const control of \[provider,model,reasoningEffort\]\)control\.disabled=legacyLocked/);
+    assert.match(page, /if\(webRunActive\)closeLockedComposerPopovers\(\{includeModel:legacyLocked\}\)/);
+    assert.doesNotMatch(page, /if\(webRunActive\)closeComposerPopovers\(\)/);
+    assert.match(page, /createComposerModelMenuRow\('model','模型'\)/);
+    assert.match(page, /createComposerModelMenuRow\('reasoning','推理强度'\)/);
+    assert.match(page, /createComposerModelMenuRow\('advanced','高级'\)/);
+    assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
+    assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
+    assert.match(page, /运行中修改将用于下一条消息/);
+    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -2163,6 +2317,11 @@ updated_at = 1784422800000
     assert.equal(planOnlyProgressCard.tagName, 'DIV');
     assert.equal(planOnlyProgressCard.className, 'turnResultCard editedFilesResult live withPlan planOnly');
     assert.equal(planOnlyProgressCard.children.length, 1);
+    assert.equal(planOnlyProgressCard.children[0].tabIndex, 0);
+    const planTooltip = planOnlyProgressCard.children[0].children.find((node) => node.className === 'turnPlanTooltip');
+    assert.ok(planTooltip);
+    assert.equal(planTooltip.attributes.get('role'), 'tooltip');
+    assert.deepEqual(planTooltip.children.map((node) => node.children.find((child) => child.className === 'turnPlanTooltipText')?.textContent), referencePlan.map((item) => item.step));
 
     const liveResultHelpers = inlineScript.match(
       /(function moveLiveEditedFilesResultToEnd[\s\S]*?)(?=function createWebPreviewResultCard)/,
@@ -2695,118 +2854,6 @@ updated_at = 1784422800000
     });
     assert.equal(desktopInterrupted.status, 200);
 
-    const forksBeforeActiveSwitch = (await readFile(appServerTraceFile, 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line))
-      .filter((message) => message.method === 'thread/fork').length;
-    await writeFile(appServerControlFile, JSON.stringify({
-      inProgressThreadId: nativeSessionId,
-      inProgressTurnId: nativeSecondTurnId,
-    }));
-    const activeSwitch = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: 'switch while active',
-        provider: 'alternate',
-        model: 'alternate-model',
-        cwd: temporary,
-        sandbox: 'read-only',
-        approval: 'on-request',
-      }),
-    });
-    assert.equal(activeSwitch.status, 409);
-    assert.match((await activeSwitch.json()).error, /当前任务仍在运行/);
-    const forksAfterActiveSwitch = (await readFile(appServerTraceFile, 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line))
-      .filter((message) => message.method === 'thread/fork').length;
-    assert.equal(forksAfterActiveSwitch, forksBeforeActiveSwitch);
-    await writeFile(appServerControlFile, '{}');
-
-    const desktopStartsBeforeProviderSwitch = desktopIpc.messages.filter(
-      (message) => message.method === 'thread-follower-start-turn',
-    ).length;
-    desktopIpc.ownerAvailable = false;
-    const switchedProvider = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: 'switch provider',
-        provider: 'alternate',
-        model: 'alternate-model',
-        cwd: temporary,
-        sandbox: 'read-only',
-        approval: 'on-request',
-      }),
-    });
-    assert.equal(switchedProvider.status, 202);
-    const switchedProviderPayload = await switchedProvider.json();
-    assert.ok(switchedProviderPayload.turnId);
-    assert.equal(
-      desktopIpc.messages.filter((message) => message.method === 'thread-follower-start-turn').length,
-      desktopStartsBeforeProviderSwitch,
-    );
-    const switchedProviderMessages = (await readFile(appServerTraceFile, 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line));
-    const switchedProviderFork = switchedProviderMessages.findLast((message) => message.method === 'thread/fork');
-    assert.equal(switchedProviderFork.params.threadId, nativeSessionId);
-    assert.equal(switchedProviderFork.params.lastTurnId, nativeSecondTurnId);
-    assert.equal(switchedProviderFork.params.modelProvider, 'alternate');
-    assert.equal(switchedProviderFork.params.model, 'alternate-model');
-    assert.equal(switchedProviderPayload.threadId, forkedNativeSessionId);
-    assert.equal(switchedProviderPayload.sourceThreadId, nativeSessionId);
-    const interruptedProviderSwitch = await fetch(`${baseUrl}/api/native-sessions/${switchedProviderPayload.threadId}/interrupt`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ turnId: switchedProviderPayload.turnId }),
-    });
-    assert.equal(interruptedProviderSwitch.status, 200);
-    desktopIpc.ownerAvailable = true;
-
-    const desktopStartsBeforeModelSwitch = desktopIpc.messages.filter(
-      (message) => message.method === 'thread-follower-start-turn',
-    ).length;
-    const switchedModel = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: 'switch model',
-        provider: 'fake',
-        model: 'new-model',
-        cwd: temporary,
-        sandbox: 'read-only',
-        approval: 'on-request',
-      }),
-    });
-    assert.equal(switchedModel.status, 202);
-    const switchedModelPayload = await switchedModel.json();
-    assert.equal(
-      desktopIpc.messages.filter((message) => message.method === 'thread-follower-start-turn').length,
-      desktopStartsBeforeModelSwitch,
-    );
-    const modelSwitchMessages = (await readFile(appServerTraceFile, 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line));
-    const switchedModelFork = modelSwitchMessages.findLast((message) => message.method === 'thread/fork');
-    assert.equal(switchedModelFork.params.threadId, nativeSessionId);
-    assert.equal(switchedModelFork.params.lastTurnId, nativeSecondTurnId);
-    assert.equal(switchedModelFork.params.modelProvider, 'fake');
-    assert.equal(switchedModelFork.params.model, 'new-model');
-    assert.equal(switchedModelPayload.threadId, forkedNativeSessionId);
-    assert.equal(switchedModelPayload.sourceThreadId, nativeSessionId);
-    const interruptedModelSwitch = await fetch(`${baseUrl}/api/native-sessions/${switchedModelPayload.threadId}/interrupt`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ turnId: switchedModelPayload.turnId }),
-    });
-    assert.equal(interruptedModelSwitch.status, 200);
-
     desktopIpc.startTurnMode = 'echo-only';
     desktopIpc.onStartTurn = async (message) => {
       const text = message.params.turnStartParams.input.find((item) => item.type === 'text')?.text || '';
@@ -3004,7 +3051,7 @@ updated_at = 1784422800000
       text_elements: [],
     }]);
     assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
-    assert.equal(desktopStart.params.turnStartParams.modelProvider, 'fake');
+    assert.equal(desktopStart.params.turnStartParams.model, 'test-model');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
@@ -3038,6 +3085,7 @@ updated_at = 1784422800000
     assert.ok(trace.args.includes('model_reasoning_effort="max"'));
     assert.equal(trace.codexHome, codexHome);
     assert.equal(trace.home, temporary);
+    assert.equal(trace.sub2ApiKey, undefined);
 
     const created = await fetch(`${baseUrl}/api/native-sessions`, {
       method: 'POST',
@@ -3143,6 +3191,43 @@ updated_at = 1784422800000
     });
     assert.equal(stoppedForProjectArchive.status, 200);
 
+    const desktopStartsBeforeProviderSwitch = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-follower-start-turn',
+    ).length;
+    const mismatchedProvider = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'switch native provider',
+        provider: 'custom',
+        model: 'custom-model',
+        reasoningEffort: 'max',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(mismatchedProvider.status, 202);
+    const mismatchedProviderPayload = await mismatchedProvider.json();
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-start-turn').length,
+      desktopStartsBeforeProviderSwitch,
+    );
+    const mismatchedProviderConversation = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}`,
+      { headers: { Cookie: cookie } },
+    );
+    const mismatchedProviderMetadata = (await mismatchedProviderConversation.json()).conversation.metadata;
+    assert.equal(mismatchedProviderMetadata.modelProvider, 'custom');
+    assert.equal(mismatchedProviderMetadata.model, 'custom-model');
+
+    const mismatchedInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: mismatchedProviderPayload.turnId }),
+    });
+    assert.equal(mismatchedInterrupted.status, 200);
+
     const archivedProject = await fetch(`${baseUrl}/api/native-projects/archive`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -3182,6 +3267,7 @@ updated_at = 1784422800000
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
+    assert.ok(protocolMessages.some((message) => message.type === 'process_env' && message.sub2ApiKey === undefined));
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
     assert.ok(protocolMessages.some((message) => (
@@ -3261,9 +3347,14 @@ updated_at = 1784422800000
         .length,
       createdDeleteCountBeforeBulkRace,
     );
-    const resumeMessages = protocolMessages.filter((message) => message.method === 'thread/resume');
-    assert.equal(resumeMessages.length, 1);
-    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 4);
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 2);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 3);
+    const switchedProviderResume = protocolMessages.find((message) => (
+      message.method === 'thread/resume'
+      && message.params.modelProvider === 'custom'
+    ));
+    assert.ok(switchedProviderResume);
+    assert.equal(switchedProviderResume.params.model, 'custom-model');
     const restartFromFirstMessage = protocolMessages.find((message) => (
       message.method === 'thread/start'
       && message.params.sandbox === 'read-only'
@@ -3271,34 +3362,18 @@ updated_at = 1784422800000
     ));
     assert.ok(restartFromFirstMessage);
     const forkMessages = protocolMessages.filter((message) => message.method === 'thread/fork');
-    assert.equal(forkMessages.length, 4);
-    const forkMessage = forkMessages.find((message) => (
-      message.params.threadId === nativeSessionId
-      && message.params.lastTurnId === nativeFirstTurnId
-      && message.params.modelProvider === 'fake'
-    ));
-    assert.ok(forkMessage);
+    assert.equal(forkMessages.length, 2);
+    const forkMessage = forkMessages[0];
     assert.equal(forkMessage.params.threadId, nativeSessionId);
     assert.equal(forkMessage.params.lastTurnId, nativeFirstTurnId);
     assert.equal(forkMessage.params.sandbox, 'workspace-write');
     assert.equal(forkMessage.params.approvalPolicy, 'on-request');
-    assert.ok(forkMessages.some((message) => (
-      message.params.threadId === nativeSessionId
-      && message.params.lastTurnId === nativeSecondTurnId
-      && message.params.modelProvider === 'alternate'
-      && message.params.model === 'alternate-model'
-    )));
-    assert.ok(forkMessages.some((message) => (
-      message.params.threadId === nativeSessionId
-      && message.params.lastTurnId === nativeSecondTurnId
-      && message.params.modelProvider === 'fake'
-      && message.params.model === 'new-model'
-    )));
     const turnStartMessages = protocolMessages.filter((message) => message.method === 'turn/start');
-    const workspaceWriteTurn = turnStartMessages.find((message) => message.params.sandboxPolicy.type === 'workspaceWrite');
-    assert.ok(workspaceWriteTurn);
-    assert.deepEqual(workspaceWriteTurn.params.sandboxPolicy.writableRoots, [temporary]);
-    assert.ok(turnStartMessages.some((message) => message.params.sandboxPolicy.type === 'readOnly'));
+    assert.equal(turnStartMessages[0].params.sandboxPolicy.type, 'workspaceWrite');
+    assert.deepEqual(turnStartMessages[0].params.sandboxPolicy.writableRoots, [temporary]);
+    assert.equal(turnStartMessages[1].params.sandboxPolicy.type, 'readOnly');
+    assert.equal(turnStartMessages[2].params.model, 'custom-model');
+    assert.equal(turnStartMessages[2].params.effort, 'max');
     const steerMessage = protocolMessages.find((message) => message.method === 'turn/steer');
     assert.equal(steerMessage.params.expectedTurnId, continuedPayload.turnId);
     assert.deepEqual(steerMessage.params.input, [{ type: 'text', text: 'change direction while running' }]);
@@ -3359,10 +3434,22 @@ updated_at = 1784422800000
     child = undefined;
     await unlink(path.join(runtime, 'port'));
 
-    child = await startServer({ temporary, runtime, codexHome, fakeCodex, traceFile, appServerTraceFile, webEnv });
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+      webEnv,
+      sub2ApiBaseUrl: providerBaseUrl,
+    });
     port = await waitForServer(child, runtime);
     const restored = await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { Cookie: cookie } });
     assert.equal(restored.status, 200);
+    const restoredSubQuotaConfig = await fetch(`http://127.0.0.1:${port}/api/sub-quota-config`, { headers: { Cookie: cookie } });
+    assert.equal(restoredSubQuotaConfig.status, 200);
+    assert.equal((await restoredSubQuotaConfig.json()).keyConfigured, true);
   } finally {
     if (child) await stopServer(child);
     if (desktopIpc) await desktopIpc.close();
@@ -3501,10 +3588,10 @@ function startServer({
   desktopIpcEnabled = 'false',
   desktopIpcSocket = '',
   playgroundProxyAllowedOrigins = '',
+  sub2ApiBaseUrl,
+  sub2ApiKey,
 }) {
-  return spawn(process.execPath, [path.join(ROOT, 'server.mjs')], {
-    cwd: ROOT,
-    env: {
+  const env = {
       ...process.env,
       APP_NAME: 'Codex Web Test',
       CODEX_WEB_PASSWORD: 'test-password',
@@ -3531,7 +3618,14 @@ function startServer({
       FAKE_CODEX_TRACE: traceFile,
       FAKE_APP_SERVER_TRACE: appServerTraceFile,
       FAKE_APP_SERVER_CONTROL: appServerControlFile,
-    },
+  };
+  delete env.SUB2API_BASE_URL;
+  delete env.SUB2API_API_KEY;
+  if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;
+  if (sub2ApiKey !== undefined) env.SUB2API_API_KEY = sub2ApiKey;
+  return spawn(process.execPath, [path.join(ROOT, 'server.mjs')], {
+    cwd: ROOT,
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }

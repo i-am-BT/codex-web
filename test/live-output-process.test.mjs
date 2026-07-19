@@ -194,7 +194,8 @@ test('active reasoning is temporary and collapse restores the owned cluster titl
     const cluster = {
       isConnected: true,
       open: true,
-      dataset: { activityReasoning: JSON.stringify(['Planning owned tool A']) },
+      dataset: { activityReasoning: JSON.stringify(['Planning owned tool A']), activityLive: 'true' },
+      classList: { remove() {} },
     };
     let currentActivityCluster = cluster;
     let turnReasoningStatus = null;
@@ -242,6 +243,7 @@ test('active reasoning is temporary and collapse restores the owned cluster titl
   assert.equal(api.state().cluster.dataset.reasoningActive, undefined);
   assert.deepEqual(JSON.parse(api.state().cluster.dataset.activityReasoning), ['Planning owned tool A']);
   assert.equal(api.state().cluster.open, false);
+  assert.equal(api.state().cluster.dataset.activityLive, undefined);
   assert.equal(api.state().currentActivityCluster, null);
   assert.equal(api.state().updates, 4);
 });
@@ -445,8 +447,10 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.doesNotMatch(inlineScript, /function createTurnPlanElement|turnPlanPanel/);
   assert.doesNotMatch(uiStyles, /\.turnPlanPanel|\.turnPlanList|\.turnPlanStep/);
   assert.match(inlineScript, /function activityClusterPresentation\(cluster\)\{[\s\S]*?activityClusterReasoning\(cluster\)\.at\(-1\)/);
-  assert.match(inlineScript, /function createActivityCluster[\s\S]*?cluster\.open=true;/);
+  assert.match(inlineScript, /function createActivityCluster[\s\S]*?cluster\.open=false;/);
   assert.match(inlineScript, /function collapseCurrentActivityCluster[\s\S]*?currentActivityCluster\.open=false/);
+  assert.match(inlineScript, /currentActivityCluster\.dataset\.activityLive='true'/);
+  assert.match(inlineScript, /cluster\.dataset\.activityLive==='true'/);
   assert.match(inlineScript, /function markCurrentActivityItem[\s\S]*?current\.dataset\.current='true'/);
   assert.match(inlineScript, /if\(expandable\)item\.open=false;/);
   assert.match(inlineScript, /if\(item\.tagName==='DETAILS'\)item\.open=false;/);

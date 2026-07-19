@@ -79,6 +79,45 @@ export class AutomationStore {
     return item;
   }
 
+  update(id, input) {
+    const current = this.get(id);
+    if (!current) return null;
+    const name = cleanText(input.name, 120, '自动化名称');
+    const prompt = cleanText(input.prompt, 12000, '任务说明');
+    const rrule = normalizeRrule(input.rrule);
+    const model = cleanOptionalText(input.model, 120);
+    const reasoningEffort = cleanOptionalText(input.reasoningEffort, 24);
+    const notificationPolicy = cleanOptionalText(input.notificationPolicy, 40);
+    const status = VALID_STATUS.has(input.status) ? input.status : current.status;
+    if (reasoningEffort && !VALID_REASONING.has(reasoningEffort)) throw new Error('思考档位无效');
+    if (notificationPolicy && !VALID_NOTIFICATION.has(notificationPolicy)) throw new Error('通知策略无效');
+
+    const item = {
+      ...current,
+      name,
+      prompt,
+      status,
+      rrule,
+      model: model || null,
+      reasoningEffort: reasoningEffort || null,
+      notificationPolicy: notificationPolicy || null,
+      updatedAt: Date.now(),
+    };
+    if (current.kind === 'cron') {
+      const preserveTarget = input.preserveTarget === true
+        && current.target
+        && current.target.type !== 'projectless'
+        && !(current.cwds || []).length;
+      if (!preserveTarget) {
+        const cwd = cleanOptionalText(input.cwd, 2048);
+        item.target = cwd ? null : { type: 'projectless' };
+        item.cwds = cwd ? [cwd] : [];
+      }
+    }
+    this.write(item);
+    return item;
+  }
+
   setStatus(id, status) {
     if (!VALID_STATUS.has(status)) throw new Error('自动化状态无效');
     const current = this.get(id);

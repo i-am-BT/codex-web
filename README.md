@@ -73,6 +73,10 @@ cp .env.example .env
 | `SESSION_TTL_HOURS` | 登录有效期，默认 168 小时 |
 | `HOMEPAGE_API_TOKEN` | Homepage 统计接口访问令牌；未设置时接口禁用 |
 | `HOMEPAGE_MODEL_CACHE_SECONDS` | Homepage 模型数量缓存秒数，默认 60 |
+| `SUB2API_BASE_URL` | 要监控的单个 Sub2API 服务地址；与 API Key 同时设置后启用额度入口 |
+| `SUB2API_API_KEY` | 目标 Sub2API 渠道的 API Key，仅保存在服务端本地 `.env` |
+| `SUB_QUOTA_TIMEOUT_MS` | Sub2API 额度请求超时，默认 10000 毫秒 |
+| `SUB_QUOTA_CACHE_SECONDS` | Sub2API 额度结果缓存时间，默认 30 秒 |
 | `IMAGE_PROMPT_AUTO_SYNC` | 启动时及定时检查 `awesome-gpt-image-2` 更新，默认开启 |
 | `IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` | 提示词库自动检查间隔，默认 360 分钟 |
 | `IMAGE_PROMPT_SYNC_TIMEOUT_MS` | 单次 GitHub 请求超时，默认 20000 毫秒 |
@@ -93,6 +97,19 @@ cp .env.example .env
 | `DEFAULT_CWD` | 新会话默认工作目录 |
 | `DEFAULT_SANDBOX` | Codex 默认沙箱模式 |
 | `DEFAULT_APPROVAL` | Codex 默认审批模式 |
+
+### Sub2API 单渠道额度
+
+左侧额度入口只查询一个 Sub2API 渠道。悬停额度图标显示只读额度卡，点击图标进入 Key 设置并立即检测。服务端使用 `SUB2API_BASE_URL` 和 `SUB2API_API_KEY` 请求该服务的 `/v1/usage`；Web 不会枚举其他渠道，也不会读取 Codex Provider 或 AxonHub 的额度记录。
+
+```dotenv
+SUB2API_BASE_URL=https://sub2api.example.com
+SUB2API_API_KEY=<replace-with-the-target-channel-api-key>
+SUB_QUOTA_TIMEOUT_MS=10000
+SUB_QUOTA_CACHE_SECONDS=30
+```
+
+如果 Sub2API 中配置了多个渠道，请填写目标渠道对应的 API Key。真实 `SUB2API_API_KEY` 只应写入已忽略的本地 `.env`，不要写入 `.env.example`、README、提交记录或浏览器端代码；额度请求的 `Authorization` 头由 Codex Web 服务端添加。点击设置时 Key 输入框不会回显现有值。未同时配置地址和 Key 时，额度入口会显示未配置状态。
 
 本仓库已默认忽略 `.env`、`runtime/` 和 `node_modules/`。请勿手动移除忽略规则或强制提交这些本地敏感/运行时文件。
 
