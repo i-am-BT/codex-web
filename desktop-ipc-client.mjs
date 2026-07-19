@@ -47,17 +47,40 @@ export function isCodexDesktopIpcUnavailableError(error) {
     || error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE';
 }
 
-export function defaultCodexDesktopIpcSocketPath() {
-  if (process.platform === 'win32') return String.raw`\\.\pipe\codex-ipc`;
-  const uid = process.getuid?.();
-  return path.join(os.tmpdir(), 'codex-ipc', uid === undefined ? 'ipc.sock' : `ipc-${uid}.sock`);
+export function defaultCodexDesktopIpcSocketPath(options = {}) {
+  return defaultCodexDesktopIpcSocketPaths(options)[0];
+}
+
+export function defaultCodexDesktopIpcSocketPaths(options = {}) {
+  if (process.platform === 'win32') return [String.raw`\\.\pipe\codex-ipc`];
+  const codexHome = String(
+    options.codexHome
+      || process.env.CODEX_HOME
+      || path.join(os.homedir(), '.codex'),
+  );
+  const uid = options.uid === undefined ? process.getuid?.() : options.uid;
+  const legacySocket = path.join(
+    options.tmpDir || os.tmpdir(),
+    'codex-ipc',
+    uid ? `ipc-${uid}.sock` : 'ipc.sock',
+  );
+  const currentSocket = path.join(codexHome, 'ipc', 'ipc.sock');
+  return [...new Set([currentSocket, legacySocket])];
 }
 
 export class CodexDesktopIpcClient extends EventEmitter {
   constructor(options = {}) {
     super();
     this.enabled = options.enabled !== false;
-    this.socketPath = options.socketPath || defaultCodexDesktopIpcSocketPath();
+    const configuredSocketPath = String(options.socketPath || '').trim();
+    this.socketPaths = configuredSocketPath
+      ? [configuredSocketPath]
+      : defaultCodexDesktopIpcSocketPaths({
+        codexHome: options.codexHome,
+        tmpDir: options.tmpDir,
+        uid: options.uid,
+      });
+    this.socketPath = this.socketPaths[0];
     this.clientType = options.clientType || 'codex-web';
     this.connectTimeoutMs = positiveTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
     this.requestTimeoutMs = positiveTimeout(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
@@ -218,7 +241,22 @@ export class CodexDesktopIpcClient extends EventEmitter {
   }
 
   async connectAndInitialize() {
+    let lastError;
+    for (const socketPath of this.socketPaths) {
+      try {
+        await this.connectAndInitializeAt(socketPath);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (!error?.retryableSocketPath) throw error;
+      }
+    }
+    throw lastError;
+  }
+
+  async connectAndInitializeAt(socketPath) {
     this.closing = false;
+    this.socketPath = socketPath;
     const socket = net.createConnection(this.socketPath);
     this.socket = socket;
     this.readBuffer = Buffer.alloc(0);
@@ -240,8 +278,23 @@ export class CodexDesktopIpcClient extends EventEmitter {
       if (this.socket === socket) this.socket = null;
       socket.destroy();
       this.clientId = INITIAL_CLIENT_ID;
+      if (isCodexDesktopIpcUnavailableError(error)) throw error;
+      const retryableSocketPath = [
+        'ENOENT',
+        'ECONNREFUSED',
+        'ENOTSOCK',
+        'ETIMEDOUT',
+        'EPIPE',
+        'ECONNRESET',
+      ].includes(error?.code);
       const reason = error?.code === 'ENOENT' ? 'socket-not-found' : 'connect-failed';
-      throw new CodexDesktopIpcUnavailableError(`Codex Desktop IPC 不可用: ${error.message}`, reason, { cause: error });
+      const unavailable = new CodexDesktopIpcUnavailableError(
+        `Codex Desktop IPC 不可用: ${error.message}`,
+        reason,
+        { cause: error },
+      );
+      unavailable.retryableSocketPath = retryableSocketPath;
+      throw unavailable;
     }
   }
 
@@ -321,8 +374,12 @@ export class CodexDesktopIpcClient extends EventEmitter {
         return;
       }
       const reason = String(message.error || 'request-failed');
-      if (SAFE_FALLBACK_ERRORS.has(reason)) {
-        pending.reject(new CodexDesktopIpcUnavailableError(`Codex Desktop IPC 无可用 App owner: ${reason}`, reason));
+      const safeFallbackReason = reason.split(':', 1)[0].trim();
+      if (SAFE_FALLBACK_ERRORS.has(safeFallbackReason)) {
+        pending.reject(new CodexDesktopIpcUnavailableError(
+          `Codex Desktop IPC 无可用 App owner: ${reason}`,
+          safeFallbackReason,
+        ));
         return;
       }
       const error = new Error(`Codex Desktop IPC 请求失败: ${reason}`);
