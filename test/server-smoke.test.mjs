@@ -44,6 +44,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
       providerRequests.push({
         method: req.method,
         url: req.url,
+        host: req.headers.host || '',
         authorization: req.headers.authorization || '',
         contentType: req.headers['content-type'] || '',
         body,
@@ -809,24 +810,60 @@ if (args[0] === 'app-server') {
     assert.equal(subQuotaConfigPayload.keyConfigured, true);
     assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
 
+    const rejectedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl: 'file:///tmp/sub2api', apiKey: 'new-sub-key' }),
+    });
+    assert.equal(rejectedSubQuotaUrl.status, 400);
+    assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /SUB2API_BASE_URL/);
+
     const rejectedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiKey: 'bad-sub-key' }),
+      body: JSON.stringify({ baseUrl: `${customProviderBaseUrl}/`, apiKey: 'bad-sub-key' }),
     });
     assert.equal(rejectedSubQuotaKey.status, 422);
     assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /bad-sub-key/);
+    assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), new RegExp(customProviderBaseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 
     const updatedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiKey: 'new-sub-key' }),
+      body: JSON.stringify({ baseUrl: `${customProviderBaseUrl}/`, apiKey: 'new-sub-key' }),
     });
     assert.equal(updatedSubQuotaKey.status, 200);
-    assert.doesNotMatch(await updatedSubQuotaKey.text(), /new-sub-key/);
-    assert.match(await readFile(webEnv, 'utf8'), /^SUB2API_API_KEY="new-sub-key"$/m);
+    const updatedSubQuotaPayload = await updatedSubQuotaKey.json();
+    assert.equal(updatedSubQuotaPayload.baseUrl, customProviderBaseUrl);
+    assert.doesNotMatch(JSON.stringify(updatedSubQuotaPayload), /new-sub-key/);
+    let persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
+    assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(customProviderBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+    assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
     assert.equal((await stat(webEnv)).mode & 0o777, 0o600);
     assert.equal(providerRequests.at(-1).authorization, 'Bearer new-sub-key');
+    assert.equal(providerRequests.at(-1).host, new URL(customProviderBaseUrl).host);
+
+    const updatedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl: `${providerBaseUrl}/v1/usage`, apiKey: '' }),
+    });
+    assert.equal(updatedSubQuotaUrl.status, 200);
+    assert.equal((await updatedSubQuotaUrl.json()).baseUrl, providerBaseUrl);
+    persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
+    assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(providerBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+    assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
+    assert.equal(providerRequests.at(-1).authorization, 'Bearer new-sub-key');
+    assert.equal(providerRequests.at(-1).host, new URL(providerBaseUrl).host);
+
+    const refreshedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(refreshedSubQuotaConfig.status, 200);
+    const refreshedSubQuotaConfigPayload = await refreshedSubQuotaConfig.json();
+    assert.equal(refreshedSubQuotaConfigPayload.baseUrl, providerBaseUrl);
+    assert.equal(refreshedSubQuotaConfigPayload.keyConfigured, true);
+    assert.doesNotMatch(JSON.stringify(refreshedSubQuotaConfigPayload), /new-sub-key/);
 
     const subQuotas = await fetch(`${baseUrl}/api/sub-quotas`, {
       headers: { Cookie: cookie },
@@ -1324,6 +1361,12 @@ updated_at = 1784422800000
     assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
     assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
     assert.match(page, /subQuotaSettingsDialog\.setAttribute\('aria-modal','true'\)/);
+    assert.match(page, /subQuotaBaseUrlInput\.type='url'/);
+    assert.match(page, /subQuotaBaseUrlInput\.required=true/);
+    assert.match(page, /subQuotaBaseUrlInput\.autocomplete='url'/);
+    assert.match(page, /subQuotaBaseUrlInput\.value=data\.baseUrl\|\|''/);
+    assert.match(page, /data\.keyConfigured\?'Key 已配置，留空保留':'输入 Sub2API API Key'/);
+    assert.match(page, /JSON\.stringify\(\{baseUrl:subQuotaBaseUrlInput\.value,apiKey:subQuotaApiKeyInput\.value\}\)/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);
     assert.match(page, /subQuotaSettingsClose\.addEventListener\('click',closeSubQuotaSettings\)/);
@@ -3450,7 +3493,9 @@ updated_at = 1784422800000
     assert.equal(restored.status, 200);
     const restoredSubQuotaConfig = await fetch(`http://127.0.0.1:${port}/api/sub-quota-config`, { headers: { Cookie: cookie } });
     assert.equal(restoredSubQuotaConfig.status, 200);
-    assert.equal((await restoredSubQuotaConfig.json()).keyConfigured, true);
+    const restoredSubQuotaConfigPayload = await restoredSubQuotaConfig.json();
+    assert.equal(restoredSubQuotaConfigPayload.baseUrl, providerBaseUrl);
+    assert.equal(restoredSubQuotaConfigPayload.keyConfigured, true);
   } finally {
     if (child) await stopServer(child);
     if (desktopIpc) await desktopIpc.close();

@@ -100,7 +100,7 @@ cp .env.example .env
 
 ### Sub2API 单渠道额度
 
-左侧额度入口只查询一个 Sub2API 渠道。悬停额度图标显示只读额度卡，点击图标进入 Key 设置并立即检测。服务端使用 `SUB2API_BASE_URL` 和 `SUB2API_API_KEY` 请求该服务的 `/v1/usage`；Web 不会枚举其他渠道，也不会读取 Codex Provider 或 AxonHub 的额度记录。
+左侧额度入口只查询一个 Sub2API 渠道。悬停额度图标显示只读额度卡，点击图标可填写 API URL 与 API Key，并在保存时立即检测。服务端使用 `SUB2API_BASE_URL` 和 `SUB2API_API_KEY` 请求该服务的 `/v1/usage`；Web 不会枚举其他渠道，也不会读取 Codex Provider 或 AxonHub 的额度记录。
 
 ```dotenv
 SUB2API_BASE_URL=https://sub2api.example.com
@@ -109,7 +109,7 @@ SUB_QUOTA_TIMEOUT_MS=10000
 SUB_QUOTA_CACHE_SECONDS=30
 ```
 
-如果 Sub2API 中配置了多个渠道，请填写目标渠道对应的 API Key。真实 `SUB2API_API_KEY` 只应写入已忽略的本地 `.env`，不要写入 `.env.example`、README、提交记录或浏览器端代码；额度请求的 `Authorization` 头由 Codex Web 服务端添加。点击设置时 Key 输入框不会回显现有值。未同时配置地址和 Key 时，额度入口会显示未配置状态。
+API URL 与 Key 均可在额度设置弹窗中保存，环境变量仍可用于首次或手工配置。如果 Sub2API 中配置了多个渠道，请填写目标渠道对应的 API Key。真实 `SUB2API_API_KEY` 只应写入已忽略的本地 `.env`，不要写入 `.env.example`、README、提交记录或浏览器端代码；额度请求的 `Authorization` 头由 Codex Web 服务端添加。点击设置时 Key 输入框不会回显现有值，留空不会替换当前 Key。未同时配置地址和 Key 时，额度入口会显示未配置状态。
 
 本仓库已默认忽略 `.env`、`runtime/` 和 `node_modules/`。请勿手动移除忽略规则或强制提交这些本地敏感/运行时文件。
 

@@ -678,16 +678,6 @@ body .subQuotaClose:hover {
   line-height: 1.5;
 }
 
-.subQuotaEndpoint {
-  min-width: 0;
-  overflow: hidden;
-  margin-bottom: 10px;
-  color: var(--text-subtle);
-  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .subQuotaSettingsForm {
   display: grid;
   gap: 10px;
@@ -695,6 +685,12 @@ body .subQuotaClose:hover {
 
 .subQuotaSettingsForm .field {
   margin: 0;
+}
+
+.subQuotaCredentialHint {
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .subQuotaSettingsSubmit {
@@ -734,13 +730,6 @@ body .subQuotaClose:hover {
 
 .subQuotaSettingsBody .subQuotaSettingsDescription {
   margin: 0;
-}
-
-.subQuotaSettingsBody .subQuotaEndpoint {
-  margin: 0;
-  border-radius: 8px;
-  background: var(--surface-raised);
-  padding: 8px 10px;
 }
 
 @media (prefers-reduced-motion: reduce) {

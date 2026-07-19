@@ -32,7 +32,7 @@ import {
   buildAutomationRrule,
   decorateAutomation,
 } from './automation-store.mjs';
-import { SubQuotaService } from './sub-quota.mjs';
+import { normalizeSubQuotaBaseUrl, SubQuotaService } from './sub-quota.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -543,16 +543,23 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
 
 app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
+  let candidateBaseUrl;
+  try {
+    candidateBaseUrl = normalizeSubQuotaBaseUrl(
+      req.body?.baseUrl === undefined ? subQuotaBaseUrl : req.body.baseUrl,
+    );
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
   const suppliedApiKey = String(req.body?.apiKey || '').trim();
-  const apiKey = suppliedApiKey;
-  if (!isHttpUrl(subQuotaBaseUrl)) return res.status(503).json({ error: 'Sub2API 地址尚未配置' });
+  const apiKey = suppliedApiKey || getSubQuotaApiKey();
   if (!apiKey) return res.status(400).json({ error: 'Sub2API API Key 不能为空' });
   if (apiKey.length > 4096 || /[\r\n\0]/.test(apiKey)) {
     return res.status(400).json({ error: 'Sub2API API Key 包含无效字符' });
   }
 
   try {
-    const candidate = createSubQuotaService(subQuotaBaseUrl, apiKey);
+    const candidate = createSubQuotaService(candidateBaseUrl, apiKey);
     const result = await candidate.list({ refresh: true });
     const quota = result.quotas[0];
     if (!quota || quota.error) {
@@ -560,11 +567,15 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
     }
     if (quota.valid === false) return res.status(422).json({ error: 'Sub2API API Key 已失效' });
 
-    updateEnvVar(ENV_FILE, 'SUB2API_API_KEY', apiKey);
+    updateEnvVars(ENV_FILE, {
+      SUB2API_BASE_URL: candidateBaseUrl,
+      ...(suppliedApiKey ? { SUB2API_API_KEY: apiKey } : {}),
+    });
+    subQuotaBaseUrl = candidateBaseUrl;
     subQuotaService = candidate;
     res.json({
       ok: true,
-      baseUrl: subQuotaBaseUrl,
+      baseUrl: candidateBaseUrl,
       keyConfigured: true,
       configured: true,
       quota: {
@@ -3669,20 +3680,28 @@ function removeTopLevelTomlValue(content, key) {
   return content.replace(new RegExp(`^${key}\\s*=.*(?:\\r?\\n|$)`, 'm'), '');
 }
 
-function updateEnvVar(file, key, value) {
+function updateEnvVars(file, values) {
   mkdirSync(path.dirname(file), { recursive: true });
   const lines = existsSync(file) ? readFileSync(file, 'utf8').split(/\r?\n/) : [];
-  const nextLine = `${key}=${JSON.stringify(String(value))}`;
-  let found = false;
+  const entries = new Map(Object.entries(values).map(([key, value]) => [key, JSON.stringify(String(value))]));
+  const found = new Set();
   const next = lines.map((line) => {
-    if (line.startsWith(`${key}=`)) {
-      found = true;
-      return nextLine;
+    const separator = line.indexOf('=');
+    const key = separator > 0 ? line.slice(0, separator) : '';
+    if (entries.has(key)) {
+      found.add(key);
+      return `${key}=${entries.get(key)}`;
     }
     return line;
   });
-  if (!found) next.push(nextLine);
+  for (const [key, value] of entries) {
+    if (!found.has(key)) next.push(`${key}=${value}`);
+  }
   atomicWriteFile(file, next.filter((line, index, arr) => line || index < arr.length - 1).join('\n') + '\n');
+}
+
+function updateEnvVar(file, key, value) {
+  updateEnvVars(file, { [key]: value });
 }
 
 function deleteEnvVar(file, key) {
@@ -3860,7 +3879,7 @@ const settingsToggle = document.getElementById('settingsToggle'), settingsPanel 
 const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
 const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
 let subQuotaToggle = null, subQuotaPopover = null, subQuotaStatus = null, subQuotaContent = null;
-let subQuotaSettingsForm = null, subQuotaApiKeyInput = null, subQuotaEndpoint = null, subQuotaSettingsStatus = null;
+let subQuotaSettingsForm = null, subQuotaBaseUrlInput = null, subQuotaApiKeyInput = null, subQuotaCredentialHint = null, subQuotaSettingsStatus = null;
 let subQuotaSettingsOverlay = null, subQuotaSettingsDialog = null, subQuotaSettingsClose = null, subQuotaSettingsReturnFocus = null;
 const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
@@ -4984,13 +5003,26 @@ function ensureSubQuotaSettingsDialog(){
   body.className='subQuotaSettingsBody';
   const subQuotaDescription=document.createElement('p');
   subQuotaDescription.className='subQuotaSettingsDescription';
-  subQuotaDescription.textContent='更新 API Key 后会立即检测，仅用于 Sub2API 额度监控。';
-  subQuotaEndpoint=document.createElement('div');
-  subQuotaEndpoint.className='subQuotaEndpoint';
-  subQuotaEndpoint.textContent='正在读取服务地址…';
+  subQuotaDescription.textContent='填写 API URL 与 API Key，保存后会立即检测，仅用于 Sub2API 额度监控。';
   subQuotaSettingsForm=document.createElement('form');
   subQuotaSettingsForm.id='subQuotaSettingsForm';
   subQuotaSettingsForm.className='subQuotaSettingsForm';
+  const subQuotaUrlField=document.createElement('label');
+  subQuotaUrlField.className='field';
+  const subQuotaUrlLabel=document.createElement('span');
+  subQuotaUrlLabel.textContent='API URL';
+  subQuotaBaseUrlInput=document.createElement('input');
+  subQuotaBaseUrlInput.id='subQuotaBaseUrl';
+  subQuotaBaseUrlInput.name='baseUrl';
+  subQuotaBaseUrlInput.type='url';
+  subQuotaBaseUrlInput.required=true;
+  subQuotaBaseUrlInput.maxLength=2048;
+  subQuotaBaseUrlInput.autocomplete='url';
+  subQuotaBaseUrlInput.inputMode='url';
+  subQuotaBaseUrlInput.spellcheck=false;
+  subQuotaBaseUrlInput.placeholder='https://sub2api.example.com';
+  subQuotaUrlField.appendChild(subQuotaUrlLabel);
+  subQuotaUrlField.appendChild(subQuotaBaseUrlInput);
   const subQuotaKeyField=document.createElement('label');
   subQuotaKeyField.className='field';
   const subQuotaKeyLabel=document.createElement('span');
@@ -5004,6 +5036,10 @@ function ensureSubQuotaSettingsDialog(){
   subQuotaApiKeyInput.placeholder='输入 Sub2API API Key';
   subQuotaKeyField.appendChild(subQuotaKeyLabel);
   subQuotaKeyField.appendChild(subQuotaApiKeyInput);
+  subQuotaCredentialHint=document.createElement('small');
+  subQuotaCredentialHint.className='subQuotaCredentialHint';
+  subQuotaCredentialHint.textContent='Key 未配置';
+  subQuotaKeyField.appendChild(subQuotaCredentialHint);
   const subQuotaSave=document.createElement('button');
   subQuotaSave.type='submit';
   subQuotaSave.className='miniPrimary subQuotaSettingsSubmit';
@@ -5011,11 +5047,11 @@ function ensureSubQuotaSettingsDialog(){
   subQuotaSettingsStatus=document.createElement('div');
   subQuotaSettingsStatus.className='errorText subQuotaSettingsStatus';
   subQuotaSettingsStatus.setAttribute('role','status');
+  subQuotaSettingsForm.appendChild(subQuotaUrlField);
   subQuotaSettingsForm.appendChild(subQuotaKeyField);
   subQuotaSettingsForm.appendChild(subQuotaSave);
   subQuotaSettingsForm.appendChild(subQuotaSettingsStatus);
   body.appendChild(subQuotaDescription);
-  body.appendChild(subQuotaEndpoint);
   body.appendChild(subQuotaSettingsForm);
   subQuotaSettingsDialog.appendChild(head);
   subQuotaSettingsDialog.appendChild(body);
@@ -5112,31 +5148,33 @@ function enhanceSettingsModal(){
   passwordForm.addEventListener('submit',submitPasswordChange);
 }
 async function syncSubQuotaSettings(){
-  if(!subQuotaEndpoint||!subQuotaSettingsStatus)return;
+  if(!subQuotaBaseUrlInput||!subQuotaApiKeyInput||!subQuotaSettingsStatus)return;
   subQuotaSettingsStatus.textContent='';
   subQuotaSettingsStatus.classList.remove('success');
   try{
     const response=await fetch('/api/sub-quota-config',{headers:{Accept:'application/json'}});
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'读取设置失败');
-    subQuotaEndpoint.textContent=(data.baseUrl||'未配置服务地址')+' · '+(data.keyConfigured?'Key 已配置':'Key 未配置');
-  }catch(error){subQuotaEndpoint.textContent=String(error?.message||'读取设置失败')}
+    subQuotaBaseUrlInput.value=data.baseUrl||'';
+    subQuotaApiKeyInput.placeholder=data.keyConfigured?'Key 已配置，留空保留':'输入 Sub2API API Key';
+    if(subQuotaCredentialHint)subQuotaCredentialHint.textContent=data.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，首次保存时必须填写';
+  }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'读取设置失败')}
 }
 async function submitSubQuotaSettings(event){
   event.preventDefault();
-  if(!subQuotaSettingsForm||!subQuotaApiKeyInput||!subQuotaSettingsStatus)return;
+  if(!subQuotaSettingsForm||!subQuotaBaseUrlInput||!subQuotaApiKeyInput||!subQuotaSettingsStatus)return;
   const submit=subQuotaSettingsForm.querySelector('[type="submit"]');
   submit.disabled=true;
   subQuotaSettingsStatus.classList.remove('success');
   subQuotaSettingsStatus.textContent='正在检测 Sub2API…';
   try{
-    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({apiKey:subQuotaApiKeyInput.value})});
+    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({baseUrl:subQuotaBaseUrlInput.value,apiKey:subQuotaApiKeyInput.value})});
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'检测失败');
     subQuotaApiKeyInput.value='';
+    await syncSubQuotaSettings();
     subQuotaSettingsStatus.classList.add('success');
     subQuotaSettingsStatus.textContent='检测通过，已启用 '+(data.quota?.planName||'Sub2API 额度监控');
-    await syncSubQuotaSettings();
     await loadSubQuota({refresh:true});
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'检测失败')}
   finally{submit.disabled=false}
@@ -5152,7 +5190,7 @@ function openSubQuotaSettings(){
   subQuotaToggle?.setAttribute('aria-expanded','true');
   syncModalOpenState();
   syncSubQuotaSettings();
-  requestAnimationFrame(()=>subQuotaApiKeyInput?.focus());
+  requestAnimationFrame(()=>subQuotaBaseUrlInput?.focus());
 }
 function closeSubQuotaSettings(){
   if(!subQuotaSettingsOverlay||subQuotaSettingsOverlay.classList.contains('hidden'))return;
@@ -5319,8 +5357,8 @@ function enhanceSubQuota(sideActions){
   subQuotaToggle.id='subQuotaToggle';
   subQuotaToggle.className='subQuotaToggle';
   subQuotaToggle.type='button';
-  subQuotaToggle.title='悬停查看 Sub2API 额度，点击设置 Key';
-  subQuotaToggle.setAttribute('aria-label','悬停查看 Sub2API 额度，点击设置 Key');
+  subQuotaToggle.title='悬停查看 Sub2API 额度，点击设置 API URL 与 Key';
+  subQuotaToggle.setAttribute('aria-label','悬停查看 Sub2API 额度，点击设置 API URL 与 Key');
   subQuotaToggle.setAttribute('aria-haspopup','dialog');
   subQuotaToggle.setAttribute('aria-controls','subQuotaSettingsDialog');
   subQuotaToggle.setAttribute('aria-describedby','subQuotaPopover');

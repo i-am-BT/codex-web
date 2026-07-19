@@ -4,6 +4,7 @@ const MAX_RESPONSE_BYTES = 1024 * 1024;
 const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 const ENV_KEY_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
 const RATE_LIMIT_WINDOWS = new Set(['5h', '1d', '7d']);
+const MAX_BASE_URL_LENGTH = 2048;
 
 export class SubQuotaService {
   constructor(options = {}) {
@@ -166,20 +167,29 @@ export function normalizeSubQuota(data) {
   };
 }
 
-function normalizeSubUsageUrl(value) {
+export function normalizeSubQuotaBaseUrl(value) {
+  const text = String(value || '').trim();
+  if (!text) throw new Error('Sub2API API URL 不能为空');
+  if (text.length > MAX_BASE_URL_LENGTH || /[\r\n\0]/.test(text)) {
+    throw new Error('Sub2API API URL 包含无效字符或过长');
+  }
   let url;
   try {
-    url = new URL(String(value || '').trim());
+    url = new URL(text);
   } catch {
-    throw new Error('Sub 额度来源 baseUrl 无效');
+    throw new Error('Sub2API API URL 无效');
   }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
-    throw new Error('Sub 额度来源 baseUrl 必须是 http/https URL');
+    throw new Error('Sub2API API URL 必须是无凭据的 http/https 地址');
   }
-  url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '') + '/v1/usage';
   url.search = '';
   url.hash = '';
-  return url.toString();
+  url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/v1\/usage$/i, '').replace(/\/v1$/i, '');
+  return url.toString().replace(/\/+$/, '');
+}
+
+function normalizeSubUsageUrl(value) {
+  return `${normalizeSubQuotaBaseUrl(value)}/v1/usage`;
 }
 
 function quotaWindow(usedValue, limitValue, remainingValue) {
