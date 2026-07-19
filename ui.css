@@ -5947,13 +5947,13 @@ body .composer {
 }
 
 body .composer:has(> .composerProjectPicker:not(.hidden)) {
-  width: min(calc(var(--composer-width) + 3px), calc(100% - 34px));
+  width: min(var(--composer-width), calc(100% - 34px));
   margin: 0 auto 18px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface);
-  padding: 20px 12px 12px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.025);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  box-shadow: none;
 }
 
 body[data-theme="light"] .composer {
@@ -5961,8 +5961,8 @@ body[data-theme="light"] .composer {
 }
 
 body[data-theme="light"] .composer:has(> .composerProjectPicker:not(.hidden)) {
-  border-color: #eceef1;
-  background: #ffffff;
+  border-color: transparent;
+  background: transparent;
 }
 
 body[data-theme="light"] .composerProjectToggle {

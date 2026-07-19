@@ -11,6 +11,10 @@ const serverSource = readFileSync(path.join(ROOT, 'server.mjs'), 'utf8');
 test('composer project row and queued prompts share the native visual surface', () => {
   assert.match(
     uiStyles,
+    /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\)\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent;[^}]*padding:\s*0;[^}]*box-shadow:\s*none/s,
+  );
+  assert.match(
+    uiStyles,
     /body\[data-theme="light"\] \.composerProjectToggle\s*\{[^}]*border-color:\s*transparent;[^}]*background:\s*#f6f6f6;[^}]*box-shadow:\s*none/s,
   );
   assert.match(
