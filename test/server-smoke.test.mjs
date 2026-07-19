@@ -1411,6 +1411,16 @@ updated_at = 1784422800000
     assert.match(page, /function openAutomationView/);
     assert.match(page, /function renderAutomations/);
     assert.match(page, /function openArchivedView/);
+    assert.match(page, /ask:\{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'\}/);
+    assert.match(page, /auto:\{sandbox:'workspace-write',approval:'on-request',label:'替我审批',icon:'shield-check'\}/);
+    assert.match(page, /full:\{sandbox:'danger-full-access',approval:'never',label:'完全访问',icon:'shield-alert'\}/);
+    assert.match(page, /createComposerPermissionOption\('custom','自定义 \(config\.toml\)','使用 config\.toml 中定义的权限','settings'\)/);
+    assert.match(page, /options\.setAttribute\('role','radiogroup'\)/);
+    assert.match(page, /option\.setAttribute\('role','radio'\)/);
+    assert.match(page, /option\.setAttribute\('aria-checked',String\(selected\)\)/);
+    assert.match(page, /option\.tabIndex=selected\?0:-1/);
+    assert.match(page, /function composerPermissionPayload/);
+    assert.match(page, /if\(mode==='custom'\)return\{permissionMode:'custom'\}/);
     assert.match(page, /function renderArchivedTasks/);
     assert.match(page, /永久删除全部已归档任务/);
     assert.match(page, /function createTurnResultArtifacts/);
@@ -1434,14 +1444,17 @@ updated_at = 1784422800000
     assert.match(page, /function rememberNativeComposerOverride\(\)/);
     assert.match(page, /provider\?\.addEventListener\('change',async\(\)=>\{rememberNativeComposerOverride\(\);await loadModels\(provider\.value\);rememberNativeComposerOverride\(\);syncComposerChrome\(\)\}\)/);
     assert.match(page, /reasoningEffort\?\.addEventListener\('change',\(\)=>\{rememberNativeComposerOverride\(\);syncComposerChrome\(\)\}\)/);
-    assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*reasoningEffort:/);
+    assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*permissionMode:composerPermissionMode,sandbox:/);
     assert.match(page, /if\(!preserveProviderModel&&\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&metadata\.modelProvider/);
-    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort\);\s*const res=await fetch\(endpoint/);
-    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort\)/);
-    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort\);/);
+    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval\)/);
+    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval\)/);
+    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort,item\.permissionMode,item\.sandbox,item\.approval\);/);
+    assert.match(page, /permissionMode:\s*composerPermissionMode/);
+    assert.match(page, /\.\.\.composerPermissionPayload\(item\.permissionMode,item\.sandbox,item\.approval\)/);
+    assert.match(page, /\.\.\.composerPermissionPayload\(\)/);
     assert.match(page, /for\(const control of \[provider,model,reasoningEffort\]\)control\.disabled=legacyLocked/);
-    assert.match(page, /if\(webRunActive\)closeLockedComposerPopovers\(\{includeModel:legacyLocked\}\)/);
+    assert.match(page, /if\(webRunActive\)closeLockedComposerPopovers\(\{includePermission:legacyLocked,includeModel:legacyLocked\}\)/);
     assert.doesNotMatch(page, /if\(webRunActive\)closeComposerPopovers\(\)/);
     assert.match(page, /createComposerModelMenuRow\('model','模型'\)/);
     assert.match(page, /createComposerModelMenuRow\('reasoning','推理强度'\)/);
@@ -3132,6 +3145,24 @@ updated_at = 1784422800000
     assert.equal(trace.codexHome, codexHome);
     assert.equal(trace.home, temporary);
     assert.equal(trace.sub2ApiKey, undefined);
+
+    const customPermissionChat = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'use config permissions',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        permissionMode: 'custom',
+      }),
+    });
+    assert.equal(customPermissionChat.status, 200);
+    assert.match(await customPermissionChat.text(), /FAKE_OK/);
+    const customPermissionTrace = JSON.parse(await readFile(traceFile, 'utf8'));
+    assert.equal(customPermissionTrace.args.includes('-a'), false);
+    assert.equal(customPermissionTrace.args.includes('-s'), false);
+    assert.equal(customPermissionTrace.args[0], 'exec');
 
     const created = await fetch(`${baseUrl}/api/native-sessions`, {
       method: 'POST',

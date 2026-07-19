@@ -110,3 +110,72 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
     /\.composerReasoningMarks\s*\{[^}]*grid-template-columns:\s*repeat\(var\(--reasoning-step-count\), 1fr\)/s,
   );
 });
+
+test('permission picker mirrors native approval profiles and preserves custom config semantics', () => {
+  const helperStart = serverSource.indexOf('function cleanSandbox(value)');
+  const helperEnd = serverSource.indexOf('function nativeSandboxPolicy(value, cwd)');
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const helperSource = serverSource.slice(helperStart, helperEnd);
+  const createPermissionSettings = new Function(
+    'FORCE_FULL_ACCESS',
+    'DEFAULT_SANDBOX',
+    'DEFAULT_APPROVAL',
+    `${helperSource}; return permissionSettingsFromRequest;`,
+  );
+  const permissionSettings = createPermissionSettings(false, 'read-only', 'never');
+  assert.deepEqual(permissionSettings({ permissionMode: 'ask' }), {
+    permissionMode: 'ask', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'user',
+  });
+  assert.deepEqual(permissionSettings({ permissionMode: 'auto' }), {
+    permissionMode: 'auto', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'guardian_subagent',
+  });
+  assert.deepEqual(permissionSettings({ permissionMode: 'full' }), {
+    permissionMode: 'full', sandbox: 'danger-full-access', approval: 'never', approvalsReviewer: 'user',
+  });
+  assert.deepEqual(permissionSettings({ permissionMode: 'custom' }), {
+    permissionMode: 'custom', sandbox: undefined, approval: undefined, approvalsReviewer: undefined,
+  });
+  assert.deepEqual(createPermissionSettings(true, 'read-only', 'untrusted')({ permissionMode: 'custom' }), {
+    permissionMode: 'full', sandbox: 'danger-full-access', approval: 'never', approvalsReviewer: 'user',
+  });
+
+  assert.match(
+    serverSource,
+    /requestedMode === 'ask'[\s\S]*permissionMode: 'ask', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'user'/,
+  );
+  assert.match(
+    serverSource,
+    /requestedMode === 'auto'[\s\S]*permissionMode: 'auto', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'guardian_subagent'/,
+  );
+  assert.match(
+    serverSource,
+    /requestedMode === 'full'[\s\S]*permissionMode: 'full', sandbox: 'danger-full-access', approval: 'never', approvalsReviewer: 'user'/,
+  );
+  assert.match(
+    serverSource,
+    /requestedMode === 'custom'[\s\S]*permissionMode: 'custom', sandbox: undefined, approval: undefined, approvalsReviewer: undefined/,
+  );
+  assert.match(serverSource, /useAppServerPermissionDefault: turn\.permissionMode === 'custom' \? true : undefined/);
+  assert.match(serverSource, /options\.setAttribute\('role','radiogroup'\)/);
+  assert.match(serverSource, /option\.setAttribute\('role','radio'\)/);
+  assert.match(serverSource, /option\.setAttribute\('aria-checked',String\(selected\)\)/);
+  assert.match(serverSource, /option\.tabIndex=selected\?0:-1/);
+  assert.match(serverSource, /event\.key==='ArrowDown'\|\|event\.key==='ArrowRight'/);
+  assert.match(serverSource, /else if\(event\.key==='Home'\)next=0/);
+  assert.match(serverSource, /if\(event\.key==='Escape'\)/);
+  assert.match(serverSource, /permissionMode:\s*composerPermissionMode/);
+  assert.match(serverSource, /\.\.\.composerPermissionPayload\(item\.permissionMode,item\.sandbox,item\.approval\)/);
+  assert.match(serverSource, /\.\.\.composerPermissionPayload\(\)/);
+
+  assert.match(
+    uiStyles,
+    /\.composerPermissionPanel\s*\{[^}]*width:\s*min\(360px, calc\(100vw - 24px\)\);[^}]*max-height:\s*min\(410px, calc\(100dvh - 96px\)\)/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.composerPermissionOption\s*\{[^}]*min-height:\s*58px;[^}]*grid-template-columns:\s*24px minmax\(0, 1fr\) 20px/s,
+  );
+  assert.match(uiStyles, /\.composerPermissionOption\[aria-checked="true"\] \.composerPermissionCheck\s*\{[^}]*opacity:\s*1/s);
+  assert.match(uiStyles, /\.composerPermissionOption\[data-permission-mode="full"\]\[aria-checked="true"\][^}]*#f2773d/s);
+  assert.match(uiStyles, /@media \(max-width: 520px\)[\s\S]*\.composerPermissionPanel\s*\{[^}]*width:\s*min\(360px, calc\(100vw - 20px\)\)/s);
+});
