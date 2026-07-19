@@ -3112,7 +3112,23 @@ updated_at = 1784422800000
     assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
     assert.equal(desktopStart.params.turnStartParams.model, 'test-model');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
-    assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
+    const desktopSteer = desktopIpc.messages.find((message) => message.method === 'thread-follower-steer-turn');
+    assert.equal(desktopSteer.params.conversationId, nativeSessionId);
+    assert.deepEqual(desktopSteer.params.input, [{
+      type: 'text',
+      text: 'steer through desktop owner',
+      text_elements: [],
+    }]);
+    assert.match(desktopSteer.params.clientUserMessageId, /^[a-f0-9]{32}$/);
+    assert.match(desktopSteer.params.restoreMessage.id, /^[a-f0-9]{32}$/);
+    assert.notEqual(desktopSteer.params.restoreMessage.id, desktopSteer.params.clientUserMessageId);
+    assert.equal(desktopSteer.params.restoreMessage.text, 'steer through desktop owner');
+    assert.equal(desktopSteer.params.restoreMessage.cwd, temporary);
+    assert.deepEqual(desktopSteer.params.restoreMessage.context.prompt, 'steer through desktop owner');
+    assert.deepEqual(desktopSteer.params.restoreMessage.context.workspaceRoots, [temporary]);
+    assert.deepEqual(desktopSteer.params.restoreMessage.context.commentAttachments, []);
+    assert.equal(desktopSteer.params.serviceTier, null);
+    assert.deepEqual(desktopSteer.params.attachments, []);
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
     desktopIpc.ownerAvailable = false;
 

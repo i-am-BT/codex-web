@@ -2919,14 +2919,16 @@ function recoverDesktopNativeTurn(threadId, conversation, turn = {}) {
 async function steerNativeTurn(threadId, steer, expectedTurnId) {
   const cwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
   const clientUserMessageId = randomBytes(16).toString('hex');
+  const restoreMessageId = randomBytes(16).toString('hex');
+  const targetClientId = String(desktopThreadStates.get(threadId)?.ownerClientId || '');
   try {
     const result = await desktopIpcClient.steerTurn(threadId, {
       input: buildDesktopTurnInput(steer.input),
-      restoreMessage: buildDesktopRestoreMessage(steer, cwd, clientUserMessageId),
+      restoreMessage: buildDesktopRestoreMessage(steer, cwd, restoreMessageId),
       serviceTier: null,
       attachments: [],
       clientUserMessageId,
-    });
+    }, targetClientId ? { targetClientId } : {});
     return { ...result, transport: 'desktop-ipc' };
   } catch (error) {
     if (!isCodexDesktopIpcUnavailableError(error) && !isNativeThreadNotFoundError(error)) throw error;
@@ -3072,6 +3074,7 @@ function buildDesktopRestoreMessage(steer, cwd, id) {
       fileAttachments: [],
       ideContext: null,
       imageAttachments: [],
+      commentAttachments: [],
       workspaceRoots: [cwd],
     },
     cwd,
