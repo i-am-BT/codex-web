@@ -2510,6 +2510,8 @@ function setNativeTurnState(threadId, state) {
     turnId,
     status,
     transport: String(state.transport || current?.transport || 'app-server'),
+    provider: String(state.provider ?? current?.provider ?? ''),
+    model: String(state.model ?? current?.model ?? ''),
     startedAt: status === 'running'
       ? String(state.startedAt || (sameTurn ? current?.startedAt : '') || updatedAt)
       : String(state.startedAt || current?.startedAt || ''),
@@ -2745,8 +2747,16 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
   const persistedStartedAt = activeTurnId && String(conversation.latestTurnId || '') === String(activeTurnId)
     ? conversation.latestTurnStartedAt || ''
     : '';
+  const metadata = active?.status === 'running'
+    ? {
+      ...conversation.metadata,
+      ...(active.provider ? { modelProvider: active.provider } : {}),
+      ...(active.model ? { model: active.model } : {}),
+    }
+    : conversation.metadata;
   return {
     ...conversation,
+    metadata,
     messages: externalizeImages
       ? conversation.messages.map((message) => externalizeNativeImage(conversation, message))
       : conversation.messages,
@@ -2775,6 +2785,10 @@ function decodeNativeImage(message) {
 
 async function continueNativeTurn(threadId, turn) {
   const baseline = nativeSessions.get(threadId);
+  const currentProvider = String(baseline?.metadata?.modelProvider || '');
+  if (turn.provider !== currentProvider) {
+    return resumeNativeTurn(threadId, turn);
+  }
   const requestedAt = Date.now();
   const echoController = new AbortController();
   const desktopAttempt = desktopIpcClient.startTurn(threadId, buildDesktopTurnStartParams(turn)).then(
@@ -2788,24 +2802,34 @@ async function continueNativeTurn(threadId, turn) {
   echoController.abort();
 
   if (outcome.type === 'native-echo' && outcome.conversation) {
-    return recoverDesktopNativeTurn(threadId, outcome.conversation);
+    return recoverDesktopNativeTurn(threadId, outcome.conversation, turn);
   }
 
   if (outcome.type === 'ipc-result') {
     const result = outcome.result;
     const turnId = String(result?.turn?.id || '');
     if (!turnId) throw new Error('Codex Desktop IPC 未返回有效 turn id');
-    setNativeTurnState(threadId, { turnId, status: 'running', transport: 'desktop-ipc' });
+    setNativeTurnState(threadId, {
+      turnId,
+      status: 'running',
+      transport: 'desktop-ipc',
+      provider: turn.provider,
+      model: turn.model,
+    });
     return { turnId, result, transport: 'desktop-ipc' };
   }
 
   const error = outcome.error;
   if (!isCodexDesktopIpcUnavailableError(error)) {
     const conversation = findNativeTurnEcho(threadId, turn, baseline, requestedAt);
-    if (conversation) return recoverDesktopNativeTurn(threadId, conversation);
+    if (conversation) return recoverDesktopNativeTurn(threadId, conversation, turn);
     throw error;
   }
 
+  return resumeNativeTurn(threadId, turn);
+}
+
+async function resumeNativeTurn(threadId, turn) {
   await appServerClient.request('thread/resume', compactObject({
     threadId,
     cwd: turn.cwd,
@@ -2845,10 +2869,16 @@ function findNativeTurnEcho(threadId, turn, baseline, requestedAt) {
   return matched ? conversation : null;
 }
 
-function recoverDesktopNativeTurn(threadId, conversation) {
+function recoverDesktopNativeTurn(threadId, conversation, turn = {}) {
   const turnId = String(conversation.latestTurnId || `desktop-${randomBytes(8).toString('hex')}`);
   const status = conversation.status === 'running' ? 'running' : 'done';
-  setNativeTurnState(threadId, { turnId, status, transport: 'desktop-ipc' });
+  setNativeTurnState(threadId, {
+    turnId,
+    status,
+    transport: 'desktop-ipc',
+    provider: turn.provider,
+    model: turn.model,
+  });
   if (status !== 'running') {
     setTimeout(() => {
       const current = activeNativeTurns.get(threadId);
@@ -2958,7 +2988,12 @@ async function startNativeTurn(threadId, turn) {
   }));
   const turnId = String(result?.turn?.id || '');
   if (!turnId) throw new Error('Codex app-server 未返回有效 turn id');
-  setNativeTurnState(threadId, { turnId, status: 'running' });
+  setNativeTurnState(threadId, {
+    turnId,
+    status: 'running',
+    provider: turn.provider,
+    model: turn.model,
+  });
   return { turnId, result };
 }
 
@@ -3896,6 +3931,13 @@ let composerReasoningSelect = null;
 let composerModelName = null;
 let composerEffortName = null;
 let composerModelState = null;
+let composerModelMainMenu = null;
+let composerModelSubmenu = null;
+let composerModelSubmenuTitle = null;
+let composerModelSubmenuOptions = null;
+let composerModelRunHint = null;
+let composerModelMenuRows = new Map();
+let nativeComposerOverride = null;
 let promptQueuePanel = null;
 let promptQueueList = null;
 let promptQueues = readPromptQueues();
@@ -3992,6 +4034,90 @@ function composerModelLabel(value){
   return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
 }
 function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'极高'})[String(value||'')]||String(value||'默认')}
+function composerSelectedOptionLabel(select,fallback='默认'){return select?.selectedOptions?.[0]?.textContent?.trim()||fallback}
+function composerModelMenuSource(kind){return kind==='model'?composerModelSelect:kind==='reasoning'?composerReasoningSelect:composerProviderSelect}
+function composerModelMenuValue(kind){return kind==='model'?composerModelLabel(model.value):kind==='reasoning'?composerEffortLabel(reasoningEffort.value):composerSelectedOptionLabel(provider,'默认')}
+function createComposerModelMenuRow(kind,label){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='composerModelMenuRow';
+  button.dataset.kind=kind;
+  button.setAttribute('aria-haspopup','listbox');
+  const name=document.createElement('span');
+  name.className='composerModelMenuLabel';
+  name.textContent=label;
+  const value=document.createElement('span');
+  value.className='composerModelMenuValue';
+  const chevron=document.createElement('i');
+  chevron.setAttribute('data-lucide','chevron-right');
+  chevron.setAttribute('aria-hidden','true');
+  button.append(name,value,chevron);
+  button.addEventListener('click',()=>openComposerModelSubmenu(kind));
+  composerModelMenuRows.set(kind,{button,value});
+  return button;
+}
+function showComposerModelMainMenu({focus=false}={}){
+  composerModelMainMenu?.classList.remove('hidden');
+  composerModelSubmenu?.classList.add('hidden');
+  composerModelPanel?.removeAttribute('data-submenu');
+  renderComposerModelMenuState();
+  if(focus)composerModelMainMenu?.querySelector('button:not(:disabled)')?.focus();
+}
+function renderComposerModelMenuState(){
+  const activeKind=composerModelSubmenu&&!composerModelSubmenu.classList.contains('hidden')?composerModelPanel?.dataset.submenu||'':'';
+  for(const [kind,row] of composerModelMenuRows){
+    const source=composerModelMenuSource(kind);
+    row.value.textContent=composerModelMenuValue(kind);
+    row.button.disabled=Boolean(source?.disabled);
+    row.button.classList.toggle('active',kind===activeKind);
+    row.button.setAttribute('aria-expanded',String(kind===activeKind));
+    row.button.setAttribute('aria-label',(kind==='model'?'模型 ':kind==='reasoning'?'推理强度 ':'高级，服务商 ')+row.value.textContent);
+  }
+  composerModelRunHint?.classList.toggle('hidden',!webRunActive||currentConversationSource!=='codex');
+}
+function openComposerModelSubmenu(kind){
+  const source=composerModelMenuSource(kind);
+  if(!source||source.disabled||!composerModelSubmenuOptions)return;
+  composerModelMainMenu?.classList.remove('hidden');
+  composerModelSubmenu.classList.remove('hidden');
+  composerModelPanel.dataset.submenu=kind;
+  renderComposerModelMenuState();
+  composerModelSubmenuTitle.textContent=kind==='model'?'模型':kind==='reasoning'?'推理强度':'高级';
+  composerModelSubmenuOptions.replaceChildren();
+  for(const option of source.options){
+    if(option.disabled)continue;
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='composerModelOption';
+    button.setAttribute('role','option');
+    button.setAttribute('aria-selected',String(option.value===source.value));
+    const copy=document.createElement('span');
+    copy.className='composerModelOptionCopy';
+    const label=document.createElement('strong');
+    label.textContent=kind==='model'?composerModelLabel(option.value):kind==='reasoning'?composerEffortLabel(option.value):option.textContent;
+    copy.appendChild(label);
+    if(kind==='reasoning'&&option.value==='ultra'){
+      const note=document.createElement('small');
+      note.textContent='更快消耗使用额度';
+      copy.appendChild(note);
+    }
+    const check=document.createElement('i');
+    check.setAttribute('data-lucide','check');
+    check.setAttribute('aria-hidden','true');
+    button.append(copy,check);
+    button.addEventListener('click',()=>{
+      source.value=option.value;
+      source.dispatchEvent(new Event('change',{bubbles:true}));
+      closeComposerPopovers();
+      input.focus();
+    });
+    composerModelSubmenuOptions.appendChild(button);
+  }
+  refreshIcons(composerModelSubmenu);
+  const selected=composerModelSubmenuOptions.querySelector('[aria-selected="true"]');
+  selected?.scrollIntoView({block:'nearest'});
+  selected?.focus();
+}
 function createTrailingSingleFlight(task){
   let active=null;
   let rerun=false;
@@ -4331,6 +4457,7 @@ async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
     }
     setPromptQueue(threadId,promptQueueFor(threadId).filter((entry)=>entry.id!==item.id));
     if(currentConversationSource==='codex'&&currentConversationId===threadId){
+      setNativeComposerOverride(threadId,item.provider,item.model,item.reasoningEffort);
       showNativePromptOptimistically(item);
       activeNativeTurnId=data.turnId||'';
       webRunActive=true;
@@ -4360,15 +4487,24 @@ function closeComposerPopovers(){
     button?.setAttribute('aria-expanded','false');
   }
 }
+function closeLockedComposerPopovers({includeModel=false}={}){
+  const pairs=[[composerProjectPanel,composerProjectToggle],[composerPermissionPanel,composerPermissionToggle]];
+  if(includeModel)pairs.push([composerModelPanel,composerModelToggle]);
+  for(const [panel,button] of pairs){
+    panel?.classList.add('hidden');
+    button?.setAttribute('aria-expanded','false');
+  }
+}
 function toggleComposerPopover(panel,button){
   if(!panel||!button)return;
   const open=panel.classList.contains('hidden');
   closeComposerPopovers();
   if(!open)return;
   if(panel===composerProjectPanel)renderComposerProjectOptions();
+  if(panel===composerModelPanel)showComposerModelMainMenu();
   panel.classList.remove('hidden');
   button.setAttribute('aria-expanded','true');
-  panel.querySelector('select,input')?.focus();
+  panel.querySelector('button:not(:disabled),select:not(:disabled),input:not(:disabled)')?.focus();
 }
 function syncComposerChrome(){
   syncComposerSelect(provider,composerProviderSelect);
@@ -4394,8 +4530,13 @@ function syncComposerChrome(){
     composerProjectToggle.disabled=webRunActive||hasConversation;
   }
   composerModelToggle?.classList.toggle('running',webRunActive);
-  if(composerModelToggle)composerModelToggle.disabled=webRunActive;
-  for(const control of [composerProviderSelect,composerModelSelect,composerReasoningSelect])if(control)control.disabled=webRunActive;
+  if(composerModelToggle){
+    composerModelToggle.disabled=Boolean(provider.disabled&&model.disabled&&reasoningEffort.disabled);
+    const modelSummary=composerModelLabel(model.value)+' '+composerEffortLabel(reasoningEffort.value);
+    composerModelToggle.title=webRunActive&&currentConversationSource==='codex'?modelSummary+' · 修改将用于下一条消息':modelSummary;
+    composerModelToggle.setAttribute('aria-label',composerModelToggle.title);
+  }
+  renderComposerModelMenuState();
   const mode=sandbox.value;
   if(composerPermissionToggle){
     const label=mode==='read-only'?'只读权限':mode==='workspace-write'?'工作区写入':'高危全权限';
@@ -4526,13 +4667,42 @@ function enhanceComposer(){
   composerProviderSelect=createComposerMirrorField(composerModelPanel,'服务商','服务商');
   composerModelSelect=createComposerMirrorField(composerModelPanel,'模型','模型');
   composerReasoningSelect=createComposerMirrorField(composerModelPanel,'思考档位','思考档位');
+  for(const field of composerModelPanel.querySelectorAll('.composerMenuField'))field.classList.add('composerModelNativeField');
+  composerModelMainMenu=document.createElement('div');
+  composerModelMainMenu.className='composerModelMainMenu';
+  composerModelMainMenu.appendChild(createComposerModelMenuRow('model','模型'));
+  composerModelMainMenu.appendChild(createComposerModelMenuRow('reasoning','推理强度'));
+  const modelMenuDivider=document.createElement('div');
+  modelMenuDivider.className='composerModelMenuDivider';
+  composerModelMainMenu.appendChild(modelMenuDivider);
+  composerModelMainMenu.appendChild(createComposerModelMenuRow('advanced','高级'));
+  composerModelRunHint=document.createElement('div');
+  composerModelRunHint.className='composerModelRunHint hidden';
+  composerModelRunHint.textContent='运行中修改将用于下一条消息';
+  composerModelMainMenu.appendChild(composerModelRunHint);
+  composerModelSubmenu=document.createElement('div');
+  composerModelSubmenu.className='composerModelSubmenu hidden';
+  const submenuHead=document.createElement('div');
+  submenuHead.className='composerModelSubmenuHead';
+  const submenuBack=document.createElement('button');
+  submenuBack.type='button';
+  submenuBack.className='composerModelSubmenuBack';
+  setIconLabel(submenuBack,'chevron-left','返回',false);
+  submenuBack.addEventListener('click',()=>showComposerModelMainMenu({focus:true}));
+  composerModelSubmenuTitle=document.createElement('strong');
+  submenuHead.append(submenuBack,composerModelSubmenuTitle);
+  composerModelSubmenuOptions=document.createElement('div');
+  composerModelSubmenuOptions.className='composerModelSubmenuOptions';
+  composerModelSubmenuOptions.setAttribute('role','listbox');
+  composerModelSubmenu.append(submenuHead,composerModelSubmenuOptions);
+  composerModelPanel.append(composerModelMainMenu,composerModelSubmenu);
   dropZone.appendChild(composerModelPanel);
   composerProjectToggle.addEventListener('click',()=>toggleComposerPopover(composerProjectPanel,composerProjectToggle));
   composerPermissionToggle.addEventListener('click',()=>toggleComposerPopover(composerPermissionPanel,composerPermissionToggle));
   composerModelToggle.addEventListener('click',()=>toggleComposerPopover(composerModelPanel,composerModelToggle));
-  composerProviderSelect.addEventListener('change',async()=>{provider.value=composerProviderSelect.value;await loadModels(provider.value);syncComposerChrome()});
-  composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;syncComposerChrome()});
-  composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;syncComposerChrome()});
+  composerProviderSelect.addEventListener('change',async()=>{provider.value=composerProviderSelect.value;rememberNativeComposerOverride();await loadModels(provider.value);rememberNativeComposerOverride();syncComposerChrome()});
+  composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;rememberNativeComposerOverride();syncComposerChrome()});
+  composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;rememberNativeComposerOverride();syncComposerChrome()});
   input.addEventListener('focus',closeComposerPopovers);
   document.addEventListener('click',(event)=>{if(!dropZone.contains(event.target)&&!composerProjectPicker.contains(event.target))closeComposerPopovers()});
   syncComposerChrome();
@@ -5302,9 +5472,9 @@ desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();app.c
 document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
-provider?.addEventListener('change',async()=>{await loadModels(provider.value);syncComposerChrome()});
-model?.addEventListener('change',syncComposerChrome);
-reasoningEffort?.addEventListener('change',syncComposerChrome);
+provider?.addEventListener('change',async()=>{rememberNativeComposerOverride();await loadModels(provider.value);rememberNativeComposerOverride();syncComposerChrome()});
+model?.addEventListener('change',()=>{rememberNativeComposerOverride();syncComposerChrome()});
+reasoningEffort?.addEventListener('change',()=>{rememberNativeComposerOverride();syncComposerChrome()});
 sandbox?.addEventListener('change',()=>{dangerConfirmed=false;updateSafetyHint();syncComposerChrome()});
 approval?.addEventListener('change',syncComposerChrome);
 themeToggle?.addEventListener('click',toggleTheme);
@@ -6880,7 +7050,7 @@ function applyConversationMode(){
   attachFile.disabled=legacyLocked||steerSubmitting||queueStarting;
   fileInput.disabled=legacyLocked||steerSubmitting||queueStarting;
   sendBtn.disabled=legacyLocked||steerSubmitting||queueStarting||(!input.value.trim()&&!pendingAttachments.length);
-  for(const control of [provider,model,reasoningEffort])control.disabled=webRunActive;
+  for(const control of [provider,model,reasoningEffort])control.disabled=legacyLocked;
   sandbox.disabled=webRunActive||forceFullAccess;
   approval.disabled=webRunActive||forceFullAccess;
   nativeNotice.classList.toggle('hidden',!native);
@@ -6892,7 +7062,7 @@ function applyConversationMode(){
   cancelBtn.classList.toggle('hidden',!webRunActive||!native);
   cancelBtn.disabled=!webRunActive;
   dropZone?.classList.toggle('runActive',webRunActive&&native);
-  if(webRunActive)closeComposerPopovers();
+  if(webRunActive)closeLockedComposerPopovers({includeModel:legacyLocked});
   syncComposerChrome();
   renderPromptQueue();
   if(activeMainView==='archive'){
@@ -6909,10 +7079,21 @@ function resetStandaloneComposerCwd(){
   if(currentNativeWorkspaceKind==='projectless'&&defaultComposerCwd)cwd.value=defaultComposerCwd;
   currentNativeWorkspaceKind='';
 }
-function newChat(){showChatView();closeComposerPopovers();resetStandaloneComposerCwd();clearNativeCompletionSync();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
+function clearNativeComposerOverride(){nativeComposerOverride=null}
+function rememberNativeComposerOverride(){
+  if(currentConversationSource!=='codex'||!currentConversationId)return;
+  nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||'')};
+}
+function setNativeComposerOverride(threadId,selectedProvider,selectedModel,selectedReasoningEffort){
+  if(!threadId)return;
+  nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||'')};
+}
+function nativeComposerOverrideApplies(threadId){return Boolean(nativeComposerOverride?.threadId&&nativeComposerOverride.threadId===threadId)}
+function newChat(){showChatView();closeComposerPopovers();resetStandaloneComposerCwd();clearNativeCompletionSync();clearNativeComposerOverride();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
 async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
+  if(source!=='codex'||currentConversationSource!=='codex'||currentConversationId!==id)clearNativeComposerOverride();
   showChatView();
   clearNativeCompletionSync();
   clearSubagentTraceStates();
@@ -6950,7 +7131,7 @@ async function loadConversation(id,source='web',options={}){
   nativeGeneration=Number(conversation.generation||0);
   activeNativeTurnId=String(conversation.activeTurnId||'');
   webRunActive=currentConversationSource==='codex'&&conversation.status==='running';
-  if(currentConversationSource==='codex')applyNativeConversationMetadata(conversation.metadata||{});
+  if(currentConversationSource==='codex')applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(conversation.id)});
   applyConversationMode();
   updateActiveHistory();
   chat.innerHTML='';
@@ -6991,7 +7172,7 @@ function updateConversationStatus(conversation){
     statusEl.textContent='Loaded '+stamp;
   }
 }
-function applyNativeConversationMetadata(metadata){currentNativeWorkspaceKind=String(metadata.workspaceKind||currentNativeWorkspaceKind||'');if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max','ultra'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
+function applyNativeConversationMetadata(metadata,{preserveProviderModel=false}={}){currentNativeWorkspaceKind=String(metadata.workspaceKind||currentNativeWorkspaceKind||'');if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(!preserveProviderModel&&['low','medium','high','xhigh','max','ultra'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(!preserveProviderModel&&metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(!preserveProviderModel&&metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
 async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
   if(!currentConversationId||currentConversationSource!=='codex')return;
@@ -7115,7 +7296,7 @@ async function syncCurrentNativeConversationOnce(){
   const data=await res.json();
   const conversation=data.conversation;
   if(conversation.status==='running'){
-    applyNativeConversationMetadata(conversation.metadata||{});
+    applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
     syncComposerChrome();
   }
   if(conversation.reset){
@@ -9461,11 +9642,16 @@ async function send(){
   statusEl.textContent='Codex App · 运行中';
   try{
     const endpoint=existingId?'/api/native-sessions/'+encodeURIComponent(existingId)+'/turns':'/api/native-sessions';
+    const requestedProvider=provider.value;
+    const requestedModel=model.value;
+    const requestedReasoningEffort=reasoningEffort.value;
+    setNativeComposerOverride(existingId,requestedProvider,requestedModel,requestedReasoningEffort);
     const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,attachments,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,sandbox:sandbox.value,approval:approval.value})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||res.statusText);
     currentConversationSource='codex';
     currentConversationId=data.threadId;
+    setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort);
     activeNativeTurnId=data.turnId||'';
     if(!existingId){nativeCursor=0;nativeGeneration=0}
     updateActiveHistory();

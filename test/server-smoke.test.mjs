@@ -623,8 +623,14 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.composerProjectPicker:not\(\.hidden\) \+ \.box/);
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
-    assert.match(uiStyles, /\.composerModelToggle\.running:disabled\s*\{[^}]*opacity:\s*1/s);
+    assert.match(uiStyles, /\.composerModelToggle\.running:not\(:disabled\)\s*\{[^}]*cursor:\s*pointer/s);
     assert.match(uiStyles, /\.composerModelToggle\.running \.composerModelState\s*\{[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/s);
+    assert.match(uiStyles, /\.composerModelPanel\s*\{[^}]*width:\s*min\(244px,[^}]*border-radius:\s*18px/s);
+    assert.match(uiStyles, /\.composerModelMenuRow\s*\{[^}]*min-height:\s*44px;[^}]*grid-template-columns:/s);
+    assert.match(uiStyles, /\.composerModelMenuRow\.active\s*\{[^}]*background:\s*var\(--surface-hover\)/s);
+    assert.match(uiStyles, /\.composerModelSubmenu\s*\{[^}]*left:\s*calc\(100% \+ 8px\);[^}]*right:\s*auto;[^}]*max-height:/s);
+    assert.match(uiStyles, /\.composerModelPanel\[data-submenu\] \.composerModelMainMenu\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /\.composerModelOption\[aria-selected="true"\]/);
     assert.match(uiStyles, /body \.box\.runActive > \.send:not\(\.cancelButton\):disabled\s*\{[^}]*display:\s*none/s);
     assert.match(uiStyles, /body \.cancelButton \.lucide\s*\{[^}]*fill:\s*currentColor;[^}]*stroke:\s*none/s);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
@@ -1352,7 +1358,25 @@ updated_at = 1784422800000
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
     assert.match(page, /<option value="ultra">ultra<\/option>/);
     assert.match(page, /\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)/);
-    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
+    assert.match(page, /function rememberNativeComposerOverride\(\)/);
+    assert.match(page, /provider\?\.addEventListener\('change',async\(\)=>\{rememberNativeComposerOverride\(\);await loadModels\(provider\.value\);rememberNativeComposerOverride\(\);syncComposerChrome\(\)\}\)/);
+    assert.match(page, /reasoningEffort\?\.addEventListener\('change',\(\)=>\{rememberNativeComposerOverride\(\);syncComposerChrome\(\)\}\)/);
+    assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*reasoningEffort:/);
+    assert.match(page, /if\(!preserveProviderModel&&\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)\)/);
+    assert.match(page, /if\(!preserveProviderModel&&metadata\.modelProvider/);
+    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort\);\s*const res=await fetch\(endpoint/);
+    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort\)/);
+    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort\);/);
+    assert.match(page, /for\(const control of \[provider,model,reasoningEffort\]\)control\.disabled=legacyLocked/);
+    assert.match(page, /if\(webRunActive\)closeLockedComposerPopovers\(\{includeModel:legacyLocked\}\)/);
+    assert.doesNotMatch(page, /if\(webRunActive\)closeComposerPopovers\(\)/);
+    assert.match(page, /createComposerModelMenuRow\('model','模型'\)/);
+    assert.match(page, /createComposerModelMenuRow\('reasoning','推理强度'\)/);
+    assert.match(page, /createComposerModelMenuRow\('advanced','高级'\)/);
+    assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
+    assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
+    assert.match(page, /运行中修改将用于下一条消息/);
+    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -3000,6 +3024,7 @@ updated_at = 1784422800000
       text_elements: [],
     }]);
     assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
+    assert.equal(desktopStart.params.turnStartParams.model, 'test-model');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
@@ -3139,6 +3164,43 @@ updated_at = 1784422800000
     });
     assert.equal(stoppedForProjectArchive.status, 200);
 
+    const desktopStartsBeforeProviderSwitch = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-follower-start-turn',
+    ).length;
+    const mismatchedProvider = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'switch native provider',
+        provider: 'custom',
+        model: 'custom-model',
+        reasoningEffort: 'max',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(mismatchedProvider.status, 202);
+    const mismatchedProviderPayload = await mismatchedProvider.json();
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-start-turn').length,
+      desktopStartsBeforeProviderSwitch,
+    );
+    const mismatchedProviderConversation = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}`,
+      { headers: { Cookie: cookie } },
+    );
+    const mismatchedProviderMetadata = (await mismatchedProviderConversation.json()).conversation.metadata;
+    assert.equal(mismatchedProviderMetadata.modelProvider, 'custom');
+    assert.equal(mismatchedProviderMetadata.model, 'custom-model');
+
+    const mismatchedInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: mismatchedProviderPayload.turnId }),
+    });
+    assert.equal(mismatchedInterrupted.status, 200);
+
     const archivedProject = await fetch(`${baseUrl}/api/native-projects/archive`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -3258,8 +3320,14 @@ updated_at = 1784422800000
         .length,
       createdDeleteCountBeforeBulkRace,
     );
-    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 1);
-    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 2);
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 2);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 3);
+    const switchedProviderResume = protocolMessages.find((message) => (
+      message.method === 'thread/resume'
+      && message.params.modelProvider === 'custom'
+    ));
+    assert.ok(switchedProviderResume);
+    assert.equal(switchedProviderResume.params.model, 'custom-model');
     const restartFromFirstMessage = protocolMessages.find((message) => (
       message.method === 'thread/start'
       && message.params.sandbox === 'read-only'
@@ -3277,6 +3345,8 @@ updated_at = 1784422800000
     assert.equal(turnStartMessages[0].params.sandboxPolicy.type, 'workspaceWrite');
     assert.deepEqual(turnStartMessages[0].params.sandboxPolicy.writableRoots, [temporary]);
     assert.equal(turnStartMessages[1].params.sandboxPolicy.type, 'readOnly');
+    assert.equal(turnStartMessages[2].params.model, 'custom-model');
+    assert.equal(turnStartMessages[2].params.effort, 'max');
     const steerMessage = protocolMessages.find((message) => message.method === 'turn/steer');
     assert.equal(steerMessage.params.expectedTurnId, continuedPayload.turnId);
     assert.deepEqual(steerMessage.params.input, [{ type: 'text', text: 'change direction while running' }]);
