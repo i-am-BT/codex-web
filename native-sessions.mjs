@@ -56,6 +56,7 @@ export class NativeSessionStore extends EventEmitter {
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
     this.projectThreadIds = new Set();
+    this.pinnedThreadIds = [];
     this.appThreads = null;
     this.stateDb = null;
     this.stateDbIno = 0;
@@ -121,7 +122,7 @@ export class NativeSessionStore extends EventEmitter {
 
   refresh() {
     this.refreshTitles();
-    this.refreshWorkspaceState();
+    const pinnedChangedIds = this.refreshWorkspaceState();
     this.refreshAppThreads();
     const nextEntries = scanSessionFiles(
       this.sessionsDir,
@@ -134,6 +135,7 @@ export class NativeSessionStore extends EventEmitter {
       ...new Set([
         ...changedSessionIds(this.entries, nextEntries),
         ...changedSessionIds(this.subagentEntries, nextSubagentEntries),
+        ...pinnedChangedIds,
       ]),
     ];
     this.entries = nextEntries;
@@ -157,8 +159,14 @@ export class NativeSessionStore extends EventEmitter {
     } catch {
       // Codex Desktop replaces this file atomically. Keep the last valid
       // snapshot while it is temporarily missing or incomplete.
-      return;
+      return [];
     }
+
+    const previousPinnedThreadIds = this.pinnedThreadIds;
+    this.pinnedThreadIds = normalizePinnedThreadIds(state?.['pinned-thread-ids']);
+    const pinnedChangedIds = equalStringArrays(previousPinnedThreadIds, this.pinnedThreadIds)
+      ? []
+      : [...new Set([...previousPinnedThreadIds, ...this.pinnedThreadIds])];
 
     const hasProjectlessIds = state
       && typeof state === 'object'
@@ -168,7 +176,7 @@ export class NativeSessionStore extends EventEmitter {
       this.projectlessThreadIds = new Set();
       this.projectThreadIds = new Set();
       this.workspaceStateAvailable = false;
-      return;
+      return pinnedChangedIds;
     }
 
     const value = state?.['projectless-thread-ids'];
@@ -177,7 +185,7 @@ export class NativeSessionStore extends EventEmitter {
       : value && typeof value === 'object'
         ? Object.keys(value)
         : null;
-    if (!ids) return;
+    if (!ids) return pinnedChangedIds;
 
     this.projectlessThreadIds = new Set(ids
       .map((id) => String(id || '').trim().toLowerCase())
@@ -189,6 +197,11 @@ export class NativeSessionStore extends EventEmitter {
       .map((id) => String(id || '').trim().toLowerCase())
       .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
     this.workspaceStateAvailable = true;
+    return pinnedChangedIds;
+  }
+
+  listPinnedThreadIds() {
+    return [...this.pinnedThreadIds];
   }
 
   workspaceKindForThread(id) {
@@ -282,11 +295,19 @@ export class NativeSessionStore extends EventEmitter {
     this.titles = readSessionIndex(this.indexFile);
   }
 
-  list(limit = this.maxSessions) {
+  list(limit = this.maxSessions, { includeIds = [] } = {}) {
     const now = Date.now();
-    return [...this.entries.values()]
-      .sort((left, right) => right.recencyMs - left.recencyMs)
+    const sortedEntries = [...this.entries.values()]
+      .sort((left, right) => right.recencyMs - left.recencyMs);
+    const selectedIds = new Set(sortedEntries
       .slice(0, positiveNumber(limit, this.maxSessions))
+      .map((entry) => entry.id));
+    for (const id of includeIds) {
+      const cleanId = String(id || '').trim().toLowerCase();
+      if (this.entries.has(cleanId)) selectedIds.add(cleanId);
+    }
+    return sortedEntries
+      .filter((entry) => selectedIds.has(entry.id))
       .map((entry) => {
         let cached = this.details.get(entry.id);
         let cacheIsCurrent = cached
@@ -1520,6 +1541,23 @@ function limitText(value, limit) {
   const text = String(value || '');
   if (text.length <= limit) return text;
   return `${text.slice(0, limit)}\n\n[内容过长，已截断 ${text.length - limit} 字符]`;
+}
+
+function normalizePinnedThreadIds(value) {
+  if (!Array.isArray(value)) return [];
+  const ids = [];
+  const seen = new Set();
+  for (const item of value) {
+    const id = String(item || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(`${id}.jsonl`) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+function equalStringArrays(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function positiveNumber(value, fallback) {

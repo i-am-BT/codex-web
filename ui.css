@@ -2041,6 +2041,7 @@ body .history {
   gap: 2px;
 }
 
+.historyPinned,
 .historyTasks {
   display: grid;
   min-width: 0;
@@ -2048,6 +2049,7 @@ body .history {
   padding-bottom: 4px;
 }
 
+.historyPinnedHead,
 .historyTasksHead {
   display: grid;
   width: 100%;
@@ -2065,11 +2067,14 @@ body .history {
   transition: background 120ms var(--ease), color 120ms var(--ease);
 }
 
+.historyPinnedHead:hover,
+.historyPinnedHead:focus-visible,
 .historyTasksHead:hover,
 .historyTasksHead:focus-visible {
   background: var(--surface-hover);
 }
 
+.historyPinnedTitle,
 .historyTasksTitle {
   margin: 0;
   color: var(--text-muted);
@@ -2079,6 +2084,7 @@ body .history {
   line-height: 1.4;
 }
 
+.historyPinnedChevron,
 .historyTasksChevron {
   display: grid;
   width: 14px;
@@ -2090,28 +2096,34 @@ body .history {
   transition: transform 160ms var(--ease), color 140ms var(--ease);
 }
 
+.historyPinnedChevron .lucide,
 .historyTasksChevron .lucide {
   width: 12px;
   height: 12px;
 }
 
+.historyPinnedHead:hover .historyPinnedChevron,
 .historyTasksHead:hover .historyTasksChevron {
   color: var(--text-muted);
 }
 
+.historyPinnedHead[aria-expanded="true"] .historyPinnedChevron,
 .historyTasksHead[aria-expanded="true"] .historyTasksChevron {
   transform: rotate(90deg);
 }
 
+.historyPinnedItems,
 .historyTasksItems {
   display: grid;
   gap: 1px;
 }
 
+.historyPinnedItems[hidden],
 .historyTasksItems[hidden] {
   display: none;
 }
 
+.historyPinned.collapsed,
 .historyTasks.collapsed {
   gap: 0;
 }
@@ -2371,6 +2383,39 @@ body[data-theme] .hist.active {
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.histOpenLabel {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.histOpen.hasAutomation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 15px;
+  align-items: center;
+  gap: 5px;
+}
+
+.histAutomationIcon {
+  display: grid;
+  width: 15px;
+  height: 15px;
+  place-items: center;
+  color: var(--text-subtle);
+}
+
+.histAutomationIcon .lucide {
+  width: 13px;
+  height: 13px;
+}
+
+.hist:hover .histAutomationIcon,
+.hist.active .histAutomationIcon {
+  color: var(--text-muted);
 }
 
 .histOpen.running {

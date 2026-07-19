@@ -90,6 +90,11 @@ wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "test-token"
 `);
+    await writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'pinned-thread-ids': [nativeSessionId, archivedNativeSessionId],
+      'projectless-thread-ids': [],
+      'thread-project-assignments': {},
+    }));
     const nativeSessionDir = path.join(codexHome, 'sessions', '2026', '07', '11');
     await mkdir(nativeSessionDir, { recursive: true });
     await writeFile(path.join(codexHome, 'session_index.jsonl'), [
@@ -731,6 +736,19 @@ if (args[0] === 'app-server') {
     });
     assert.equal(emptyAutomations.status, 200);
     assert.equal((await emptyAutomations.json()).count, 0);
+    const heartbeatDirectory = path.join(codexHome, 'automations', 'fixture-heartbeat');
+    await mkdir(heartbeatDirectory, { recursive: true });
+    await writeFile(path.join(heartbeatDirectory, 'automation.toml'), `version = 1
+id = "fixture-heartbeat"
+kind = "heartbeat"
+name = "Fixture heartbeat"
+prompt = "Keep the fixture task moving."
+status = "ACTIVE"
+rrule = "FREQ=DAILY;BYHOUR=9;BYMINUTE=30"
+target_thread_id = "${nativeSessionId}"
+created_at = 1784422800000
+updated_at = 1784422800000
+`);
     const createdAutomation = await fetch(`${baseUrl}/api/automations`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -2239,6 +2257,7 @@ if (args[0] === 'app-server') {
     assert.equal(config.defaults.reasoningEffort, 'max');
     assert.equal(config.capabilities.manageProviders, false);
     assert.equal(config.appearance.chatBackground, 'default');
+    assert.deepEqual(config.pinnedThreadIds, [nativeSessionId, archivedNativeSessionId]);
 
     const playgroundConfigResponse = await fetch(`${baseUrl}/api/playground-config`, {
       headers: { Cookie: cookie },
@@ -2347,6 +2366,10 @@ if (args[0] === 'app-server') {
       && conversation.source === 'codex'
       && conversation.title === 'Codex App fixture'
       && conversation.cwd === temporary
+      && conversation.automation?.id === 'fixture-heartbeat'
+      && conversation.automation?.kind === 'heartbeat'
+      && conversation.automation?.name === 'Fixture heartbeat'
+      && conversation.automation?.scheduleLabel === '每天 09:30'
     )));
     assert.equal(config.conversations.some((conversation) => conversation.id === archivedNativeSessionId), false);
     assert.equal(config.conversations.some((conversation) => conversation.id === automationNativeSessionId), false);

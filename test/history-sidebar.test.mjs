@@ -57,6 +57,41 @@ test('projectless working directories do not pollute the composer project picker
   assert.deepEqual(composerProjectPaths(), [explicitProjectPath]);
 });
 
+test('pinned Codex sessions keep App order and are removed from regular history groups', () => {
+  const api = new Function(`${groupingSource}; return { partitionPinnedHistoryItems };`)();
+  const items = [
+    { id: 'project-b', source: 'codex', workspaceKind: 'project', cwd: '/workspace/b' },
+    { id: 'pin-b', source: 'codex', workspaceKind: 'projectless', cwd: '/generated/b' },
+    { id: 'pin-a', source: 'web', workspaceKind: 'projectless', cwd: '' },
+    { id: 'task-a', source: 'codex', workspaceKind: 'projectless', cwd: '/generated/a' },
+    { id: 'pin-a', source: 'codex', workspaceKind: 'project', cwd: '/workspace/a' },
+  ];
+
+  const { pinned, remaining } = api.partitionPinnedHistoryItems(items, ['pin-a', 'missing', 'pin-b', 'pin-a']);
+  assert.deepEqual(pinned.map((item) => `${item.source}:${item.id}`), ['codex:pin-a', 'codex:pin-b']);
+  assert.deepEqual(remaining.map((item) => `${item.source}:${item.id}`), ['codex:project-b', 'web:pin-a', 'codex:task-a']);
+});
+
+test('the pinned section renders above tasks, collapses independently, and marks automations', () => {
+  const pinnedRenderSource = sourceBetween('function appendPinnedHistoryTasks', 'function setHistoryTasksExpanded');
+  const rowSource = sourceBetween('function createHistoryRow', 'function updateActiveHistory');
+  assert.match(pinnedRenderSource, /section\.className='historyPinned'/);
+  assert.match(pinnedRenderSource, /head\.className='historyPinnedHead'/);
+  assert.match(pinnedRenderSource, /title\.textContent='置顶'/);
+  assert.match(pinnedRenderSource, /rows\.className='historyPinnedItems'/);
+  assert.match(pinnedRenderSource, /setHistoryPinnedExpanded\(section,Boolean\(query\)\|\|containsCurrent\|\|!historyPinnedCollapsed\)/);
+  assert.match(pinnedRenderSource, /historyPinnedCollapsed=expanded;\s*storeHistoryPinnedCollapsed\(\)/);
+  assert.match(inlineScript, /const HISTORY_PINNED_COLLAPSED_STORAGE_KEY='codexWeb\.historyPinnedCollapsed'/);
+  assert.match(inlineScript, /const \{pinned,remaining\}=partitionPinnedHistoryItems\(visibleItems\);\s*appendPinnedHistoryTasks\(pinned,\{query:Boolean\(query\)\}\);\s*const \{tasks:standaloneTasks,projects:groups\}=partitionHistoryItems\(remaining\);/);
+  assert.match(rowSource, /automationIcon\.className='histAutomationIcon'/);
+  assert.match(rowSource, /icon\.setAttribute\('data-lucide','calendar-clock'\)/);
+  assert.match(rowSource, /automationIcon\.setAttribute\('aria-label','自动化任务：'\+automationName\)/);
+  assert.match(uiStyles, /\.historyPinned,\s*\.historyTasks\s*\{[^}]*display:\s*grid/s);
+  assert.match(uiStyles, /\.historyPinnedItems\[hidden\],\s*\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
+  assert.match(uiStyles, /\.historyPinnedHead\[aria-expanded="true"\] \.historyPinnedChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);
+  assert.match(uiStyles, /\.histOpen\.hasAutomation\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 15px/s);
+});
+
 test('the task section is rendered before project groups and can collapse independently', () => {
   const taskRenderSource = sourceBetween('function appendStandaloneHistoryTasks', 'function renderHistory');
   assert.match(taskRenderSource, /section\.className='historyTasks'/);
@@ -69,7 +104,7 @@ test('the task section is rendered before project groups and can collapse indepe
   assert.match(taskRenderSource, /setHistoryTasksExpanded\(section,Boolean\(query\)\|\|containsCurrent\|\|!historyTasksCollapsed\)/);
   assert.match(taskRenderSource, /historyTasksCollapsed=expanded;\s*storeHistoryTasksCollapsed\(\)/);
   assert.match(inlineScript, /const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb\.historyTasksCollapsed'/);
-  assert.match(inlineScript, /const \{tasks:standaloneTasks,projects:groups\}=partitionHistoryItems\(visibleItems\);\s*appendStandaloneHistoryTasks\(standaloneTasks,\{query:Boolean\(query\)\}\);/);
+  assert.match(inlineScript, /const \{tasks:standaloneTasks,projects:groups\}=partitionHistoryItems\(remaining\);\s*appendStandaloneHistoryTasks\(standaloneTasks,\{query:Boolean\(query\)\}\);/);
   assert.match(uiStyles, /\.historyTasksHead\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 14px/s);
   assert.match(uiStyles, /\.historyTasksTitle\s*\{[^}]*color:\s*var\(--text-muted\);[^}]*font-size:\s*12px/s);
   assert.match(uiStyles, /\.historyTasksItems\s*\{[^}]*display:\s*grid;[^}]*gap:\s*1px/s);
