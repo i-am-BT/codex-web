@@ -3852,6 +3852,7 @@ const archiveToggle = document.getElementById('archiveToggle'), archiveView = do
 const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
 let subQuotaToggle = null, subQuotaPopover = null, subQuotaStatus = null, subQuotaContent = null;
 let subQuotaSettingsForm = null, subQuotaApiKeyInput = null, subQuotaEndpoint = null, subQuotaSettingsStatus = null;
+let subQuotaSettingsOverlay = null, subQuotaSettingsDialog = null, subQuotaSettingsClose = null, subQuotaSettingsReturnFocus = null;
 const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
 const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
@@ -4862,6 +4863,78 @@ function createDreamSkinGenerator(general){
   renderDreamSkinConcepts();
   refreshIcons(dreamSkinPanel);
 }
+function ensureSubQuotaSettingsDialog(){
+  if(subQuotaSettingsOverlay)return;
+  subQuotaSettingsOverlay=document.createElement('div');
+  subQuotaSettingsOverlay.id='subQuotaSettingsOverlay';
+  subQuotaSettingsOverlay.className='settingsOverlay subQuotaSettingsOverlay hidden';
+  subQuotaSettingsOverlay.setAttribute('role','presentation');
+  subQuotaSettingsDialog=document.createElement('section');
+  subQuotaSettingsDialog.id='subQuotaSettingsDialog';
+  subQuotaSettingsDialog.className='subQuotaSettingsDialog';
+  subQuotaSettingsDialog.setAttribute('role','dialog');
+  subQuotaSettingsDialog.setAttribute('aria-modal','true');
+  subQuotaSettingsDialog.setAttribute('aria-labelledby','subQuotaSettingsTitle');
+  const head=document.createElement('header');
+  head.className='settingsDialogHead subQuotaSettingsDialogHead';
+  const title=document.createElement('h2');
+  title.id='subQuotaSettingsTitle';
+  title.textContent='Sub2API 额度监控';
+  subQuotaSettingsClose=document.createElement('button');
+  subQuotaSettingsClose.type='button';
+  subQuotaSettingsClose.className='settingsDialogClose';
+  subQuotaSettingsClose.title='关闭 Sub2API 设置';
+  subQuotaSettingsClose.setAttribute('aria-label','关闭 Sub2API 设置');
+  setIconLabel(subQuotaSettingsClose,'x','关闭 Sub2API 设置',false);
+  head.appendChild(title);
+  head.appendChild(subQuotaSettingsClose);
+  const body=document.createElement('div');
+  body.className='subQuotaSettingsBody';
+  const subQuotaDescription=document.createElement('p');
+  subQuotaDescription.className='subQuotaSettingsDescription';
+  subQuotaDescription.textContent='更新 API Key 后会立即检测，仅用于 Sub2API 额度监控。';
+  subQuotaEndpoint=document.createElement('div');
+  subQuotaEndpoint.className='subQuotaEndpoint';
+  subQuotaEndpoint.textContent='正在读取服务地址…';
+  subQuotaSettingsForm=document.createElement('form');
+  subQuotaSettingsForm.id='subQuotaSettingsForm';
+  subQuotaSettingsForm.className='subQuotaSettingsForm';
+  const subQuotaKeyField=document.createElement('label');
+  subQuotaKeyField.className='field';
+  const subQuotaKeyLabel=document.createElement('span');
+  subQuotaKeyLabel.textContent='API Key';
+  subQuotaApiKeyInput=document.createElement('input');
+  subQuotaApiKeyInput.id='subQuotaApiKey';
+  subQuotaApiKeyInput.name='apiKey';
+  subQuotaApiKeyInput.type='password';
+  subQuotaApiKeyInput.maxLength=4096;
+  subQuotaApiKeyInput.autocomplete='new-password';
+  subQuotaApiKeyInput.placeholder='输入 Sub2API API Key';
+  subQuotaKeyField.appendChild(subQuotaKeyLabel);
+  subQuotaKeyField.appendChild(subQuotaApiKeyInput);
+  const subQuotaSave=document.createElement('button');
+  subQuotaSave.type='submit';
+  subQuotaSave.className='miniPrimary subQuotaSettingsSubmit';
+  setIconLabel(subQuotaSave,'badge-check','保存并检测');
+  subQuotaSettingsStatus=document.createElement('div');
+  subQuotaSettingsStatus.className='errorText subQuotaSettingsStatus';
+  subQuotaSettingsStatus.setAttribute('role','status');
+  subQuotaSettingsForm.appendChild(subQuotaKeyField);
+  subQuotaSettingsForm.appendChild(subQuotaSave);
+  subQuotaSettingsForm.appendChild(subQuotaSettingsStatus);
+  body.appendChild(subQuotaDescription);
+  body.appendChild(subQuotaEndpoint);
+  body.appendChild(subQuotaSettingsForm);
+  subQuotaSettingsDialog.appendChild(head);
+  subQuotaSettingsDialog.appendChild(body);
+  subQuotaSettingsOverlay.appendChild(subQuotaSettingsDialog);
+  document.body.appendChild(subQuotaSettingsOverlay);
+  subQuotaSettingsClose.addEventListener('click',closeSubQuotaSettings);
+  subQuotaSettingsOverlay.addEventListener('click',(event)=>{if(event.target===subQuotaSettingsOverlay)closeSubQuotaSettings()});
+  subQuotaSettingsDialog.addEventListener('keydown',(event)=>trapDialogFocus(subQuotaSettingsDialog,event));
+  subQuotaSettingsForm.addEventListener('submit',submitSubQuotaSettings);
+  refreshIcons(subQuotaSettingsDialog);
+}
 function enhanceSettingsModal(){
   if(!settingsPanel||settingsOverlay)return;
   settingsOverlay=document.createElement('div');
@@ -4896,45 +4969,6 @@ function enhanceSettingsModal(){
     createDreamSkinGenerator(general);
   }
   providerManager?.classList.add('settingsSection','providerSettings');
-  const subQuotaSection=document.createElement('section');
-  subQuotaSection.id='subQuotaSettings';
-  subQuotaSection.className='settingsSection subQuotaSettings';
-  subQuotaSection.appendChild(settingsSectionTitle('Sub2API 额度监控'));
-  const subQuotaDescription=document.createElement('p');
-  subQuotaDescription.className='subQuotaSettingsDescription';
-  subQuotaDescription.textContent='悬停侧栏额度图标可直接查看；在这里更新 API Key 并立即检测。';
-  subQuotaEndpoint=document.createElement('div');
-  subQuotaEndpoint.className='subQuotaEndpoint';
-  subQuotaEndpoint.textContent='正在读取服务地址…';
-  subQuotaSettingsForm=document.createElement('form');
-  subQuotaSettingsForm.id='subQuotaSettingsForm';
-  subQuotaSettingsForm.className='subQuotaSettingsForm';
-  const subQuotaKeyField=document.createElement('label');
-  subQuotaKeyField.className='field';
-  const subQuotaKeyLabel=document.createElement('span');
-  subQuotaKeyLabel.textContent='API Key';
-  subQuotaApiKeyInput=document.createElement('input');
-  subQuotaApiKeyInput.id='subQuotaApiKey';
-  subQuotaApiKeyInput.name='apiKey';
-  subQuotaApiKeyInput.type='password';
-  subQuotaApiKeyInput.maxLength=4096;
-  subQuotaApiKeyInput.autocomplete='new-password';
-  subQuotaApiKeyInput.placeholder='输入 Sub2API API Key';
-  subQuotaKeyField.appendChild(subQuotaKeyLabel);
-  subQuotaKeyField.appendChild(subQuotaApiKeyInput);
-  const subQuotaSave=document.createElement('button');
-  subQuotaSave.type='submit';
-  subQuotaSave.className='miniPrimary subQuotaSettingsSubmit';
-  setIconLabel(subQuotaSave,'badge-check','保存并检测');
-  subQuotaSettingsStatus=document.createElement('div');
-  subQuotaSettingsStatus.className='errorText subQuotaSettingsStatus';
-  subQuotaSettingsStatus.setAttribute('role','status');
-  subQuotaSettingsForm.appendChild(subQuotaKeyField);
-  subQuotaSettingsForm.appendChild(subQuotaSave);
-  subQuotaSettingsForm.appendChild(subQuotaSettingsStatus);
-  subQuotaSection.appendChild(subQuotaDescription);
-  subQuotaSection.appendChild(subQuotaEndpoint);
-  subQuotaSection.appendChild(subQuotaSettingsForm);
   const passwordSection=document.createElement('section');
   passwordSection.className='settingsSection passwordSettings';
   passwordSection.appendChild(settingsSectionTitle('Web 密码'));
@@ -4973,7 +5007,6 @@ function enhanceSettingsModal(){
   passwordForm.appendChild(passwordStatus);
   passwordSection.appendChild(passwordForm);
   settingsPanel.classList.remove('open');
-  settingsPanel.appendChild(subQuotaSection);
   settingsPanel.appendChild(passwordSection);
   body.appendChild(settingsPanel);
   settingsDialog.appendChild(head);
@@ -4984,7 +5017,6 @@ function enhanceSettingsModal(){
   settingsClose.addEventListener('click',closeSettings);
   settingsOverlay.addEventListener('click',(event)=>{if(event.target===settingsOverlay)closeSettings()});
   settingsDialog.addEventListener('keydown',trapSettingsFocus);
-  subQuotaSettingsForm.addEventListener('submit',submitSubQuotaSettings);
   passwordForm.addEventListener('submit',submitPasswordChange);
 }
 async function syncSubQuotaSettings(){
@@ -5017,6 +5049,32 @@ async function submitSubQuotaSettings(event){
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'检测失败')}
   finally{submit.disabled=false}
 }
+function openSubQuotaSettings(){
+  ensureSubQuotaSettingsDialog();
+  if(!subQuotaSettingsOverlay)return;
+  closeComposerPopovers();
+  hideSubQuotaPreview();
+  if(settingsOverlay&&!settingsOverlay.classList.contains('hidden'))closeSettings();
+  subQuotaSettingsReturnFocus=subQuotaToggle||document.activeElement;
+  subQuotaSettingsOverlay.classList.remove('hidden');
+  subQuotaToggle?.setAttribute('aria-expanded','true');
+  syncModalOpenState();
+  syncSubQuotaSettings();
+  requestAnimationFrame(()=>subQuotaApiKeyInput?.focus());
+}
+function closeSubQuotaSettings(){
+  if(!subQuotaSettingsOverlay||subQuotaSettingsOverlay.classList.contains('hidden'))return;
+  subQuotaSettingsOverlay.classList.add('hidden');
+  subQuotaToggle?.setAttribute('aria-expanded','false');
+  subQuotaSettingsForm?.reset();
+  if(subQuotaSettingsStatus){subQuotaSettingsStatus.textContent='';subQuotaSettingsStatus.classList.remove('success')}
+  syncModalOpenState();
+  const returnFocus=subQuotaSettingsReturnFocus||subQuotaToggle;
+  subQuotaSettingsReturnFocus=null;
+  suppressSubQuotaFocusPreview=true;
+  returnFocus?.focus();
+  setTimeout(()=>{suppressSubQuotaFocusPreview=false},0);
+}
 function openSettings({returnFocus=settingsToggle,focusTarget=settingsClose}={}){
   if(!settingsOverlay)return;
   closeComposerPopovers();
@@ -5027,7 +5085,6 @@ function openSettings({returnFocus=settingsToggle,focusTarget=settingsClose}={})
   settingsToggle.setAttribute('aria-expanded','true');
   settingsToggle.title='关闭设置';
   if(findDreamSkinConcept(appearance.chatBackground))openDreamSkinGenerator();
-  syncSubQuotaSettings();
   requestAnimationFrame(()=>focusTarget?.focus());
 }
 function closeSettings(){
@@ -5038,20 +5095,16 @@ function closeSettings(){
   settingsToggle.title='设置';
   passwordForm?.reset();
   if(passwordStatus){passwordStatus.textContent='';passwordStatus.classList.remove('success')}
-  subQuotaSettingsForm?.reset();
-  if(subQuotaSettingsStatus){subQuotaSettingsStatus.textContent='';subQuotaSettingsStatus.classList.remove('success')}
   closeDreamSkinGenerator();
   const returnFocus=settingsReturnFocus||settingsToggle;
   settingsReturnFocus=null;
-  const suppressPreview=returnFocus===subQuotaToggle;
-  if(suppressPreview)suppressSubQuotaFocusPreview=true;
   returnFocus?.focus();
-  if(suppressPreview)setTimeout(()=>{suppressSubQuotaFocusPreview=false},0);
 }
 function syncModalOpenState(){
   const settingsOpen=settingsOverlay&&!settingsOverlay.classList.contains('hidden');
+  const subQuotaSettingsOpen=subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden');
   const previewOpen=imagePreview&&!imagePreview.classList.contains('hidden');
-  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||previewOpen));
+  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||subQuotaSettingsOpen||previewOpen));
 }
 function ensureImagePreview(){
   if(imagePreview)return;
@@ -5096,15 +5149,16 @@ function closeImagePreview(){
   if(imagePreviewReturnFocus?.isConnected)imagePreviewReturnFocus.focus();
   imagePreviewReturnFocus=null;
 }
-function trapSettingsFocus(event){
-  if(event.key!=='Tab'||!settingsDialog)return;
-  const focusable=[...settingsDialog.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),summary,[href]')].filter((item)=>item.offsetParent!==null);
+function trapDialogFocus(dialog,event){
+  if(event.key!=='Tab'||!dialog)return;
+  const focusable=[...dialog.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),summary,[href]')].filter((item)=>item.offsetParent!==null);
   if(!focusable.length)return;
   const first=focusable[0];
   const last=focusable[focusable.length-1];
   if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus()}
   else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}
 }
+function trapSettingsFocus(event){trapDialogFocus(settingsDialog,event)}
 async function submitPasswordChange(event){
   event.preventDefault();
   const currentPassword=document.getElementById('currentPassword').value;
@@ -5176,7 +5230,7 @@ function enhanceSubQuota(sideActions){
   subQuotaToggle.title='悬停查看 Sub2API 额度，点击设置 Key';
   subQuotaToggle.setAttribute('aria-label','悬停查看 Sub2API 额度，点击设置 Key');
   subQuotaToggle.setAttribute('aria-haspopup','dialog');
-  subQuotaToggle.setAttribute('aria-controls','subQuotaSettings');
+  subQuotaToggle.setAttribute('aria-controls','subQuotaSettingsDialog');
   subQuotaToggle.setAttribute('aria-describedby','subQuotaPopover');
   subQuotaToggle.setAttribute('aria-expanded','false');
   setIconLabel(subQuotaToggle,'gauge','Sub2API 额度',false);
@@ -5203,6 +5257,7 @@ function enhanceSubQuota(sideActions){
   subQuotaPopover.appendChild(subQuotaStatus);
   subQuotaPopover.appendChild(subQuotaContent);
   sideActions.appendChild(subQuotaPopover);
+  ensureSubQuotaSettingsDialog();
 
   subQuotaToggle.addEventListener('pointerenter',showSubQuotaPreview);
   subQuotaToggle.addEventListener('mouseenter',showSubQuotaPreview);
@@ -5210,7 +5265,7 @@ function enhanceSubQuota(sideActions){
   subQuotaToggle.addEventListener('mouseleave',scheduleSubQuotaPreviewHide);
   subQuotaToggle.addEventListener('focus',()=>{if(!suppressSubQuotaFocusPreview)showSubQuotaPreview()});
   subQuotaToggle.addEventListener('blur',(event)=>{if(!subQuotaPopover.contains(event.relatedTarget))scheduleSubQuotaPreviewHide()});
-  subQuotaToggle.addEventListener('click',()=>openSettings({returnFocus:subQuotaToggle,focusTarget:subQuotaApiKeyInput}));
+  subQuotaToggle.addEventListener('click',openSubQuotaSettings);
   subQuotaPopover.addEventListener('pointerenter',cancelSubQuotaPreviewHide);
   subQuotaPopover.addEventListener('pointerleave',scheduleSubQuotaPreviewHide);
   refreshIcons(subQuotaPopover);
@@ -5219,13 +5274,11 @@ function showSubQuotaPreview(){
   if(!subQuotaPopover||!subQuotaToggle)return;
   cancelSubQuotaPreviewHide();
   subQuotaPopover.classList.remove('hidden');
-  subQuotaToggle.setAttribute('aria-expanded','true');
   loadSubQuota();
 }
 function hideSubQuotaPreview(){
   if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
   subQuotaPopover.classList.add('hidden');
-  subQuotaToggle?.setAttribute('aria-expanded','false');
 }
 function cancelSubQuotaPreviewHide(){if(subQuotaHoverTimer){clearTimeout(subQuotaHoverTimer);subQuotaHoverTimer=null}}
 function scheduleSubQuotaPreviewHide(){cancelSubQuotaPreviewHide();subQuotaHoverTimer=setTimeout(()=>{subQuotaHoverTimer=null;hideSubQuotaPreview()},180)}
@@ -5469,7 +5522,7 @@ menuBtn?.addEventListener('click', toggleMenu);
 document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();app.classList.remove('menuOpen');renderSidebarWidth();syncMenuButton()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',async()=>{rememberNativeComposerOverride();await loadModels(provider.value);rememberNativeComposerOverride();syncComposerChrome()});
