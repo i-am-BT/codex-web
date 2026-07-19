@@ -395,17 +395,23 @@ body .pill {
 .sideActions {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(4, 36px);
-  gap: 8px;
+  grid-template-columns: minmax(112px, 1fr) repeat(4, 36px);
+  gap: 6px;
 }
 
 .sideActions .miniPrimary {
+  display: inline-flex;
   min-width: 0;
   width: 100%;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: 6px;
   overflow: hidden;
   min-height: 36px;
-  padding: 0 12px;
+  padding: 0 10px;
   font-size: 13px;
+  white-space: nowrap;
 }
 
 .sideActions .miniPrimary .lucide {
@@ -414,10 +420,14 @@ body .pill {
 }
 
 .sideActions .miniPrimary .buttonLabel {
+  flex: 0 0 auto;
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
+  line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
+  word-break: keep-all;
 }
 
 body .archiveToggle,
@@ -707,7 +717,7 @@ body .subQuotaClose:hover {
   }
 }
 
-@container sidebar (max-width: 264px) {
+@container sidebar (max-width: 280px) {
   .sideActions {
     grid-template-columns: repeat(5, 36px);
     justify-content: space-between;
@@ -4532,6 +4542,19 @@ body .msg.user.browserCommentSteering::after {
   justify-self: center;
   overflow: hidden;
   border-radius: 999px;
+}
+
+.editedFilesResult:not(.live):not([open]) {
+  width: max-content;
+  max-width: 100%;
+}
+
+.editedFilesResult:not(.live):not([open]) > .turnResultHead {
+  display: inline-flex;
+  width: max-content;
+  max-width: 100%;
+  grid-template-columns: none;
+  flex-wrap: nowrap;
 }
 
 .turnResultHead {
