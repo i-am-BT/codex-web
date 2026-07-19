@@ -1117,6 +1117,8 @@ if (args[0] === 'app-server') {
     assert.match(page, /if\(item\._subagentTrace\?\.autoTrack\)loadSubagentTrace/);
     assert.doesNotMatch(page, /currentActivityCluster\.dataset\.activityGroup!==group/);
     assert.match(page, /turnProcessTimeline\.insertBefore\(element,matched\.nextSibling\)/);
+    assert.match(page, /function appendConversationElement\(element,role\)/);
+    assert.match(page, /appendConversationElement\(el,role\)/);
     assert.doesNotMatch(page, /matched\.open=true/);
     assert.match(page, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
     assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);

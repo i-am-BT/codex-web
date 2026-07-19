@@ -7752,6 +7752,11 @@ function createBrowserCommentDetails(text,count){
   details.appendChild(content);
   return details;
 }
+function appendConversationElement(element,role){
+  if(role==='user'&&turnProcessHeader?.parentNode===chat)chat.insertBefore(element,turnProcessHeader);
+  else chat.appendChild(element);
+  return element;
+}
 function addMsg(role,text,options={}){
   const kind=String(options.kind||'');
   const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
@@ -8006,7 +8011,7 @@ function addMsg(role,text,options={}){
     el._messageBody=body;
   }
   if(role==='tool'&&latestToolElement?.parentNode)latestToolElement.remove();
-  chat.appendChild(el);
+  appendConversationElement(el,role);
   if(steeringUser&&completedSteeringTimeline)completedSteeringTimeline.appendChild(el);
   else if(steeringUser||isTurnProcessMessage(role,kind))activateTurnProcessElement(el);
   refreshIcons(el);
