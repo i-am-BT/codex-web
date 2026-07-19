@@ -1189,7 +1189,7 @@ updated_at = 1784422800000
     assert.match(page, /freezeTurnProcessElapsed\(conversation\.updatedAt,completingTurnId\)/);
     assert.match(page, /freezeTurnProcessElapsed\('',activeNativeTurnId\);clearLiveTurnProgress\(\);webRunActive=false/);
     assert.match(page, /function createActivityCluster/);
-    assert.match(page, /function createActivityCluster[\s\S]*?cluster\.open=true;/);
+    assert.match(page, /function createActivityCluster[\s\S]*?cluster\.open=false;/);
     assert.match(page, /function updateTurnReasoningStatus/);
     assert.match(page, /if\(!turnReasoningStatus\)\{[\s\S]*turnReasoningStatus\.textContent=clean;[\s\S]*turnProcessTimeline\.appendChild\(turnReasoningStatus\)/);
     assert.doesNotMatch(page, /pendingActivityClusterTitle/);

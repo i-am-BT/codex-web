@@ -445,7 +445,7 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.doesNotMatch(inlineScript, /function createTurnPlanElement|turnPlanPanel/);
   assert.doesNotMatch(uiStyles, /\.turnPlanPanel|\.turnPlanList|\.turnPlanStep/);
   assert.match(inlineScript, /function activityClusterPresentation\(cluster\)\{[\s\S]*?activityClusterReasoning\(cluster\)\.at\(-1\)/);
-  assert.match(inlineScript, /function createActivityCluster[\s\S]*?cluster\.open=true;/);
+  assert.match(inlineScript, /function createActivityCluster[\s\S]*?cluster\.open=false;/);
   assert.match(inlineScript, /function collapseCurrentActivityCluster[\s\S]*?currentActivityCluster\.open=false/);
   assert.match(inlineScript, /function markCurrentActivityItem[\s\S]*?current\.dataset\.current='true'/);
   assert.match(inlineScript, /if\(expandable\)item\.open=false;/);

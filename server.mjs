@@ -8009,7 +8009,7 @@ function createActivityCluster(group='tools',reasoning=[]){
   cluster.dataset.messageKind='activity_cluster';
   cluster.dataset.activityGroup=String(group||'tools');
   cluster.dataset.activityReasoning=JSON.stringify((reasoning||[]).map((item)=>String(item||'').trim()).filter(Boolean));
-  cluster.open=true;
+  cluster.open=false;
   const summary=document.createElement('summary');
   summary.className='activityClusterSummary';
   const icon=document.createElement('span');
