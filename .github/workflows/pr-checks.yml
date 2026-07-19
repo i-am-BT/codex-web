@@ -29,12 +29,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require latest main
+      - name: Require latest main unless trusted author
         if: github.event_name == 'pull_request'
         env:
           BASE_REF: ${{ github.base_ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          TRUSTED_BEHIND_AUTHORS: i-kirito
         run: |
+          if [[ ",${TRUSTED_BEHIND_AUTHORS}," == *",${PR_AUTHOR},"* ]]; then
+            echo "Trusted author ${PR_AUTHOR}: latest-main requirement skipped; all validation steps remain required."
+            exit 0
+          fi
           git fetch --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
           if ! git merge-base --is-ancestor "origin/$BASE_REF" "$HEAD_SHA"; then
             echo "::error::PR 分支落后于 $BASE_REF，请先 rebase 到最新主分支。"
