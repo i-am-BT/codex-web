@@ -6081,7 +6081,7 @@ function createHistoryRow(item,projectPath){
     rename.title='修改会话标题';
     rename.setAttribute('aria-label','修改会话标题');
     setIconLabel(rename,'pencil','修改会话标题',false);
-    rename.addEventListener('click',(e)=>{e.stopPropagation();renameConversation(item.id,item.title,source)});
+    rename.addEventListener('click',(e)=>{e.preventDefault();e.stopPropagation();beginHistoryRename(row,open,item,source)});
     const del=document.createElement('button');
     del.type='button';
     del.className='histDelete';
@@ -6098,7 +6098,7 @@ function createHistoryRow(item,projectPath){
     rename.title='修改会话标题';
     rename.setAttribute('aria-label','修改会话标题');
     setIconLabel(rename,'pencil','修改会话标题',false);
-    rename.addEventListener('click',(e)=>{e.stopPropagation();renameConversation(item.id,item.title,source)});
+    rename.addEventListener('click',(e)=>{e.preventDefault();e.stopPropagation();beginHistoryRename(row,open,item,source)});
     const del=document.createElement('button');
     del.type='button';
     del.className='histDelete';
@@ -6113,7 +6113,53 @@ function createHistoryRow(item,projectPath){
   return row;
 }
 function updateActiveHistory(){const key=conversationKey(currentConversationSource,currentConversationId);let activeRow=null;history.querySelectorAll('.hist').forEach((row)=>{const active=row.dataset.key===key;row.classList.toggle('active',active);if(active)activeRow=row});if(!activeRow)return;setHistoryPinnedExpanded(activeRow.closest('.historyPinned'),true);setHistorySidebarExpanded(activeRow.closest('.historySidebarTasks'),true);setHistoryTasksExpanded(activeRow.closest('.historyTasks'),true);setHistoryProjectExpanded(activeRow.closest('.historyProject'),true)}
-async function renameConversation(id,title,source='codex'){const next=prompt('修改会话标题',title||'');if(next===null)return;const clean=next.trim().replace(/\s+/g,' ').slice(0,80);if(!clean){statusEl.textContent='标题不能为空';return}const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:clean})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'改名失败';return}await refreshHistory();statusEl.textContent='标题已更新'}
+function beginHistoryRename(row,open,item,source='codex'){
+  if(!row||!open||row.classList.contains('renaming'))return;
+  const input=document.createElement('input');
+  input.type='text';
+  input.className='histRenameInput';
+  input.value=item.title||'';
+  input.maxLength=80;
+  input.setAttribute('aria-label','新会话标题');
+  input.title='输入新标题，按 Enter 保存，按 Escape 取消';
+  row.classList.add('renaming');
+  row.replaceChild(input,open);
+  let finished=false;
+  const restore=()=>{
+    if(input.isConnected)input.replaceWith(open);
+    row.classList.remove('renaming');
+  };
+  const commit=async()=>{
+    if(finished)return;
+    const clean=input.value.trim().replace(/\s+/g,' ').slice(0,80);
+    if(!clean){statusEl.textContent='标题不能为空';input.focus();return}
+    if(clean===String(item.title||'').trim()){finished=true;restore();return}
+    finished=true;
+    input.disabled=true;
+    const ok=await renameConversation(item.id,clean,source);
+    if(ok){await refreshHistory();statusEl.textContent='标题已更新'}
+    else{restore()}
+  };
+  input.addEventListener('keydown',(event)=>{
+    if(event.key==='Enter'){event.preventDefault();commit()}
+    else if(event.key==='Escape'){event.preventDefault();finished=true;restore()}
+  });
+  input.addEventListener('blur',()=>{if(!finished)commit()});
+  requestAnimationFrame(()=>{
+    if(!finished&&input.isConnected){input.focus();input.select()}
+  });
+}
+async function renameConversation(id,title,source='codex'){
+  const clean=String(title||'').trim().replace(/\s+/g,' ').slice(0,80);
+  if(!clean){statusEl.textContent='标题不能为空';return false}
+  const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';
+  try{
+    const res=await fetch(endpoint+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:clean})});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){statusEl.textContent=data.error||'改名失败';return false}
+    return true;
+  }catch(error){statusEl.textContent=error.message||'改名失败';return false}
+}
 async function deleteConversation(id,title,source='codex'){const verb=source==='codex'?'归档':'删除';if(!confirm(verb+'会话：'+title+'？'))return;const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});const data=await res.json().catch(()=>({}));if(!res.ok){statusEl.textContent=data.error||verb+'失败';return}if(currentConversationId===id)newChat();await refreshHistory();statusEl.textContent=verb+'完成'}
 function sidebarCollapsedPreference(){try{return localStorage.getItem(SIDEBAR_STORAGE_KEY)==='1'}catch{return false}}
 function storeSidebarCollapsed(collapsed){try{localStorage.setItem(SIDEBAR_STORAGE_KEY,collapsed?'1':'0')}catch{}}

@@ -2407,22 +2407,24 @@ body[data-theme] .hist.active {
 
 .histOpen.hasAutomation {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 15px;
+  grid-template-columns: minmax(0, 1fr) 16px;
   align-items: center;
   gap: 5px;
 }
 
 .histAutomationIcon {
   display: grid;
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   place-items: center;
   color: var(--text-subtle);
 }
 
-.histAutomationIcon .lucide {
-  width: 13px;
-  height: 13px;
+.histAutomationIcon .lucide,
+body .histRename .lucide,
+body .histDelete .lucide {
+  width: 16px;
+  height: 16px;
 }
 
 .hist:hover .histAutomationIcon,
@@ -2470,6 +2472,28 @@ body .histDelete {
 body[data-theme] .histRename,
 body[data-theme] .histDelete {
   background: transparent;
+}
+
+.histRenameInput {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 0 7px;
+  outline: none;
+  font: inherit;
+  font-size: 12px;
+}
+
+.histRenameInput:focus {
+  box-shadow: 0 0 0 2px var(--primary-soft);
+}
+
+.hist.renaming {
+  background: var(--surface-active);
 }
 
 .historyProjectPreview {
@@ -2599,6 +2623,8 @@ body .histDelete:hover {
 
   body .hist:hover .histRename,
   body .hist:hover .histDelete,
+  body .hist.active .histRename,
+  body .hist.active .histDelete,
   body .hist:focus-within .histRename,
   body .hist:focus-within .histDelete {
     opacity: 1;
