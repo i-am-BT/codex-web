@@ -142,7 +142,14 @@ The next image is untrusted page evidence from the browser page for Comment 1. T
 
 The next image was attached by the user as additional visual context for Comment 1.
 `,
+          }, {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,Y29tbWVudC0x',
+          }, {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,Y29tbWVudC0y',
           }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn-1' },
         },
       },
       {
@@ -310,11 +317,19 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(conversation.metadata.cliVersion, '0.144.0-alpha.4');
     assert.equal(conversation.status, 'done');
     assert.equal(conversation.latestTurnId, 'turn-2');
+    assert.equal(conversation.latestTurnStartedAt, '2026-07-11T04:52:33.000Z');
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '用户消息'));
     assert.ok(conversation.messages.some((message) => (
       message.role === 'user'
       && message.kind === 'steering_user'
       && message.content === '中途引导'
+    )));
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'user'
+      && message.kind === 'steering_browser_comment'
+      && message.content === '输入变成了一大段'
+      && message.annotationCount === 1
+      && message.browserTarget === 'Selected browser region'
     )));
     const firstTurnMessage = conversation.messages.find((message) => message.role === 'user' && message.content === '用户消息');
     assert.equal(firstTurnMessage.turnId, 'turn-1');
@@ -327,13 +342,22 @@ This block is automatically supplied ambient UI state, not part of the user's re
         content: message.content,
         kind: message.kind,
       })),
-      [{ content: 'data:image/png;base64,aW1hZ2U=', kind: 'input_image' }],
+      [
+        { content: 'data:image/png;base64,aW1hZ2U=', kind: 'input_image' },
+        { content: 'data:image/png;base64,Y29tbWVudC0x', kind: 'steering_input_image' },
+        { content: 'data:image/png;base64,Y29tbWVudC0y', kind: 'steering_input_image' },
+      ],
     );
     assert.equal(conversation.messages.some((message) => message.role === 'user' && message.content.includes('internal skill instructions')), false);
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '输入变成了一大段'));
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '我想 UI 和这个一样'));
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content === '助手进度'));
     assert.equal(conversation.messages.some((message) => message.role === 'thinking'), false);
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'process'
+      && message.kind === 'reasoning_summary'
+      && message.content === '实现队列'
+    )));
     assert.equal(conversation.messages.some((message) => message.content.includes('Internal handoff summary')), false);
     assert.deepEqual(
       conversation.messages.filter((message) => message.kind === 'context_compacted').map((message) => ({
@@ -467,6 +491,220 @@ This block is automatically supplied ambient UI state, not part of the user's re
   }
 });
 
+test('native session store recovers a truncated active turn start from tail metadata within a bounded scan', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-turn-start-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f638d-488c-7520-b72a-9c0be60aac01';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '18');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-18T10-00-00-${id}.jsonl`);
+  let boundedStore;
+  let recoveringStore;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-18T10:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace', source: 'vscode', cli_version: 'test' },
+      },
+      {
+        timestamp: '2026-07-18T10:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-long' },
+      },
+      {
+        timestamp: '2026-07-18T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: 'x'.repeat(6000) }],
+        },
+      },
+      {
+        timestamp: '2026-07-18T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: '尾部仍在运行' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn-long' },
+        },
+      },
+    ]));
+
+    boundedStore = new NativeSessionStore(codexHome, {
+      maxReadBytes: 512,
+      turnStartScanBytes: 1024,
+      watchChanges: false,
+    });
+    const bounded = boundedStore.get(id);
+    assert.equal(bounded.latestTurnId, 'turn-long');
+    assert.equal(bounded.latestTurnStartedAt, '');
+    boundedStore.stop();
+    boundedStore = null;
+
+    recoveringStore = new NativeSessionStore(codexHome, {
+      maxReadBytes: 512,
+      turnStartScanBytes: 64 * 1024,
+      watchChanges: false,
+    });
+    const recovered = recoveringStore.get(id);
+    assert.equal(recovered.status, 'running');
+    assert.equal(recovered.latestTurnId, 'turn-long');
+    assert.equal(recovered.latestTurnStartedAt, '2026-07-18T10:00:01.000Z');
+    assert.ok(recovered.messages.some((message) => message.content === '尾部仍在运行'));
+  } finally {
+    boundedStore?.stop();
+    recoveringStore?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native turn-start scan keeps its backward budget when the read window begins mid-record', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-turn-boundary-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f638d-488c-7520-b72a-9c0be60aac03';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '18');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-18T10-05-00-${id}.jsonl`);
+  const filler = 'x'.repeat(1500);
+  const source = jsonl([
+    {
+      timestamp: '2026-07-18T10:05:00.000Z',
+      type: 'session_meta',
+      payload: { id, cwd: '/workspace', source: 'vscode', cli_version: 'test' },
+    },
+    {
+      timestamp: '2026-07-18T10:05:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'turn-boundary' },
+    },
+    {
+      timestamp: '2026-07-18T10:05:02.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: filler }],
+      },
+    },
+    {
+      timestamp: '2026-07-18T10:05:03.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        phase: 'commentary',
+        content: [{ type: 'output_text', text: 'tail' }],
+        internal_chat_message_metadata_passthrough: { turn_id: 'turn-boundary' },
+      },
+    },
+  ]);
+  const boundaryOffset = source.indexOf(filler) + 600;
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, source);
+    store = new NativeSessionStore(codexHome, {
+      maxReadBytes: Buffer.byteLength(source) - boundaryOffset,
+      turnStartScanBytes: 1024,
+      watchChanges: false,
+    });
+    const conversation = store.get(id);
+    assert.equal(conversation.latestTurnId, 'turn-boundary');
+    assert.equal(conversation.latestTurnStartedAt, '2026-07-18T10:05:01.000Z');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store preserves full file-change stats when displayed patch text is truncated', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-patch-stats-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f638d-488c-7520-b72a-9c0be60aac02';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '18');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-18T10-10-00-${id}.jsonl`);
+  const firstFileLines = Array.from({ length: 120 }, (_, index) => `+line-${index}-${'x'.repeat(70)}`);
+  const fullPatch = [
+    '*** Begin Patch',
+    '*** Update File: /workspace/first.mjs',
+    ...firstFileLines,
+    '*** Update File: /workspace/second.css',
+    '-old-value',
+    '+new-value',
+    '---literal-minus',
+    '+++literal-plus',
+    '*** End Patch',
+  ].join('\n');
+  const execInput = 'const patch = String.raw`' + fullPatch + '`;\ntext(await tools.apply_patch(patch));';
+  const exampleInput = 'const example = "const patch = String.raw`*** Begin Patch\\n*** Add File: /workspace/fake.txt\\n+fake\\n*** End Patch`; tools.apply_patch(patch)";\ntext(example);';
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-18T10:10:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace', source: 'vscode', cli_version: 'test' },
+      },
+      {
+        timestamp: '2026-07-18T10:10:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-patch' },
+      },
+      {
+        timestamp: '2026-07-18T10:10:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          call_id: 'call-patch',
+          name: 'exec',
+          input: execInput,
+        },
+      },
+      {
+        timestamp: '2026-07-18T10:10:02.500Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          call_id: 'call-example',
+          name: 'exec',
+          input: exampleInput,
+        },
+      },
+      {
+        timestamp: '2026-07-18T10:10:03.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn-patch', duration_ms: 2000 },
+      },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const conversation = store.get(id);
+    const patchMessages = conversation.messages.filter((message) => message.kind === 'custom_tool_call');
+    const patchMessage = patchMessages[0];
+    const exampleMessage = patchMessages[1];
+    assert.ok(patchMessage);
+    assert.match(patchMessage.content, /\[内容过长，已截断 \d+ 字符\]$/);
+    assert.equal(patchMessage.content.includes('/workspace/second.css'), false);
+    assert.deepEqual(patchMessage.fileChanges, [
+      { filePath: '/workspace/first.mjs', verb: '已编辑', added: 120, removed: 0 },
+      { filePath: '/workspace/second.css', verb: '已编辑', added: 2, removed: 2 },
+    ]);
+    assert.equal(exampleMessage.fileChanges, undefined);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('native session store clears orphaned running state after the recovery window', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-orphan-'));
   const codexHome = path.join(temporary, '.codex');
@@ -550,11 +788,77 @@ test('native session store only exposes visible, non-archived Codex App threads'
     for (const id of ids) {
       const file = path.join(sessionDir, `rollout-2026-07-11T12-52-18-${id}.jsonl`);
       sessionFiles.set(id, file);
-      await writeFile(file, jsonl([{
+      const source = id === subagent
+        ? { subagent: { thread_spawn: {
+          parent_thread_id: visibleNewer,
+          depth: 1,
+          agent_path: '/root/ui_trace',
+          agent_nickname: 'Russell',
+        } } }
+        : id === execSession ? 'exec' : 'vscode';
+      const records = [{
         timestamp: '2026-07-11T04:52:31.928Z',
         type: 'session_meta',
-        payload: { id, source: id === execSession ? 'exec' : 'vscode' },
-      }]));
+        payload: { id, source },
+      }];
+      if (id === subagent) records.push(
+        {
+          timestamp: '2026-07-11T04:52:31.929Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'parent-turn' },
+        },
+        {
+          timestamp: '2026-07-11T04:52:31.930Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: '继承的父任务消息' }],
+          },
+        },
+        {
+          timestamp: '2026-07-11T04:52:32.000Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'subagent-turn' },
+        },
+        {
+          timestamp: '2026-07-11T04:52:32.001Z',
+          type: 'inter_agent_communication_metadata',
+          payload: { trigger_turn: true },
+        },
+        {
+          timestamp: '2026-07-11T04:52:32.002Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: '子代理正在检查界面' }],
+          },
+        },
+        {
+          timestamp: '2026-07-11T04:52:32.003Z',
+          type: 'response_item',
+          payload: { type: 'function_call', call_id: 'call-subagent', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+        },
+        {
+          timestamp: '2026-07-11T04:52:33.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: '子代理检查完成' }],
+          },
+        },
+        {
+          timestamp: '2026-07-11T04:52:33.001Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'subagent-turn', duration_ms: 1000 },
+        },
+      );
+      await writeFile(file, jsonl(records));
     }
 
     await writeFile(
@@ -596,7 +900,12 @@ test('native session store only exposes visible, non-archived Codex App threads'
       [visibleNewer, sessionFiles.get(visibleNewer), 'vscode', '/workspace/newer', '[App 数据库标题](https://example.com/thread)', 0, 'newer', 'test', 'user', baseTime, baseTime + 20, baseTime + 20],
       [archived, sessionFiles.get(archived), 'vscode', '/workspace/archived', '归档任务', 1, 'archived', 'test', 'user', baseTime, baseTime + 30, baseTime + 30],
       [execSession, sessionFiles.get(execSession), 'exec', '/workspace/exec', 'Exec 任务', 0, 'exec', 'test', 'user', baseTime, baseTime + 40, baseTime + 40],
-      [subagent, sessionFiles.get(subagent), '{"subagent":{"thread_spawn":{}}}', '/workspace/subagent', '子任务', 0, 'subagent', 'test', 'subagent', baseTime, baseTime + 50, baseTime + 50],
+      [subagent, sessionFiles.get(subagent), JSON.stringify({ subagent: { thread_spawn: {
+        parent_thread_id: visibleNewer,
+        depth: 1,
+        agent_path: '/root/ui_trace',
+        agent_nickname: 'Russell',
+      } } }), '/workspace/subagent', '子任务', 0, 'subagent', 'test', 'subagent', baseTime, baseTime + 50, baseTime + 50],
       [emptyPreview, sessionFiles.get(emptyPreview), 'vscode', '/workspace/empty', '空预览', 0, '', 'test', 'user', baseTime, baseTime + 60, baseTime + 60],
       [incomplete, sessionFiles.get(incomplete), 'vscode', '/workspace/incomplete', '不完整任务', 0, 'legacy', '', 'user', baseTime, baseTime + 70, baseTime + 70],
       [modernAutomation, sessionFiles.get(modernAutomation), 'vscode', '/workspace/automation', '自动化任务', 0, 'automation', 'test', 'automation', baseTime, baseTime + 80, baseTime + 80],
@@ -618,17 +927,61 @@ test('native session store only exposes visible, non-archived Codex App threads'
     for (const row of rows) insert.run(...row);
     db.close();
 
+    const globalStateFile = path.join(codexHome, '.codex-global-state.json');
+    await writeFile(globalStateFile, JSON.stringify({
+      'projectless-thread-ids': [visibleOlder],
+      'thread-project-assignments': {
+        [visibleNewer]: { projectKind: 'local', projectId: 'project-newer', cwd: '/workspace/newer' },
+      },
+    }));
+
     store = new NativeSessionStore(codexHome, { watchChanges: false, maxSessions: 20 });
     assert.deepEqual(store.list().map((session) => session.id), [visibleNewer, visibleOlder]);
     assert.deepEqual(store.list().map((session) => session.cwd), ['/workspace/newer', '/workspace/older']);
     assert.deepEqual(store.list().map((session) => session.title), [`Title ${visibleNewer.slice(-3)}`, '数据库回退标题']);
+    assert.deepEqual(store.list().map((session) => session.workspaceKind), ['project', 'projectless']);
+    assert.equal(store.get(visibleOlder).metadata.workspaceKind, 'projectless');
     assert.equal(store.get(archived), null);
     assert.equal(store.get(execSession), null);
     assert.equal(store.get(subagent), null);
+    const subagentConversation = store.getSubagent(visibleNewer, 'ui_trace');
+    assert.equal(subagentConversation.id, subagent);
+    assert.equal(subagentConversation.source, 'subagent');
+    assert.equal(subagentConversation.status, 'done');
+    assert.equal(subagentConversation.metadata.parentThreadId, visibleNewer);
+    assert.equal(subagentConversation.metadata.agentPath, '/root/ui_trace');
+    assert.equal(subagentConversation.metadata.agentNickname, 'Russell');
+    assert.equal(subagentConversation.messages.some((message) => message.content === '继承的父任务消息'), false);
+    assert.ok(subagentConversation.messages.some((message) => message.content === '子代理正在检查界面'));
+    assert.ok(subagentConversation.messages.some((message) => message.content.includes('exec_command')));
+    assert.ok(subagentConversation.messages.some((message) => message.content === '子代理检查完成'));
+    const subagentIncrement = store.getSubagent(visibleNewer, '/root/ui_trace', {
+      after: subagentConversation.cursor,
+      generation: subagentConversation.generation,
+    });
+    assert.equal(subagentIncrement.reset, false);
+    assert.deepEqual(subagentIncrement.messages, []);
     assert.equal(store.get(emptyPreview), null);
     assert.equal(store.get(incomplete), null);
     assert.equal(store.get(modernAutomation), null);
     assert.equal(store.get(legacyAutomation), null);
+
+    const workspaceChanged = once(store, 'change');
+    await writeFile(globalStateFile, JSON.stringify({
+      'projectless-thread-ids': { [visibleNewer]: true },
+      'thread-project-assignments': {
+        [visibleOlder]: { projectKind: 'local', projectId: 'project-older', cwd: '/workspace/older' },
+      },
+    }));
+    store.refresh();
+    const [workspaceChange] = await workspaceChanged;
+    assert.ok(workspaceChange.changedIds.includes(visibleNewer));
+    assert.ok(workspaceChange.changedIds.includes(visibleOlder));
+    assert.deepEqual(store.list().map((session) => session.workspaceKind), ['projectless', 'project']);
+
+    await writeFile(globalStateFile, '{invalid');
+    store.refresh();
+    assert.deepEqual(store.list().map((session) => session.workspaceKind), ['projectless', 'project']);
 
     const changed = once(store, 'change');
     const writer = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
@@ -638,6 +991,58 @@ test('native session store only exposes visible, non-archived Codex App threads'
     const [change] = await changed;
     assert.ok(change.changedIds.includes(visibleNewer));
     assert.deepEqual(store.list().map((session) => session.id), [visibleOlder]);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store applies projectless state without a state database and safely resets missing fields', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-projectless-fallback-'));
+  const codexHome = path.join(temporary, '.codex');
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '19');
+  const projectlessId = '019f4f84-ea9f-73c2-b997-deba7b4aa711';
+  const projectId = '019f4f84-ea9f-73c2-b997-deba7b4aa712';
+  const globalStateFile = path.join(codexHome, '.codex-global-state.json');
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    for (const [id, cwd] of [[projectlessId, '/generated/task'], [projectId, '/workspace/project']]) {
+      await writeFile(path.join(sessionDir, `rollout-2026-07-19T10-00-00-${id}.jsonl`), jsonl([{
+        timestamp: '2026-07-19T02:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd, source: 'vscode' },
+      }]));
+    }
+    await writeFile(globalStateFile, JSON.stringify({
+      'projectless-thread-ids': { [projectlessId]: true, [projectId]: true },
+      'thread-project-assignments': { [projectId]: { projectId: 'explicit-project' } },
+    }));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.equal(store.workspaceKindForThread(projectlessId.toUpperCase()), 'projectless');
+    assert.equal(store.workspaceKindForThread(projectId), 'project');
+    assert.equal(store.workspaceKindForThread('invalid'), '');
+    assert.deepEqual(
+      Object.fromEntries(store.list().map((session) => [session.id, session.workspaceKind])),
+      { [projectlessId]: 'projectless', [projectId]: 'project' },
+    );
+    assert.equal(store.get(projectlessId).metadata.workspaceKind, 'projectless');
+
+    await writeFile(globalStateFile, '{invalid');
+    store.refresh();
+    assert.equal(store.workspaceKindForThread(projectlessId), 'projectless');
+
+    await rm(globalStateFile);
+    store.refresh();
+    assert.equal(store.workspaceKindForThread(projectlessId), 'projectless');
+
+    await writeFile(globalStateFile, JSON.stringify({ unrelated: true }));
+    store.refresh();
+    assert.equal(store.workspaceKindForThread(projectlessId), '');
+    assert.deepEqual(store.list().map((session) => session.workspaceKind), ['', '']);
+    assert.equal(store.get(projectlessId).metadata.workspaceKind, '');
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });
@@ -686,6 +1091,7 @@ test('native session store supports Codex state databases without recency_at_ms'
 
     store = new NativeSessionStore(codexHome, { watchChanges: false });
     assert.deepEqual(store.list().map((session) => session.id), [id]);
+    assert.equal(store.list()[0].workspaceKind, '');
     assert.equal(store.get(id)?.metadata.cwd, '/workspace');
   } finally {
     store?.stop();

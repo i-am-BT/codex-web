@@ -18,6 +18,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const fakeCodex = path.join(temporary, 'fake-codex.mjs');
   const traceFile = path.join(temporary, 'codex-trace.json');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
+  const appServerControlFile = path.join(temporary, 'app-server-control.json');
   const webEnv = path.join(temporary, 'web.env');
   const toolImagePath = path.join(temporary, 'tool-preview.png');
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
@@ -27,6 +28,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const createdNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa799';
   const archivedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa730';
   const automationNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa731';
+  const subagentNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa732';
   let child;
   let desktopIpc;
   let providerServer;
@@ -72,6 +74,7 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     customProviderBaseUrl = `http://127.0.0.1:${customProviderServer.address().port}`;
     await mkdir(runtime, { recursive: true });
     await mkdir(codexHome, { recursive: true });
+    await writeFile(appServerControlFile, '{}');
     await writeFile(
       toolImagePath,
       Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
@@ -200,6 +203,70 @@ experimental_bearer_token = "test-token"
       nativeSessionDir,
       `rollout-2026-07-11T12-52-19-${archivedNativeSessionId}.jsonl`,
     );
+    const subagentNativeSessionFile = path.join(
+      nativeSessionDir,
+      `rollout-2026-07-11T12-52-21-${subagentNativeSessionId}.jsonl`,
+    );
+    await writeFile(
+      subagentNativeSessionFile,
+      [
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.000Z',
+          type: 'session_meta',
+          payload: {
+            id: subagentNativeSessionId,
+            cwd: temporary,
+            source: { subagent: { thread_spawn: {
+              parent_thread_id: nativeSessionId,
+              depth: 1,
+              agent_path: '/root/ui_trace',
+              agent_nickname: 'Russell',
+            } } },
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.001Z',
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'subagent-turn' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.002Z',
+          type: 'inter_agent_communication_metadata',
+          payload: { trigger_turn: true },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.003Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: '子代理正在检查界面' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.004Z',
+          type: 'response_item',
+          payload: { type: 'function_call', call_id: 'subagent-call', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:36.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: '子代理检查完成' }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:36.001Z',
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'subagent-turn', duration_ms: 1000 },
+        }),
+        '',
+      ].join('\n'),
+    );
     await writeFile(
       archivedNativeSessionFile,
       `${JSON.stringify({
@@ -270,6 +337,7 @@ experimental_bearer_token = "test-token"
       archivedNativeSessionFile,
       'vscode',
       temporary,
+      'Archived fixture',
       1,
       'archived fixture message',
       'test',
@@ -283,6 +351,7 @@ experimental_bearer_token = "test-token"
       automationNativeSessionFile,
       'vscode',
       temporary,
+      'Automation fixture',
       0,
       'Automation: Fixture\nAutomation ID: fixture\nAutomation memory: $CODEX_HOME/automations/fixture/memory.md',
       'test',
@@ -291,9 +360,28 @@ experimental_bearer_token = "test-token"
       1783745554000,
       1783745554000,
     );
+    insertThread.run(
+      subagentNativeSessionId,
+      subagentNativeSessionFile,
+      JSON.stringify({ subagent: { thread_spawn: {
+        parent_thread_id: nativeSessionId,
+        depth: 1,
+        agent_path: '/root/ui_trace',
+        agent_nickname: 'Russell',
+      } } }),
+      temporary,
+      'UI trace',
+      0,
+      'subagent fixture',
+      'test',
+      'subagent',
+      1783745555000,
+      1783745556001,
+      1783745556001,
+    );
     stateDb.close();
     await writeFile(fakeCodex, `#!/usr/bin/env node
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args.includes('--version')) {
   console.log('codex-cli test');
@@ -303,6 +391,16 @@ if (args[0] === 'app-server') {
   const createdThreadId = '${createdNativeSessionId}';
   const forkedThreadId = '${forkedNativeSessionId}';
   const fixtureThreadId = '${nativeSessionId}';
+  const archivedThreadId = '${archivedNativeSessionId}';
+  const archivedThreadIds = new Set([archivedThreadId]);
+  const archiveListCounters = new Map();
+  const archiveControl = () => {
+    try {
+      return JSON.parse(readFileSync(process.env.FAKE_APP_SERVER_CONTROL, 'utf8'));
+    } catch {
+      return {};
+    }
+  };
   const thread = (id) => ({
     id,
     sessionId: id,
@@ -333,6 +431,20 @@ if (args[0] === 'app-server') {
       appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify(message) + '\\n');
       if (!Object.hasOwn(message, 'id') || !message.method) continue;
       if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake' } });
+      else if (message.method === 'thread/list') {
+        const control = archiveControl();
+        const raceToken = String(control.unarchiveAfterFirstListToken || '');
+        const raceId = String(control.unarchiveAfterFirstListId || '');
+        if (message.params.archived === true && raceToken && raceId) {
+          const seen = archiveListCounters.get(raceToken) || 0;
+          if (seen >= 1) archivedThreadIds.delete(raceId);
+          archiveListCounters.set(raceToken, seen + 1);
+        }
+        const data = message.params.archived === true
+          ? [...archivedThreadIds].map((id) => thread(id))
+          : [];
+        send({ id: message.id, result: { data, nextCursor: null, backwardsCursor: null } });
+      }
       else if (message.method === 'thread/start') send({ id: message.id, result: { thread: thread(createdThreadId) } });
       else if (message.method === 'thread/fork') send({ id: message.id, result: { thread: thread(forkedThreadId) } });
       else if (message.method === 'thread/resume') send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
@@ -369,7 +481,19 @@ if (args[0] === 'app-server') {
       else if (message.method === 'turn/steer') {
         send({ id: message.id, result: { turnId: message.params.expectedTurnId } });
       }
-      else if (['thread/name/set', 'thread/archive', 'turn/interrupt'].includes(message.method)) {
+      else if (message.method === 'thread/archive') {
+        archivedThreadIds.add(message.params.threadId);
+        send({ id: message.id, result: {} });
+      }
+      else if (message.method === 'thread/unarchive') {
+        archivedThreadIds.delete(message.params.threadId);
+        send({ id: message.id, result: { thread: thread(message.params.threadId) } });
+      }
+      else if (message.method === 'thread/delete') {
+        archivedThreadIds.delete(message.params.threadId);
+        send({ id: message.id, result: {} });
+      }
+      else if (['thread/name/set', 'turn/interrupt'].includes(message.method)) {
         send({ id: message.id, result: {} });
       }
       else send({ id: message.id, error: { code: -32601, message: 'unsupported fake method' } });
@@ -397,6 +521,7 @@ if (args[0] === 'app-server') {
       fakeCodex,
       traceFile,
       appServerTraceFile,
+      appServerControlFile,
       desktopIpcEnabled: 'true',
       desktopIpcSocket: desktopIpc.socketPath,
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
@@ -456,23 +581,73 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.composerProjectPicker:not\(\.hidden\) \+ \.box/);
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
+    assert.match(uiStyles, /\.composerModelToggle\.running:disabled\s*\{[^}]*opacity:\s*1/s);
+    assert.match(uiStyles, /\.composerModelToggle\.running \.composerModelState\s*\{[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/s);
+    assert.match(uiStyles, /body \.box\.runActive > \.send:not\(\.cancelButton\):disabled\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /body \.cancelButton \.lucide\s*\{[^}]*fill:\s*currentColor;[^}]*stroke:\s*none/s);
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
     assert.match(uiStyles, /\.msg\.user::after\s*\{[^}]*width:\s*min\(124px, 100%\);[^}]*height:\s*6px/s);
     assert.match(uiStyles, /\.msg\.user \.msgActions\s*\{[^}]*top:\s*calc\(100% - 1px\);[^}]*padding:\s*5px 0 0 8px/s);
     assert.match(uiStyles, /\.completionTimeline > \.activityBatch \+ \.activityBatch/);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.completionTimeline\s*\{[^}]*--text:\s*#ffffff;[^}]*--text-muted:\s*#acacac;[^}]*--text-subtle:\s*#7b7b7b/s);
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.activityClusterText\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
+    assert.match(uiStyles, /\.activityClusterSummary\s*\{[^}]*width:\s*100%;[^}]*grid-template-columns:\s*var\(--activity-icon-box\) minmax\(0, 1fr\) 14px/s);
     assert.match(uiStyles, /\.activityCluster\[open\] > summary \.activityClusterChevron/);
+    assert.match(uiStyles, /\.activityCluster:not\(\[open\]\) > \.activityClusterItems\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /\.activityClusterItems::before\s*\{[^}]*width:\s*1px;[^}]*background:\s*var\(--activity-rail\)/s);
+    assert.match(uiStyles, /\.activityCluster \.activityItemChevron\s*\{[^}]*opacity:\s*0/s);
+    assert.match(uiStyles, /\.activityCluster \.activityItem\[data-current="true"\] > \.activityItemSummary \.activityItemChevron,[^}]*opacity:\s*1/s);
+    assert.match(uiStyles, /\.activityCluster \.activityItem\[data-current="true"\] > \.activityItemSummary,[^}]*color:\s*var\(--text\)/s);
+    assert.match(uiStyles, /body\[data-theme\] \.msg\.process\.reasoningStatus/);
+    assert.match(uiStyles, /--reasoning-flow-muted:\s*#b0b0b1/);
+    assert.match(uiStyles, /\.reasoningStatus\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
+    assert.match(uiStyles, /> \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*var\(--reasoning-flow-muted\)[^}]*var\(--reasoning-flow-strong\)/s);
+    assert.match(uiStyles, /\.browserCommentChip\s*\{/);
+    assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
+    assert.match(uiStyles, /\.agentActivityItem\[open\] > \.agentActivityRow \.agentActivityChevron/);
+    assert.match(uiStyles, /\.completionTimeline > \.msg\.agentActivityGroup\s*\{[^}]*display:\s*flex;[^}]*width:\s*100%;[^}]*flex-wrap:\s*wrap;[^}]*column-gap:\s*6px/s);
+    assert.match(uiStyles, /\.agentActivityGroup > \.activityBatch\s*\{[^}]*display:\s*contents/s);
+    assert.match(uiStyles, /\.agentActivityGroup \.agentActivityItem\[open\]\s*\{[^}]*flex:\s*1 0 100%/s);
+    assert.match(uiStyles, /\.agentActivityGroup \.agentActivityItem > \.agentActivityRow \.agentActivityStatus,[^}]*\.agentActivityChevron\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /\.agentActivityLabel\s*\{[^}]*max-width:\s*150px/s);
+    assert.match(uiStyles, /\.agentActivityGroupStatus\[data-trace-state="done"\],\s*\.agentActivityGroupStatus\[data-trace-state="updated"\]\s*\{[^}]*color:\s*var\(--text-muted\)/s);
+    assert.match(uiStyles, /\.subagentTraceTimeline\s*\{/);
+    assert.match(uiStyles, /\.subagentTraceMessage\.final\s*\{/);
+    assert.match(uiStyles, /\.subagentTraceNotice\.loading::before/);
     assert.match(uiStyles, /\.activityImageGallery\s*\{/);
     assert.match(uiStyles, /\.activityImagePreview\s*\{[^}]*display:\s*grid;[^}]*border:\s*0;[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /\.activityImagePreview\.loaded\s*\{[^}]*aspect-ratio:\s*auto/s);
     assert.match(uiStyles, /\.activityImagePreview img\s*\{[^}]*width:\s*100%;[^}]*object-fit:\s*contain/s);
     assert.match(uiStyles, /\.activityImagePreview\.loaded img\s*\{[^}]*height:\s*auto/s);
+    assert.match(uiStyles, /\.liveProcessElapsed\s*\{[^}]*width:\s*100%;[^}]*height:\s*40px;[^}]*align-items:\s*center;[^}]*border-bottom:\s*1px solid var\(--border\);[^}]*font-size:\s*14px;[^}]*white-space:\s*nowrap/s);
+    assert.match(uiStyles, /\.liveProcessElapsed \+ \.liveProcessTimeline\s*\{[^}]*margin-top:\s*14px/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.liveProcessElapsed\s*\{[^}]*border-bottom-color:\s*#303030;[^}]*color:\s*#acacac/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
-    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary:last-child \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming:last-child > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.doesNotMatch(uiStyles, /\.turnPlanPanel|\.turnPlanList|\.turnPlanStep/);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary\.streaming \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
+    assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 36px 36px/s);
+    assert.match(uiStyles, /\.archiveView\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*auto/s);
+    assert.match(uiStyles, /\.archiveTaskRestore,[^}]*\.archiveTaskDelete\s*\{/s);
+    assert.match(uiStyles, /body\[data-theme\] \.archiveProjectFilter select\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.turnResultArtifacts\s*\{[^}]*align-self:\s*center/s);
+    assert.match(uiStyles, /\.editedFilesResult\s*\{[^}]*width:\s*min\(160px, 100%\);[^}]*border-radius:\s*999px/s);
+    assert.match(uiStyles, /\.editedFilesResult\.withPlan\s*\{[^}]*width:\s*max-content/s);
+    assert.match(uiStyles, /\.editedFilesResult\.withPlan > \.turnResultHead\s*\{[^}]*min-height:\s*36px;[^}]*gap:\s*7px;[^}]*padding-inline:\s*12px/s);
+    assert.match(uiStyles, /\.turnPlanProgressRing\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px;[^}]*flex:\s*0 0 12px;[^}]*conic-gradient\(var\(--info\) var\(--turn-plan-progress\)/s);
+    assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
+    assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
+    assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult:not\(\[open\]\)\s*\{[^}]*border-color:\s*#383838;[^}]*background:\s*#272727/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult\.withPlan \.turnPlanProgressRing\s*\{[^}]*conic-gradient\(#339cff var\(--turn-plan-progress\), #2b3c4f 0\)/s);
+    assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult\.withPlan \.turnPlanProgressLabel,[^}]*\.turnResultFileLabel\s*\{[^}]*color:\s*#bbbbbb/s);
+    assert.match(uiStyles, /\.turnResultStat\.added\s*\{[^}]*color:\s*var\(--success\)/s);
+    assert.match(uiStyles, /\.turnResultStat\.removed\s*\{[^}]*color:\s*var\(--danger\)/s);
+    assert.match(uiStyles, /\.webPreviewResult\s*\{/);
     assert.match(uiStyles, /body\[data-theme\] \.msg\.assistant\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgBody > :not\(\.memoryCitations\)\s*\{[^}]*max-width:\s*min\(780px, 100%\)/s);
     assert.match(uiStyles, /\.msg\.assistant > \.msgActions\s*\{[^}]*width:\s*fit-content;[^}]*opacity:\s*0/s);
@@ -481,6 +656,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /--conversation-width:\s*760px/);
     assert.match(uiStyles, /body \.chat > :is\([^}]*\.msg:not\(\.user\):not\(\.inputImage\)[^}]*\.liveProcessPanel[^}]*\)\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\);[^}]*align-self:\s*center/s);
     assert.match(uiStyles, /body \.chat > :is\(\.msg\.user, \.msg\.image\.inputImage\)\s*\{[^}]*margin-right:\s*max\(0px, calc\(\(100% - var\(--conversation-width\)\) \/ 2\)\)/s);
+    assert.match(uiStyles, /body \.composer\s*\{[^}]*border-top:\s*0;[^}]*background:\s*var\(--canvas\)/s);
+    assert.match(uiStyles, /body\[data-theme="light"\] \.composer\s*\{[^}]*background:\s*#ffffff/s);
     assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
@@ -534,6 +711,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedImagePromptSync.status, 401);
     const unauthorizedDreamSkin = await fetch(`${baseUrl}/api/dream-skin/prompt`, { method: 'POST' });
     assert.equal(unauthorizedDreamSkin.status, 401);
+    const unauthorizedArchivedTasks = await fetch(`${baseUrl}/api/native-archived-sessions`);
+    assert.equal(unauthorizedArchivedTasks.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
@@ -544,6 +723,45 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    const archivedTasks = await fetch(`${baseUrl}/api/native-archived-sessions`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(archivedTasks.status, 200);
+    assert.match(archivedTasks.headers.get('cache-control'), /private, no-store/);
+    const archivedTasksPayload = await archivedTasks.json();
+    assert.equal(archivedTasksPayload.count, 1);
+    assert.equal(archivedTasksPayload.sessions[0].id, archivedNativeSessionId);
+    assert.equal(archivedTasksPayload.sessions[0].source, 'codex');
+    assert.equal(archivedTasksPayload.sessions[0].cwd, temporary);
+
+    const rejectedUnarchivedDelete = await fetch(
+      `${baseUrl}/api/native-archived-sessions/${nativeSessionId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(rejectedUnarchivedDelete.status, 404);
+    assert.match((await rejectedUnarchivedDelete.json()).error, /不在已归档列表/);
+
+    const unarchivedTask = await fetch(
+      `${baseUrl}/api/native-archived-sessions/${archivedNativeSessionId}/unarchive`,
+      { method: 'POST', headers: { Cookie: cookie } },
+    );
+    assert.equal(unarchivedTask.status, 200);
+    assert.equal((await unarchivedTask.json()).id, archivedNativeSessionId);
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.type === 'broadcast'
+      && message.method === 'thread-unarchived'
+      && message.version === 1
+      && message.params?.hostId === 'local'
+      && message.params?.conversationId === archivedNativeSessionId
+      && message.params?.cwd === temporary
+    )));
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.type === 'broadcast'
+      && message.method === 'query-cache-invalidate'
+      && message.version === 0
+      && JSON.stringify(message.params?.queryKey) === JSON.stringify(['archived-threads'])
+    )));
 
     const playgroundResponse = await fetch(`${baseUrl}/playground/`, {
       headers: { Cookie: cookie },
@@ -567,6 +785,8 @@ if (args[0] === 'app-server') {
     assert.match(playgroundAssetScript, /codex-web-agent/);
     assert.match(playgroundAssetScript, /agentApiConfigMode/);
     assert.match(playgroundAssetScript, /codex_upstream/);
+    assert.match(playgroundAssetScript, /Agent 规划服务暂时不可用，已切换为直接生图/);
+    assert.match(playgroundAssetScript, /上游 Agent 流式请求失败/);
     assert.match(playgroundAssetScript, /请求将通过 Codex Web 同源代理转发到此 URL/);
     assert.doesNotMatch(playgroundAssetScript, /此处设置被忽略/);
     const playgroundPatchSource = await readFile(
@@ -575,6 +795,9 @@ if (args[0] === 'app-server') {
     );
     assert.match(playgroundPatchSource, /baseUrl: existing\?\.baseUrl\?\.trim\(\) \|\| profile\.baseUrl/);
     assert.match(playgroundPatchSource, /apiKey: existing\?\.apiKey\?\.trim\(\) \|\| profile\.apiKey/);
+    assert.match(playgroundPatchSource, /responseError = getErrorMessageFromValue\(response\?\.error\)/);
+    assert.match(playgroundPatchSource, /isDirectAgentImageFallbackPrompt/);
+    assert.match(playgroundPatchSource, /modulePreload: \{ polyfill: false \}/);
     assert.match(playgroundAssetScript, /输入 @ 选择或上传参考图/);
     assert.match(playgroundAssetScript, /上传新的参考图/);
     const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
@@ -785,16 +1008,44 @@ if (args[0] === 'app-server') {
     assert.match(page, /generatedBackgroundApply/);
     assert.match(page, /function renderAssistantMarkdown/);
     assert.match(page, /function toolActivityPresentations/);
+    assert.match(page, /function planActivityPresentation/);
+    assert.doesNotMatch(page, /function createTurnPlanElement|turnPlanPanel/);
+    assert.match(page, /function upsertLiveTurnPlan/);
+    assert.match(page, /presentation\.variant==='plan'/);
     assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
     assert.doesNotMatch(page, /descriptor\.name\+\(descriptor\.detail/);
     assert.match(page, /activityBatch/);
     assert.match(page, /liveProcessPanel/);
+    assert.match(page, /let turnProcessStartedAt = 0;[\s\S]*let turnProcessElapsedLabel = null;[\s\S]*let turnProcessElapsedTimer = null;[\s\S]*let turnProcessElapsedFrozen = false;[\s\S]*let turnProcessElapsedTurnId = '';/);
     assert.match(page, /turnProcessHeader=document\.createElement\('div'\)/);
+    assert.match(page, /turnProcessHeader\.insertBefore\(turnProcessElapsedLabel,turnProcessTimeline\)/);
+    assert.match(page, /function beginTurnProcessCollection\(startedAt='',showElapsed=false,turnId=''\)/);
+    assert.match(page, /beginTurnProcessCollection\(options\.at,showElapsed,options\.turnId\)/);
+    assert.match(page, /function clearTurnProcessHeader\(\)\{\s*clearTurnReasoningStatus\(\);\s*clearTurnProcessElapsed\(\);/);
+    assert.match(page, /beginTurnProcessCollection\(activeStartedAt,true,activeNativeTurnId\)/);
+    assert.match(page, /hydrating:true/);
+    assert.match(page, /function turnProcessElapsedMatches\(turnId\)/);
+    assert.match(page, /if\(terminalProcess&&!turnProcessElapsedMatches\(options\.turnId\)\)return null/);
+    assert.match(page, /if\(isCompletedNativeRuntimeTurn\(runtime\.turnId\)&&\['delta','item-completed','connection-error','turn'\]\.includes\(runtime\.type\)\)return/);
+    assert.match(page, /\['delta','item-completed','connection-error','turn'\]\.includes\(runtime\.type\)\)return/);
+    assert.match(page, /freezeTurnProcessElapsed\(options\.at,options\.turnId\)/);
+    assert.match(page, /freezeTurnProcessElapsed\(runtime\.updatedAt,runtimeTurnId\)/);
+    assert.match(page, /freezeTurnProcessElapsed\(conversation\.updatedAt,completingTurnId\)/);
+    assert.match(page, /freezeTurnProcessElapsed\('',activeNativeTurnId\);clearLiveTurnProgress\(\);webRunActive=false/);
     assert.match(page, /function createActivityCluster/);
+    assert.match(page, /function createActivityCluster[\s\S]*?cluster\.open=true;/);
+    assert.match(page, /function updateTurnReasoningStatus/);
+    assert.match(page, /if\(!turnReasoningStatus\)\{[\s\S]*turnReasoningStatus\.textContent=clean;[\s\S]*turnProcessTimeline\.appendChild\(turnReasoningStatus\)/);
+    assert.doesNotMatch(page, /pendingActivityClusterTitle/);
     assert.match(page, /function isImageViewActivityPresentation/);
     assert.match(page, /image_view_activity/);
     assert.match(page, /function nativeToolImageUrls/);
     assert.match(page, /function createActivityImageGallery/);
+    assert.match(page, /function loadSubagentTrace/);
+    assert.match(page, /function appendSubagentTraceMessage/);
+    assert.match(page, /function markSubagentTraceFinal/);
+    assert.match(page, /if\(kind==='reasoning_summary'\)return false/);
+    assert.match(page, /\/api\/native-sessions\/'\+encodeURIComponent\(state\.parentThreadId\)\+'\/subagents/);
     assert.match(page, /row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\);\s*if\(item\.status==='running'\)[\s\S]*row\.appendChild\(running\);\s*}\s*if\(source==='codex'\)/s);
     assert.match(page, /galleryOnly:true/);
     assert.doesNotMatch(page, /base\+\(index\+1\)\+generation/);
@@ -827,6 +1078,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /function showHistoryProjectPreview/);
     assert.match(page, /itemCount\+' 个对话串 · '\+runningCount\+' 个已开启'/);
     assert.match(page, /codexWeb\.historyProjectsCollapsed/);
+    assert.match(page, /codexWeb\.historyTasksCollapsed/);
     assert.match(page, /codexWeb\.historyProjectsHidden/);
     assert.match(page, /function createHistoryProjectMenu/);
     assert.match(page, /function archiveHistoryProject/);
@@ -835,7 +1087,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /function renameHistoryProject/);
     assert.match(page, /'pencil','重命名项目'/);
     assert.match(page, /historyProjectName\(item\.cwd\)/);
-    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)return/);
+    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)\{historyRefreshPending=true;return\}/);
     assert.match(page, /\/api\/native-projects\/archive/);
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);
@@ -850,8 +1102,29 @@ if (args[0] === 'app-server') {
     assert.match(page, /function steerQueuedPrompt/);
     assert.match(page, /function showNativeSteerOptimistically/);
     assert.match(page, /kind:'steering_user'/);
+    assert.match(page, /steering_browser_comment/);
+    assert.match(page, /function createBrowserCommentDetails/);
+    assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><\/div><button id="settingsToggle"/);
+    assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
+    assert.match(page, /function openArchivedView/);
+    assert.match(page, /function renderArchivedTasks/);
+    assert.match(page, /永久删除全部已归档任务/);
+    assert.match(page, /function createTurnResultArtifacts/);
+    assert.match(page, /function createEditedFilesResultCard/);
+    assert.match(page, /function createWebPreviewResultCard/);
+    assert.match(page, /function refreshLiveEditedFilesResult/);
+    assert.match(page, /createEditedFilesResultCard\(files,'',\{live:true,plan:liveTurnPlan\}\)/);
+    assert.match(page, /if\(item\._subagentTrace\?\.autoTrack\)loadSubagentTrace/);
+    assert.doesNotMatch(page, /currentActivityCluster\.dataset\.activityGroup!==group/);
+    assert.match(page, /turnProcessTimeline\.insertBefore\(element,matched\.nextSibling\)/);
+    assert.doesNotMatch(page, /matched\.open=true/);
+    assert.match(page, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
+    assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
+    assert.match(page, /<option value="ultra">ultra<\/option>/);
+    assert.match(page, /\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -867,6 +1140,15 @@ if (args[0] === 'app-server') {
     assert.match(page, /async function boot\(selectRecent=false\)/);
     const inlineScript = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert.ok(inlineScript);
+    const completedRuntimeHelper = inlineScript.match(/(function isCompletedNativeRuntimeTurn[\s\S]*?)(?=function connectSessionEvents)/)?.[1];
+    assert.ok(completedRuntimeHelper);
+    const isCompletedNativeRuntimeTurn = new Function(
+      completedRuntimeHelper + '; return isCompletedNativeRuntimeTurn;',
+    )();
+    assert.equal(isCompletedNativeRuntimeTurn('turn-old', 'turn-old', ''), true);
+    assert.equal(isCompletedNativeRuntimeTurn('turn-old', '', 'turn-old'), true);
+    assert.equal(isCompletedNativeRuntimeTurn('turn-new', 'turn-old', 'turn-old'), false);
+    assert.equal(isCompletedNativeRuntimeTurn('', 'turn-old', 'turn-old'), false);
     assert.doesNotThrow(() => new Function(inlineScript));
     const singleFlightHelper = inlineScript.match(/(function createTrailingSingleFlight[\s\S]*?)(?=function readPromptQueues)/)?.[1];
     assert.ok(singleFlightHelper);
@@ -895,12 +1177,200 @@ if (args[0] === 'app-server') {
     )();
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
-    const completionTitleHelper = inlineScript.match(/(function completionMessageTitle[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
-    assert.ok(completionTitleHelper);
-    const completionMessageTitle = new Function(
-      completionTitleHelper + '; return completionMessageTitle;',
+    assert.equal(composerLabels.composerEffortLabel('ultra'), '极高');
+    const elapsedTitleHelpers = inlineScript.match(/(function processedMessageTitle[\s\S]*?)(?=function clearTurnReasoningStatus)/)?.[1];
+    assert.ok(elapsedTitleHelpers);
+    const elapsedTitleApi = new Function(
+      elapsedTitleHelpers + '; return { completionMessageTitle, liveProcessElapsedTitle, turnProcessStartTimestamp };',
     )();
-    assert.equal(completionMessageTitle('任务完成，耗时 2159.6s'), '已处理 36m');
+    assert.equal(elapsedTitleApi.completionMessageTitle('任务完成，耗时 0.1s'), '已处理 1s');
+    assert.equal(elapsedTitleApi.completionMessageTitle('任务完成，耗时 2159.6s'), '已处理 36m');
+    assert.equal(elapsedTitleApi.completionMessageTitle('任务完成', 65), '已处理 1m 5s');
+    assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 100_000), '已处理 0s');
+    assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 133_999), '已处理 33s');
+    assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 160_000), '已处理 1m');
+    assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 165_000), '已处理 1m 5s');
+    assert.equal(elapsedTitleApi.turnProcessStartTimestamp('not-a-date', 100_000), 100_000);
+    const elapsedLifecycleHelpers = inlineScript.match(/(function turnProcessElapsedMatches[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
+    assert.ok(elapsedLifecycleHelpers);
+    const elapsedHeader = {
+      children: [],
+      insertBefore(node, before) {
+        node.remove?.();
+        const index = this.children.indexOf(before);
+        node.parentNode = this;
+        this.children.splice(index >= 0 ? index : this.children.length, 0, node);
+        return node;
+      },
+    };
+    const elapsedTimeline = { parentNode: elapsedHeader };
+    elapsedHeader.children.push(elapsedTimeline);
+    const elapsedDocument = {
+      createElement() {
+        return {
+          className: '',
+          dataset: {},
+          parentNode: null,
+          textContent: '',
+          remove() {
+            if (!this.parentNode) return;
+            const index = this.parentNode.children.indexOf(this);
+            if (index >= 0) this.parentNode.children.splice(index, 1);
+            this.parentNode = null;
+          },
+        };
+      },
+    };
+    let elapsedTimerCallback = null;
+    let nextElapsedTimer = 17;
+    const clearedElapsedTimers = [];
+    const elapsedLifecycleApi = new Function(
+      'document',
+      'setInterval',
+      'clearInterval',
+      'liveProcessElapsedTitle',
+      'turnProcessStartTimestamp',
+      'turnProcessHeader',
+      'turnProcessTimeline',
+      `
+        let turnProcessStartedAt = 0;
+        let turnProcessElapsedLabel = null;
+        let turnProcessElapsedTimer = null;
+        let turnProcessElapsedFrozen = false;
+        let turnProcessElapsedTurnId = '';
+        function ensureTurnProcessHeader() { return turnProcessHeader; }
+        ${elapsedLifecycleHelpers}
+        return {
+          clear: clearTurnProcessElapsed,
+          ensure: ensureTurnProcessElapsedRunning,
+          freeze: freezeTurnProcessElapsed,
+          resume: resumeTurnProcessElapsed,
+          start: startTurnProcessElapsed,
+          update: updateTurnProcessElapsed,
+          state: () => ({ turnProcessStartedAt, turnProcessElapsedLabel, turnProcessElapsedTimer, turnProcessElapsedFrozen, turnProcessElapsedTurnId }),
+        };
+      `,
+    )(
+      elapsedDocument,
+      (callback, delay) => {
+        assert.equal(delay, 1000);
+        elapsedTimerCallback = callback;
+        return nextElapsedTimer++;
+      },
+      (timer) => clearedElapsedTimers.push(timer),
+      elapsedTitleApi.liveProcessElapsedTitle,
+      elapsedTitleApi.turnProcessStartTimestamp,
+      elapsedHeader,
+      elapsedTimeline,
+    );
+    const liveElapsed = elapsedLifecycleApi.start('', 100_000, 'turn-new');
+    assert.equal(liveElapsed.className, 'liveProcessElapsed');
+    assert.equal(liveElapsed.dataset.messageKind, 'live_elapsed');
+    assert.equal(liveElapsed.textContent, '已处理 0s');
+    assert.deepEqual(elapsedHeader.children, [liveElapsed, elapsedTimeline]);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, 17);
+    elapsedLifecycleApi.update(133_999);
+    assert.equal(liveElapsed.textContent, '已处理 33s');
+    elapsedLifecycleApi.freeze(133_999, 'turn-old');
+    assert.deepEqual(clearedElapsedTimers, []);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, 17);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedFrozen, false);
+    elapsedLifecycleApi.freeze(133_999, 'turn-new');
+    assert.deepEqual(clearedElapsedTimers, [17]);
+    assert.deepEqual(elapsedHeader.children, [liveElapsed, elapsedTimeline]);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, null);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedFrozen, true);
+    elapsedTimerCallback();
+    assert.equal(liveElapsed.textContent, '已处理 33s');
+    assert.strictEqual(elapsedLifecycleApi.resume(165_000), liveElapsed);
+    assert.equal(liveElapsed.textContent, '已处理 1m 5s');
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, 18);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedFrozen, false);
+    assert.strictEqual(elapsedLifecycleApi.ensure('ignored', 166_000, 'turn-new'), liveElapsed);
+    assert.equal(elapsedLifecycleApi.state().turnProcessElapsedTimer, 18);
+    elapsedLifecycleApi.clear();
+    assert.deepEqual(clearedElapsedTimers, [17, 18]);
+    assert.deepEqual(elapsedHeader.children, [elapsedTimeline]);
+    assert.deepEqual(elapsedLifecycleApi.state(), {
+      turnProcessStartedAt: 0,
+      turnProcessElapsedLabel: null,
+      turnProcessElapsedTimer: null,
+      turnProcessElapsedFrozen: false,
+      turnProcessElapsedTurnId: '',
+    });
+    const reasoningStatusHelpers = inlineScript.match(/(function clearTurnReasoningStatus[\s\S]*?)(?=function clearTurnProcessHeader)/)?.[1];
+    assert.ok(reasoningStatusHelpers);
+    const reasoningTimeline = {
+      children: [],
+      appendChild(node) {
+        if (node.parentNode) {
+          const currentIndex = node.parentNode.children.indexOf(node);
+          if (currentIndex >= 0) node.parentNode.children.splice(currentIndex, 1);
+        }
+        node.parentNode = this;
+        node.isConnected = true;
+        this.children.push(node);
+        return node;
+      },
+    };
+    const reasoningDocument = {
+      createElement() {
+        return {
+          className: '',
+          dataset: {},
+          isConnected: false,
+          parentNode: null,
+          remove() {
+            if (!this.parentNode) return;
+            const currentIndex = this.parentNode.children.indexOf(this);
+            if (currentIndex >= 0) this.parentNode.children.splice(currentIndex, 1);
+            this.parentNode = null;
+            this.isConnected = false;
+          },
+        };
+      },
+    };
+    const reasoningApi = new Function('document', 'turnProcessTimeline', `
+      let turnReasoningStatus = null;
+      let currentActivityCluster = null;
+      function shortActivityText(value, max = 100) {
+        const clean = String(value || '').replace(/\\s+/g, ' ').trim();
+        return clean.length > max ? clean.slice(0, max - 3) + '...' : clean;
+      }
+      function ensureTurnProcessHeader() { return turnProcessTimeline; }
+      function moveLiveEditedFilesResultToEnd() {}
+      function clearActiveActivityReasoning() {}
+      ${reasoningStatusHelpers}
+      return {
+        clear: clearTurnReasoningStatus,
+        current: () => turnReasoningStatus,
+        move: moveTurnReasoningStatusToEnd,
+        shouldClear: shouldClearTurnReasoningStatus,
+        shouldClearPending: shouldClearPendingActivityReasoning,
+        update: updateTurnReasoningStatus,
+      };
+    `)(reasoningDocument, reasoningTimeline);
+    const firstReasoning = reasoningApi.update('Opening browser skill for execution');
+    const secondReasoning = reasoningApi.update('Refining chat view loading and display logic');
+    assert.strictEqual(secondReasoning, firstReasoning);
+    assert.equal(reasoningTimeline.children.length, 1);
+    assert.equal(secondReasoning.textContent, 'Refining chat view loading and display logic');
+    const laterTool = { isConnected: false, parentNode: null };
+    reasoningTimeline.appendChild(laterTool);
+    reasoningApi.move();
+    assert.strictEqual(reasoningTimeline.children.at(-1), secondReasoning);
+    assert.equal(reasoningApi.shouldClear('assistant', 'commentary'), true);
+    assert.equal(reasoningApi.shouldClear('assistant', 'final_answer'), true);
+    assert.equal(reasoningApi.shouldClear('process', 'turn_aborted'), true);
+    assert.equal(reasoningApi.shouldClear('process', 'task_error'), true);
+    assert.equal(reasoningApi.shouldClear('process', 'context_compacted'), false);
+    assert.equal(reasoningApi.shouldClearPending('assistant', 'commentary'), false);
+    assert.equal(reasoningApi.shouldClearPending('assistant', 'final_answer'), true);
+    assert.equal(reasoningApi.shouldClearPending('user', 'steering_browser_comment', true), false);
+    assert.equal(reasoningApi.shouldClearPending('user', 'message', false), true);
+    reasoningApi.clear();
+    assert.equal(reasoningTimeline.children.length, 1);
+    assert.equal(reasoningApi.current(), null);
     const memoryHelper = inlineScript.match(/(function extractMemoryCitations[\s\S]*?)(?=function memoryCitationTitle)/)?.[1];
     assert.ok(memoryHelper);
     const parseMemoryCitations = new Function(memoryHelper + '; return extractMemoryCitations;')();
@@ -929,35 +1399,232 @@ if (args[0] === 'app-server') {
     });
     const activityHelpers = inlineScript.match(/(function decodeEmbeddedToolString[\s\S]*?)(?=function toolMessageTitle)/)?.[1];
     assert.ok(activityHelpers);
-    const parseToolActivity = new Function(`${activityHelpers}; return toolActivityPresentations;`)();
+    const activityApi = new Function(`${activityHelpers}; return { normalizeTurnPlanItems, toolActivityPresentations, activityClusterPresentation, activityClusterMatchesBrowserTarget, markCurrentActivityItem };`)();
+    const parseToolActivity = activityApi.toolActivityPresentations;
+    const semanticCluster = (activityGroup, streaming = false) => ({
+      dataset: { activityGroup },
+      querySelectorAll(selector) {
+        if (selector === ':scope > .activityClusterItems > .activityBatch') {
+          return streaming ? [{ classList: { contains: (name) => name === 'streaming' } }] : [];
+        }
+        return [];
+      },
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(semanticCluster('loaded_tools')), {
+      icon: 'wrench',
+      text: '已加载工具',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(semanticCluster('files_read')), {
+      icon: 'book-open',
+      text: '已读取文件',
+    });
+    const clusterItem = ({ verb, currentVerb = verb, target = '', icon = 'wrench', classes = [] }) => ({
+      classList: { contains: (name) => classes.includes(name) },
+      querySelector(selector) {
+        if (selector === '.activityVerb') return { dataset: { completedVerb: verb }, textContent: currentVerb };
+        if (selector === '.activityTarget') return { textContent: target };
+        if (selector === '.activityItemIcon [data-lucide]') {
+          return { getAttribute: (name) => name === 'data-lucide' ? icon : null };
+        }
+        return null;
+      },
+    });
+    const clusterBatch = (activityGroup, items, streaming = false) => ({
+      dataset: { activityGroup },
+      classList: { contains: (name) => name === 'streaming' && streaming },
+      querySelectorAll: (selector) => selector === '.activityItem' ? items : [],
+    });
+    const activityCluster = (batches, reasoning = [], rawReasoning = null) => ({
+      dataset: {
+        activityGroup: 'tools',
+        activityReasoning: rawReasoning ?? JSON.stringify(reasoning),
+      },
+      querySelectorAll(selector) {
+        if (selector === ':scope > .activityClusterItems > .activityBatch') return batches;
+        if (selector === '.activityItem') return batches.flatMap((batch) => batch.querySelectorAll('.activityItem'));
+        return [];
+      },
+    });
+    const commandItem = () => clusterItem({
+      verb: 'Ran',
+      currentVerb: 'Ran',
+      target: 'command',
+      icon: 'square-terminal',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('commands', [commandItem()]),
+      clusterBatch('commands', [commandItem()]),
+      clusterBatch('commands', [commandItem()]),
+    ])), {
+      icon: 'square-terminal',
+      text: '运行了多个命令',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('commands', [commandItem()]),
+      clusterBatch('commands', [commandItem()]),
+    ], ['Planning first step', 'Planning latest step'])), {
+      icon: 'square-terminal',
+      text: 'Planning latest step',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('commands', [commandItem()]),
+      clusterBatch('commands', [commandItem()]),
+    ], ['   '])), {
+      icon: 'square-terminal',
+      text: '运行了多个命令',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('commands', [commandItem()]),
+      clusterBatch('commands', [commandItem()]),
+    ], [], '{broken')), {
+      icon: 'square-terminal',
+      text: '运行了多个命令',
+    });
+    const currentItems = [{ dataset: { current: 'true' } }, { dataset: {} }];
+    assert.strictEqual(activityApi.markCurrentActivityItem({
+      querySelectorAll: (selector) => selector === '.activityItem' ? currentItems : [],
+    }), currentItems[1]);
+    assert.equal(currentItems[0].dataset.current, undefined);
+    assert.equal(currentItems[1].dataset.current, 'true');
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('loaded_tools', [clusterItem({
+        verb: '读取',
+        currentVerb: '读取',
+        target: 'Browser 技能',
+        icon: 'wrench',
+        classes: ['skillTarget'],
+      })]),
+      clusterBatch('commands', [commandItem(), commandItem()]),
+    ])), {
+      icon: 'wrench',
+      text: '已加载工具运行了多个命令',
+    });
+    assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
+      clusterBatch('files_read', [clusterItem({
+        verb: '已读取',
+        currentVerb: '正在读取',
+        target: '2026-07-11T04-52-18-ZaKl-codex_web',
+        icon: 'book-open',
+        classes: ['memoryTarget'],
+      })], true),
+    ])), {
+      icon: 'book-open',
+      text: '正在读取 2026-07-11T04-52-18-ZaKl-codex_web',
+    });
+    const skillClusterAfterCommentary = {
+      dataset: { activityReasoning: JSON.stringify(['Opening browser skill for execution']) },
+    };
+    assert.equal(
+      activityApi.activityClusterMatchesBrowserTarget(skillClusterAfterCommentary, 'Opening browser skill for execution'),
+      true,
+    );
+    assert.equal(
+      activityApi.activityClusterMatchesBrowserTarget({
+        dataset: { activityReasoning: JSON.stringify(['Older planning title', 'Latest planning title']) },
+      }, 'Older planning title'),
+      true,
+    );
+    const skillCall = [
+      'exec',
+      'const result = await tools.exec_command({"cmd":"cat /tmp/plugins/browser/skills/control-in-app-browser/SKILL.md"});',
+    ].join('\n');
+    assert.deepEqual(parseToolActivity(skillCall), [{
+      verb: '读取',
+      target: 'Control In App Browser 技能',
+      icon: 'wrench',
+      targetType: 'skill',
+      activityGroup: 'loaded_tools',
+      expandable: false,
+    }]);
     assert.deepEqual(parseToolActivity("exec_command\nsed -n '1,40p' server.mjs\nworkdir=/workspace"), [{
       verb: '已读取',
       target: 'server.mjs',
       icon: 'book-open',
+      targetType: 'file',
     }]);
     assert.deepEqual(parseToolActivity('exec\nconst result = await tools.exec_command({cmd:"sed -n \'1,40p\' server.mjs", workdir:"/workspace"});'), [{
       verb: '已读取',
       target: 'server.mjs',
       icon: 'book-open',
+      targetType: 'file',
+      expandable: false,
     }]);
     assert.deepEqual(parseToolActivity('exec_command\nrg -n "menuBtn|toggleMenu" server.mjs ui.css'), [{
-      verb: '已搜索',
-      target: 'server.mjs、ui.css · “menuBtn|toggleMenu”',
+      verb: '已在',
+      target: 'server.mjs',
+      suffix: '中搜索“menuBtn|toggleMenu”',
       icon: 'search',
+      targetType: 'file',
     }]);
     assert.deepEqual(parseToolActivity('spawn_agent\n{\n  "task_name": "ui_trace",\n  "fork_turns": "all"\n}'), [{
       variant: 'agent',
+      agentKey: 'ui_trace',
       label: 'Ui trace',
+      agentAction: 'spawn',
       status: '已开始工作',
       icon: 'flower-2',
+      expandable: true,
+    }]);
+    assert.deepEqual(parseToolActivity('followup_task\n{\n  "target": "agent_group_final_review",\n  "message": "复核当前改动"\n}'), [{
+      variant: 'agent',
+      agentKey: 'agent_group_final_review',
+      label: 'Agent group final review',
+      agentAction: 'followup',
+      status: '已更新',
+      icon: 'flower-2',
+      expandable: true,
+    }]);
+    assert.deepEqual(parseToolActivity([
+      '调用工具: update_plan',
+      'call_id=call-plan-1',
+      '{"explanation":"同步当前进度","plan":[{"step":"拆解参考图并对照当前实页 DOM、状态与样式","status":"completed"},{"step":"实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill","status":"in_progress"},{"step":"补充状态/DOM/CSS 回归测试并运行完整检查","status":"pending"}]}',
+    ].join('\n')), [{
+      variant: 'plan',
+      explanation: '同步当前进度',
+      plan: [
+        { step: '拆解参考图并对照当前实页 DOM、状态与样式', status: 'completed' },
+        { step: '实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill', status: 'in_progress' },
+        { step: '补充状态/DOM/CSS 回归测试并运行完整检查', status: 'pending' },
+      ],
+    }]);
+    assert.deepEqual(parseToolActivity([
+      'exec',
+      'const result = await tools.update_plan({',
+      '  explanation: "同步当前进度",',
+      '  plan: [',
+      '    { step: "拆解参考图并对照当前实页 DOM、状态与样式", status: "completed" },',
+      '    { step: "实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill", status: "in_progress" },',
+      '    { step: "补充状态/DOM/CSS 回归测试并运行完整检查", status: "pending" }',
+      '  ]',
+      '});',
+      'text(result);',
+    ].join('\n')), [{
+      variant: 'plan',
+      explanation: '同步当前进度',
+      plan: [
+        { step: '拆解参考图并对照当前实页 DOM、状态与样式', status: 'completed' },
+        { step: '实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill', status: 'in_progress' },
+        { step: '补充状态/DOM/CSS 回归测试并运行完整检查', status: 'pending' },
+      ],
+    }]);
+    assert.deepEqual(parseToolActivity([
+      'exec_command',
+      'nl -ba /Users/ikirito/.codex/memories/rollout_summaries/2026-07-11T04-52-18-ZaKl-codex_web.md',
+    ].join('\n')), [{
+      verb: '已读取',
+      target: '2026-07-11T04-52-18-ZaKl-codex_web',
+      icon: 'book-open',
+      targetType: 'memory',
       expandable: false,
     }]);
     assert.deepEqual(parseToolActivity('调用工具: spawn_agent\ncall_id=call-1\n{"task_name":"ui_trace"}'), [{
       variant: 'agent',
+      agentKey: 'ui_trace',
       label: 'Ui trace',
+      agentAction: 'spawn',
       status: '已开始工作',
       icon: 'flower-2',
-      expandable: false,
+      expandable: true,
     }]);
     const orchestratedCall = [
       'exec',
@@ -969,17 +1636,137 @@ if (args[0] === 'app-server') {
     ].join('\n');
     assert.deepEqual(parseToolActivity(orchestratedCall), [
       { verb: '已查看', target: '1 张图像', icon: 'images' },
-      { verb: '已读取文件并运行了多个命令', icon: 'search' },
+      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
+      { verb: '已在', target: 'ui.css', suffix: '中搜索“composer”', icon: 'search', targetType: 'file', expandable: false },
     ]);
-    const patchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/server.mjs\\n-old\\n+new\\n*** Update File: /workspace/ui.css\\n+added\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
+    const archiveProtocolCall = [
+      'exec',
+      'const results = await Promise.all([',
+      ...[
+        "rg -n -C 6 'archive|archived|归档|unarchive' server.mjs native-sessions.mjs desktop-ipc-client.mjs",
+        "sed -n '430,670p' desktop-ipc-client.mjs",
+        "sed -n '4300,4660p' server.mjs",
+        "sed -n '2500,2825p' server.mjs",
+        "rg -n -i 'thread.*archive|archive.*thread|conversation.*archive|archived' /Applications/Codex.app/Contents/Resources | head",
+      ].map((command) => '  tools.exec_command({cmd:'+JSON.stringify(command)+'}),'),
+      ']);',
+    ].join('\n');
+    const archiveProtocolActivity = parseToolActivity(archiveProtocolCall);
+    assert.deepEqual(archiveProtocolActivity.slice(0, 4), [
+      { verb: '已读取', target: 'desktop-ipc-client.mjs', icon: 'book-open', targetType: 'file', expandable: false },
+      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
+      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
+      {
+        verb: '已在',
+        target: 'server.mjs',
+        suffix: '中搜索“archive|archived|归档|unarchive”',
+        icon: 'search',
+        targetType: 'file',
+        expandable: false,
+      },
+    ]);
+    assert.equal(archiveProtocolActivity[4].verb, 'Ran');
+    assert.equal(archiveProtocolActivity[4].icon, 'square-terminal');
+    assert.equal(archiveProtocolActivity[4].expandable, false);
+    assert.match(archiveProtocolActivity[4].target, /^rg -n -i/);
+    const patchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/server.mjs\\n-old\\n---literal-minus\\n+new\\n+++literal-plus\\n*** Update File: /workspace/ui.css\\n+added\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
     assert.deepEqual(parseToolActivity(patchCall), [
-      { verb: '已编辑', icon: 'pencil', target: 'server.mjs', added: 1, removed: 1, meta: '+1 -1' },
-      { verb: '已编辑', icon: 'pencil', target: 'ui.css', added: 1, removed: 0, meta: '+1 -0' },
+      {
+        verb: '已编辑',
+        icon: 'pencil',
+        target: 'server.mjs',
+        filePath: '/workspace/server.mjs',
+        added: 2,
+        removed: 2,
+        meta: '+2 -2',
+      },
+      {
+        verb: '已编辑',
+        icon: 'pencil',
+        target: 'ui.css',
+        filePath: '/workspace/ui.css',
+        added: 1,
+        removed: 0,
+        meta: '+1 -0',
+      },
     ]);
     const falseImagePatchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/fake-ui.js\\n+tools.view_image({path:\\"/tmp/not-a-real-image.png\\"})\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
     assert.deepEqual(parseToolActivity(falseImagePatchCall), [
-      { verb: '已编辑', icon: 'pencil', target: 'fake-ui.js', added: 1, removed: 0, meta: '+1 -0' },
+      {
+        verb: '已编辑',
+        icon: 'pencil',
+        target: 'fake-ui.js',
+        filePath: '/workspace/fake-ui.js',
+        added: 1,
+        removed: 0,
+        meta: '+1 -0',
+      },
     ]);
+
+    const editedFilesHelper = inlineScript.match(
+      /(function editedFilesFromTurnArtifacts[\s\S]*?)(?=function browserPreviewFromTurnArtifacts)/,
+    )?.[1];
+    assert.ok(editedFilesHelper);
+    const editedFilesFromTurnArtifacts = new Function(
+      editedFilesHelper + '; return editedFilesFromTurnArtifacts;',
+    )();
+    const editedItem = {
+      dataset: { filePath: '/workspace/server.mjs' },
+      querySelector(selector) {
+        if (selector === '.activityVerb') return { dataset: { completedVerb: '已编辑' } };
+        if (selector === '.activityTarget') return { textContent: 'server.mjs' };
+        if (selector === '.activityMeta') return { textContent: '+12 -3' };
+        return null;
+      },
+    };
+    assert.deepEqual(editedFilesFromTurnArtifacts([{
+      matches: () => false,
+      querySelectorAll: () => [editedItem],
+    }]), [{ name: '/workspace/server.mjs', verb: '已编辑', added: 12, removed: 3 }]);
+    const sameBasenameItem = {
+      dataset: { filePath: '/workspace/test/server.mjs' },
+      querySelector(selector) {
+        if (selector === '.activityVerb') return { dataset: { completedVerb: '已编辑' } };
+        if (selector === '.activityTarget') return { textContent: 'server.mjs' };
+        if (selector === '.activityMeta') return { textContent: '+4 -1' };
+        return null;
+      },
+    };
+    assert.deepEqual(editedFilesFromTurnArtifacts([{
+      matches: () => false,
+      querySelectorAll: () => [editedItem, sameBasenameItem],
+    }]), [
+      { name: '/workspace/server.mjs', verb: '已编辑', added: 12, removed: 3 },
+      { name: '/workspace/test/server.mjs', verb: '已编辑', added: 4, removed: 1 },
+    ]);
+
+    const browserPreviewHelper = inlineScript.match(
+      /(function browserPreviewFromTurnArtifacts[\s\S]*?)(?=function createResultCardButton)/,
+    )?.[1];
+    assert.ok(browserPreviewHelper);
+    const browserPreviewFromTurnArtifacts = new Function(
+      browserPreviewHelper + '; return browserPreviewFromTurnArtifacts;',
+    )();
+    assert.deepEqual(browserPreviewFromTurnArtifacts([{
+      dataset: {
+        messageText: [
+          'mcp__node_repl__js',
+          'await tab.goto("http://127.0.0.1:36354/demo")',
+          'await tab.playwright.domSnapshot()',
+          'const docs = "https://example.com/unrelated"',
+        ].join('\n'),
+      },
+      querySelectorAll: () => [],
+    }]), {
+      url: 'http://127.0.0.1:36354/demo',
+      label: '127.0.0.1:36354/demo',
+    });
+    assert.equal(browserPreviewFromTurnArtifacts([{
+      dataset: {
+        messageText: 'mcp__node_repl__js\nawait browser.documentation()\nconst docs = "https://example.com/docs"',
+      },
+      querySelectorAll: () => [],
+    }]), null);
 
     class FixtureElement {
       constructor(tagName) {
@@ -992,9 +1779,42 @@ if (args[0] === 'app-server') {
       }
 
       appendChild(child) {
+        if (child.parentNode) {
+          const previousIndex = child.parentNode.children.indexOf(child);
+          if (previousIndex >= 0) child.parentNode.children.splice(previousIndex, 1);
+        }
         this.children.push(child);
         child.parentNode = this;
         return child;
+      }
+
+      insertBefore(child, before) {
+        if (child.parentNode) {
+          const previousIndex = child.parentNode.children.indexOf(child);
+          if (previousIndex >= 0) child.parentNode.children.splice(previousIndex, 1);
+        }
+        const index = this.children.indexOf(before);
+        this.children.splice(index < 0 ? this.children.length : index, 0, child);
+        child.parentNode = this;
+        return child;
+      }
+
+      get classList() {
+        const element = this;
+        const values = () => new Set(String(element.className || '').split(/\s+/).filter(Boolean));
+        const write = (items) => { element.className = [...items].join(' '); };
+        return {
+          contains(name) { return values().has(name); },
+          add(name) { const items = values(); items.add(name); write(items); },
+          remove(name) { const items = values(); items.delete(name); write(items); },
+          toggle(name, force) {
+            const items = values();
+            const enabled = force === undefined ? !items.has(name) : Boolean(force);
+            if (enabled) items.add(name); else items.delete(name);
+            write(items);
+            return enabled;
+          },
+        };
       }
 
       setAttribute(name, value) {
@@ -1004,21 +1824,22 @@ if (args[0] === 'app-server') {
       addEventListener() {}
     }
     const activityDomHelpers = inlineScript.match(
-      /(function createActivityImageGallery[\s\S]*?)(?=function createActivityBatch)/,
+      /(function createActivityImageGallery[\s\S]*?)(?=const SUBAGENT_TRACE_POLL_MS)/,
     )?.[1];
     assert.ok(activityDomHelpers);
-    const createToolActivityItem = new Function(
+    const activityDomApi = new Function(
       'document',
       'openImagePreview',
       'refreshIcons',
       'setIconLabel',
-      `${activityDomHelpers}; return createToolActivityItem;`,
+      `let pendingAgentActivityBatches = []; ${activityDomHelpers}; return { createToolActivityItem, createActivityBatch, createAgentActivityGroup, appendAgentActivityBatch, updateAgentActivityGroupStatus, isAgentActivityOutput, queueAgentActivityBatch, takePendingAgentActivityBatch };`,
     )(
       { createElement: (tagName) => new FixtureElement(tagName) },
       () => {},
       () => {},
       () => {},
     );
+    const { createToolActivityItem } = activityDomApi;
     const imageActivity = createToolActivityItem({
       verb: '已查看',
       target: '1 张图像',
@@ -1028,6 +1849,74 @@ if (args[0] === 'app-server') {
       imageUrls: ['/api/native-sessions/thread/tool-images/7/1'],
     }, 'exec\nreal image call');
     const activityNodes = (node) => [node, ...node.children.flatMap(activityNodes)];
+    const turnPlanProgressHelper = inlineScript.match(
+      /(function turnPlanProgress[\s\S]*?)(?=function upsertLiveTurnPlan)/,
+    )?.[1];
+    assert.ok(turnPlanProgressHelper);
+    const turnPlanDomApi = new Function(
+      'normalizeTurnPlanItems',
+      turnPlanProgressHelper + '; return { turnPlanProgress };',
+    )(
+      activityApi.normalizeTurnPlanItems,
+    );
+    const referencePlan = [
+      { step: '拆解参考图并对照当前实页 DOM、状态与样式', status: 'completed' },
+      { step: '实现连续工具聚合、最新运行项、Agent 自动完成与紧凑文件 pill', status: 'in_progress' },
+      { step: '补充状态/DOM/CSS 回归测试并运行完整检查', status: 'pending' },
+      { step: '重启本地服务并在桌面、375px、345px 深浅主题验收', status: 'pending' },
+      { step: '提交、推送到 PR #12 并等待 CI', status: 'pending' },
+    ];
+    assert.deepEqual(turnPlanDomApi.turnPlanProgress(referencePlan), {
+      items: referencePlan,
+      total: 5,
+      current: 2,
+      completed: 1,
+      percent: 40,
+    });
+    const upsertLiveTurnPlanHelper = inlineScript.match(
+      /(function upsertLiveTurnPlan[\s\S]*?)(?=function appendTurnTool)/,
+    )?.[1];
+    assert.ok(upsertLiveTurnPlanHelper);
+    const planTransparencyApi = new Function('normalizeTurnPlanItems', `
+      const toolCluster = { kind: 'tool-cluster' };
+      const agentGroup = { kind: 'agent-group' };
+      const livePill = { kind: 'live-pill' };
+      let currentActivityCluster = toolCluster;
+      let currentAgentActivityGroup = agentGroup;
+      let pendingActivityReasoning = ['kept reasoning'];
+      let liveTurnPlan = [];
+      let ensureCalls = 0;
+      let refreshCalls = 0;
+      let moveCalls = 0;
+      function ensureTurnProcessHeader() { ensureCalls += 1; }
+      function refreshLiveEditedFilesResult() { refreshCalls += 1; return livePill; }
+      function moveLiveEditedFilesResultToEnd() { moveCalls += 1; }
+      ${upsertLiveTurnPlanHelper}
+      return {
+        run: upsertLiveTurnPlan,
+        state: () => ({
+          currentActivityCluster,
+          currentAgentActivityGroup,
+          pendingActivityReasoning,
+          liveTurnPlan,
+          ensureCalls,
+          refreshCalls,
+          moveCalls,
+          toolCluster,
+          agentGroup,
+          livePill,
+        }),
+      };
+    `)(activityApi.normalizeTurnPlanItems);
+    assert.strictEqual(planTransparencyApi.run(referencePlan), planTransparencyApi.state().livePill);
+    const transparentPlanState = planTransparencyApi.state();
+    assert.strictEqual(transparentPlanState.currentActivityCluster, transparentPlanState.toolCluster);
+    assert.strictEqual(transparentPlanState.currentAgentActivityGroup, transparentPlanState.agentGroup);
+    assert.deepEqual(transparentPlanState.pendingActivityReasoning, ['kept reasoning']);
+    assert.deepEqual(transparentPlanState.liveTurnPlan, referencePlan);
+    assert.equal(transparentPlanState.ensureCalls, 1);
+    assert.equal(transparentPlanState.refreshCalls, 1);
+    assert.equal(transparentPlanState.moveCalls, 1);
     const renderedActivityNodes = activityNodes(imageActivity);
     assert.equal(imageActivity.tagName, 'DETAILS');
     assert.equal(imageActivity.open, false);
@@ -1038,17 +1927,265 @@ if (args[0] === 'app-server') {
 
     const agentActivity = createToolActivityItem({
       variant: 'agent',
+      agentKey: 'ui_trace',
       label: 'Ui trace',
       status: '已开始工作',
       icon: 'flower-2',
-      expandable: false,
-    }, 'spawn_agent\n{"task_name":"ui_trace"}', true);
+      expandable: true,
+    }, 'spawn_agent\n{"task_name":"ui_trace"}', true, { parentThreadId: nativeSessionId });
     const agentActivityNodes = activityNodes(agentActivity);
-    assert.equal(agentActivity.tagName, 'DIV');
-    assert.equal(agentActivity.className, 'activityItem agentActivityItem static');
+    assert.equal(agentActivity.tagName, 'DETAILS');
+    assert.equal(agentActivity.open, false);
+    assert.equal(agentActivity.className, 'activityItem agentActivityItem');
+    assert.equal(agentActivity.dataset.agentKey, 'ui_trace');
+    assert.equal(agentActivity.dataset.parentThreadId, nativeSessionId);
     assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityLabel').textContent, 'Ui trace');
-    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityStatus').textContent, '已开始工作');
+    assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityStatus').textContent, '正在启动');
     assert.equal(agentActivityNodes.find((node) => node.className === 'agentActivityIcon').children[0].attributes.get('data-lucide'), 'flower-2');
+    assert.equal(agentActivityNodes.filter((node) => node.className.includes('subagentTraceTimeline')).length, 1);
+    assert.equal(agentActivityNodes.filter((node) => node.className.includes('agentActivityChevron')).length, 1);
+
+    const agentPresentation = (agentKey, label) => ({
+      variant: 'agent',
+      agentKey,
+      label,
+      status: '已开始工作',
+      icon: 'flower-2',
+      expandable: true,
+    });
+    const firstAgentBatch = activityDomApi.createActivityBatch(
+      [agentPresentation('final_diff_review', 'Final diff review')],
+      'spawn_agent\n{"task_name":"final_diff_review"}',
+      'agent_activity',
+      true,
+      { parentThreadId: nativeSessionId },
+    );
+    const secondAgentBatch = activityDomApi.createActivityBatch(
+      [agentPresentation('final_ui_review', 'Final ui review')],
+      'spawn_agent\n{"task_name":"final_ui_review"}',
+      'agent_activity',
+      true,
+      { parentThreadId: nativeSessionId },
+    );
+    const agentGroup = activityDomApi.createAgentActivityGroup();
+    activityDomApi.appendAgentActivityBatch(agentGroup, firstAgentBatch);
+    activityDomApi.appendAgentActivityBatch(agentGroup, secondAgentBatch);
+    assert.equal(agentGroup.className, 'msg agentActivityGroup streaming');
+    assert.deepEqual(agentGroup.children, [firstAgentBatch, secondAgentBatch, agentGroup._agentActivityStatus]);
+    assert.equal(agentGroup._agentActivityItems.length, 2);
+    assert.equal(agentGroup._agentActivityStatus.textContent, '正在启动');
+    assert.equal(agentGroup._agentActivityStatus.attributes.get('role'), 'status');
+    assert.equal(activityDomApi.isAgentActivityOutput('spawn_agent output\n{"task_name":"/root/final_diff_review"}'), true);
+    assert.equal(activityDomApi.isAgentActivityOutput('followup_task output\n{"target":"/root/final_diff_review"}'), true);
+    assert.equal(activityDomApi.isAgentActivityOutput('exec output\n[]'), false);
+    activityDomApi.queueAgentActivityBatch(firstAgentBatch);
+    activityDomApi.queueAgentActivityBatch(secondAgentBatch);
+    assert.strictEqual(activityDomApi.takePendingAgentActivityBatch(), firstAgentBatch);
+    firstAgentBatch.classList.remove('streaming');
+    assert.strictEqual(activityDomApi.takePendingAgentActivityBatch(), secondAgentBatch);
+    for (const item of agentGroup._agentActivityItems) item.dataset.traceState = 'ready';
+    firstAgentBatch.classList.remove('streaming');
+    secondAgentBatch.classList.remove('streaming');
+    activityDomApi.updateAgentActivityGroupStatus(agentGroup);
+    assert.equal(agentGroup.className, 'msg agentActivityGroup');
+    assert.equal(agentGroup._agentActivityStatus.textContent, '已开始工作');
+
+    const editedFilesCardHelper = inlineScript.match(
+      /(function createEditedFilesResultCard[\s\S]*?)(?=function moveLiveEditedFilesResultToEnd)/,
+    )?.[1];
+    assert.ok(editedFilesCardHelper);
+    const createEditedFilesResultCard = new Function(
+      'document',
+      'createResultCardButton',
+      'prepareUndoEditedFiles',
+      'reviewTurnArtifacts',
+      'turnPlanProgress',
+      editedFilesCardHelper + '; return createEditedFilesResultCard;',
+    )(
+      { createElement: (tagName) => new FixtureElement(tagName) },
+      () => new FixtureElement('button'),
+      () => {},
+      () => {},
+      turnPlanDomApi.turnPlanProgress,
+    );
+    const compactEditedFiles = createEditedFilesResultCard([
+      { name: '/workspace/ui.css', verb: '已编辑', added: 1, removed: 1 },
+      { name: '/workspace/server.mjs', verb: '已编辑', added: 1, removed: 1 },
+    ], '', { live: true });
+    const compactEditedNodes = activityNodes(compactEditedFiles);
+    assert.equal(compactEditedFiles.tagName, 'DETAILS');
+    assert.equal(compactEditedFiles.className, 'turnResultCard editedFilesResult live');
+    assert.equal(compactEditedFiles.attributes.get('aria-label'), '2 个文件已更改');
+    assert.equal(compactEditedFiles.children[0].tagName, 'SUMMARY');
+    assert.equal(compactEditedNodes.find((node) => node.tagName === 'STRONG').textContent, '2 个文件已更改');
+    assert.equal(compactEditedNodes.find((node) => node.className === 'turnResultStat added').textContent, '+2');
+    assert.equal(compactEditedNodes.find((node) => node.className === 'turnResultStat removed').textContent, '-2');
+    assert.equal(compactEditedNodes.some((node) => node.className === 'turnResultActions'), false);
+    const planProgressCard = createEditedFilesResultCard([
+      { name: '/workspace/ui.css', verb: '已编辑', added: 370, removed: 92 },
+      { name: '/workspace/server.mjs', verb: '已编辑', added: 0, removed: 0 },
+      { name: '/workspace/test/server-smoke.test.mjs', verb: '已编辑', added: 0, removed: 0 },
+    ], '', { live: true, plan: referencePlan });
+    const planProgressNodes = activityNodes(planProgressCard);
+    assert.equal(planProgressCard.className, 'turnResultCard editedFilesResult live withPlan');
+    assert.equal(planProgressCard.attributes.get('aria-label'), '第 2 / 5 步，3 个文件已更改');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnPlanProgressLabel').textContent, '第 2 / 5 步');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnPlanProgressRing').attributes.get('style'), '--turn-plan-progress:40%');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnResultFileLabel').textContent, '3 个文件已更改');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnResultStat added').textContent, '+370');
+    assert.equal(planProgressNodes.find((node) => node.className === 'turnResultStat removed').textContent, '-92');
+    const planOnlyProgressCard = createEditedFilesResultCard([], '', { live: true, plan: referencePlan });
+    assert.equal(planOnlyProgressCard.tagName, 'DIV');
+    assert.equal(planOnlyProgressCard.className, 'turnResultCard editedFilesResult live withPlan planOnly');
+    assert.equal(planOnlyProgressCard.children.length, 1);
+
+    const liveResultHelpers = inlineScript.match(
+      /(function moveLiveEditedFilesResultToEnd[\s\S]*?)(?=function createWebPreviewResultCard)/,
+    )?.[1];
+    assert.ok(liveResultHelpers);
+    const detachLiveNode = (node) => {
+      if (!node.parentNode) return;
+      const previousIndex = node.parentNode.children.indexOf(node);
+      if (previousIndex >= 0) node.parentNode.children.splice(previousIndex, 1);
+    };
+    const liveTimeline = {
+      children: [],
+      appendChild(node) {
+        detachLiveNode(node);
+        node.parentNode = this;
+        node.isConnected = true;
+        this.children.push(node);
+        return node;
+      },
+      replaceChild(next, previous) {
+        const index = this.children.indexOf(previous);
+        assert.notEqual(index, -1);
+        previous.parentNode = null;
+        previous.isConnected = false;
+        next.parentNode = this;
+        next.isConnected = true;
+        this.children.splice(index, 1, next);
+        return previous;
+      },
+    };
+    const livePromptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
+    const liveAttachmentTray = { kind: 'attachment-tray', parentNode: null, isConnected: true };
+    const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true };
+    let liveComposerInsertCalls = 0;
+    const liveComposer = {
+      children: [livePromptQueuePanel, liveAttachmentTray, liveDropZone],
+      insertBefore(node, reference) {
+        liveComposerInsertCalls += 1;
+        assert.strictEqual(reference, livePromptQueuePanel);
+        detachLiveNode(node);
+        const index = this.children.indexOf(reference);
+        assert.notEqual(index, -1);
+        node.parentNode = this;
+        node.isConnected = true;
+        this.children.splice(index, 0, node);
+        return node;
+      },
+      replaceChild(next, previous) {
+        const index = this.children.indexOf(previous);
+        assert.notEqual(index, -1);
+        previous.parentNode = null;
+        previous.isConnected = false;
+        next.parentNode = this;
+        next.isConnected = true;
+        this.children.splice(index, 1, next);
+        return previous;
+      },
+    };
+    livePromptQueuePanel.parentNode = liveComposer;
+    liveAttachmentTray.parentNode = liveComposer;
+    liveDropZone.parentNode = liveComposer;
+    const toolArtifact = { kind: 'tool-artifact' };
+    const liveElements = [toolArtifact];
+    const createdLiveCards = [];
+    const makeLiveCard = (files, turnId, options) => {
+      const card = {
+        files,
+        turnId,
+        options,
+        parentNode: null,
+        isConnected: false,
+        get nextSibling() {
+          if (!this.parentNode) return null;
+          const index = this.parentNode.children.indexOf(this);
+          return this.parentNode.children[index + 1] || null;
+        },
+        remove() {
+          if (!this.parentNode) return;
+          const index = this.parentNode.children.indexOf(this);
+          if (index >= 0) this.parentNode.children.splice(index, 1);
+          this.parentNode = null;
+          this.isConnected = false;
+        },
+      };
+      createdLiveCards.push(card);
+      return card;
+    };
+    const liveResultApi = new Function(
+      'turnProcessTimeline',
+      'turnProcessElements',
+      'editedFilesFromTurnArtifacts',
+      'createEditedFilesResultCard',
+      'refreshIcons',
+      'initialPlan',
+      'composer',
+      'dropZone',
+      'promptQueuePanel',
+      `
+        let liveEditedFilesResult = null;
+        let liveTurnPlan = initialPlan;
+        ${liveResultHelpers}
+        return {
+          refresh: refreshLiveEditedFilesResult,
+          state: () => ({ liveEditedFilesResult, liveTurnPlan, turnProcessElements }),
+        };
+      `,
+    )(
+      liveTimeline,
+      liveElements,
+      (elements) => {
+        assert.strictEqual(elements, liveElements);
+        return [{ name: '/workspace/server.mjs', verb: '已编辑', added: 2, removed: 1 }];
+      },
+      makeLiveCard,
+      () => {},
+      referencePlan,
+      liveComposer,
+      liveDropZone,
+      livePromptQueuePanel,
+    );
+    const firstLivePill = liveResultApi.refresh();
+    const secondLivePill = liveResultApi.refresh();
+    assert.notStrictEqual(firstLivePill, secondLivePill);
+    assert.deepEqual(liveTimeline.children, []);
+    assert.deepEqual(liveComposer.children, [secondLivePill, livePromptQueuePanel, liveAttachmentTray, liveDropZone]);
+    assert.strictEqual(secondLivePill.parentNode, liveComposer);
+    assert.strictEqual(secondLivePill.nextSibling, livePromptQueuePanel);
+    assert.strictEqual(liveComposer.children.at(-1), liveDropZone);
+    assert.equal(liveComposerInsertCalls, 1);
+    assert.deepEqual(liveResultApi.state().turnProcessElements, [toolArtifact]);
+    assert.equal(liveResultApi.state().turnProcessElements.includes(secondLivePill), false);
+    assert.equal(createdLiveCards.length, 2);
+    assert.deepEqual(createdLiveCards.at(-1).options, { live: true, plan: referencePlan });
+    assert.match(inlineScript, /const anchor=promptQueuePanel\?\.parentNode===composer\?promptQueuePanel:dropZone/);
+    assert.match(inlineScript, /if\(files\.length\)container\.appendChild\(createEditedFilesResultCard\(files,turnId\)\)/);
+
+    const searchActivity = createToolActivityItem({
+      verb: '已在',
+      target: 'server.mjs',
+      suffix: '中搜索“archive”',
+      icon: 'search',
+      targetType: 'file',
+      expandable: false,
+    }, 'exec\nsearch archive');
+    const searchActivityNodes = activityNodes(searchActivity);
+    assert.equal(searchActivity.className, 'activityItem static fileTarget');
+    assert.equal(searchActivityNodes.find((node) => node.className === 'activityTarget').textContent, 'server.mjs');
+    assert.equal(searchActivityNodes.find((node) => node.className === 'activitySuffix').textContent, '中搜索“archive”');
 
     const configResponse = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
     assert.equal(configResponse.status, 200);
@@ -1214,6 +2351,38 @@ if (args[0] === 'app-server') {
     assert.ok(nativeConversation.messages.some((message) => (
       message.role === 'user' && message.content === 'native fixture message'
     )));
+
+    const unauthorizedSubagent = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=ui_trace`,
+    );
+    assert.equal(unauthorizedSubagent.status, 401);
+    const subagentResponse = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=ui_trace&limit=100`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(subagentResponse.status, 200);
+    const subagentConversation = (await subagentResponse.json()).subagent;
+    assert.equal(subagentConversation.id, subagentNativeSessionId);
+    assert.equal(subagentConversation.source, 'subagent');
+    assert.equal(subagentConversation.status, 'done');
+    assert.equal(subagentConversation.metadata.parentThreadId, nativeSessionId);
+    assert.equal(subagentConversation.metadata.agentPath, '/root/ui_trace');
+    assert.ok(subagentConversation.messages.some((message) => message.content === '子代理正在检查界面'));
+    assert.ok(subagentConversation.messages.some((message) => message.content.includes('exec_command')));
+    assert.ok(subagentConversation.messages.some((message) => message.content === '子代理检查完成'));
+    const incrementalSubagentResponse = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=%2Froot%2Fui_trace&after=${subagentConversation.cursor}&generation=${subagentConversation.generation}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(incrementalSubagentResponse.status, 200);
+    const incrementalSubagent = (await incrementalSubagentResponse.json()).subagent;
+    assert.equal(incrementalSubagent.reset, false);
+    assert.deepEqual(incrementalSubagent.messages, []);
+    const missingSubagent = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=missing_agent`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(missingSubagent.status, 404);
     const nativeTargetMessage = nativeConversation.messages.find((message) => (
       message.role === 'user' && message.content === 'native fixture message'
     ));
@@ -1360,6 +2529,7 @@ if (args[0] === 'app-server') {
         message: 'sync through desktop owner',
         provider: 'fake',
         model: 'test-model',
+        reasoningEffort: 'ultra',
         cwd: temporary,
         sandbox: 'read-only',
         approval: 'on-request',
@@ -1368,6 +2538,13 @@ if (args[0] === 'app-server') {
     assert.equal(desktopContinued.status, 202);
     const desktopContinuedPayload = await desktopContinued.json();
     assert.equal(desktopContinuedPayload.turnId, 'desktop-turn-1');
+    const activeDesktopSession = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(activeDesktopSession.status, 200);
+    const activeDesktopConversation = (await activeDesktopSession.json()).conversation;
+    assert.equal(activeDesktopConversation.activeTurnId, desktopContinuedPayload.turnId);
+    assert.match(activeDesktopConversation.activeTurnStartedAt, /^\d{4}-\d{2}-\d{2}T/);
 
     const desktopSteered = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
       method: 'POST',
@@ -1583,6 +2760,7 @@ if (args[0] === 'app-server') {
       text: 'sync through desktop owner',
       text_elements: [],
     }]);
+    assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
@@ -1663,6 +2841,13 @@ if (args[0] === 'app-server') {
       && message.params?.cwd === temporary
     )));
 
+    const deletedArchivedTask = await fetch(
+      `${baseUrl}/api/native-archived-sessions/${createdNativeSessionId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(deletedArchivedTask.status, 200);
+    assert.equal((await deletedArchivedTask.json()).id, createdNativeSessionId);
+
     const continued = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -1731,12 +2916,107 @@ if (args[0] === 'app-server') {
       && message.params?.cwd === temporary
     )));
 
+    const rejectedDeleteAll = await fetch(`${baseUrl}/api/native-archived-sessions`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: 'delete' }),
+    });
+    assert.equal(rejectedDeleteAll.status, 400);
+
+    const deletedAllArchived = await fetch(`${baseUrl}/api/native-archived-sessions`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: '永久删除全部已归档任务' }),
+    });
+    assert.equal(deletedAllArchived.status, 200);
+    const deletedAllArchivedPayload = await deletedAllArchived.json();
+    assert.deepEqual(deletedAllArchivedPayload.deleted, [nativeSessionId]);
+    assert.deepEqual(deletedAllArchivedPayload.skipped, []);
+    assert.deepEqual(deletedAllArchivedPayload.failed, []);
+
     const protocolMessages = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
+    assert.ok(protocolMessages.some((message) => (
+      message.method === 'thread/list'
+      && message.params.archived === true
+      && message.params.useStateDbOnly === true
+    )));
+    assert.ok(protocolMessages.some((message) => (
+      message.method === 'thread/unarchive'
+      && message.params.threadId === archivedNativeSessionId
+    )));
+    assert.deepEqual(
+      protocolMessages.filter((message) => message.method === 'thread/delete').map((message) => message.params.threadId),
+      [createdNativeSessionId, nativeSessionId],
+    );
+
+    const archivedForRace = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(archivedForRace.status, 200);
+    const deleteCountBeforeRace = protocolMessages
+      .filter((message) => message.method === 'thread/delete' && message.params.threadId === nativeSessionId)
+      .length;
+    await writeFile(appServerControlFile, JSON.stringify({
+      unarchiveAfterFirstListToken: 'single-delete-race',
+      unarchiveAfterFirstListId: nativeSessionId,
+    }));
+    const racedArchivedDelete = await fetch(`${baseUrl}/api/native-archived-sessions/${nativeSessionId}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(racedArchivedDelete.status, 409);
+    assert.deepEqual((await racedArchivedDelete.json()).skipped, [nativeSessionId]);
+    const protocolMessagesAfterRace = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(
+      protocolMessagesAfterRace
+        .filter((message) => message.method === 'thread/delete' && message.params.threadId === nativeSessionId)
+        .length,
+      deleteCountBeforeRace,
+    );
+
+    for (const threadId of [nativeSessionId, createdNativeSessionId]) {
+      const archivedForBulkRace = await fetch(`${baseUrl}/api/native-sessions/${threadId}`, {
+        method: 'DELETE',
+        headers: { Cookie: cookie },
+      });
+      assert.equal(archivedForBulkRace.status, 200);
+    }
+    const createdDeleteCountBeforeBulkRace = protocolMessagesAfterRace
+      .filter((message) => message.method === 'thread/delete' && message.params.threadId === createdNativeSessionId)
+      .length;
+    await writeFile(appServerControlFile, JSON.stringify({
+      unarchiveAfterFirstListToken: 'bulk-delete-race',
+      unarchiveAfterFirstListId: createdNativeSessionId,
+    }));
+    const bulkRaceDelete = await fetch(`${baseUrl}/api/native-archived-sessions`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: '永久删除全部已归档任务' }),
+    });
+    assert.equal(bulkRaceDelete.status, 200);
+    const bulkRaceDeletePayload = await bulkRaceDelete.json();
+    assert.deepEqual(bulkRaceDeletePayload.deleted, [nativeSessionId]);
+    assert.deepEqual(bulkRaceDeletePayload.skipped, [createdNativeSessionId]);
+    assert.deepEqual(bulkRaceDeletePayload.failed, []);
+    const protocolMessagesAfterBulkRace = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(
+      protocolMessagesAfterBulkRace
+        .filter((message) => message.method === 'thread/delete' && message.params.threadId === createdNativeSessionId)
+        .length,
+      createdDeleteCountBeforeBulkRace,
+    );
     assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 1);
     assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 2);
     const restartFromFirstMessage = protocolMessages.find((message) => (
@@ -1952,6 +3232,7 @@ function startServer({
   fakeCodex,
   traceFile,
   appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl'),
+  appServerControlFile = path.join(temporary, 'app-server-control.json'),
   webEnv = path.join(temporary, 'web.env'),
   configWritable = 'false',
   desktopIpcEnabled = 'false',
@@ -1986,6 +3267,7 @@ function startServer({
       FORCE_FULL_ACCESS: 'false',
       FAKE_CODEX_TRACE: traceFile,
       FAKE_APP_SERVER_TRACE: appServerTraceFile,
+      FAKE_APP_SERVER_CONTROL: appServerControlFile,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

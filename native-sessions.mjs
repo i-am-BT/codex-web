@@ -16,6 +16,8 @@ const SESSION_ID_PATTERN = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 const READ_CHUNK_BYTES = 256 * 1024;
 const FIRST_RECORD_LIMIT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_READ_BYTES = 32 * 1024 * 1024;
+const DEFAULT_TURN_START_SCAN_BYTES = 32 * 1024 * 1024;
+const TURN_START_RECORD_LIMIT_BYTES = 256 * 1024;
 const DEFAULT_MAX_MESSAGES = 700;
 const DEFAULT_MAX_SESSIONS = 100;
 const DEFAULT_POLL_INTERVAL_MS = 3000;
@@ -23,6 +25,8 @@ const DEFAULT_RUNNING_WINDOW_MS = 60000;
 const MESSAGE_TEXT_LIMIT = 80000;
 const DETAIL_TEXT_LIMIT = 8000;
 const IMAGE_URL_LIMIT = 16 * 1024 * 1024;
+const TOOL_FILE_CHANGE_LIMIT = 200;
+const TOOL_FILE_PATH_LIMIT = 2048;
 const APP_THREAD_SOURCES = new Set(['vscode', 'appServer', 'app_server']);
 
 export class NativeSessionStore extends EventEmitter {
@@ -31,21 +35,32 @@ export class NativeSessionStore extends EventEmitter {
     this.codexHome = path.resolve(codexHome);
     this.sessionsDir = path.join(this.codexHome, 'sessions');
     this.indexFile = path.join(this.codexHome, 'session_index.jsonl');
+    this.globalStateFile = path.join(this.codexHome, '.codex-global-state.json');
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.maxReadBytes = positiveNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
+    this.turnStartScanBytes = positiveNumber(
+      options.turnStartScanBytes,
+      Math.max(DEFAULT_TURN_START_SCAN_BYTES, this.maxReadBytes),
+    );
     this.maxMessages = positiveNumber(options.maxMessages, DEFAULT_MAX_MESSAGES);
     this.maxSessions = positiveNumber(options.maxSessions, DEFAULT_MAX_SESSIONS);
     this.pollIntervalMs = positiveNumber(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
     this.runningWindowMs = positiveNumber(options.runningWindowMs, DEFAULT_RUNNING_WINDOW_MS);
     this.watchChanges = options.watchChanges !== false;
     this.entries = new Map();
+    this.subagentEntries = new Map();
+    this.subagentThreads = new Map();
     this.titles = new Map();
     this.details = new Map();
     this.indexStamp = '';
+    this.workspaceStateAvailable = false;
+    this.projectlessThreadIds = new Set();
+    this.projectThreadIds = new Set();
     this.appThreads = null;
     this.stateDb = null;
     this.stateDbIno = 0;
     this.stateThreadQuery = null;
+    this.stateSubagentThreadQuery = null;
     this.version = 0;
     this.cacheGeneration = 0;
     this.watcher = null;
@@ -63,6 +78,7 @@ export class NativeSessionStore extends EventEmitter {
           const relative = String(filename || '').replace(/\\/g, '/');
           if (
             relative
+            && relative !== '.codex-global-state.json'
             && relative !== 'session_index.jsonl'
             && relative !== 'state_5.sqlite'
             && relative !== 'state_5.sqlite-wal'
@@ -105,13 +121,26 @@ export class NativeSessionStore extends EventEmitter {
 
   refresh() {
     this.refreshTitles();
+    this.refreshWorkspaceState();
     this.refreshAppThreads();
-    const nextEntries = scanSessionFiles(this.sessionsDir, this.titles, this.appThreads);
-    const changedIds = changedSessionIds(this.entries, nextEntries);
+    const nextEntries = scanSessionFiles(
+      this.sessionsDir,
+      this.titles,
+      this.appThreads,
+      (id) => this.workspaceKindForThread(id),
+    );
+    const nextSubagentEntries = scanSessionFiles(this.sessionsDir, this.titles, this.subagentThreads);
+    const changedIds = [
+      ...new Set([
+        ...changedSessionIds(this.entries, nextEntries),
+        ...changedSessionIds(this.subagentEntries, nextSubagentEntries),
+      ]),
+    ];
     this.entries = nextEntries;
+    this.subagentEntries = nextSubagentEntries;
 
     for (const id of [...this.details.keys()]) {
-      if (!this.entries.has(id)) this.details.delete(id);
+      if (!this.entries.has(id) && !this.subagentEntries.has(id)) this.details.delete(id);
     }
 
     if (changedIds.length) {
@@ -121,6 +150,54 @@ export class NativeSessionStore extends EventEmitter {
     return this.list();
   }
 
+  refreshWorkspaceState() {
+    let state;
+    try {
+      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+    } catch {
+      // Codex Desktop replaces this file atomically. Keep the last valid
+      // snapshot while it is temporarily missing or incomplete.
+      return;
+    }
+
+    const hasProjectlessIds = state
+      && typeof state === 'object'
+      && !Array.isArray(state)
+      && Object.prototype.hasOwnProperty.call(state, 'projectless-thread-ids');
+    if (!hasProjectlessIds) {
+      this.projectlessThreadIds = new Set();
+      this.projectThreadIds = new Set();
+      this.workspaceStateAvailable = false;
+      return;
+    }
+
+    const value = state?.['projectless-thread-ids'];
+    const ids = Array.isArray(value)
+      ? value
+      : value && typeof value === 'object'
+        ? Object.keys(value)
+        : null;
+    if (!ids) return;
+
+    this.projectlessThreadIds = new Set(ids
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
+    const assignments = state?.['thread-project-assignments'];
+    this.projectThreadIds = new Set((assignments && typeof assignments === 'object' && !Array.isArray(assignments)
+      ? Object.keys(assignments)
+      : [])
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
+    this.workspaceStateAvailable = true;
+  }
+
+  workspaceKindForThread(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!this.workspaceStateAvailable || !SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return '';
+    if (this.projectThreadIds.has(threadId)) return 'project';
+    return this.projectlessThreadIds.has(threadId) ? 'projectless' : 'project';
+  }
+
   refreshAppThreads() {
     let stat;
     try {
@@ -128,6 +205,7 @@ export class NativeSessionStore extends EventEmitter {
     } catch {
       this.closeStateDb();
       this.appThreads = null;
+      this.subagentThreads = new Map();
       return;
     }
 
@@ -137,6 +215,7 @@ export class NativeSessionStore extends EventEmitter {
         this.stateDb = new DatabaseSync(this.stateDbFile, { readOnly: true, timeout: 500 });
         this.stateDbIno = stat.ino;
         this.stateThreadQuery = prepareAppThreadQuery(this.stateDb);
+        this.stateSubagentThreadQuery = prepareSubagentThreadQuery(this.stateDb);
       }
 
       const next = new Map();
@@ -149,6 +228,7 @@ export class NativeSessionStore extends EventEmitter {
         next.set(id, {
           rolloutPath: path.resolve(rolloutPath),
           cwd: String(row.cwd || '').trim(),
+          workspaceKind: this.workspaceStateAvailable ? this.workspaceKindForThread(id) : '',
           title: cleanTitle(row.title),
           createdAtMs: timestampMs(row.created_at_ms),
           updatedAtMs: timestampMs(row.updated_at_ms),
@@ -156,9 +236,28 @@ export class NativeSessionStore extends EventEmitter {
         });
       }
       this.appThreads = next;
+
+      const nextSubagents = new Map();
+      for (const row of this.stateSubagentThreadQuery?.all() || []) {
+        const id = String(row.id || '').trim().toLowerCase();
+        const rolloutPath = String(row.rollout_path || '').trim();
+        const spawn = parseSubagentThreadSource(row.source);
+        if (!SESSION_ID_PATTERN.test(`${id}.jsonl`) || !rolloutPath || !spawn) continue;
+        nextSubagents.set(id, {
+          rolloutPath: path.resolve(rolloutPath),
+          cwd: String(row.cwd || '').trim(),
+          title: cleanTitle(row.title) || agentPathLabel(spawn.agentPath),
+          createdAtMs: timestampMs(row.created_at_ms),
+          updatedAtMs: timestampMs(row.updated_at_ms),
+          recencyAtMs: timestampMs(row.recency_at_ms),
+          ...spawn,
+        });
+      }
+      this.subagentThreads = nextSubagents;
     } catch {
       this.closeStateDb();
       if (this.appThreads === null) this.appThreads = new Map();
+      this.subagentThreads = new Map();
     }
   }
 
@@ -169,6 +268,7 @@ export class NativeSessionStore extends EventEmitter {
     this.stateDb = null;
     this.stateDbIno = 0;
     this.stateThreadQuery = null;
+    this.stateSubagentThreadQuery = null;
   }
 
   refreshTitles() {
@@ -214,10 +314,45 @@ export class NativeSessionStore extends EventEmitter {
   }
 
   get(id, options = {}) {
-    let entry = this.entries.get(id);
+    return this.getConversationFromEntries(id, options, false);
+  }
+
+  getSubagent(parentId, agentRef, options = {}) {
+    let entry = findSubagentEntry(this.subagentEntries, parentId, agentRef);
     if (!entry) {
       this.refresh();
-      entry = this.entries.get(id);
+      entry = findSubagentEntry(this.subagentEntries, parentId, agentRef);
+    }
+    if (!entry) return null;
+    const conversation = this.getConversationFromEntries(entry.id, options, true);
+    if (!conversation) return null;
+    const cache = this.details.get(entry.id);
+    const ownTurns = cache?.subagentTurnIds || new Set();
+    const fallbackTurnId = conversation.latestTurnId;
+    const messages = conversation.messages.filter((message) => (
+      ownTurns.size ? ownTurns.has(message.turnId) : message.turnId === fallbackTurnId
+    ));
+    return {
+      ...conversation,
+      source: 'subagent',
+      title: agentPathLabel(entry.agentPath),
+      metadata: {
+        ...conversation.metadata,
+        parentThreadId: entry.parentThreadId,
+        agentPath: entry.agentPath,
+        agentNickname: entry.agentNickname,
+        depth: entry.depth,
+      },
+      messages,
+    };
+  }
+
+  getConversationFromEntries(id, options = {}, subagent = false) {
+    const entries = () => (subagent ? this.subagentEntries : this.entries);
+    let entry = entries().get(id);
+    if (!entry) {
+      this.refresh();
+      entry = entries().get(id);
     }
     if (!entry) return null;
 
@@ -225,11 +360,11 @@ export class NativeSessionStore extends EventEmitter {
       const stat = statSync(entry.filePath);
       if (stat.size !== entry.size || stat.mtimeMs !== entry.mtimeMs || stat.ino !== entry.ino) {
         this.refresh();
-        entry = this.entries.get(id);
+        entry = entries().get(id);
       }
     } catch {
       this.refresh();
-      entry = this.entries.get(id);
+      entry = entries().get(id);
     }
     if (!entry) return null;
 
@@ -251,6 +386,16 @@ export class NativeSessionStore extends EventEmitter {
     }
 
     readSessionUpdates(cache, entry, this.maxMessages);
+    if (cache.status === 'running' && cache.latestTurnId && !cache.currentTurnStartedAt && !cache.turnStartScanComplete) {
+      cache.currentTurnStartedAt = findTurnStartedAtBeforeOffset(
+        entry.filePath,
+        cache.latestTurnId,
+        cache.startOffset,
+        entry.size,
+        this.turnStartScanBytes,
+      );
+      cache.turnStartScanComplete = true;
+    }
     return buildConversation(entry, cache, options, this.runningWindowMs);
   }
 
@@ -301,6 +446,58 @@ function prepareAppThreadQuery(db) {
   `);
 }
 
+function prepareSubagentThreadQuery(db) {
+  const columns = new Set(db.prepare('PRAGMA table_info(threads)').all().map((column) => String(column.name || '')));
+  if (!columns.has('thread_source')) return null;
+  const recencyColumn = columns.has('recency_at_ms') ? 'recency_at_ms' : 'updated_at_ms';
+  return db.prepare(`
+    SELECT id, rollout_path, source, cwd, title, created_at_ms, updated_at_ms, ${recencyColumn} AS recency_at_ms
+    FROM threads
+    WHERE archived = 0
+      AND thread_source = 'subagent'
+      AND rollout_path <> ''
+  `);
+}
+
+function parseSubagentThreadSource(value) {
+  try {
+    const source = typeof value === 'string' ? JSON.parse(value) : value;
+    const spawn = source?.subagent?.thread_spawn;
+    const parentThreadId = String(spawn?.parent_thread_id || '').trim().toLowerCase();
+    const agentPath = String(spawn?.agent_path || '').trim();
+    if (!SESSION_ID_PATTERN.test(`${parentThreadId}.jsonl`) || !/^\/[A-Za-z0-9_.\/-]+$/.test(agentPath)) return null;
+    return {
+      parentThreadId,
+      agentPath,
+      agentNickname: String(spawn?.agent_nickname || '').trim(),
+      depth: Number.isInteger(spawn?.depth) ? spawn.depth : Number(spawn?.depth) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function agentPathLabel(value) {
+  const name = String(value || '').split('/').filter(Boolean).at(-1) || 'agent';
+  const clean = name.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return clean ? clean.charAt(0).toUpperCase() + clean.slice(1) : 'Agent';
+}
+
+function findSubagentEntry(entries, parentId, agentRef) {
+  const parent = String(parentId || '').trim().toLowerCase();
+  const ref = String(agentRef || '').trim();
+  if (!SESSION_ID_PATTERN.test(`${parent}.jsonl`) || !ref) return null;
+  const leaf = ref.split('/').filter(Boolean).at(-1) || ref;
+  return [...entries.values()]
+    .filter((entry) => entry.parentThreadId === parent)
+    .sort((left, right) => right.recencyMs - left.recencyMs)
+    .find((entry) => (
+      entry.id === ref.toLowerCase()
+      || entry.agentPath === ref
+      || entry.agentPath.split('/').filter(Boolean).at(-1) === leaf
+    )) || null;
+}
+
 export function readSessionIndex(file) {
   const titles = new Map();
   if (!existsSync(file)) return titles;
@@ -327,7 +524,7 @@ export function readSessionIndex(file) {
   return titles;
 }
 
-function scanSessionFiles(root, titles, appThreads = null) {
+function scanSessionFiles(root, titles, appThreads = null, workspaceKindForThread = null) {
   const entries = new Map();
   if (!existsSync(root)) return entries;
   const pending = [root];
@@ -364,6 +561,7 @@ function scanSessionFiles(root, titles, appThreads = null) {
           id,
           title,
           cwd: appThread?.cwd || String(firstRecord?.payload?.cwd || '').trim(),
+          workspaceKind: appThread?.workspaceKind || workspaceKindForThread?.(id) || '',
           filePath,
           size: stat.size,
           ino: stat.ino,
@@ -371,6 +569,10 @@ function scanSessionFiles(root, titles, appThreads = null) {
           recencyMs,
           createdAt: new Date(createdAtMs).toISOString(),
           updatedAt: new Date(recencyMs).toISOString(),
+          parentThreadId: appThread?.parentThreadId || '',
+          agentPath: appThread?.agentPath || '',
+          agentNickname: appThread?.agentNickname || '',
+          depth: appThread?.depth || 0,
         };
         const previous = entries.get(id);
         if (!previous || entry.recencyMs > previous.recencyMs) entries.set(id, entry);
@@ -394,7 +596,7 @@ function changedSessionIds(previous, next) {
 }
 
 function entrySignature(entry) {
-  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}`;
+  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
 }
 
 function sessionSummary(entry, status) {
@@ -403,6 +605,7 @@ function sessionSummary(entry, status) {
     source: 'codex',
     title: entry.title,
     cwd: entry.cwd || '',
+    workspaceKind: entry.workspaceKind || '',
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     status,
@@ -418,6 +621,7 @@ function createDetailCache(entry, options) {
     ino: entry.ino,
     generation: options.generation,
     offset: startOffset,
+    startOffset,
     size: entry.size,
     mtimeMs: entry.mtimeMs,
     remainder: Buffer.alloc(0),
@@ -426,13 +630,16 @@ function createDetailCache(entry, options) {
     nextSequence: 1,
     messagesTruncated: startOffset > 0,
     calls: new Map(),
-    metadata: {},
+    metadata: { workspaceKind: entry.workspaceKind || '' },
     currentTurnId: '',
     previousTurnId: '',
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
     latestTurnId: '',
+    currentTurnStartedAt: '',
+    turnStartScanComplete: startOffset === 0,
     displayUserMessagesInTurn: 0,
     lastTimestamp: '',
+    subagentTurnIds: new Set(),
   };
 
   const firstRecord = readFirstRecord(entry.filePath);
@@ -498,6 +705,109 @@ function readSessionUpdates(cache, entry, maxMessages) {
   }
 }
 
+function findTurnStartedAtBeforeOffset(filePath, turnId, boundaryOffset, fileSize, maxScanBytes) {
+  const targetTurnId = String(turnId || '');
+  if (!targetTurnId || boundaryOffset <= 0) return '';
+  const scanBudget = positiveNumber(maxScanBytes, DEFAULT_TURN_START_SCAN_BYTES);
+  let fd;
+  try {
+    fd = openSync(filePath, 'r');
+    const scanEnd = Math.min(boundaryOffset, fileSize);
+    const scanFloor = Math.max(0, scanEnd - scanBudget);
+
+    const startedAtFromLine = (line) => {
+      if (!line.length) return '';
+      const source = line.toString('utf8').replace(/\r$/, '');
+      if (!source.includes('"task_started"') || !source.includes(targetTurnId)) return '';
+      try {
+        const record = JSON.parse(source);
+        const payload = record?.payload || {};
+        const recordTurnId = String(payload.turn_id || payload.turnId || '');
+        return record?.type === 'event_msg' && payload.type === 'task_started' && recordTurnId === targetTurnId
+          ? String(record.timestamp || '')
+          : '';
+      } catch {
+        return '';
+      }
+    };
+
+    let position = scanEnd;
+    let lineParts = [];
+    let lineBytes = 0;
+    let skipBoundaryLine = false;
+    if (scanEnd < fileSize) {
+      const forwardParts = [];
+      let forwardBytes = 0;
+      let forward = scanEnd;
+      const forwardLimit = Math.min(fileSize, scanEnd + TURN_START_RECORD_LIMIT_BYTES);
+      let foundNewline = false;
+      while (forward < forwardLimit) {
+        const chunk = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, forwardLimit - forward));
+        const bytesRead = readSync(fd, chunk, 0, chunk.length, forward);
+        if (!bytesRead) break;
+        const body = chunk.subarray(0, bytesRead);
+        const newline = body.indexOf(10);
+        const part = newline === -1 ? body : body.subarray(0, newline);
+        if (part.length) {
+          forwardParts.push(Buffer.from(part));
+          forwardBytes += part.length;
+        }
+        if (newline !== -1) {
+          foundNewline = true;
+          break;
+        }
+        forward += bytesRead;
+      }
+      if (foundNewline) {
+        lineParts = forwardParts;
+        lineBytes = forwardBytes;
+      } else {
+        skipBoundaryLine = true;
+      }
+    }
+
+    const finishLine = (prefix) => {
+      const total = prefix.length + lineBytes;
+      let startedAt = '';
+      if (!skipBoundaryLine && total > 0 && total <= TURN_START_RECORD_LIMIT_BYTES) {
+        const line = lineParts.length ? Buffer.concat([prefix, ...lineParts], total) : prefix;
+        startedAt = startedAtFromLine(line);
+      }
+      lineParts = [];
+      lineBytes = 0;
+      skipBoundaryLine = false;
+      return startedAt;
+    };
+
+    while (position > scanFloor) {
+      const start = Math.max(scanFloor, position - READ_CHUNK_BYTES);
+      const chunk = Buffer.allocUnsafe(position - start);
+      const bytesRead = readSync(fd, chunk, 0, chunk.length, start);
+      if (!bytesRead) break;
+      const body = chunk.subarray(0, bytesRead);
+      let lineEnd = body.length;
+      for (let index = body.length - 1; index >= 0; index -= 1) {
+        if (body[index] !== 10) continue;
+        const startedAt = finishLine(body.subarray(index + 1, lineEnd));
+        if (startedAt) return startedAt;
+        lineEnd = index;
+      }
+      if (lineEnd > 0) {
+        const prefix = Buffer.from(body.subarray(0, lineEnd));
+        lineParts.unshift(prefix);
+        lineBytes += prefix.length;
+        if (lineBytes > TURN_START_RECORD_LIMIT_BYTES) skipBoundaryLine = true;
+      }
+      position = start;
+    }
+    return scanFloor === 0 ? finishLine(Buffer.alloc(0)) : '';
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 function consumeJsonlBuffer(cache, data, maxMessages) {
   let start = 0;
   if (cache.skipFirstPartial) {
@@ -536,6 +846,11 @@ function applyNativeRecord(cache, record, maxMessages) {
     return;
   }
 
+  if (record.type === 'inter_agent_communication_metadata') {
+    if (record.payload?.trigger_turn && cache.currentTurnId) cache.subagentTurnIds.add(cache.currentTurnId);
+    return;
+  }
+
   const payload = record.payload || {};
   if (record.type === 'event_msg') {
     applyEventRecord(cache, record, payload, maxMessages);
@@ -543,21 +858,37 @@ function applyNativeRecord(cache, record, maxMessages) {
   }
   if (record.type !== 'response_item') return;
 
+  const responseTurnId = String(
+    payload.internal_chat_message_metadata_passthrough?.turn_id
+      || payload.internal_chat_message_metadata_passthrough?.turnId
+      || '',
+  );
+  if (responseTurnId) updateNativeTurnId(cache, responseTurnId);
+
   switch (payload.type) {
     case 'message':
       applyMessageRecord(cache, record, payload, maxMessages);
       break;
-    case 'reasoning':
-      // Codex App presents user-facing commentary as progress. Raw reasoning
-      // summaries are model internals and are commonly emitted in English.
+    case 'reasoning': {
+      const summary = reasoningSummaryText(payload);
+      if (summary) appendNativeMessage(cache, 'process', summary, record, maxMessages, 'reasoning_summary');
       break;
+    }
     case 'function_call':
     case 'custom_tool_call': {
       const name = String(payload.name || payload.type || 'tool');
       const callId = String(payload.call_id || payload.id || '');
       if (callId) cache.calls.set(callId, name);
       const input = payload.type === 'custom_tool_call' ? payload.input : payload.arguments;
-      appendNativeMessage(cache, 'tool', formatToolText(name, input), record, maxMessages, payload.type);
+      appendNativeMessage(
+        cache,
+        'tool',
+        formatToolText(name, input),
+        record,
+        maxMessages,
+        payload.type,
+        toolMessageMetadata(name, input),
+      );
       break;
     }
     case 'function_call_output':
@@ -622,6 +953,8 @@ function applyEventRecord(cache, record, payload, maxMessages) {
   switch (payload.type) {
     case 'task_started':
       cache.status = 'running';
+      if (!cache.currentTurnStartedAt) cache.currentTurnStartedAt = String(record.timestamp || '');
+      cache.turnStartScanComplete = true;
       appendNativeMessage(cache, 'process', '任务开始', record, maxMessages, payload.type);
       break;
     case 'task_complete': {
@@ -680,25 +1013,43 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   const text = contentText(payload.content);
   const images = contentImages(payload.content);
   if ((!text && !images.length) || (text && isInjectedWorkspaceInstructions(payload.role, text))) return;
+  const browserComments = payload.role === 'user' && isBrowserCommentsMessage(text);
+  const browserCommentMeta = browserComments ? browserCommentsMetadata(text) : null;
   const context = payload.role === 'user' ? normalizeInjectedContext(text) : null;
   const displayText = payload.role === 'user' ? normalizeUserDisplayText(text) : text;
   let messageKind = payload.phase || 'message';
   if (payload.role === 'user' && !context && (displayText || images.length)) {
     const turnId = String(payload.internal_chat_message_metadata_passthrough?.turn_id || '');
     if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
-      messageKind = 'steering_user';
+      messageKind = browserComments ? 'steering_browser_comment' : 'steering_user';
     }
     cache.displayUserMessagesInTurn += 1;
   }
   if (context) {
     appendNativeMessage(cache, 'context', context.content, record, maxMessages, context.kind);
   } else if (displayText) {
-    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind);
+    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind, browserCommentMeta);
   }
   const imageKind = payload.role === 'user'
-    ? messageKind === 'steering_user' ? 'steering_input_image' : 'input_image'
+    ? ['steering_user', 'steering_browser_comment'].includes(messageKind) ? 'steering_input_image' : 'input_image'
     : 'output_image';
   for (const image of images) appendNativeMessage(cache, 'image', image, record, maxMessages, imageKind);
+}
+
+function isBrowserCommentsMessage(text) {
+  return String(text || '').replace(/\r\n/g, '\n').trimStart().startsWith('# Browser comments:');
+}
+
+function browserCommentsMetadata(text) {
+  const source = String(text || '').replace(/\r\n/g, '\n');
+  const headings = source.match(/^## (?:User )?Comment \d+\s*$/gm) || [];
+  const target = source.match(/^Target:\s*"([^"]+)"\s*$/m)?.[1]
+    || source.match(/^File:\s*browser:([^\n]+)$/m)?.[1]
+    || '';
+  return {
+    annotationCount: Math.max(1, headings.length),
+    browserTarget: target.trim().slice(0, 240),
+  };
 }
 
 function isInjectedWorkspaceInstructions(role, text) {
@@ -823,7 +1174,7 @@ function isBrowserEvidenceBoilerplate(paragraph) {
   return compact.startsWith('The element ') && compact.includes('marked by comment marker');
 }
 
-function appendNativeMessage(cache, role, content, record, maxMessages, kind) {
+function appendNativeMessage(cache, role, content, record, maxMessages, kind, metadata = null) {
   const limit = role === 'image'
     ? IMAGE_URL_LIMIT
     : role === 'user' || role === 'assistant'
@@ -839,6 +1190,7 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind) {
     kind,
     turnId: cache.currentTurnId || undefined,
     previousTurnId: cache.previousTurnId || undefined,
+    ...(metadata && typeof metadata === 'object' ? metadata : {}),
   });
   if (cache.messages.length > maxMessages) {
     cache.messages.splice(0, cache.messages.length - maxMessages);
@@ -853,6 +1205,8 @@ function updateNativeTurnId(cache, value) {
   if (turnId === cache.currentTurnId) return;
   cache.previousTurnId = cache.currentTurnId || '';
   cache.currentTurnId = turnId;
+  cache.currentTurnStartedAt = '';
+  cache.turnStartScanComplete = false;
   cache.displayUserMessagesInTurn = 0;
 }
 
@@ -886,6 +1240,193 @@ function cleanImageUrl(value) {
   if (/^data:image\/(?:png|jpe?g|webp|gif|avif);base64,[A-Za-z0-9+/=]+$/i.test(image)) return image;
   if (/^https?:\/\/[^\s]+$/i.test(image)) return image;
   return '';
+}
+
+function reasoningSummaryText(payload) {
+  const summaries = Array.isArray(payload?.summary) ? payload.summary : [];
+  const text = [...summaries]
+    .reverse()
+    .find((item) => item?.type === 'summary_text' && String(item.text || '').trim())?.text;
+  return String(text || '')
+    .trim()
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/^\*{1,3}\s*/, '')
+    .replace(/\s*\*{1,3}$/, '')
+    .trim();
+}
+
+function readDoubleQuotedJsString(source, start) {
+  if (source[start] !== '"') return null;
+  let escaped = false;
+  for (let index = start + 1; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === '"' && !escaped) {
+      try {
+        const value = JSON.parse(source.slice(start, index + 1));
+        return typeof value === 'string' ? { value, end: index + 1 } : null;
+      } catch {
+        return null;
+      }
+    }
+    if (char === '\\') escaped = !escaped;
+    else escaped = false;
+  }
+  return null;
+}
+
+function readRawJsTemplate(source, start) {
+  if (source[start] !== '`') return null;
+  let escaped = false;
+  let value = '';
+  for (let index = start + 1; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === '`' && !escaped) return { value, end: index + 1 };
+    if (char === '$' && source[index + 1] === '{' && !escaped) return null;
+    value += char;
+    if (char === '\\') escaped = !escaped;
+    else escaped = false;
+  }
+  return null;
+}
+
+function patchAssignmentAt(source, start) {
+  if (!source.startsWith('const', start)) return null;
+  const before = source[start - 1] || '';
+  const after = source[start + 5] || '';
+  if (/[A-Za-z0-9_$]/.test(before) || /[A-Za-z0-9_$]/.test(after)) return null;
+  let cursor = start + 5;
+  while (source[cursor] && source[cursor].charCodeAt(0) <= 32) cursor += 1;
+  if (!source.startsWith('patch', cursor) || /[A-Za-z0-9_$]/.test(source[cursor + 5] || '')) return null;
+  cursor += 5;
+  while (source[cursor] && source[cursor].charCodeAt(0) <= 32) cursor += 1;
+  if (source[cursor] !== '=') return null;
+  cursor += 1;
+  while (source[cursor] && source[cursor].charCodeAt(0) <= 32) cursor += 1;
+  if (source[cursor] === '"') return readDoubleQuotedJsString(source, cursor);
+  if (!source.startsWith('String.raw', cursor)) return null;
+  cursor += 'String.raw'.length;
+  while (source[cursor] && source[cursor].charCodeAt(0) <= 32) cursor += 1;
+  return readRawJsTemplate(source, cursor);
+}
+
+function executablePatchCode(source) {
+  const calls = [];
+  const assignments = [];
+  let quote = '';
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = '';
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    const assignment = patchAssignmentAt(source, index);
+    if (assignment) {
+      assignments.push({ ...assignment, start: index });
+      index = assignment.end - 1;
+      continue;
+    }
+    if (!source.startsWith('tools.apply_patch', index)) continue;
+    let cursor = index + 'tools.apply_patch'.length;
+    while (source[cursor] && source[cursor].charCodeAt(0) <= 32) cursor += 1;
+    if (source[cursor] === '(') calls.push(index);
+  }
+  return { calls, assignments };
+}
+
+function orchestratedPatchText(source) {
+  const parsed = executablePatchCode(source);
+  for (let index = parsed.calls.length - 1; index >= 0; index -= 1) {
+    const call = parsed.calls[index];
+    if (!/^tools\.apply_patch\s*\(\s*patch\s*\)/.test(source.slice(call))) continue;
+    const assignment = [...parsed.assignments].reverse().find((item) => item.end <= call);
+    if (assignment) return assignment.value;
+  }
+  return '';
+}
+
+function toolPatchText(name, value) {
+  const toolName = String(name || '').split('.').at(-1);
+  if (toolName === 'apply_patch') {
+    if (typeof value === 'object' && value?.patch) return String(value.patch);
+    const source = String(value || '');
+    if (source.includes('*** Begin Patch')) return source;
+    try {
+      const parsed = JSON.parse(source);
+      if (typeof parsed === 'string') return parsed;
+      if (parsed && typeof parsed === 'object' && parsed.patch) return String(parsed.patch);
+    } catch {}
+    return '';
+  }
+  if (toolName !== 'exec') return '';
+  return orchestratedPatchText(String(value || ''));
+}
+
+function patchFileChanges(patch) {
+  const files = new Map();
+  let current = null;
+  for (const line of String(patch || '').split('\n')) {
+    const prefixes = [
+      ['*** Update File: ', '已编辑'],
+      ['*** Add File: ', '已新增'],
+      ['*** Delete File: ', '已删除'],
+    ];
+    const match = prefixes.find(([prefix]) => line.startsWith(prefix));
+    if (match) {
+      const filePath = line.slice(match[0].length).trim().replace(/^['"]+|['",;\)\]]+$/g, '');
+      if (!filePath || filePath.length > TOOL_FILE_PATH_LIMIT) {
+        current = null;
+        continue;
+      }
+      if (!files.has(filePath) && files.size >= TOOL_FILE_CHANGE_LIMIT) {
+        current = null;
+        continue;
+      }
+      current = files.get(filePath) || { filePath, verb: match[1], added: 0, removed: 0 };
+      if (current.verb !== match[1]) current.verb = '已编辑';
+      files.set(filePath, current);
+      continue;
+    }
+    if (!current) continue;
+    if (line.startsWith('+')) current.added += 1;
+    else if (line.startsWith('-')) current.removed += 1;
+  }
+  return [...files.values()];
+}
+
+function toolMessageMetadata(name, value) {
+  const fileChanges = patchFileChanges(toolPatchText(name, value));
+  return fileChanges.length ? { fileChanges } : null;
 }
 
 function formatToolText(name, value) {
@@ -946,6 +1487,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     updatedAt: cache.lastTimestamp || entry.updatedAt,
     status: effectiveSessionStatus(cache.status, entry.mtimeMs, runningWindowMs),
     latestTurnId: cache.latestTurnId,
+    latestTurnStartedAt: cache.currentTurnStartedAt,
     readOnly: false,
     truncated: cache.messagesTruncated,
     hasEarlierMessages: messages.length < availableMessages.length,
@@ -953,7 +1495,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     cursor: Math.max(0, cache.nextSequence - 1),
     reset,
     revision: `${entry.ino}:${entry.size}:${entry.mtimeMs}`,
-    metadata: { ...cache.metadata },
+    metadata: { ...cache.metadata, workspaceKind: entry.workspaceKind || '' },
     messages: messages.map((message) => ({ ...message })),
   };
 }

@@ -501,6 +501,106 @@ app.get('/api/native-sessions', requireAuth, (_req, res) => {
   res.json({ sessions: nativeSessionSummaries(), version: nativeSessions.version });
 });
 
+app.get('/api/native-archived-sessions', requireAuth, async (_req, res) => {
+  try {
+    const sessions = await listArchivedNativeThreads();
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ sessions, count: sessions.length });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `读取已归档任务失败: ${err.message}` });
+  }
+});
+
+app.post('/api/native-archived-sessions/:id/unarchive', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  try {
+    const archivedSession = await findArchivedNativeThread(threadId);
+    const result = await appServerClient.request('thread/unarchive', { threadId });
+    const session = nativeArchivedThreadSummary(result?.thread) || archivedSession || { id: threadId, cwd: '' };
+    await notifyDesktopThreadUnarchived(threadId, session.cwd);
+    nativeSessions.scheduleRefresh();
+    res.json({
+      ok: true,
+      id: threadId,
+      session,
+    });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `取消归档 Codex App 会话失败: ${err.message}` });
+  }
+});
+
+app.delete('/api/native-archived-sessions', requireAuth, async (req, res) => {
+  if (String(req.body?.confirm || '') !== '永久删除全部已归档任务') {
+    return res.status(400).json({ error: '删除全部已归档任务需要再次确认' });
+  }
+
+  try {
+    const sessions = await listArchivedNativeThreads();
+    const deleted = [];
+    const skipped = [];
+    const failed = [];
+    for (const session of sessions) {
+      let archived;
+      try {
+        archived = await findArchivedNativeThread(session.id);
+      } catch (err) {
+        failed.push({ id: session.id, error: `删除前复核失败: ${err.message}` });
+        continue;
+      }
+      if (!archived) {
+        skipped.push(session.id);
+        continue;
+      }
+      try {
+        await appServerClient.request('thread/delete', { threadId: session.id });
+        deleted.push(session.id);
+      } catch (err) {
+        failed.push({ id: session.id, error: err.message });
+      }
+    }
+    await notifyDesktopArchivedThreadsChanged();
+    nativeSessions.scheduleRefresh();
+    if (failed.length) {
+      return res.status(502).json({
+        error: `已永久删除 ${deleted.length} 个任务，跳过 ${skipped.length} 个，${failed.length} 个失败`,
+        deleted,
+        skipped,
+        failed,
+      });
+    }
+    res.json({ ok: true, deleted, skipped, failed: [] });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `永久删除全部已归档任务失败: ${err.message}` });
+  }
+});
+
+app.delete('/api/native-archived-sessions/:id', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  try {
+    if (!await findArchivedNativeThread(threadId)) {
+      return res.status(404).json({ error: '该任务不在已归档列表中，未执行删除' });
+    }
+    if (!await findArchivedNativeThread(threadId)) {
+      await notifyDesktopArchivedThreadsChanged();
+      nativeSessions.scheduleRefresh();
+      return res.status(409).json({
+        error: '归档状态已变化，已跳过永久删除',
+        skipped: [threadId],
+      });
+    }
+    await appServerClient.request('thread/delete', { threadId });
+    await notifyDesktopArchivedThreadsChanged();
+    nativeSessions.scheduleRefresh();
+    res.json({ ok: true, id: threadId });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `永久删除已归档任务失败: ${err.message}` });
+  }
+});
+
 app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
   try {
     const limit = positiveInteger(req.query.limit);
@@ -515,6 +615,23 @@ app.get('/api/native-sessions/:id', requireAuth, (req, res) => {
     res.json({ conversation: decorateNativeConversation(conversation, { externalizeImages }) });
   } catch (err) {
     res.status(500).json({ error: `读取 Codex App 会话失败: ${err.message}` });
+  }
+});
+
+app.get('/api/native-sessions/:id/subagents', requireAuth, (req, res) => {
+  try {
+    const parentThreadId = cleanNativeThreadId(req.params.id);
+    const agentRef = cleanSubagentRef(req.query.agent);
+    if (!parentThreadId || !agentRef) return res.status(400).json({ error: '子代理参数无效' });
+    const subagent = nativeSessions.getSubagent(parentThreadId, agentRef, {
+      after: req.query.after,
+      generation: req.query.generation,
+      limit: positiveInteger(req.query.limit),
+    });
+    if (!subagent) return res.status(404).json({ error: '子代理尚未创建或已不可用' });
+    res.json({ subagent });
+  } catch (err) {
+    res.status(500).json({ error: `读取子代理进度失败: ${err.message}` });
   }
 });
 
@@ -754,9 +871,7 @@ app.post('/api/native-projects/archive', requireAuth, async (req, res) => {
   const projectPath = normalizeNativeProjectPath(req.body?.cwd);
   if (!projectPath) return res.status(400).json({ error: '项目路径无效' });
 
-  const targets = nativeSessionSummaries().filter((session) => (
-    normalizeNativeProjectPath(session.cwd) === projectPath
-  ));
+  const targets = nativeSessionSummaries().filter((session) => nativeSessionMatchesProject(session, projectPath));
   if (!targets.length) return res.status(404).json({ error: '该项目没有可归档任务' });
 
   const running = targets.filter((session) => {
@@ -2252,11 +2367,18 @@ function setNativeTurnState(threadId, state) {
   const cleanId = cleanNativeThreadId(threadId);
   if (!cleanId) return;
   const current = activeNativeTurns.get(cleanId);
+  const turnId = String(state.turnId || '');
+  const status = nativeTurnStatus(state.status);
+  const updatedAt = new Date().toISOString();
+  const sameTurn = Boolean(current?.turnId && current.turnId === turnId);
   const next = {
-    turnId: String(state.turnId || ''),
-    status: nativeTurnStatus(state.status),
+    turnId,
+    status,
     transport: String(state.transport || current?.transport || 'app-server'),
-    updatedAt: new Date().toISOString(),
+    startedAt: status === 'running'
+      ? String(state.startedAt || (sameTurn ? current?.startedAt : '') || updatedAt)
+      : String(state.startedAt || current?.startedAt || ''),
+    updatedAt,
   };
   activeNativeTurns.set(cleanId, next);
   if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
@@ -2295,12 +2417,96 @@ function nativeSessionSummaries() {
   });
 }
 
+async function listArchivedNativeThreads() {
+  const sessions = [];
+  const seenIds = new Set();
+  const seenCursors = new Set();
+  let cursor = null;
+  for (let page = 0; page < 100; page += 1) {
+    const result = await appServerClient.request('thread/list', compactObject({
+      archived: true,
+      cursor,
+      limit: 200,
+      sortKey: 'recency_at',
+      sortDirection: 'desc',
+      useStateDbOnly: true,
+    }));
+    for (const thread of result?.data || []) {
+      const session = nativeArchivedThreadSummary(thread);
+      if (!session || seenIds.has(session.id)) continue;
+      seenIds.add(session.id);
+      sessions.push(session);
+    }
+    const nextCursor = String(result?.nextCursor || '');
+    if (!nextCursor) return sessions;
+    if (seenCursors.has(nextCursor)) throw new Error('Codex app-server 返回了重复的归档分页游标');
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  throw new Error('已归档任务数量超过安全分页上限');
+}
+
+async function findArchivedNativeThread(threadId) {
+  const targetId = cleanNativeThreadId(threadId);
+  if (!targetId) return null;
+  const seenCursors = new Set();
+  let cursor = null;
+  for (let page = 0; page < 100; page += 1) {
+    const result = await appServerClient.request('thread/list', compactObject({
+      archived: true,
+      cursor,
+      limit: 200,
+      sortKey: 'recency_at',
+      sortDirection: 'desc',
+      useStateDbOnly: true,
+    }));
+    for (const thread of result?.data || []) {
+      const session = nativeArchivedThreadSummary(thread);
+      if (session?.id === targetId) return session;
+    }
+    const nextCursor = String(result?.nextCursor || '');
+    if (!nextCursor) return null;
+    if (seenCursors.has(nextCursor)) throw new Error('Codex app-server 返回了重复的归档分页游标');
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  throw new Error('已归档任务数量超过安全分页上限');
+}
+
+function nativeArchivedThreadSummary(thread) {
+  const id = cleanNativeThreadId(thread?.id);
+  if (!id) return null;
+  const title = String(thread?.name || thread?.preview || '未命名任务')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, 120) || '未命名任务';
+  const createdAt = unixSecondsToIso(thread?.createdAt);
+  const updatedAt = unixSecondsToIso(thread?.updatedAt) || createdAt;
+  const recencyAt = unixSecondsToIso(thread?.recencyAt) || updatedAt;
+  return {
+    id,
+    source: 'codex',
+    title,
+    preview: String(thread?.preview || '').trim().replace(/\s+/g, ' ').slice(0, 240),
+    cwd: String(thread?.cwd || '').trim(),
+    workspaceKind: nativeSessions.workspaceKindForThread?.(id) || '',
+    createdAt,
+    updatedAt,
+    recencyAt,
+  };
+}
+
 function normalizeNativeProjectPath(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
   const normalized = path.normalize(raw);
   const root = path.parse(normalized).root;
   return normalized === root ? root : normalized.replace(/[\\/]+$/, '');
+}
+
+function nativeSessionMatchesProject(session, projectPath) {
+  return session?.workspaceKind !== 'projectless'
+    && normalizeNativeProjectPath(session?.cwd) === projectPath;
 }
 
 function executableOrchestratedToolCallOffsets(source, toolName) {
@@ -2401,6 +2607,9 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
     : conversation.status === 'running'
       ? conversation.latestTurnId || ''
       : '';
+  const persistedStartedAt = activeTurnId && String(conversation.latestTurnId || '') === String(activeTurnId)
+    ? conversation.latestTurnStartedAt || ''
+    : '';
   return {
     ...conversation,
     messages: externalizeImages
@@ -2409,6 +2618,7 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
     status: active?.status === 'running' ? 'running' : conversation.status,
     readOnly: false,
     activeTurnId,
+    activeTurnStartedAt: activeTurnId ? persistedStartedAt || active?.startedAt || '' : '',
   };
 }
 
@@ -2572,6 +2782,24 @@ async function notifyDesktopThreadArchived(threadId, cwd) {
   } catch (error) {
     console.warn(`Codex Desktop IPC 归档同步失败: ${error.message}`);
   }
+  await notifyDesktopArchivedThreadsChanged();
+}
+
+async function notifyDesktopThreadUnarchived(threadId, cwd) {
+  try {
+    await desktopIpcClient.threadUnarchived(threadId, cwd);
+  } catch (error) {
+    console.warn(`Codex Desktop IPC 取消归档同步失败: ${error.message}`);
+  }
+  await notifyDesktopArchivedThreadsChanged();
+}
+
+async function notifyDesktopArchivedThreadsChanged() {
+  try {
+    await desktopIpcClient.invalidateQueryCache(['archived-threads']);
+  } catch (error) {
+    console.warn(`Codex Desktop IPC 归档列表刷新失败: ${error.message}`);
+  }
 }
 
 async function startNativeTurn(threadId, turn) {
@@ -2731,6 +2959,13 @@ function findInProgressTurnId(thread) {
 function cleanNativeThreadId(value) {
   const id = String(value || '').trim().toLowerCase();
   return NATIVE_THREAD_ID_PATTERN.test(id) ? id : '';
+}
+
+function cleanSubagentRef(value) {
+  const ref = String(value || '').trim();
+  if (!ref || ref.length > 240 || !/^\/?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(ref)) return '';
+  if (ref.split('/').includes('..')) return '';
+  return ref;
 }
 
 function positiveInteger(value) {
@@ -3207,7 +3442,7 @@ function setCodexDefaults(provider, model, reasoningEffort) {
 function cleanReasoningEffort(value) {
   const effort = String(value || '').trim().toLowerCase();
   if (!effort) return '';
-  if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) throw new Error('思考档位无效');
+  if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort)) throw new Error('思考档位无效');
   return effort;
 }
 
@@ -3373,18 +3608,19 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
 <div id="nativeRequestModal" class="requestOverlay hidden" role="presentation"><div class="requestPanel" role="dialog" aria-modal="true" aria-labelledby="nativeRequestTitle"><div class="requestHead"><div><div id="nativeRequestTitle" class="requestTitle">Codex 请求确认</div><div id="nativeRequestMeta" class="requestMeta"></div></div></div><pre id="nativeRequestDetail" class="requestDetail"></pre><form id="nativeRequestForm"><div id="nativeRequestFields" class="requestFields"></div><div id="nativeRequestActions" class="requestActions"></div></form></div></div>
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
 <script src="/vendor/lucide.js"></script>
 <script>
 const login = document.getElementById('login'), app = document.getElementById('app'), loginForm = document.getElementById('loginForm'), loginError = document.getElementById('loginError');
-const chat = document.getElementById('chat'), input = document.getElementById('input'), sendBtn = document.getElementById('send'), cancelBtn = document.getElementById('cancelRun'), statusEl = document.getElementById('status');
+const chat = document.getElementById('chat'), composer = document.querySelector('.composer'), input = document.getElementById('input'), sendBtn = document.getElementById('send'), cancelBtn = document.getElementById('cancelRun'), statusEl = document.getElementById('status');
 const dropZone = document.getElementById('dropZone'), attachFile = document.getElementById('attachFile'), fileInput = document.getElementById('fileInput'), attachmentTray = document.getElementById('attachmentTray');
 const provider = document.getElementById('provider'), model = document.getElementById('model'), reasoningEffort = document.getElementById('reasoningEffort'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
-const menuBtn = document.getElementById('menuBtn');
+const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
+const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
 const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
 const modeLabel = document.getElementById('modeLabel'), nativeNotice = document.getElementById('nativeNotice');
@@ -3392,6 +3628,12 @@ const nativeRequestModal = document.getElementById('nativeRequestModal'), native
 const titleEl = document.querySelector('.top .title');
 let currentConversationId = '';
 let currentConversationSource = 'codex';
+let currentNativeWorkspaceKind = '';
+let defaultComposerCwd = '';
+let activeMainView = 'chat';
+let archivedItems = [];
+let archivedLoading = false;
+let archiveNotice = '';
 let conversationLoadSeq = 0;
 let nativeCursor = 0;
 let nativeGeneration = 0;
@@ -3407,15 +3649,29 @@ let nativeRunningElement = null;
 let nativeOptimisticElements = [];
 let nativeOptimisticSteering = new Map();
 let nativeLiveItems = new Map();
+let nativeRuntimeStreamTurnIds = new Set();
+let nativeRenderedMessageKeys = new Set();
+let subagentTraceStates = new Set();
 let latestToolElement = null;
 let latestAssistantElement = null;
 let latestFinalAssistantElement = null;
 let latestUserElement = null;
 let turnProcessElements = [];
 let currentActivityCluster = null;
+let currentAgentActivityGroup = null;
+let pendingAgentActivityBatches = [];
+let pendingActivityReasoning = [];
+let turnReasoningStatus = null;
+let liveTurnPlan = [];
+let liveEditedFilesResult = null;
 let collectingTurnProcess = false;
 let turnProcessHeader = null;
 let turnProcessTimeline = null;
+let turnProcessStartedAt = 0;
+let turnProcessElapsedLabel = null;
+let turnProcessElapsedTimer = null;
+let turnProcessElapsedFrozen = false;
+let turnProcessElapsedTurnId = '';
 let currentNativeRequest = null;
 let dangerConfirmed = false;
 let pendingAttachments = [];
@@ -3469,16 +3725,28 @@ let imagePreviewReturnFocus = null;
 let appearance = {theme:'light',chatBackground:'default',customBackgrounds:[]};
 const desktopSidebarMedia=window.matchMedia('(min-width: 821px)');
 const SIDEBAR_STORAGE_KEY='codexWeb.sidebarCollapsed';
+const SIDEBAR_WIDTH_STORAGE_KEY='codexWeb.sidebarWidth.v1';
+const SIDEBAR_WIDTH_MIN=240;
+const SIDEBAR_WIDTH_MAX=480;
+const SIDEBAR_WIDTH_DEFAULT=316;
+const SIDEBAR_MAIN_MIN=480;
+let sidebarResizeHandle=null;
+let sidebarPreferredWidth=SIDEBAR_WIDTH_DEFAULT;
+let sidebarRenderedWidth=SIDEBAR_WIDTH_DEFAULT;
+let sidebarResizePointerId=null;
 const HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsCollapsed';
+const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb.historyTasksCollapsed';
 const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 const NATIVE_INITIAL_MESSAGE_LIMIT=60;
 const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
+let historyTasksCollapsed=readHistoryTasksCollapsed();
 let hiddenHistoryProjects=readHiddenHistoryProjects();
 let renamedHistoryProjects=readRenamedHistoryProjects();
 let activeHistoryProjectMenu=null;
+let historyRefreshPending=false;
 let historyProjectPreview=null;
 let historyProjectPreviewAnchor=null;
 function refreshIcons(root=document){if(!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
@@ -3512,7 +3780,7 @@ function composerModelLabel(value){
   const clean=String(value||'默认模型').replace(/^gpt-/i,'').replace(/[-_]+/g,' ').trim();
   return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
 }
-function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高'})[String(value||'')]||String(value||'默认')}
+function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'极高'})[String(value||'')]||String(value||'默认')}
 function createTrailingSingleFlight(task){
   let active=null;
   let rerun=false;
@@ -3587,7 +3855,11 @@ function queuedPromptLabel(item){
 function composerProjectPaths(){
   const paths=[];
   const seen=new Set();
-  for(const value of [cwd.value,...historyItems.map((item)=>item.cwd)]){
+  const projectItems=historyItems.filter((item)=>!isStandaloneHistoryItem(item));
+  const selectedPath=normalizeProjectPath(cwd.value);
+  const selectedIsStandalone=historyItems.some((item)=>isStandaloneHistoryItem(item)&&normalizeProjectPath(item.cwd)===selectedPath);
+  const values=[...(selectedIsStandalone?[]:[cwd.value]),...projectItems.map((item)=>item.cwd)];
+  for(const value of values){
     const path=normalizeProjectPath(value);
     const key=historyProjectKey(path);
     if(!path||seen.has(key))continue;
@@ -3682,15 +3954,15 @@ function renderPromptQueue(){
       if(queueFailures.has(item.id))dispatchNextQueuedPrompt(threadId,{force:true});else steerQueuedPrompt(threadId,item.id);
     },true);
     guide.disabled=busy||(!webRunActive&&!queueFailures.has(item.id));
-    const edit=queueActionButton('pencil','编辑',()=>restoreQueuedPrompt(threadId,item.id));
-    edit.disabled=busy;
     const remove=queueActionButton('trash-2','删除',()=>deleteQueuedPrompt(threadId,item.id));
     remove.disabled=busy;
+    const more=queueActionButton('ellipsis','编辑',()=>restoreQueuedPrompt(threadId,item.id));
+    more.disabled=busy;
     row.appendChild(lead);
     row.appendChild(body);
     row.appendChild(guide);
-    row.appendChild(edit);
     row.appendChild(remove);
+    row.appendChild(more);
     const error=queueFailures.get(item.id);
     if(error){
       const errorText=document.createElement('div');
@@ -3736,7 +4008,7 @@ async function restoreQueuedPrompt(threadId,itemId){
   pendingAttachments=item.attachments.map((attachment)=>({...attachment}));
   if([...provider.options].some((option)=>option.value===item.provider))provider.value=item.provider;
   await loadModels(provider.value,item.model);
-  if(['low','medium','high','xhigh','max',''].includes(item.reasoningEffort))reasoningEffort.value=item.reasoningEffort;
+  if(['low','medium','high','xhigh','max','ultra',''].includes(item.reasoningEffort))reasoningEffort.value=item.reasoningEffort;
   if(['read-only','workspace-write','danger-full-access'].includes(item.sandbox))sandbox.value=item.sandbox;
   if(['never','on-request','untrusted'].includes(item.approval))approval.value=item.approval;
   if(item.cwd)cwd.value=item.cwd;
@@ -3772,6 +4044,7 @@ function showNativeSteerOptimistically(item){
   const element=addMsg('user',item.message||'请分析上传的附件。',{
     kind:'steering_user',
     at:new Date().toISOString(),
+    turnId:activeNativeTurnId,
     optimisticQueueId:item.id,
   });
   if(!element)return null;
@@ -4418,6 +4691,11 @@ function enhanceInterface(){
   if(sideActions&&settingsToggle)sideActions.appendChild(settingsToggle);
   enhanceSettingsModal();
   setIconLabel(document.getElementById('newChat'),'plus','新建任务');
+  setIconLabel(archiveToggle,'archive','已归档任务',false);
+  archiveToggle?.setAttribute('title','已归档任务');
+  archiveToggle?.setAttribute('aria-pressed','false');
+  setIconLabel(archiveRefresh,'refresh-cw','刷新');
+  setIconLabel(archiveDeleteAll,'trash-2','永久删除全部');
   setIconLabel(settingsToggle,'settings','设置',false);
   settingsToggle?.setAttribute('title','设置');
   settingsToggle?.setAttribute('aria-expanded','false');
@@ -4430,6 +4708,7 @@ function enhanceInterface(){
   deleteBackground?.setAttribute('title','删除背景');
   setIconLabel(document.getElementById('logout'),'log-out','退出登录');
   menuBtn?.setAttribute('aria-controls','sidePanel');
+  enhanceSidebarResize();
   enhanceComposer();
   setIconLabel(loginForm?.querySelector('.primary'),'log-in','登录');
   if(titleEl)titleEl.textContent='新任务';
@@ -4458,7 +4737,7 @@ function enhanceInterface(){
     historyTitle.after(search);
   }
   history?.addEventListener('scroll',()=>hideHistoryProjectPreview(),{passive:true});
-  window.addEventListener('resize',()=>hideHistoryProjectPreview(),{passive:true});
+  window.addEventListener('resize',()=>{hideHistoryProjectPreview();renderSidebarWidth()},{passive:true});
   desktopSidebarMedia.addEventListener('change',()=>hideHistoryProjectPreview());
   const empty=document.querySelector('.empty');
   if(empty){
@@ -4475,6 +4754,11 @@ applyAppearance();
 loginForm?.addEventListener('submit', async (e)=>{e.preventDefault();loginError.textContent='';const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});if(res.ok){login.classList.add('hidden');app.classList.remove('hidden');await boot(true);input.focus()}else{loginError.textContent=(await res.json()).error||'登录失败'}});
 document.getElementById('logout')?.addEventListener('click', async()=>{await fetch('/api/logout',{method:'POST'});location.reload()});
 document.getElementById('newChat')?.addEventListener('click', newChat);
+archiveToggle?.addEventListener('click',openArchivedView);
+archiveSearch?.addEventListener('input',renderArchivedTasks);
+archiveProjectFilter?.addEventListener('change',renderArchivedTasks);
+archiveRefresh?.addEventListener('click',()=>loadArchivedTasks({force:true}));
+archiveDeleteAll?.addEventListener('click',deleteAllArchivedTasks);
 document.getElementById('refreshProviderModels')?.addEventListener('click', refreshProviderModels);
 document.getElementById('saveDefault')?.addEventListener('click', saveDefaultModel);
 document.getElementById('deleteProvider')?.addEventListener('click', deleteSelectedProvider);
@@ -4482,7 +4766,7 @@ settingsToggle?.addEventListener('click', toggleSettings);
 menuBtn?.addEventListener('click', toggleMenu);
 document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
-desktopSidebarMedia.addEventListener?.('change',()=>{app.classList.remove('menuOpen');syncMenuButton()});
+desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();app.classList.remove('menuOpen');renderSidebarWidth();syncMenuButton()});
 document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
@@ -4621,8 +4905,13 @@ async function handleChatBackgroundChange(){const value=chatBackground.value;if(
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
 async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);cwd.value=data.defaults.cwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
-async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor)return;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');cwd.value=defaultComposerCwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
+function flushPendingHistoryRefresh(){
+  if(!historyRefreshPending||activeHistoryProjectMenu||historyProjectPreviewAnchor)return;
+  historyRefreshPending=false;
+  queueMicrotask(()=>refreshHistory());
+}
+async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor){historyRefreshPending=true;return}historyRefreshPending=false;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
 async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
 async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
@@ -4633,6 +4922,303 @@ function conversationKey(source,id){return (source==='codex'?'codex':'web')+':'+
 function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown__'}
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
 function projectNameFromPath(value){const clean=String(value||'').replace(/\\\\/g,'/').replace(/\\/+$/,'');const parts=clean.split('/').filter(Boolean);return parts.length?parts[parts.length-1]:'未指定项目'}
+function isStandaloneHistoryItem(item){return String(item?.workspaceKind||'')==='projectless'}
+function partitionHistoryItems(items){
+  const tasks=[];
+  const projects=new Map();
+  for(const item of items||[]){
+    if(isStandaloneHistoryItem(item)){tasks.push(item);continue}
+    const projectPath=normalizeProjectPath(item.cwd);
+    const groupKey=historyProjectKey(projectPath);
+    if(!projects.has(groupKey))projects.set(groupKey,{path:projectPath,items:[]});
+    projects.get(groupKey).items.push(item);
+  }
+  return{tasks,projects};
+}
+function setMainView(view){
+  const archived=view==='archive';
+  activeMainView=archived?'archive':'chat';
+  archiveView?.classList.toggle('hidden',!archived);
+  chat?.classList.toggle('hidden',archived);
+  composer?.classList.toggle('hidden',archived);
+  archiveToggle?.setAttribute('aria-pressed',String(archived));
+  archiveToggle?.classList.toggle('active',archived);
+  if(archived){
+    closeComposerPopovers();
+    if(titleEl)titleEl.textContent='已归档任务';
+    statusEl.textContent=archivedLoading?'正在读取归档列表...':'Codex App · 已归档';
+    setIconLabel(modeLabel,'archive','已归档');
+  }else applyConversationMode();
+}
+function showChatView(){if(activeMainView!=='chat')setMainView('chat')}
+async function openArchivedView(){
+  closeSettings();
+  setMainView('archive');
+  closeMenu();
+  await loadArchivedTasks({force:true});
+  archiveSearch?.focus();
+}
+function archivedTaskTimestamp(item){
+  const value=item?.recencyAt||item?.updatedAt||item?.createdAt;
+  const date=new Date(value||0);
+  if(Number.isNaN(date.getTime()))return'';
+  return date.toLocaleString([],{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+function syncArchivedProjectOptions(){
+  if(!archiveProjectFilter)return;
+  const selected=archiveProjectFilter.value;
+  const standaloneCount=archivedItems.filter(isStandaloneHistoryItem).length;
+  const projects=[...new Set(archivedItems.filter((item)=>!isStandaloneHistoryItem(item)).map((item)=>normalizeProjectPath(item.cwd)))].sort((left,right)=>historyProjectName(left).localeCompare(historyProjectName(right),'zh-CN'));
+  archiveProjectFilter.replaceChildren();
+  const all=document.createElement('option');
+  all.value='';
+  all.textContent='所有项目';
+  archiveProjectFilter.appendChild(all);
+  if(standaloneCount){
+    const tasks=document.createElement('option');
+    tasks.value='__tasks__';
+    tasks.textContent='任务 ('+standaloneCount+')';
+    archiveProjectFilter.appendChild(tasks);
+  }
+  for(const projectPath of projects){
+    const option=document.createElement('option');
+    option.value=projectPath||'__unknown__';
+    const count=archivedItems.filter((item)=>!isStandaloneHistoryItem(item)&&normalizeProjectPath(item.cwd)===projectPath).length;
+    option.textContent=historyProjectName(projectPath)+' ('+count+')';
+    archiveProjectFilter.appendChild(option);
+  }
+  archiveProjectFilter.value=[...archiveProjectFilter.options].some((option)=>option.value===selected)?selected:'';
+}
+async function loadArchivedTasks({force=false}={}){
+  if(archivedLoading)return;
+  archivedLoading=true;
+  archiveNotice='正在读取已归档任务...';
+  archiveRefresh.disabled=true;
+  archiveDeleteAll.disabled=true;
+  renderArchivedTasks();
+  try{
+    const res=await fetch('/api/native-archived-sessions',{headers:{Accept:'application/json'}});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'读取已归档任务失败');
+    archivedItems=Array.isArray(data.sessions)?data.sessions:[];
+    archiveNotice='';
+    syncArchivedProjectOptions();
+  }catch(error){
+    archiveNotice=error.message;
+  }finally{
+    archivedLoading=false;
+    archiveRefresh.disabled=false;
+    archiveDeleteAll.disabled=!archivedItems.length;
+    renderArchivedTasks();
+    if(activeMainView==='archive')statusEl.textContent=archiveNotice||'Codex App · '+archivedItems.length+' 个已归档任务';
+  }
+}
+function createArchivedAction(iconName,label,className,handler){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className=className;
+  button.title=label;
+  button.setAttribute('aria-label',label);
+  setIconLabel(button,iconName,label,false);
+  button.addEventListener('click',handler);
+  return button;
+}
+function createArchivedTaskRow(item){
+  const row=document.createElement('article');
+  row.className='archiveTask';
+  row.dataset.threadId=item.id;
+  const main=document.createElement('div');
+  main.className='archiveTaskMain';
+  const title=document.createElement('h3');
+  title.className='archiveTaskTitle';
+  title.textContent=item.title||'未命名任务';
+  const preview=document.createElement('p');
+  preview.className='archiveTaskPreview';
+  preview.textContent=item.preview&&item.preview!==item.title?item.preview:'';
+  preview.hidden=!preview.textContent;
+  const meta=document.createElement('div');
+  meta.className='archiveTaskMeta';
+  const pathNode=document.createElement('span');
+  pathNode.className='archiveTaskPath';
+  const pathIcon=document.createElement('i');
+  pathIcon.setAttribute('data-lucide','folder');
+  pathIcon.setAttribute('aria-hidden','true');
+  const pathText=document.createElement('span');
+  pathText.textContent=item.cwd||'路径未知';
+  pathText.title=item.cwd||'路径未知';
+  pathNode.appendChild(pathIcon);
+  pathNode.appendChild(pathText);
+  const time=document.createElement('time');
+  time.className='archiveTaskTime';
+  time.dateTime=String(item.recencyAt||item.updatedAt||item.createdAt||'');
+  time.textContent=archivedTaskTimestamp(item);
+  meta.appendChild(pathNode);
+  if(time.textContent)meta.appendChild(time);
+  main.appendChild(title);
+  main.appendChild(preview);
+  main.appendChild(meta);
+  const actions=document.createElement('div');
+  actions.className='archiveTaskActions';
+  const unarchive=createArchivedAction('archive-restore','取消归档','archiveTaskRestore',()=>unarchiveTask(item,row));
+  const remove=createArchivedAction('trash-2','永久删除','archiveTaskDelete',()=>deleteArchivedTask(item,row));
+  actions.appendChild(unarchive);
+  actions.appendChild(remove);
+  row.appendChild(main);
+  row.appendChild(actions);
+  refreshIcons(row);
+  return row;
+}
+function renderArchivedTasks(){
+  if(!archiveList)return;
+  const query=String(archiveSearch?.value||'').trim().toLocaleLowerCase();
+  const project=String(archiveProjectFilter?.value||'');
+  const visible=archivedItems.filter((item)=>{
+    const projectPath=normalizeProjectPath(item.cwd);
+    const standalone=isStandaloneHistoryItem(item);
+    if(project==='__tasks__'&&!standalone)return false;
+    if(project&&project!=='__tasks__'&&(standalone||projectPath!==(project==='__unknown__'?'':project)))return false;
+    if(!query)return true;
+    return (String(item.title||'')+' '+String(item.preview||'')+' '+String(item.cwd||'')+' '+historyProjectName(item.cwd)).toLocaleLowerCase().includes(query);
+  });
+  archiveList.replaceChildren();
+  if(archivedLoading&&!archivedItems.length){
+    const loading=document.createElement('div');
+    loading.className='archiveEmpty loading';
+    loading.textContent='正在读取已归档任务…';
+    archiveList.appendChild(loading);
+  }else if(!visible.length){
+    const empty=document.createElement('div');
+    empty.className='archiveEmpty';
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide',archivedItems.length?'search-x':'archive');
+    icon.setAttribute('aria-hidden','true');
+    const title=document.createElement('strong');
+    title.textContent=archivedItems.length?'没有匹配的已归档任务':'没有已归档任务';
+    const detail=document.createElement('span');
+    detail.textContent=archivedItems.length?'调整搜索词或项目筛选后重试。':'归档的任务会显示在这里。';
+    empty.appendChild(icon);
+    empty.appendChild(title);
+    empty.appendChild(detail);
+    archiveList.appendChild(empty);
+  }else{
+    const groups=new Map();
+    if(visible.some(isStandaloneHistoryItem))groups.set('__tasks__',[]);
+    for(const item of visible){
+      const groupKey=isStandaloneHistoryItem(item)?'__tasks__':normalizeProjectPath(item.cwd);
+      if(!groups.has(groupKey))groups.set(groupKey,[]);
+      groups.get(groupKey).push(item);
+    }
+    for(const [groupKey,items] of groups){
+      const standalone=groupKey==='__tasks__';
+      const projectPath=standalone?'':groupKey;
+      const group=document.createElement('section');
+      group.className='archiveProject'+(standalone?' archiveTasks':'');
+      const head=document.createElement('div');
+      head.className='archiveProjectHead';
+      const identity=document.createElement('div');
+      identity.className='archiveProjectIdentity';
+      const folder=document.createElement('i');
+      folder.setAttribute('data-lucide',standalone?'list-todo':'folder');
+      folder.setAttribute('aria-hidden','true');
+      const copy=document.createElement('div');
+      const name=document.createElement('h2');
+      name.textContent=standalone?'任务':historyProjectName(projectPath);
+      const pathText=document.createElement('p');
+      pathText.textContent=projectPath||'路径未知';
+      pathText.title=pathText.textContent;
+      copy.appendChild(name);
+      if(!standalone)copy.appendChild(pathText);
+      identity.appendChild(folder);
+      identity.appendChild(copy);
+      const count=document.createElement('span');
+      count.className='archiveProjectCount';
+      count.textContent=items.length+' 个任务';
+      head.appendChild(identity);
+      head.appendChild(count);
+      const rows=document.createElement('div');
+      rows.className='archiveProjectTasks';
+      for(const item of items)rows.appendChild(createArchivedTaskRow(item));
+      group.appendChild(head);
+      group.appendChild(rows);
+      archiveList.appendChild(group);
+    }
+  }
+  const countText=visible.length===archivedItems.length?archivedItems.length+' 个已归档任务':visible.length+' / '+archivedItems.length+' 个已归档任务';
+  archiveStatus.textContent=[archiveNotice,countText].filter(Boolean).join(' · ');
+  archiveDeleteAll.disabled=archivedLoading||!archivedItems.length;
+  refreshIcons(archiveList);
+}
+async function unarchiveTask(item,row){
+  const buttons=[...row.querySelectorAll('button')];
+  buttons.forEach((button)=>{button.disabled=true});
+  row.classList.add('working');
+  archiveNotice='正在恢复「'+item.title+'」...';
+  archiveStatus.textContent=archiveNotice;
+  try{
+    const res=await fetch('/api/native-archived-sessions/'+encodeURIComponent(item.id)+'/unarchive',{method:'POST'});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'取消归档失败');
+    archivedItems=archivedItems.filter((entry)=>entry.id!==item.id);
+    archiveNotice='已恢复「'+item.title+'」';
+    syncArchivedProjectOptions();
+    renderArchivedTasks();
+    await refreshHistory();
+  }catch(error){
+    const message=error.message;
+    await loadArchivedTasks({force:true});
+    archiveNotice=message;
+    renderArchivedTasks();
+  }
+}
+async function deleteArchivedTask(item,row){
+  if(!confirm('永久删除已归档任务「'+item.title+'」？\\n\\n此操作无法撤销。'))return;
+  const buttons=[...row.querySelectorAll('button')];
+  buttons.forEach((button)=>{button.disabled=true});
+  row.classList.add('working');
+  archiveNotice='正在永久删除「'+item.title+'」...';
+  archiveStatus.textContent=archiveNotice;
+  try{
+    const res=await fetch('/api/native-archived-sessions/'+encodeURIComponent(item.id),{method:'DELETE'});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'永久删除失败');
+    archivedItems=archivedItems.filter((entry)=>entry.id!==item.id);
+    archiveNotice='已永久删除「'+item.title+'」';
+    syncArchivedProjectOptions();
+    renderArchivedTasks();
+  }catch(error){
+    const message=error.message;
+    await loadArchivedTasks({force:true});
+    archiveNotice=message;
+    renderArchivedTasks();
+  }
+}
+async function deleteAllArchivedTasks(){
+  if(!archivedItems.length||archivedLoading)return;
+  if(!confirm('永久删除全部 '+archivedItems.length+' 个已归档任务？\\n\\n此操作无法撤销。'))return;
+  const phrase=prompt('为防止误删，请输入：永久删除全部已归档任务');
+  if(phrase!=='永久删除全部已归档任务'){
+    archiveNotice=phrase===null?'已取消永久删除':'确认文字不匹配，未执行删除';
+    renderArchivedTasks();
+    return;
+  }
+  archivedLoading=true;
+  archiveNotice='正在永久删除全部已归档任务...';
+  renderArchivedTasks();
+  let resultNotice='';
+  try{
+    const res=await fetch('/api/native-archived-sessions',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:phrase})});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'永久删除全部任务失败');
+    resultNotice='已永久删除 '+(data.deleted||[]).length+' 个已归档任务'+((data.skipped||[]).length?'，跳过 '+data.skipped.length+' 个':'');
+  }catch(error){
+    resultNotice=error.message;
+  }finally{
+    archivedLoading=false;
+    await loadArchivedTasks({force:true});
+    archiveNotice=resultNotice;
+    renderArchivedTasks();
+  }
+}
 function readRenamedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECT_NAMES_STORAGE_KEY)||'{}');if(!saved||Array.isArray(saved)||typeof saved!=='object')return new Map();return new Map(Object.entries(saved).filter(([key,value])=>key&&typeof value==='string'&&value.trim()).map(([key,value])=>[key,value.trim().replace(/\s+/g,' ').slice(0,80)]))}catch{return new Map()}}
 function storeRenamedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECT_NAMES_STORAGE_KEY,JSON.stringify(Object.fromEntries([...renamedHistoryProjects.entries()].sort(([left],[right])=>left.localeCompare(right)))))}catch{}}
 function historyProjectName(value){return renamedHistoryProjects.get(historyProjectKey(value))||projectNameFromPath(value)}
@@ -4704,13 +5290,16 @@ function showHistoryProjectPreview(anchor,{projectName,projectPath,itemCount,run
 function hideHistoryProjectPreview(anchor){
   if(anchor&&anchor!==historyProjectPreviewAnchor)return;
   historyProjectPreviewAnchor=null;
-  if(!historyProjectPreview)return;
+  if(!historyProjectPreview){flushPendingHistoryRefresh();return}
   historyProjectPreview.classList.remove('visible');
   historyProjectPreview.setAttribute('aria-hidden','true');
   historyProjectPreview.hidden=true;
+  flushPendingHistoryRefresh();
 }
 function readCollapsedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
 function storeCollapsedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...collapsedHistoryProjects].sort()))}catch{}}
+function readHistoryTasksCollapsed(){try{return localStorage.getItem(HISTORY_TASKS_COLLAPSED_STORAGE_KEY)==='1'}catch{return false}}
+function storeHistoryTasksCollapsed(){try{localStorage.setItem(HISTORY_TASKS_COLLAPSED_STORAGE_KEY,historyTasksCollapsed?'1':'0')}catch{}}
 function readHiddenHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
 function storeHiddenHistoryProjects(){try{localStorage.setItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...hiddenHistoryProjects].sort()))}catch{}}
 function closeHistoryProjectMenu(restoreFocus=false){
@@ -4720,6 +5309,7 @@ function closeHistoryProjectMenu(restoreFocus=false){
   active.menu.classList.remove('openAbove');
   active.button.setAttribute('aria-expanded','false');
   activeHistoryProjectMenu=null;
+  flushPendingHistoryRefresh();
   if(restoreFocus&&active.button.isConnected)active.button.focus();
 }
 function toggleHistoryProjectMenu(button,menu){
@@ -4819,11 +5409,61 @@ function setHistoryProjectExpanded(group,expanded){
   head.title=(expanded?'收起':'展开')+' '+projectName+'\\n'+projectPath;
   rows.hidden=!expanded;
 }
+function setHistoryTasksExpanded(section,expanded){
+  const head=section?.querySelector('.historyTasksHead');
+  const rows=section?.querySelector('.historyTasksItems');
+  if(!head||!rows)return;
+  const itemCount=section.dataset.taskCount||'0';
+  const runningCount=section.dataset.taskRunningCount||'0';
+  section.classList.toggle('collapsed',!expanded);
+  head.setAttribute('aria-expanded',String(expanded));
+  head.setAttribute('aria-label',(expanded?'收起':'展开')+'任务，'+itemCount+' 个对话串，'+runningCount+' 个已开启');
+  head.title=(expanded?'收起':'展开')+'任务';
+  rows.hidden=!expanded;
+}
+function appendStandaloneHistoryTasks(items,{query=false}={}){
+  if(!items.length)return;
+  const section=document.createElement('section');
+  section.className='historyTasks';
+  const runningCount=items.filter((item)=>item.status==='running').length;
+  section.dataset.taskCount=String(items.length);
+  section.dataset.taskRunningCount=String(runningCount);
+  section.setAttribute('aria-label','任务，'+items.length+' 个对话串，'+runningCount+' 个已开启');
+  const head=document.createElement('button');
+  head.type='button';
+  head.className='historyTasksHead';
+  head.setAttribute('aria-controls','history-tasks-items');
+  const title=document.createElement('span');
+  title.className='historyTasksTitle';
+  title.textContent='任务';
+  const chevron=document.createElement('span');
+  chevron.className='historyTasksChevron';
+  setIconLabel(chevron,'chevron-right','',false);
+  head.appendChild(title);
+  head.appendChild(chevron);
+  const rows=document.createElement('div');
+  rows.className='historyTasksItems';
+  rows.id='history-tasks-items';
+  for(const item of items)rows.appendChild(createHistoryRow(item,''));
+  section.appendChild(head);
+  section.appendChild(rows);
+  history.appendChild(section);
+  const currentKey=conversationKey(currentConversationSource,currentConversationId);
+  const containsCurrent=Boolean(currentConversationId)&&items.some((item)=>conversationKey(item.source,item.id)===currentKey);
+  setHistoryTasksExpanded(section,Boolean(query)||containsCurrent||!historyTasksCollapsed);
+  head.addEventListener('click',()=>{
+    const expanded=head.getAttribute('aria-expanded')==='true';
+    setHistoryTasksExpanded(section,!expanded);
+    if(query)return;
+    historyTasksCollapsed=expanded;
+    storeHistoryTasksCollapsed();
+  });
+}
 function renderHistory(items){
   if(Array.isArray(items))historyItems=items;
   renderComposerProjectOptions();
   const query=String(historyFilter?.value||'').trim().toLocaleLowerCase();
-  const candidates=query?historyItems:historyItems.filter((item)=>!hiddenHistoryProjects.has(historyProjectKey(item.cwd)));
+  const candidates=query?historyItems:historyItems.filter((item)=>isStandaloneHistoryItem(item)||!hiddenHistoryProjects.has(historyProjectKey(item.cwd)));
   const visibleItems=query?candidates.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')+' '+historyProjectName(item.cwd)).toLocaleLowerCase().includes(query)):candidates;
   const scrollTop=history.scrollTop;
   hideHistoryProjectPreview();
@@ -4838,13 +5478,8 @@ function renderHistory(items){
     history.appendChild(empty);
     return;
   }
-  const groups=new Map();
-  for(const item of visibleItems){
-    const projectPath=normalizeProjectPath(item.cwd);
-    const groupKey=historyProjectKey(projectPath);
-    if(!groups.has(groupKey))groups.set(groupKey,{path:projectPath,items:[]});
-    groups.get(groupKey).items.push(item);
-  }
+  const {tasks:standaloneTasks,projects:groups}=partitionHistoryItems(visibleItems);
+  appendStandaloneHistoryTasks(standaloneTasks,{query:Boolean(query)});
   let groupIndex=0;
   for(const [groupKey,groupData] of groups){
     const group=document.createElement('section');
@@ -4984,8 +5619,22 @@ async function renameConversation(id,title,source='codex'){const next=prompt('�
 async function deleteConversation(id,title,source='codex'){const verb=source==='codex'?'归档':'删除';if(!confirm(verb+'会话：'+title+'？'))return;const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});const data=await res.json().catch(()=>({}));if(!res.ok){statusEl.textContent=data.error||verb+'失败';return}if(currentConversationId===id)newChat();await refreshHistory();statusEl.textContent=verb+'完成'}
 function sidebarCollapsedPreference(){try{return localStorage.getItem(SIDEBAR_STORAGE_KEY)==='1'}catch{return false}}
 function storeSidebarCollapsed(collapsed){try{localStorage.setItem(SIDEBAR_STORAGE_KEY,collapsed?'1':'0')}catch{}}
-function syncMenuButton(){if(!menuBtn)return;const desktop=desktopSidebarMedia.matches;const expanded=desktop?!app.classList.contains('sideCollapsed'):app.classList.contains('menuOpen');const label=desktop?(expanded?'收起侧栏':'展开侧栏'):(expanded?'关闭菜单':'打开菜单');const icon=desktop?(expanded?'panel-left-close':'panel-left-open'):(expanded?'x':'menu');setIconLabel(menuBtn,icon,label,false);menuBtn.setAttribute('aria-label',label);menuBtn.setAttribute('title',label);menuBtn.setAttribute('aria-expanded',String(expanded))}
-function restoreSidebarState(){app.classList.toggle('sideCollapsed',sidebarCollapsedPreference());app.classList.remove('menuOpen');syncMenuButton()}
+function sidebarWidthLimit(viewportWidth=window.innerWidth){const width=Number(viewportWidth);const viewport=Number.isFinite(width)?width:window.innerWidth;return Math.max(SIDEBAR_WIDTH_MIN,Math.min(SIDEBAR_WIDTH_MAX,Math.round(viewport-SIDEBAR_MAIN_MIN)))}
+function clampSidebarWidth(value,viewportWidth=window.innerWidth){const width=Number(value);const normalized=Number.isFinite(width)?Math.round(width):SIDEBAR_WIDTH_DEFAULT;return Math.max(SIDEBAR_WIDTH_MIN,Math.min(sidebarWidthLimit(viewportWidth),normalized))}
+function sidebarWidthPreference(){try{const stored=localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);if(stored===null)return SIDEBAR_WIDTH_DEFAULT;const width=Number(stored);if(!Number.isFinite(width)||width<=0)return SIDEBAR_WIDTH_DEFAULT;return Math.max(SIDEBAR_WIDTH_MIN,Math.min(SIDEBAR_WIDTH_MAX,Math.round(width)))}catch{return SIDEBAR_WIDTH_DEFAULT}}
+function storeSidebarWidth(width=sidebarRenderedWidth){try{localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY,String(Math.max(SIDEBAR_WIDTH_MIN,Math.min(SIDEBAR_WIDTH_MAX,Math.round(Number(width)||SIDEBAR_WIDTH_DEFAULT)))))}catch{}}
+function sidebarResizeEnabled(){return Boolean(sidebarResizeHandle&&desktopSidebarMedia.matches&&!app.classList.contains('sideCollapsed'))}
+function syncSidebarResizeHandle(){if(!sidebarResizeHandle)return;const enabled=sidebarResizeEnabled();sidebarResizeHandle.tabIndex=enabled?0:-1;sidebarResizeHandle.setAttribute('aria-disabled',String(!enabled));sidebarResizeHandle.setAttribute('aria-hidden',String(!enabled));sidebarResizeHandle.setAttribute('aria-valuemin',String(SIDEBAR_WIDTH_MIN));sidebarResizeHandle.setAttribute('aria-valuemax',String(sidebarWidthLimit()));sidebarResizeHandle.setAttribute('aria-valuenow',String(sidebarRenderedWidth));sidebarResizeHandle.setAttribute('aria-valuetext',sidebarRenderedWidth+' 像素')}
+function renderSidebarWidth(){sidebarRenderedWidth=clampSidebarWidth(sidebarPreferredWidth);document.documentElement.style.setProperty('--sidebar-width',sidebarRenderedWidth+'px');syncSidebarResizeHandle();return sidebarRenderedWidth}
+function setSidebarWidth(value,{persist=false}={}){sidebarPreferredWidth=clampSidebarWidth(value);const width=renderSidebarWidth();if(persist)storeSidebarWidth(width);return width}
+function resetSidebarWidth(){sidebarPreferredWidth=SIDEBAR_WIDTH_DEFAULT;const width=renderSidebarWidth();try{localStorage.removeItem(SIDEBAR_WIDTH_STORAGE_KEY)}catch{}return width}
+function beginSidebarResize(event){if(!sidebarResizeEnabled()||event.button!==0||event.isPrimary===false)return;sidebarResizePointerId=event.pointerId;app.classList.add('sidebarResizing');hideHistoryProjectPreview();closeHistoryProjectMenu();sidebarResizeHandle.focus({preventScroll:true});try{sidebarResizeHandle.setPointerCapture(event.pointerId)}catch{}event.preventDefault()}
+function updateSidebarResize(event){if(sidebarResizePointerId===null||event.pointerId!==sidebarResizePointerId)return;const left=app.getBoundingClientRect().left;setSidebarWidth(event.clientX-left)}
+function finishSidebarResize(event){if(sidebarResizePointerId===null)return;const pointerId=sidebarResizePointerId;if(event?.pointerId!==undefined&&event.pointerId!==pointerId)return;sidebarResizePointerId=null;app.classList.remove('sidebarResizing');try{if(sidebarResizeHandle?.hasPointerCapture?.(pointerId))sidebarResizeHandle.releasePointerCapture(pointerId)}catch{}storeSidebarWidth(sidebarRenderedWidth)}
+function handleSidebarResizeKey(event){if(!sidebarResizeEnabled())return;const step=event.shiftKey?32:8;let next=null;if(event.key==='ArrowLeft')next=sidebarRenderedWidth-step;else if(event.key==='ArrowRight')next=sidebarRenderedWidth+step;else if(event.key==='Home')next=SIDEBAR_WIDTH_MIN;else if(event.key==='End')next=sidebarWidthLimit();if(next===null)return;event.preventDefault();setSidebarWidth(next,{persist:true})}
+function enhanceSidebarResize(){if(!app||!sidePanel||sidebarResizeHandle)return;sidebarResizeHandle=document.createElement('div');sidebarResizeHandle.id='sidebarResizeHandle';sidebarResizeHandle.className='sidebarResizeHandle';sidebarResizeHandle.setAttribute('role','separator');sidebarResizeHandle.setAttribute('aria-label','调整侧栏宽度');sidebarResizeHandle.setAttribute('aria-orientation','vertical');sidebarResizeHandle.setAttribute('aria-controls','sidePanel');sidebarResizeHandle.title='拖动调整侧栏宽度，双击恢复默认';sidebarResizeHandle.addEventListener('pointerdown',beginSidebarResize);sidebarResizeHandle.addEventListener('pointermove',updateSidebarResize);sidebarResizeHandle.addEventListener('pointerup',finishSidebarResize);sidebarResizeHandle.addEventListener('pointercancel',finishSidebarResize);sidebarResizeHandle.addEventListener('lostpointercapture',finishSidebarResize);sidebarResizeHandle.addEventListener('keydown',handleSidebarResizeKey);sidebarResizeHandle.addEventListener('dblclick',(event)=>{if(!sidebarResizeEnabled())return;event.preventDefault();resetSidebarWidth()});window.addEventListener('blur',()=>finishSidebarResize());app.appendChild(sidebarResizeHandle)}
+function syncMenuButton(){if(!menuBtn)return;const desktop=desktopSidebarMedia.matches;const expanded=desktop?!app.classList.contains('sideCollapsed'):app.classList.contains('menuOpen');const label=desktop?(expanded?'收起侧栏':'展开侧栏'):(expanded?'关闭菜单':'打开菜单');const icon=desktop?(expanded?'panel-left-close':'panel-left-open'):(expanded?'x':'menu');setIconLabel(menuBtn,icon,label,false);menuBtn.setAttribute('aria-label',label);menuBtn.setAttribute('title',label);menuBtn.setAttribute('aria-expanded',String(expanded));syncSidebarResizeHandle()}
+function restoreSidebarState(){sidebarPreferredWidth=sidebarWidthPreference();renderSidebarWidth();app.classList.toggle('sideCollapsed',sidebarCollapsedPreference());app.classList.remove('menuOpen');syncMenuButton()}
 function toggleMenu(){if(desktopSidebarMedia.matches){const collapsed=app.classList.toggle('sideCollapsed');storeSidebarCollapsed(collapsed)}else{app.classList.toggle('menuOpen')}syncMenuButton()}
 function closeMenu(){if(!desktopSidebarMedia.matches)app.classList.remove('menuOpen');syncMenuButton()}
 function toggleSettings(){if(settingsOverlay?.classList.contains('hidden'))openSettings();else closeSettings()}
@@ -5012,17 +5661,28 @@ function applyConversationMode(){
   if(webRunActive)closeComposerPopovers();
   syncComposerChrome();
   renderPromptQueue();
+  if(activeMainView==='archive'){
+    statusEl.classList.remove('running');
+    statusEl.textContent=archiveNotice||'Codex App · '+archivedItems.length+' 个已归档任务';
+    setIconLabel(modeLabel,'archive','已归档');
+  }
 }
-function newChat(){closeComposerPopovers();clearNativeCompletionSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();nativeLiveItems=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
+function resetStandaloneComposerCwd(){
+  if(currentNativeWorkspaceKind==='projectless'&&defaultComposerCwd)cwd.value=defaultComposerCwd;
+  currentNativeWorkspaceKind='';
+}
+function newChat(){showChatView();closeComposerPopovers();resetStandaloneComposerCwd();clearNativeCompletionSync();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>等待输入</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();input.focus()}
 function scrollChatToLatest(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
 async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
+  showChatView();
   clearNativeCompletionSync();
+  clearSubagentTraceStates();
+  clearNativeLiveItems();
   const seq=++conversationLoadSeq;
   nativeOptimisticElements=[];
   nativeOptimisticSteering=new Map();
   nativeRunningElement=null;
-  nativeLiveItems=new Map();
   latestToolElement=null;
   latestAssistantElement=null;
   latestFinalAssistantElement=null;
@@ -5047,6 +5707,7 @@ async function loadConversation(id,source='web',options={}){
   if(titleEl)titleEl.textContent=conversation.title||'Chat';
   currentConversationId=conversation.id;
   currentConversationSource=conversation.source==='codex'?'codex':'web';
+  currentNativeWorkspaceKind=currentConversationSource==='codex'?String(conversation.metadata?.workspaceKind||''):'';
   nativeCursor=Number(conversation.cursor||0);
   nativeGeneration=Number(conversation.generation||0);
   activeNativeTurnId=String(conversation.activeTurnId||'');
@@ -5055,9 +5716,16 @@ async function loadConversation(id,source='web',options={}){
   applyConversationMode();
   updateActiveHistory();
   chat.innerHTML='';
+  const messages=conversation.messages||[];
+  const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
+  const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
   beginTurnProcessCollection();
-  (conversation.messages||[]).forEach((msg,index)=>addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoScroll:false,kind:msg.kind,at:msg.at}));
-  if(!(conversation.messages||[]).length)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
+  messages.forEach((msg,index)=>{
+    if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
+    addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,hydrating:true});
+  });
+  if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
+  if(!messages.length&&!webRunActive)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   if(currentConversationSource==='codex'&&conversation.hasEarlierMessages&&!options.full)addNativeHistoryLoadButton(conversation.id);
   updateConversationStatus(conversation);
   renderPromptQueue();
@@ -5085,7 +5753,7 @@ function updateConversationStatus(conversation){
     statusEl.textContent='Loaded '+stamp;
   }
 }
-function applyNativeConversationMetadata(metadata){if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
+function applyNativeConversationMetadata(metadata){currentNativeWorkspaceKind=String(metadata.workspaceKind||currentNativeWorkspaceKind||'');if(metadata.cwd)cwd.value=metadata.cwd;if(!forceFullAccess&&['read-only','workspace-write','danger-full-access'].includes(metadata.sandboxPolicy))sandbox.value=metadata.sandboxPolicy;if(!forceFullAccess&&['never','on-request','untrusted'].includes(metadata.approvalPolicy))approval.value=metadata.approvalPolicy;if(['low','medium','high','xhigh','max','ultra'].includes(metadata.reasoningEffort))reasoningEffort.value=metadata.reasoningEffort;if(metadata.modelProvider&&[...provider.options].some((opt)=>opt.value===metadata.modelProvider))provider.value=metadata.modelProvider;if(metadata.model){if(![...model.options].some((opt)=>opt.value===metadata.model)){const opt=document.createElement('option');opt.value=metadata.model;opt.textContent=metadata.model;model.appendChild(opt)}model.value=metadata.model}if(forceFullAccess){sandbox.value='danger-full-access';approval.value='never'}updateSafetyHint()}
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
 async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
   if(!currentConversationId||currentConversationSource!=='codex')return;
@@ -5123,6 +5791,10 @@ async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
     statusEl.textContent=e.message;
   }
 }
+function isCompletedNativeRuntimeTurn(turnId,frozenTurnId=turnProcessElapsedFrozen?turnProcessElapsedTurnId:'',pendingTurnId=nativeCompletionSync?.turnId||''){
+  const id=String(turnId||'');
+  return Boolean(id&&(id===String(frozenTurnId||'')||id===String(pendingTurnId||'')));
+}
 function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
@@ -5133,6 +5805,7 @@ function connectSessionEvents(){
   sessionEvents.addEventListener('sessions',(event)=>{
     let changedIds=[];
     try{changedIds=JSON.parse(event.data||'{}').changedIds||[]}catch(e){}
+    refreshOpenSubagentTraces(changedIds);
     if(nativeSyncTimer)clearTimeout(nativeSyncTimer);
     nativeSyncTimer=setTimeout(async()=>{
       nativeSyncTimer=null;
@@ -5145,25 +5818,34 @@ function connectSessionEvents(){
     try{runtime=JSON.parse(event.data||'{}')}catch(e){}
     refreshHistory();
     if(runtime.threadId!==currentConversationId||currentConversationSource!=='codex')return;
+    if(isCompletedNativeRuntimeTurn(runtime.turnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
+    if(webRunActive&&activeNativeTurnId&&runtime.turnId&&String(runtime.turnId)!==String(activeNativeTurnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
     if(runtime.type==='delta'){
       updateNativeLiveDelta(runtime);
     }else if(runtime.type==='item-completed'){
-      finishNativeLiveItem(runtime.itemId);
+      finishNativeLiveItem(runtime.itemId,runtime.turnId);
     }else if(runtime.type==='connection-error'){
-      activeNativeTurnId=runtime.turnId||activeNativeTurnId;
+      const connectionTurnId=runtime.turnId||activeNativeTurnId;
+      activeNativeTurnId=connectionTurnId;
       if(runtime.willRetry){
         webRunActive=true;
         clearNativeCompletionSync();
+        if(!collectingTurnProcess||!turnProcessElapsedMatches(connectionTurnId))beginTurnProcessCollection(runtime.updatedAt,true,connectionTurnId);
+        else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),connectionTurnId);
         statusEl.textContent='Codex App · 上游连接中断，正在重连';
       }else{
         statusEl.textContent='Codex App · 上游请求异常，等待任务状态';
       }
       applyConversationMode();
     }else if(runtime.type==='turn'){
+      const previousTurnId=activeNativeTurnId;
       const runtimeTurnId=runtime.turnId||activeNativeTurnId;
+      if(runtime.status!=='running'&&(!turnProcessElapsedMatches(runtimeTurnId)||(previousTurnId&&runtimeTurnId&&runtimeTurnId!==previousTurnId)))return;
       activeNativeTurnId=runtimeTurnId;
       webRunActive=runtime.status==='running';
       if(!webRunActive){
+        freezeTurnProcessElapsed(runtime.updatedAt,runtimeTurnId);
+        if(['error','interrupted'].includes(runtime.status))clearLiveTurnProgress();
         activeNativeTurnId='';
         removeNativeRunningElement();
         finishAllNativeLiveItems();
@@ -5174,6 +5856,8 @@ function connectSessionEvents(){
         schedulePromptQueueDispatch(completedId,320);
       }else{
         clearNativeCompletionSync();
+        if(!collectingTurnProcess||!turnProcessElapsedMatches(runtimeTurnId))beginTurnProcessCollection(runtime.updatedAt,true,runtimeTurnId);
+        else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),runtimeTurnId);
         statusEl.textContent='Codex App · 运行中';
       }
       applyConversationMode();
@@ -5192,27 +5876,47 @@ async function syncCurrentNativeConversationOnce(){
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
   const data=await res.json();
   const conversation=data.conversation;
+  if(conversation.status==='running'){
+    applyNativeConversationMetadata(conversation.metadata||{});
+    syncComposerChrome();
+  }
   if(conversation.reset){
     if(webRunActive||nativeLiveItems.size){
       nativeCursor=Number(conversation.cursor||nativeCursor);
       nativeGeneration=Number(conversation.generation||nativeGeneration);
-      if(conversation.status!=='running')scheduleNativeCompletionSync(id,nativeCompletionSync?.turnId||activeNativeTurnId,120);
+      if(conversation.status!=='running'){
+        const resetTurnId=nativeCompletionSync?.turnId||activeNativeTurnId;
+        freezeTurnProcessElapsed(conversation.updatedAt,resetTurnId);
+        scheduleNativeCompletionSync(id,resetTurnId,120);
+      }
       return;
     }
     await loadConversation(id,'codex');return;
   }
   const wasRunning=webRunActive;
   const completingTurnId=activeNativeTurnId;
+  const incomingActiveTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
+  if(conversation.status==='running'&&incomingActiveTurnId&&incomingActiveTurnId!==activeNativeTurnId){activeNativeTurnId=incomingActiveTurnId;webRunActive=true}
   if((conversation.messages||[]).length){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
   }
-  for(const msg of conversation.messages||[]){const role=msg.role==='log'?'log':msg.role;if((webRunActive||nativeCompletionSync)&&nativeLiveItems.size&&['assistant','thinking'].includes(role))continue;addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoScroll:false,kind:msg.kind,at:msg.at})}
+  for(const msg of conversation.messages||[]){
+    const role=msg.role==='log'?'log':msg.role;
+    if(nativeRuntimeStreamTurnIds.has(String(msg.turnId||''))&&['assistant','thinking'].includes(role))continue;
+    if(isNativeSnapshotStreamingMessage(msg,conversation)){
+      upsertNativeSnapshotLiveMessage(msg,conversation);
+      continue;
+    }
+    addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges})
+  }
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
-  activeNativeTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
+  activeNativeTurnId=incomingActiveTurnId;
   webRunActive=conversation.status==='running';
+  if(webRunActive){const activeStartedAt=conversation.activeTurnStartedAt||conversation.updatedAt;if(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(wasRunning&&!webRunActive){
+    freezeTurnProcessElapsed(conversation.updatedAt,completingTurnId);
     activeNativeTurnId='';
     finishAllNativeLiveItems();
     if(nativeTerminalPersisted(conversation,completingTurnId)&&nativeLiveItems.size){
@@ -5541,27 +6245,170 @@ function executableOrchestratedToolCallOffsets(source,toolName){
   }
   return offsets;
 }
-function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim().replace(/^调用工具:\\s*/,'');let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const command=readEmbeddedToolString(detail,'tools.exec_command({cmd:"');if(command!==null)return{name:'exec_command',detail:command};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
-function activityFileLabel(file){const clean=String(file||'').trim().replace(/^["']|["',;)]$/g,'');const parts=clean.split('/').filter(Boolean);return parts[parts.length-1]||clean||'文件'}
+function toolCallDescriptor(text){const source=String(text||'');const lineBreak=source.indexOf('\\n');let name=(lineBreak<0?source:source.slice(0,lineBreak)).trim().replace(/^调用工具:\\s*/,'');let detail=lineBreak<0?'':source.slice(lineBreak+1);if(name==='exec'){const commands=orchestratedExecCommands(detail);if(commands.length)return{name:'exec_command',detail:commands[0]};const patch=readEmbeddedToolString(detail,'const patch = "');if(patch!==null&&detail.includes('tools.apply_patch'))return{name:'apply_patch',detail:patch};if(detail.includes('mcp__node_repl__js'))return{name:'browser_check',detail}}if(name==='exec_command')detail=detail.split('\\n').filter((line)=>!line.startsWith('workdir=')).join('\\n');return{name:name||'tool',detail}}
+function activityFilePath(file){return String(file||'').trim().replace(/^["']+|["',;)\]]+$/g,'')}
+function activityFileLabel(file){const clean=activityFilePath(file);const parts=clean.split('/').filter(Boolean);return parts[parts.length-1]||clean||'文件'}
 function extractActivityFiles(source){const matches=String(source||'').match(/[A-Za-z0-9_@.+-]+\\.(?:mjs|cjs|js|css|jsonl?|md|toml|ya?ml|py|sh|html|tsx?|jsx?|go|rs|java|cpp|hpp|c|h)/g)||[];return[...new Set(matches.map(activityFileLabel))].slice(0,4)}
+function humanizeSkillActivityName(value){const acronyms={ai:'AI',api:'API',ccg:'CCG',css:'CSS',html:'HTML',mcp:'MCP',pdf:'PDF',ui:'UI',url:'URL',ux:'UX'};return String(value||'').split(/[-_]+/).filter(Boolean).map((part)=>acronyms[part.toLowerCase()]||part.charAt(0).toUpperCase()+part.slice(1)).join(' ')}
+function skillActivityPresentation(command){const match=String(command||'').match(/\\/skills\\/([A-Za-z0-9_.-]+)\\/SKILL\\.md\\b/i);if(!match)return null;const name=humanizeSkillActivityName(match[1]);return name?{verb:'读取',target:name+' 技能',icon:'wrench',targetType:'skill',activityGroup:'loaded_tools',expandable:false}:null}
 function shortActivityText(value,max=100){const clean=String(value||'').replace(/\\s+/g,' ').trim();return clean.length>max?clean.slice(0,max-3)+'...':clean}
+function readJsToolString(source,start){
+  const quote=source[start];
+  if(quote!=='"'&&quote!=="'"&&quote?.charCodeAt(0)!==96)return null;
+  let value='';
+  for(let index=start+1;index<source.length;index++){
+    const char=source[index];
+    if(char===quote)return{value,end:index+1};
+    if(quote?.charCodeAt(0)===96&&char==='$'&&source[index+1]==='{')return null;
+    if(char!=='\\\\'){value+=char;continue}
+    const escaped=source[++index];
+    if(escaped===undefined)return null;
+    if(escaped==='n'){value+='\\n';continue}
+    if(escaped==='r'){value+='\\r';continue}
+    if(escaped==='t'){value+='\\t';continue}
+    if(escaped==='b'){value+='\\b';continue}
+    if(escaped==='f'){value+='\\f';continue}
+    if(escaped==='v'){value+='\\v';continue}
+    if(escaped==='0'){value+=String.fromCharCode(0);continue}
+    if(escaped==='\\n'||escaped==='\\r'){continue}
+    if(escaped==='x'){
+      const hex=source.slice(index+1,index+3);
+      if(/^[0-9a-f]{2}$/i.test(hex)){value+=String.fromCharCode(Number.parseInt(hex,16));index+=2;continue}
+    }
+    if(escaped==='u'){
+      const braced=source[index+1]==='{';
+      const end=braced?source.indexOf('}',index+2):index+5;
+      const hex=braced?source.slice(index+2,end):source.slice(index+1,end);
+      if(end>index&&/^[0-9a-f]{4,6}$/i.test(hex)){value+=String.fromCodePoint(Number.parseInt(hex,16));index=end-(braced?0:1);continue}
+    }
+    value+=escaped;
+  }
+  return null;
+}
+function readJsCollection(source,start){
+  const open=source[start];
+  const close={"(":")","[":"]","{":"}"}[open];
+  if(!close)return null;
+  let depth=0;
+  let quote='';
+  let escaped=false;
+  let lineComment=false;
+  let blockComment=false;
+  for(let index=start;index<source.length;index++){
+    const char=source[index];
+    const next=source[index+1];
+    if(lineComment){if(char.charCodeAt(0)===10)lineComment=false;continue}
+    if(blockComment){if(char==='*'&&next==='/'){blockComment=false;index++}continue}
+    if(quote){if(escaped)escaped=false;else if(char.charCodeAt(0)===92)escaped=true;else if(char===quote)quote='';continue}
+    if(char==='/'&&next==='/'){lineComment=true;index++;continue}
+    if(char==='/'&&next==='*'){blockComment=true;index++;continue}
+    if(char==='"'||char==="'"||char.charCodeAt(0)===96){quote=char;continue}
+    if(char===open){depth++;continue}
+    if(char!==close)continue;
+    depth--;
+    if(depth===0)return{value:source.slice(start+1,index),end:index+1};
+  }
+  return null;
+}
+function jsPropertyValueOffset(source,key){
+  const text=String(source||'');
+  for(let index=0;index<text.length;){
+    while(index<text.length&&(text[index]===','||text[index]==='{'||text[index].charCodeAt(0)<=32))index++;
+    if(index>=text.length)return-1;
+    let name='';
+    let cursor=index;
+    const code=text[index].charCodeAt(0);
+    if(code===34||code===39){
+      const parsed=readJsToolString(text,index);
+      if(!parsed){index++;continue}
+      name=parsed.value;
+      cursor=parsed.end;
+    }else{
+      while(cursor<text.length&&/[A-Za-z0-9_$]/.test(text[cursor]))cursor++;
+      name=text.slice(index,cursor);
+    }
+    while(cursor<text.length&&text[cursor].charCodeAt(0)<=32)cursor++;
+    if(text[cursor]!==':'){index=Math.max(index+1,cursor);continue}
+    cursor++;
+    while(cursor<text.length&&text[cursor].charCodeAt(0)<=32)cursor++;
+    if(name===key)return cursor;
+    index=Math.max(index+1,cursor);
+  }
+  return-1;
+}
+function readJsPropertyString(source,key){
+  const start=jsPropertyValueOffset(source,key);
+  return start>=0?readJsToolString(source,start)?.value||'':'';
+}
+function readJsPropertyCollection(source,key,open='['){
+  const start=jsPropertyValueOffset(source,key);
+  if(start<0)return null;
+  return source[start]===open?readJsCollection(source,start):null;
+}
+function jsObjectValues(source){
+  const values=[];
+  for(let index=0;index<source.length;index++){
+    if(source[index]!=='{')continue;
+    const parsed=readJsCollection(source,index);
+    if(!parsed)break;
+    values.push(parsed.value);
+    index=parsed.end-1;
+  }
+  return values;
+}
+function orchestratedUpdatePlanPresentation(source){
+  const offsets=executableOrchestratedToolCallOffsets(source,'update_plan');
+  for(let index=offsets.length-1;index>=0;index--){
+    const callStart=source.indexOf('(',offsets[index]);
+    const call=callStart>=0?readJsCollection(source,callStart):null;
+    const planSource=call?readJsPropertyCollection(call.value,'plan'):null;
+    if(!planSource)continue;
+    const plan=normalizeTurnPlanItems(jsObjectValues(planSource.value).map((item)=>({step:readJsPropertyString(item,'step'),status:readJsPropertyString(item,'status')})));
+    if(plan.length)return{variant:'plan',plan,explanation:readJsPropertyString(call.value,'explanation')};
+  }
+  return null;
+}
+function orchestratedExecCommands(source){
+  const commands=[];
+  for(const offset of executableOrchestratedToolCallOffsets(source,'exec_command')){
+    const head=source.slice(offset).match(/^tools\\.exec_command\\(\\s*\\{\\s*(?:["']cmd["']|cmd)\\s*:\\s*/);
+    if(!head)continue;
+    const parsed=readJsToolString(source,offset+head[0].length);
+    if(parsed?.value)commands.push(parsed.value);
+  }
+  return commands;
+}
+function activityPresentationRank(presentation){if(presentation.icon==='book-open')return 0;if(presentation.icon==='search')return 1;return 2}
 function embeddedToolObject(detail){const source=String(detail||'').split('\\n').filter((line)=>!/^call_id=/.test(line.trim())).join('\\n').trim();const candidates=[source];const start=source.indexOf('{');const end=source.lastIndexOf('}');if(start>=0&&end>start)candidates.push(source.slice(start,end+1));for(const candidate of candidates){try{const parsed=JSON.parse(candidate);if(parsed&&typeof parsed==='object')return parsed}catch(e){}}return{}}
+function normalizeTurnPlanItems(value){const statuses=new Set(['completed','in_progress','pending']);return(Array.isArray(value)?value:[]).map((item)=>({step:String(item?.step||'').replace(/\\s+/g,' ').trim(),status:statuses.has(item?.status)?item.status:'pending'})).filter((item)=>item.step)}
+function planActivityPresentation(detail){const payload=embeddedToolObject(detail);const plan=normalizeTurnPlanItems(payload.plan);return plan.length?{variant:'plan',plan,explanation:String(payload.explanation||'').trim()}:null}
 function agentActivityLabel(value){const pathParts=String(value||'').trim().split('/').filter(Boolean);const clean=(pathParts.at(-1)||'Agent').replace(/[_-]+/g,' ').replace(/\\s+/g,' ').trim();return clean?clean.charAt(0).toUpperCase()+clean.slice(1):'Agent'}
-function agentSpawnActivityPresentation(detail){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?task_name["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];return{variant:'agent',label:agentActivityLabel(payload.task_name||fallback),status:'已开始工作',icon:'flower-2',expandable:false}}
+function agentSpawnActivityPresentation(detail,action='spawn'){const payload=embeddedToolObject(detail);const fallback=String(detail||'').match(/["']?(?:task_name|target)["']?\\s*[:=]\\s*["']?([^"'\\s,}]+)/i)?.[1];const agentKey=String(payload.task_name||payload.target||fallback||'').trim();const followup=action==='followup';return{variant:'agent',agentKey,label:agentActivityLabel(agentKey),agentAction:followup?'followup':'spawn',status:followup?'已更新':'已开始工作',icon:'flower-2',expandable:true}}
 function orchestratedActivityPresentations(text){
   const source=String(text||'');
   if(!source.startsWith('exec\\n'))return[];
   const detail=source.slice(source.indexOf('\\n')+1);
+  const plan=orchestratedUpdatePlanPresentation(detail);
+  if(plan)return[plan];
   const imageCount=executableOrchestratedToolCallOffsets(detail,'view_image').length;
   const commandCount=executableOrchestratedToolCallOffsets(detail,'exec_command').length;
+  const commands=orchestratedExecCommands(detail);
   const items=[];
   if(imageCount)items.push({verb:'已查看',target:imageCount+' 张图像',icon:'images'});
-  if(commandCount>1)items.push({verb:'已读取文件并运行了多个命令',icon:'search'});
+  const commandItems=commands.map((command,index)=>({
+    ...commandActivityPresentation(command),
+    expandable:false,
+    _sourceOrder:index,
+  }));
+  commandItems.sort((left,right)=>activityPresentationRank(left)-activityPresentationRank(right)||left._sourceOrder-right._sourceOrder);
+  items.push(...commandItems.map(({_sourceOrder,...item})=>item));
+  if(commandCount>commands.length)items.push({verb:'Ran',target:(commandCount-commands.length)+' commands',icon:'square-terminal',expandable:false});
   return items;
 }
 function runningActivityVerb(verb){
   const exact={
     '已读取':'正在读取',
+    '读取':'正在读取',
     '已搜索':'正在搜索',
     '已运行':'正在运行',
     '已检查':'正在检查',
@@ -5571,13 +6418,34 @@ function runningActivityVerb(verb){
     '已新增':'正在新增',
     '已删除':'正在删除',
     '已调用':'正在调用',
+    'Ran':'Running',
     '已读取文件并运行了多个命令':'正在读取文件并运行多个命令',
   };
   return exact[verb]||verb.replace(/^已/,'正在');
 }
-function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){current={verb:match[1],icon:match[2],target:activityFileLabel(line.slice(match[0].length)),added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+')&&!line.startsWith('+++'))current.added++;else if(line.startsWith('-')&&!line.startsWith('---'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
-function commandActivityPresentation(command){const source=String(command||'');const clean=shortActivityText(source,120);const files=extractActivityFiles(source);if(/(?:^|\\s)(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files.join('、')||clean,icon:'book-open'};if(/\\brg\\b/.test(source)){const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';return{verb:'已搜索',target:(files.join('、')||'内容')+(query?' · “'+shortActivityText(query,48)+'”':''),icon:'search'}}if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files.join('、')||shortActivityText(source.split('\\n')[0],84),icon:'circle-check'};if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};return{verb:'已运行',target:files.join('、')||clean||'工具调用',icon:'terminal'}}
-function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(toolName==='spawn_agent')return[agentSpawnActivityPresentation(descriptor.detail)];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
+function patchActivityPresentations(patch){const items=[];let current=null;for(const line of String(patch||'').split('\\n')){const prefixes=[['*** Update File: ','已编辑','pencil'],['*** Add File: ','已新增','file-plus-2'],['*** Delete File: ','已删除','trash-2']];const match=prefixes.find(([prefix])=>line.startsWith(prefix));if(match){const filePath=activityFilePath(line.slice(match[0].length));current={verb:match[1],icon:match[2],target:activityFileLabel(filePath),filePath,added:0,removed:0};items.push(current);continue}if(!current)continue;if(line.startsWith('+'))current.added++;else if(line.startsWith('-'))current.removed++}return items.map((item)=>({...item,meta:'+'+item.added+' -'+item.removed}))}
+function nativeFileChangePresentations(value){const icons={'已编辑':'pencil','已新增':'file-plus-2','已删除':'trash-2'};return(Array.isArray(value)?value:[]).map((item)=>{const filePath=activityFilePath(item?.filePath||item?.name);const verb=icons[item?.verb]?item.verb:'已编辑';const added=Math.max(0,Number(item?.added)||0);const removed=Math.max(0,Number(item?.removed)||0);return filePath?{verb,icon:icons[verb],target:activityFileLabel(filePath),filePath,added,removed,meta:'+'+added+' -'+removed}:null}).filter(Boolean)}
+function memoryActivityPresentation(command){const matches=[...String(command||'').matchAll(/\\.codex\\/memories\\/([A-Za-z0-9_@.+\\/-]+\\.md)\\b/gi)];if(!matches.length)return null;const relative=matches.at(-1)[1];const filename=relative.split('/').filter(Boolean).at(-1)||relative;return{verb:'已读取',target:filename.replace(/\\.md$/i,''),icon:'book-open',targetType:'memory',expandable:false}}
+function commandActivityPresentation(command){
+  const source=String(command||'');
+  const clean=shortActivityText(source,120);
+  const files=extractActivityFiles(source);
+  const memory=memoryActivityPresentation(source);
+  if(memory)return memory;
+  const skill=skillActivityPresentation(source);
+  if(skill&&/^\\s*(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return skill;
+  if(/^\\s*(?:cat|sed|nl|head|tail)(?:\\s|$)/.test(source))return{verb:'已读取',target:files[0]||clean,icon:'book-open',targetType:files.length?'file':''};
+  if(/\\brg\\b/.test(source)&&files.length){
+    const query=source.match(/\\brg\\b[^\\n]*?["']([^"']+)["']/)?.[1]||'';
+    return{verb:'已在',target:files[0],suffix:query?'中搜索“'+shortActivityText(query,48)+'”':'中搜索',icon:'search',targetType:'file'};
+  }
+  if(/(?:npm test|node --test|pytest|unittest|compileall|node --check|git diff --check)/.test(source))return{verb:'已运行',target:/git diff --check/.test(source)?'代码差异检查':files[0]||shortActivityText(source.split('\\n')[0],84),icon:'circle-check',targetType:files.length?'file':''};
+  if(/\\bgit (?:status|diff|log|show)\\b/.test(source))return{verb:'已检查',target:'Git '+(source.match(/\\bgit (status|diff|log|show)\\b/)?.[1]||'状态'),icon:'git-branch'};
+  if(/(?:health|api\\/health)/i.test(source))return{verb:'已检查',target:'服务状态',icon:'activity'};
+  if(/\\bcurl\\b/.test(source))return{verb:'已请求',target:source.match(/https?:\\/\\/[^\\s"']+/)?.[0]||'本地资源',icon:'globe-2'};
+  return{verb:'Ran',target:clean||'command',icon:'square-terminal'};
+}
+function toolActivityPresentations(text){const orchestrated=orchestratedActivityPresentations(text);if(orchestrated.length)return orchestrated;const descriptor=toolCallDescriptor(text);const toolName=descriptor.name.split('.').at(-1);if(toolName==='update_plan'){const plan=planActivityPresentation(descriptor.detail);if(plan)return[plan]}if(['spawn_agent','followup_task'].includes(toolName))return[agentSpawnActivityPresentation(descriptor.detail,toolName==='followup_task'?'followup':'spawn')];if(descriptor.name==='apply_patch'){const patches=patchActivityPresentations(descriptor.detail);if(patches.length)return patches}if(descriptor.name==='exec_command')return[commandActivityPresentation(descriptor.detail)];if(descriptor.name==='view_image')return[{verb:'已查看',target:'1 张图像',icon:'image'}];if(descriptor.name==='browser_check')return[{verb:'已检查',target:'浏览器页面',icon:'panel-top'}];if(descriptor.name==='exec')return[{verb:'已调用',target:'工具',icon:'wrench'}];if(/search/i.test(descriptor.name))return[{verb:'已搜索',target:shortActivityText(descriptor.detail,90)||'工具',icon:'search'}];return[{verb:'已调用',target:shortActivityText(descriptor.name,72)||'工具',icon:'wrench'}]}
 function isImageViewActivityPresentation(presentation){return presentation?.verb==='已查看'&&/\\d+ 张图像$/.test(String(presentation.target||''))&&['image','images'].includes(presentation.icon)}
 function nativeToolImageUrls(presentations,messageSeq){
   const sequence=Number(messageSeq);
@@ -5620,13 +6488,19 @@ function createActivityImageGallery(urls){
   });
   return gallery;
 }
-function createToolActivityItem(presentation,rawText,running=false){
+function createToolActivityItem(presentation,rawText,running=false,options={}){
   if(presentation.variant==='agent'){
-    const item=document.createElement('div');
-    item.className='activityItem agentActivityItem static';
+    const item=document.createElement('details');
+    item.className='activityItem agentActivityItem';
+    item.open=false;
     item.dataset.messageText=String(rawText||'');
-    const row=document.createElement('div');
+    item.dataset.agentKey=String(presentation.agentKey||'');
+    item.dataset.agentAction=String(presentation.agentAction||'spawn');
+    item.dataset.parentThreadId=String(options.parentThreadId||'');
+    item.dataset.traceState=running?'starting':'ready';
+    const row=document.createElement('summary');
     row.className='agentActivityRow';
+    row.setAttribute('aria-label','查看 '+(presentation.label||'Agent')+' 子代理运行过程');
     const identity=document.createElement('span');
     identity.className='agentActivityIdentity';
     const iconWrap=document.createElement('span');
@@ -5640,21 +6514,54 @@ function createToolActivityItem(presentation,rawText,running=false){
     label.textContent=presentation.label||'Agent';
     const status=document.createElement('span');
     status.className='agentActivityStatus';
-    status.textContent=presentation.status||'已开始工作';
+    status.dataset.traceState=running?'starting':'ready';
+    status.textContent=running?(presentation.agentAction==='followup'?'正在更新':'正在启动'):presentation.status||'已开始工作';
+    const chevron=document.createElement('i');
+    chevron.className='activityItemChevron agentActivityChevron';
+    chevron.setAttribute('data-lucide','chevron-right');
+    chevron.setAttribute('aria-hidden','true');
     identity.appendChild(iconWrap);
     identity.appendChild(label);
     row.appendChild(identity);
     row.appendChild(status);
+    row.appendChild(chevron);
+    const content=document.createElement('div');
+    content.className='subagentTraceContent';
+    const meta=document.createElement('div');
+    meta.className='subagentTraceMeta';
+    meta.hidden=true;
+    const notice=document.createElement('div');
+    notice.className='subagentTraceNotice';
+    notice.setAttribute('role','status');
+    notice.textContent='展开后载入真实运行记录';
+    const timeline=document.createElement('div');
+    timeline.className='subagentTraceTimeline';
+    timeline.setAttribute('aria-live','polite');
+    const retry=document.createElement('button');
+    retry.type='button';
+    retry.className='subagentTraceRetry';
+    retry.textContent='重试';
+    retry.hidden=true;
+    content.appendChild(meta);
+    content.appendChild(notice);
+    content.appendChild(timeline);
+    content.appendChild(retry);
     item.appendChild(row);
+    item.appendChild(content);
+    const state={item,status,meta,notice,timeline,retry,parentThreadId:item.dataset.parentThreadId,agentRef:item.dataset.agentKey,subagentId:'',cursor:0,generation:0,messageSeqs:new Set(),loaded:false,loading:false,terminal:false,timer:null,controller:null,notFoundAttempts:0,failureCount:0,autoTrack:Boolean(options.autoTrack)};
+    item._subagentTrace=state;
+    retry.addEventListener('click',(event)=>{event.preventDefault();event.stopPropagation();state.terminal=false;state.notFoundAttempts=0;state.failureCount=0;loadSubagentTrace(state,{force:true})});
+    item.addEventListener('toggle',()=>{if(item.open)loadSubagentTrace(state);else if(!state.autoTrack)stopSubagentTracePolling(state,true)});
     return item;
   }
   const expandable=presentation.expandable!==false;
   const galleryOnly=Boolean(presentation.galleryOnly);
   const imageUrls=Array.isArray(presentation.imageUrls)?presentation.imageUrls.filter(Boolean):[];
   const item=document.createElement(expandable?'details':'div');
-  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'');
+  item.className='activityItem'+(expandable?'':' static')+(imageUrls.length?' withImages':'')+(presentation.targetType==='file'?' fileTarget':'')+(presentation.targetType==='skill'?' skillTarget':'')+(presentation.targetType==='memory'?' memoryTarget':'');
   if(expandable)item.open=false;
   item.dataset.messageText=String(rawText||'');
+  if(presentation.filePath)item.dataset.filePath=String(presentation.filePath);
   const summary=document.createElement(expandable?'summary':'div');
   summary.className='activityItemSummary'+(presentation.target?'':' standalone');
   const iconWrap=document.createElement('span');
@@ -5670,11 +6577,20 @@ function createToolActivityItem(presentation,rawText,running=false){
   summary.appendChild(iconWrap);
   summary.appendChild(verb);
   if(presentation.target){
+    const targetLine=document.createElement('span');
+    targetLine.className='activityTargetLine';
     const target=document.createElement('span');
     target.className='activityTarget';
     target.textContent=presentation.target;
-    target.title=target.textContent;
-    summary.appendChild(target);
+    target.title=String(presentation.filePath||target.textContent);
+    targetLine.appendChild(target);
+    if(presentation.suffix){
+      const suffix=document.createElement('span');
+      suffix.className='activitySuffix';
+      suffix.textContent=presentation.suffix;
+      targetLine.appendChild(suffix);
+    }
+    summary.appendChild(targetLine);
   }
   if(presentation.meta){
     const meta=document.createElement('span');
@@ -5710,54 +6626,396 @@ function createToolActivityItem(presentation,rawText,running=false){
   }
   return item;
 }
-function createActivityBatch(presentations,rawText,kind,running=false){
+function activityGroupForPresentation(presentation){
+  if(presentation?.activityGroup)return String(presentation.activityGroup);
+  if(presentation?.variant==='agent')return'agents';
+  const verb=String(presentation?.verb||'');
+  const icon=String(presentation?.icon||'');
+  if(['已编辑','已新增','已删除'].includes(verb))return'files_edited';
+  if(['已读取','已搜索','已在'].includes(verb))return'files_read';
+  if(icon==='panel-top'||/浏览器/.test(String(presentation?.target||'')))return'browser';
+  if(['image','images'].includes(icon))return'images';
+  if(['已运行','已检查','已请求','Ran'].includes(verb)||['square-terminal','terminal','git-branch','circle-check'].includes(icon))return'commands';
+  return'tools';
+}
+function activityGroupForPresentations(presentations){const groups=[...new Set((presentations||[]).map(activityGroupForPresentation).filter(Boolean))];return groups.length===1?groups[0]:'tools'}
+function createActivityBatch(presentations,rawText,kind,running=false,options={}){
   const batch=document.createElement('div');
   batch.className='msg activityBatch'+(running?' streaming':'');
   batch.dataset.messageKind=kind||'activity';
   batch.dataset.messageText=String(rawText||'');
-  for(const presentation of presentations)batch.appendChild(createToolActivityItem(presentation,rawText,running));
+  batch.dataset.activityGroup=activityGroupForPresentations(presentations);
+  for(const presentation of presentations)batch.appendChild(createToolActivityItem(presentation,rawText,running,options));
   return batch;
+}
+function createAgentActivityGroup(){
+  const group=document.createElement('div');
+  group.className='msg agentActivityGroup';
+  group.dataset.messageKind='agent_activity_group';
+  group._agentActivityBatches=[];
+  group._agentActivityItems=[];
+  const status=document.createElement('span');
+  status.className='agentActivityGroupStatus';
+  status.dataset.traceState='starting';
+  status.setAttribute('role','status');
+  status.setAttribute('aria-live','polite');
+  status.textContent='正在启动';
+  group._agentActivityStatus=status;
+  group.appendChild(status);
+  return group;
+}
+function agentActivityGroupPresentation(group){
+  const items=group?._agentActivityItems||[];
+  const states=items.map((item)=>String(item.dataset.traceState||item._subagentTrace?.status?.dataset?.traceState||'ready'));
+  const followupOnly=items.length>0&&items.every((item)=>item.dataset.agentAction==='followup');
+  if(states.some((state)=>state==='error'))return{label:states.length>1?'部分失败':'失败',kind:'error'};
+  if(states.some((state)=>state==='interrupted'))return{label:states.length>1?'部分中断':'已中断',kind:'interrupted'};
+  if(states.some((state)=>state==='running'))return{label:followupOnly?'正在更新':'正在工作',kind:'running'};
+  if(states.some((state)=>state==='starting'))return{label:followupOnly?'正在更新':'正在启动',kind:'starting'};
+  if(states.length&&states.every((state)=>['done','updated'].includes(state)))return{label:followupOnly?'已更新':'已完成',kind:followupOnly?'updated':'done'};
+  return{label:followupOnly?'已更新':'已开始工作',kind:followupOnly?'updated':'ready'};
+}
+function updateAgentActivityGroupStatus(group){
+  if(!group?._agentActivityStatus)return;
+  const presentation=agentActivityGroupPresentation(group);
+  group._agentActivityStatus.textContent=presentation.label;
+  group._agentActivityStatus.dataset.traceState=presentation.kind;
+  group.classList.toggle('streaming',(group._agentActivityBatches||[]).some((batch)=>batch.classList.contains('streaming')));
+}
+function appendAgentActivityBatch(group,batch){
+  if(!group||!batch)return;
+  group._agentActivityBatches.push(batch);
+  for(const item of batch.children){
+    if(!item.classList?.contains('agentActivityItem'))continue;
+    item._agentActivityGroup=group;
+    group._agentActivityItems.push(item);
+  }
+  group.insertBefore(batch,group._agentActivityStatus);
+  updateAgentActivityGroupStatus(group);
+}
+function settleAgentActivityGroup(group){
+  for(const batch of group?._agentActivityBatches||[])settleTurnTool(batch);
+  updateAgentActivityGroupStatus(group);
+}
+function isAgentActivityOutput(text){
+  return /^(?:spawn_agent|followup_task)\\s+output$/i.test(String(text||'').split('\\n')[0].trim().replace(/^调用工具:\\s*/,''));
+}
+function queueAgentActivityBatch(batch){
+  if(batch&&!pendingAgentActivityBatches.includes(batch))pendingAgentActivityBatches.push(batch);
+}
+function takePendingAgentActivityBatch(){
+  while(pendingAgentActivityBatches.length){
+    const batch=pendingAgentActivityBatches.shift();
+    if(batch?.classList?.contains('streaming'))return batch;
+  }
+  return null;
+}
+const SUBAGENT_TRACE_POLL_MS=1600;
+function setSubagentTraceSummaryStatus(state,label,kind){
+  if(!state?.status)return;
+  state.status.textContent=label;
+  state.status.dataset.traceState=kind||'';
+  state.item.dataset.traceState=kind||'';
+  updateAgentActivityGroupStatus(state.item._agentActivityGroup);
+}
+function setSubagentTraceNotice(state,text,kind='',retry=false){
+  state.notice.textContent=String(text||'');
+  state.notice.className='subagentTraceNotice'+(kind?' '+kind:'');
+  state.notice.hidden=!text;
+  state.retry.hidden=!retry;
+}
+function stopSubagentTracePolling(state,abort=false){
+  if(!state)return;
+  if(state.timer)clearTimeout(state.timer);
+  state.timer=null;
+  if(abort&&state.controller){
+    const controller=state.controller;
+    state.requestId=(state.requestId||0)+1;
+    state.controller=null;
+    state.loading=false;
+    controller.abort();
+  }
+}
+function clearSubagentTraceStates(){
+  for(const state of subagentTraceStates)stopSubagentTracePolling(state,true);
+  subagentTraceStates.clear();
+}
+function scheduleSubagentTracePoll(state,delay=SUBAGENT_TRACE_POLL_MS){
+  stopSubagentTracePolling(state);
+  if((!state.item.open&&!state.autoTrack)||state.terminal||state.item.isConnected===false)return;
+  state.timer=setTimeout(()=>{state.timer=null;loadSubagentTrace(state)},delay);
+}
+function refreshOpenSubagentTraces(changedIds=[]){
+  const changed=new Set((changedIds||[]).map((id)=>String(id)));
+  for(const state of subagentTraceStates){
+    if((!state.item.open&&!state.autoTrack)||state.loading||state.terminal&&!state.autoTrack)continue;
+    if(changed.size&&state.subagentId&&!changed.has(state.subagentId))continue;
+    if(state.timer)clearTimeout(state.timer);
+    state.timer=null;
+    loadSubagentTrace(state,{force:state.terminal&&state.autoTrack});
+  }
+}
+function subagentTraceEvent(message,label,icon,kind=''){
+  const event=document.createElement('div');
+  event.className='subagentTraceEvent'+(kind?' '+kind:'');
+  const iconWrap=document.createElement('span');
+  iconWrap.className='subagentTraceEventIcon';
+  const iconNode=document.createElement('i');
+  iconNode.setAttribute('data-lucide',icon);
+  iconNode.setAttribute('aria-hidden','true');
+  iconWrap.appendChild(iconNode);
+  const text=document.createElement('span');
+  text.className='subagentTraceEventText';
+  text.textContent=label;
+  event.appendChild(iconWrap);
+  event.appendChild(text);
+  if(message?.at){
+    const time=document.createElement('time');
+    time.className='subagentTraceTime';
+    time.dateTime=String(message.at);
+    time.textContent=formatMessageTime(message.at);
+    event.appendChild(time);
+  }
+  return event;
+}
+function markSubagentTraceFinal(state){
+  const node=state.lastAssistantNode;
+  if(!node)return;
+  node.classList.add('final');
+  if(node._subagentTraceLabel)node._subagentTraceLabel.textContent='最终结果';
+}
+function appendSubagentTraceMessage(state,message,conversation){
+  const sequence=String(message?.seq||'');
+  if(sequence&&state.messageSeqs.has(sequence))return false;
+  if(sequence)state.messageSeqs.add(sequence);
+  const role=String(message?.role||'');
+  const kind=String(message?.kind||'');
+  let node=null;
+  if(role==='assistant'){
+    const final=kind==='final_answer';
+    node=document.createElement('article');
+    node.className='subagentTraceMessage'+(final?' final':'');
+    const head=document.createElement('div');
+    head.className='subagentTraceMessageHead';
+    const label=document.createElement('span');
+    label.textContent=final?'最终结果':'进度';
+    head.appendChild(label);
+    if(message.at){
+      const time=document.createElement('time');
+      time.className='subagentTraceTime';
+      time.dateTime=String(message.at);
+      time.textContent=formatMessageTime(message.at);
+      head.appendChild(time);
+    }
+    const body=document.createElement('div');
+    body.className='subagentTraceMarkdown';
+    renderAssistantMarkdown(body,message.content);
+    node.appendChild(head);
+    node.appendChild(body);
+    node._subagentTraceLabel=label;
+    state.lastAssistantNode=node;
+  }else if(role==='tool'){
+    if(['function_call_output','custom_tool_call_output','tool_search_output'].includes(kind))return false;
+    const presentations=toolActivityPresentations(message.content);
+    node=createActivityBatch(presentations,message.content,'subagent_tool',false,{parentThreadId:conversation.id});
+    node.classList.add('subagentTraceTool');
+  }else if(role==='process'){
+    if(kind==='reasoning_summary')return false;
+    if(kind==='task_started')node=subagentTraceEvent(message,'开始执行','play','started');
+    else if(kind==='task_complete'){
+      state.terminalKind='done';
+      markSubagentTraceFinal(state);
+      node=subagentTraceEvent(message,message.content||'任务完成','circle-check-big','success');
+    }else if(kind==='turn_aborted'){
+      state.terminalKind='interrupted';
+      node=subagentTraceEvent(message,message.content||'任务已中断','circle-stop','interrupted');
+    }else if(['task_error','error'].includes(kind)){
+      state.terminalKind='error';
+      node=subagentTraceEvent(message,message.content||'任务失败','circle-x','error');
+    }else if(kind==='context_compacted')node=subagentTraceEvent(message,message.content||'上下文已压缩','scan-text','phase');
+  }
+  if(!node)return false;
+  state.timeline.appendChild(node);
+  refreshIcons(node);
+  return true;
+}
+function resetSubagentTrace(state){
+  state.timeline.replaceChildren();
+  state.messageSeqs.clear();
+  state.cursor=0;
+  state.terminalKind='';
+  state.lastAssistantNode=null;
+}
+function updateSubagentTraceStatus(state,conversation){
+  const status=String(conversation.status||'');
+  if(status==='running'){
+    state.terminal=false;
+    setSubagentTraceSummaryStatus(state,(conversation.messages||[]).length?'正在工作':'正在启动','running');
+    return true;
+  }
+  state.terminal=true;
+  if(status==='interrupted'||state.terminalKind==='interrupted')setSubagentTraceSummaryStatus(state,'已中断','interrupted');
+  else if(status==='error'||state.terminalKind==='error')setSubagentTraceSummaryStatus(state,'失败','error');
+  else setSubagentTraceSummaryStatus(state,'已完成','done');
+  return false;
+}
+async function loadSubagentTrace(state,{force=false}={}){
+  if(!state||state.item.isConnected===false||state.loading||state.terminal&&!force)return;
+  subagentTraceStates.add(state);
+  if(!state.parentThreadId||!state.agentRef){
+    state.terminal=true;
+    setSubagentTraceSummaryStatus(state,'无法查看','error');
+    setSubagentTraceNotice(state,'这条记录缺少可关联的子代理标识。','error');
+    return;
+  }
+  if(force){state.terminal=false;state.retry.hidden=true}
+  state.loading=true;
+  const requestId=(state.requestId||0)+1;
+  state.requestId=requestId;
+  const controller=new AbortController();
+  state.controller=controller;
+  if(!state.loaded)setSubagentTraceNotice(state,'正在读取子代理运行记录…','loading');
+  let nextPoll=0;
+  try{
+    const query='?agent='+encodeURIComponent(state.agentRef)+'&after='+state.cursor+'&generation='+state.generation+'&limit=240';
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(state.parentThreadId)+'/subagents'+query,{signal:controller.signal});
+    if(requestId!==state.requestId)return;
+    if(res.status===404){
+      state.notFoundAttempts+=1;
+      setSubagentTraceSummaryStatus(state,'正在启动','starting');
+      if(state.notFoundAttempts<12){
+        setSubagentTraceNotice(state,'正在等待子代理创建运行记录…','loading');
+        nextPoll=SUBAGENT_TRACE_POLL_MS;
+      }else{
+        state.terminal=true;
+        setSubagentTraceSummaryStatus(state,'暂不可用','error');
+        setSubagentTraceNotice(state,'暂时找不到这个子代理的运行记录。','error',true);
+      }
+      return;
+    }
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'读取子代理进度失败');
+    const conversation=data.subagent;
+    if(!conversation)throw new Error('子代理返回为空');
+    state.notFoundAttempts=0;
+    state.failureCount=0;
+    state.subagentId=String(conversation.id||'');
+    state.item.dataset.subagentThreadId=state.subagentId;
+    if(conversation.reset)resetSubagentTrace(state);
+    let appended=false;
+    for(const message of conversation.messages||[])appended=appendSubagentTraceMessage(state,message,conversation)||appended;
+    state.cursor=Number(conversation.cursor||state.cursor);
+    state.generation=Number(conversation.generation||state.generation);
+    state.loaded=true;
+    const metadata=conversation.metadata||{};
+    const meta=[metadata.agentNickname,metadata.agentPath,Number(metadata.depth)>1?'深度 '+metadata.depth:''].filter(Boolean);
+    state.meta.textContent=meta.join(' · ');
+    state.meta.hidden=!meta.length;
+    const running=updateSubagentTraceStatus(state,conversation);
+    if(state.timeline.children.length)setSubagentTraceNotice(state,'');
+    else setSubagentTraceNotice(state,running?'正在等待第一条进度…':'没有可显示的运行记录',running?'loading':'empty');
+    if(appended)requestAnimationFrame(()=>{state.timeline.scrollTop=running?state.timeline.scrollHeight:0});
+    if(running)nextPoll=SUBAGENT_TRACE_POLL_MS;
+  }catch(error){
+    if(error?.name==='AbortError'||requestId!==state.requestId)return;
+    state.failureCount+=1;
+    setSubagentTraceSummaryStatus(state,state.loaded?'同步中断':'加载失败','error');
+    const autoRetry=state.loaded&&state.failureCount<4;
+    setSubagentTraceNotice(state,error?.message||'读取子代理进度失败','error',!autoRetry);
+    if(autoRetry)nextPoll=3000;else state.terminal=true;
+  }finally{
+    if(requestId===state.requestId){
+      state.loading=false;
+      state.controller=null;
+      if(nextPoll)scheduleSubagentTracePoll(state,nextPoll);
+    }
+  }
 }
 function joinActivityActions(actions){
   if(actions.length<2)return actions[0]||'';
   return actions.length===2?actions[0]+'并'+actions[1]:actions.slice(0,-1).join('、')+'并'+actions.at(-1);
 }
-function activityClusterPresentation(cluster){
+function semanticActivityGroupPresentation(group,running){
+  const labels={
+    loaded_tools:['wrench','正在加载工具','已加载工具'],
+    files_read:['book-open','正在读取文件','已读取文件'],
+    files_edited:['pencil','正在编辑文件','已编辑文件'],
+    browser:['panel-top','正在使用浏览器','已使用浏览器'],
+    agents:['flower-2','正在调用子代理','已调用子代理'],
+    images:['images','正在查看图像','已查看图像'],
+    commands:['square-terminal','正在运行命令','已运行命令'],
+    tools:['wrench','正在使用工具','已使用工具'],
+  };
+  const item=labels[group];
+  return item?{icon:item[0],text:running?item[1]:item[2]}:null;
+}
+function activityClusterReasoning(cluster){
+  try{
+    const parsed=JSON.parse(cluster?.dataset?.activityReasoning||'[]');
+    if(!Array.isArray(parsed))return[];
+    return parsed.map((item)=>String(item||'').trim()).filter(Boolean);
+  }catch(e){return[]}
+}
+function activityClusterToolPresentation(cluster){
   const batches=[...cluster.querySelectorAll(':scope > .activityClusterItems > .activityBatch')];
   const items=[...cluster.querySelectorAll('.activityItem')];
   const running=batches.some((batch)=>batch.classList.contains('streaming'));
-  const records=items.map((item)=>({
+  const semantic=semanticActivityGroupPresentation(String(cluster?.dataset?.activityGroup||''),running);
+  if(!items.length)return semantic||{icon:'wrench',text:running?'正在使用工具':'已使用工具'};
+  const recordForItem=(item)=>({
+    item,
     verb:String(item.querySelector('.activityVerb')?.dataset.completedVerb||'').trim(),
     currentVerb:String(item.querySelector('.activityVerb')?.textContent||'').trim(),
     target:String(item.querySelector('.activityTarget')?.textContent||'').trim(),
     icon:item.querySelector('.activityItemIcon [data-lucide]')?.getAttribute('data-lucide')||'activity',
-  }));
-  const browser=records.some((record)=>record.icon==='panel-top'||/浏览器/.test(record.target));
-  if(browser)return{icon:'panel-top',text:(running?'正在使用':'已使用')+' 浏览器'};
-  if(records.length===1&&batches.length===1){
-    const record=records[0];
-    return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'工具调用'};
+  });
+  const records=items.map(recordForItem);
+  const activeBatch=[...batches].reverse().find((batch)=>batch.classList.contains('streaming'));
+  const activeItems=[...(activeBatch?.querySelectorAll?.('.activityItem')||[])];
+  const activeRecord=activeItems.length?recordForItem(activeItems.at(-1)):records.at(-1);
+  if(running&&activeRecord){
+    const text=[activeRecord.currentVerb||runningActivityVerb(activeRecord.verb),activeRecord.target].filter(Boolean).join(' ');
+    return{icon:activeRecord.icon,text:text||'正在使用工具'};
   }
+  const groups=new Set(batches.map((batch)=>String(batch.dataset?.activityGroup||'')).filter(Boolean));
+  const commandRecords=records.filter((record)=>['已运行','已检查','已请求','Ran'].includes(record.verb)||['square-terminal','terminal','git-branch','circle-check'].includes(record.icon));
+  const readRecords=records.filter((record)=>['已读取','已搜索','已在'].includes(record.verb));
   const edited=records.some((record)=>['已编辑','已新增','已删除'].includes(record.verb));
-  const read=records.some((record)=>['已读取','已搜索','已查看'].includes(record.verb));
-  const ran=batches.length>1||records.some((record)=>[
-    '已运行','已检查','已请求','已调用','已使用','已读取文件并运行了多个命令',
-  ].includes(record.verb));
-  const actions=[];
-  if(edited)actions.push(running?'编辑文件':'编辑了文件');
-  if(read)actions.push(running?'读取文件':'读取文件');
-  if(ran)actions.push(running?'运行多个命令':'运行了多个命令');
-  const text=joinActivityActions(actions)||(running?'正在使用工具':'已使用工具');
-  return{
-    icon:edited?'pencil':read?'book-open':'terminal',
-    text:running&&!text.startsWith('正在')?'正在'+text:text,
-  };
+  const loadedTools=groups.has('loaded_tools')||records.some((record)=>record.item.classList?.contains('skillTarget'));
+  const browser=groups.has('browser')||records.some((record)=>record.icon==='panel-top'||/浏览器/.test(record.target));
+  const commands=groups.has('commands')||commandRecords.length>0;
+  const usedTools=groups.has('tools')||records.some((record)=>['已调用','已使用'].includes(record.verb));
+  if(loadedTools&&commands)return{icon:'wrench',text:'已加载工具运行了多个命令'};
+  if(loadedTools)return{icon:'wrench',text:'已加载工具'};
+  if(edited&&commands)return{icon:'pencil',text:'已编辑文件并运行了多个命令'};
+  if(readRecords.length&&commands)return{icon:'book-open',text:'已读取文件并运行了多个命令'};
+  if(commands){
+    if(commandRecords.length>1||[...groups].filter((group)=>group==='commands').length>1||batches.length>1)return{icon:'square-terminal',text:'运行了多个命令'};
+    const record=commandRecords.at(-1)||records.at(-1);
+    return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'已运行命令'};
+  }
+  if(readRecords.length){
+    const record=readRecords.at(-1);
+    return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'已读取文件'};
+  }
+  if(browser)return{icon:'panel-top',text:'已使用浏览器'};
+  if(edited)return{icon:'pencil',text:'已编辑文件'};
+  if(usedTools||records.length>1)return{icon:'wrench',text:'已使用工具'};
+  const record=records[0];
+  return{icon:record.icon,text:[record.currentVerb,record.target].filter(Boolean).join(' ')||'工具调用'};
 }
-function createActivityCluster(){
+function activityClusterPresentation(cluster){
+  const fallback=activityClusterToolPresentation(cluster);
+  const latestReasoning=String(cluster?.dataset?.activeReasoning||'').trim()||activityClusterReasoning(cluster).at(-1);
+  return latestReasoning?{...fallback,text:latestReasoning}:fallback;
+}
+function createActivityCluster(group='tools',reasoning=[]){
   const cluster=document.createElement('details');
   cluster.className='msg activityCluster';
   cluster.dataset.messageKind='activity_cluster';
-  cluster.open=false;
+  cluster.dataset.activityGroup=String(group||'tools');
+  cluster.dataset.activityReasoning=JSON.stringify((reasoning||[]).map((item)=>String(item||'').trim()).filter(Boolean));
+  cluster.open=true;
   const summary=document.createElement('summary');
   summary.className='activityClusterSummary';
   const icon=document.createElement('span');
@@ -5777,45 +7035,103 @@ function createActivityCluster(){
   cluster.appendChild(items);
   return cluster;
 }
+function mergeActivityClusterReasoning(cluster,reasoning){
+  if(!cluster)return;
+  let current=[];
+  try{const parsed=JSON.parse(cluster.dataset.activityReasoning||'[]');if(Array.isArray(parsed))current=parsed}catch(e){}
+  for(const item of reasoning||[]){const clean=String(item||'').trim();if(clean&&!current.includes(clean))current.push(clean)}
+  cluster.dataset.activityReasoning=JSON.stringify(current);
+}
+function activityClusterMatchesBrowserTarget(cluster,target){
+  const clean=String(target||'').trim().toLowerCase();
+  if(!cluster||!clean)return false;
+  const active=String(cluster.dataset?.activeReasoning||'').trim();
+  return[...activityClusterReasoning(cluster),active].filter(Boolean).some((label)=>label.toLowerCase().includes(clean));
+}
+function markCurrentActivityItem(cluster){
+  const items=[...(cluster?.querySelectorAll?.('.activityItem')||[])];
+  for(const item of items)delete item.dataset.current;
+  const current=items.at(-1);
+  if(current)current.dataset.current='true';
+  return current||null;
+}
+function clearActiveActivityReasoning(cluster,refresh=true){
+  if(!cluster?.dataset)return false;
+  const changed=cluster.dataset.reasoningActive==='true'||Boolean(String(cluster.dataset.activeReasoning||'').trim());
+  delete cluster.dataset.reasoningActive;
+  delete cluster.dataset.activeReasoning;
+  if(changed&&refresh)updateActivityCluster(cluster);
+  return changed;
+}
 function updateActivityCluster(cluster){
   if(!cluster)return;
   const presentation=activityClusterPresentation(cluster);
   const iconWrap=cluster.querySelector(':scope > summary .activityClusterIcon');
   const label=cluster.querySelector(':scope > summary .activityClusterText');
-  const icon=document.createElement('i');
-  icon.setAttribute('data-lucide',presentation.icon);
-  icon.setAttribute('aria-hidden','true');
-  iconWrap?.replaceChildren(icon);
+  if(iconWrap){
+    if(presentation.icon){
+      const icon=document.createElement('i');
+      icon.setAttribute('data-lucide',presentation.icon);
+      icon.setAttribute('aria-hidden','true');
+      iconWrap.replaceChildren(icon);
+    }else iconWrap.replaceChildren();
+  }
   if(label){label.textContent=presentation.text;label.title=presentation.text}
   cluster.dataset.messageText=presentation.text;
-  cluster.classList.toggle('streaming',Boolean(cluster.querySelector('.activityBatch.streaming')));
+  markCurrentActivityItem(cluster);
+  cluster.classList.toggle('streaming',cluster.dataset.reasoningActive==='true'||Boolean(cluster.querySelector('.activityBatch.streaming')));
   refreshIcons(cluster);
 }
 function appendActivityBatchToCluster(cluster,batch){
+  clearActiveActivityReasoning(cluster,false);
   cluster.querySelector(':scope > .activityClusterItems')?.appendChild(batch);
   updateActivityCluster(cluster);
 }
 function settleActivityCluster(cluster){
   for(const batch of cluster?.querySelectorAll('.activityBatch')||[])settleTurnTool(batch);
+  clearActiveActivityReasoning(cluster,false);
   cluster?.classList.remove('streaming');
   updateActivityCluster(cluster);
 }
+function turnPlanProgress(plan){
+  const items=normalizeTurnPlanItems(plan);
+  const total=items.length;
+  const activeIndex=items.findIndex((item)=>item.status==='in_progress');
+  const completed=items.filter((item)=>item.status==='completed').length;
+  const current=activeIndex>=0?activeIndex+1:completed>=total?total:Math.min(completed+1,total);
+  return{items,total,current,completed,percent:total?Math.round(current/total*100):0};
+}
+function upsertLiveTurnPlan(plan){
+  const normalized=normalizeTurnPlanItems(plan);
+  ensureTurnProcessHeader();
+  liveTurnPlan=normalized;
+  const next=refreshLiveEditedFilesResult();
+  moveLiveEditedFilesResultToEnd();
+  return next;
+}
 function appendTurnTool(text,options={}){
-  const presentations=toolActivityPresentations(text);
+  clearTurnReasoningStatus();
+  const structuredFileChanges=nativeFileChangePresentations(options.fileChanges);
+  const presentations=structuredFileChanges.length?structuredFileChanges:toolActivityPresentations(text);
+  const plan=presentations.find((presentation)=>presentation.variant==='plan');
+  if(plan){const element=upsertLiveTurnPlan(plan.plan);moveTurnReasoningStatusToEnd();return element}
   const imageViews=presentations.filter(isImageViewActivityPresentation);
   const folded=presentations.filter((presentation)=>!isImageViewActivityPresentation(presentation));
   const imageUrls=nativeToolImageUrls(imageViews,options.nativeMessageSeq);
+  const activityOptions={parentThreadId:currentConversationSource==='codex'?currentConversationId:'',autoTrack:Boolean(options.autoTrackAgent)};
   let visibleBatch=null;
   if(imageViews.length){
-    visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true);
+    visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true,activityOptions);
     activateTurnProcessElement(visibleBatch);
     refreshIcons(visibleBatch);
   }
-  if(!folded.length)return visibleBatch;
+  if(!folded.length){moveTurnReasoningStatusToEnd();return visibleBatch}
   const activityKind=folded.some((presentation)=>presentation.variant==='agent')?'agent_activity':'tool_activity';
-  const batch=createActivityBatch(folded,text,activityKind,true);
+  const batch=createActivityBatch(folded,text,activityKind,true,activityOptions);
   if(visibleBatch)batch._relatedActivityBatches=[visibleBatch];
   activateTurnProcessElement(batch);
+  if(folded.some((presentation)=>['已编辑','已新增','已删除'].includes(presentation.verb)))refreshLiveEditedFilesResult();
+  moveTurnReasoningStatusToEnd();
   refreshIcons(batch);
   return batch;
 }
@@ -5824,8 +7140,13 @@ function settleTurnTool(batch){
   for(const item of [batch,...(batch._relatedActivityBatches||[])]){
     item.classList.remove('streaming');
     for(const verb of item.querySelectorAll('.activityVerb[data-completed-verb]'))verb.textContent=verb.dataset.completedVerb;
+    for(const agent of item.querySelectorAll('.agentActivityItem')){
+      const state=agent._subagentTrace;
+      if(state&&!state.loaded&&!state.loading){const followup=agent.dataset.agentAction==='followup';setSubagentTraceSummaryStatus(state,followup?'已更新':'已开始工作',followup?'updated':'ready')}
+    }
     const cluster=item.closest('.activityCluster');
     if(cluster)updateActivityCluster(cluster);
+    updateAgentActivityGroupStatus(item._agentActivityGroup||item.closest('.agentActivityGroup'));
   }
 }
 function appendTurnProcessActivity(text,kind){
@@ -5840,16 +7161,129 @@ function appendTurnProcessActivity(text,kind){
 function toolMessageTitle(text){const lines=String(text||'').split('\\n').map((line)=>line.trim()).filter(Boolean);if(!lines.length)return '工具调用';let title=lines[0].replace(/^调用工具:\\s*/,'').trim()||'工具调用';const output=/\\soutput$/i.test(title)||['工具返回','搜索结果'].includes(title);if(!output){const detail=lines.slice(1).find((line)=>!/^call_id=/.test(line)&&!/^workdir=/.test(line)&&!['[',']','{','}','],','},'].includes(line));if(detail)title+=' · '+detail}title=title.replace(/\\s+/g,' ');return title.length>120?title.slice(0,117)+'...':title}
 function thinkingMessageTitle(text){const line=String(text||'').split('\\n').map((item)=>item.trim()).find(Boolean)||'正在思考';const clean=line.replace(/[*_~\`#]/g,'').replace(/\\s+/g,' ').trim()||'正在思考';return clean.length>120?clean.slice(0,117)+'...':clean}
 function contextMessageTitle(text,kind){const lines=String(text||'').split('\\n').map((line)=>line.trim()).filter(Boolean);if(kind==='environment_context'){const date=lines.find((line)=>line.startsWith('日期 '))?.slice(3);const workspace=lines.find((line)=>line.startsWith('工作区 '))?.slice(4);return ['环境',date,workspace?workspace+' 个工作区':''].filter(Boolean).join(' · ')}if(kind==='browser_context'){const page=lines.find((line)=>line.startsWith('当前页面 '))?.slice(5);return page?'浏览器 · '+page:'浏览器上下文'}if(kind==='goal_context')return'持续目标';if(kind==='turn_aborted')return'任务已中断';return'上下文'}
-function completionMessageTitle(text){
-  const seconds=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
-  if(!Number.isFinite(seconds))return'已处理';
-  const rounded=Math.max(1,Math.round(seconds));
+function processedMessageTitle(seconds,{minimum=0,rounding='round'}={}){
+  const numeric=Number(seconds);
+  if(!Number.isFinite(numeric))return'已处理';
+  const rounded=Math.max(0,minimum,rounding==='floor'?Math.floor(numeric):Math.round(numeric));
   if(rounded<60)return'已处理 '+rounded+'s';
   const minutes=Math.floor(rounded/60);
   const remainder=rounded%60;
   return'已处理 '+minutes+'m'+(remainder?' '+remainder+'s':'');
 }
+function completionMessageTitle(text,fallbackSeconds=NaN){
+  const parsed=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
+  const seconds=Number.isFinite(parsed)?parsed:Number(fallbackSeconds);
+  return Number.isFinite(seconds)?processedMessageTitle(seconds,{minimum:1}):'已处理';
+}
+function liveProcessElapsedTitle(startedAt,now=Date.now()){
+  const start=Number(startedAt);
+  const current=Number(now);
+  if(!Number.isFinite(start)||start<=0||!Number.isFinite(current))return processedMessageTitle(0,{rounding:'floor'});
+  return processedMessageTitle((current-start)/1000,{rounding:'floor'});
+}
+function turnProcessStartTimestamp(value,now=Date.now()){
+  const parsed=new Date(value||now).getTime();
+  return Number.isFinite(parsed)?parsed:now;
+}
+function clearTurnReasoningStatus(preserveActivity=false){
+  if(turnReasoningStatus?.parentNode)turnReasoningStatus.remove();
+  turnReasoningStatus=null;
+  if(!preserveActivity)clearActiveActivityReasoning(currentActivityCluster);
+}
+function updateTurnReasoningStatus(text){
+  const clean=shortActivityText(text,160);
+  if(!clean)return null;
+  ensureTurnProcessHeader();
+  if(currentActivityCluster?.isConnected){
+    currentActivityCluster.dataset.activeReasoning=clean;
+    currentActivityCluster.dataset.reasoningActive='true';
+    updateActivityCluster(currentActivityCluster);
+    if(turnReasoningStatus?.parentNode)turnReasoningStatus.remove();
+    turnReasoningStatus=null;
+    moveLiveEditedFilesResultToEnd();
+    return currentActivityCluster;
+  }
+  if(!turnReasoningStatus){
+    turnReasoningStatus=document.createElement('div');
+    turnReasoningStatus.className='msg process reasoningStatus streaming';
+    turnReasoningStatus.dataset.messageKind='reasoning_status';
+  }
+  turnReasoningStatus.dataset.messageText=clean;
+  turnReasoningStatus.textContent=clean;
+  turnProcessTimeline.appendChild(turnReasoningStatus);
+  moveLiveEditedFilesResultToEnd();
+  return turnReasoningStatus;
+}
+function moveTurnReasoningStatusToEnd(){
+  if(turnReasoningStatus?.isConnected&&turnProcessTimeline)turnProcessTimeline.appendChild(turnReasoningStatus);
+  moveLiveEditedFilesResultToEnd();
+}
+function shouldClearTurnReasoningStatus(role,kind){
+  return role==='assistant'||role==='user'||['task_complete','task_error','turn_aborted','error'].includes(kind);
+}
+function shouldClearPendingActivityReasoning(role,kind,steeringUser=false){
+  if(['task_complete','task_error','turn_aborted','error'].includes(kind))return true;
+  if(role==='user')return!steeringUser;
+  return role==='assistant'&&!['commentary','live_progress'].includes(kind);
+}
+function turnProcessElapsedMatches(turnId){
+  const incoming=String(turnId||'');
+  return!incoming||!turnProcessElapsedTurnId||incoming===turnProcessElapsedTurnId;
+}
+function clearTurnProcessElapsed(){
+  if(turnProcessElapsedTimer!==null)clearInterval(turnProcessElapsedTimer);
+  if(turnProcessElapsedLabel?.parentNode)turnProcessElapsedLabel.remove();
+  turnProcessStartedAt=0;
+  turnProcessElapsedLabel=null;
+  turnProcessElapsedTimer=null;
+  turnProcessElapsedFrozen=false;
+  turnProcessElapsedTurnId='';
+}
+function updateTurnProcessElapsed(now=Date.now()){
+  if(!turnProcessElapsedLabel||turnProcessElapsedFrozen)return;
+  turnProcessElapsedLabel.textContent=liveProcessElapsedTitle(turnProcessStartedAt,now);
+}
+function freezeTurnProcessElapsed(endedAt='',turnId='',now=Date.now()){
+  if(!turnProcessElapsedLabel||turnProcessElapsedFrozen||!turnProcessElapsedMatches(turnId))return;
+  updateTurnProcessElapsed(turnProcessStartTimestamp(endedAt,now));
+  turnProcessElapsedFrozen=true;
+  if(turnProcessElapsedTimer!==null)clearInterval(turnProcessElapsedTimer);
+  turnProcessElapsedTimer=null;
+}
+function resumeTurnProcessElapsed(now=Date.now()){
+  if(!turnProcessElapsedLabel)return null;
+  if(!turnProcessElapsedFrozen&&turnProcessElapsedTimer!==null)return turnProcessElapsedLabel;
+  turnProcessElapsedFrozen=false;
+  updateTurnProcessElapsed(now);
+  turnProcessElapsedTimer=setInterval(updateTurnProcessElapsed,1000);
+  return turnProcessElapsedLabel;
+}
+function startTurnProcessElapsed(startedAt='',now=Date.now(),turnId=''){
+  clearTurnProcessElapsed();
+  turnProcessStartedAt=turnProcessStartTimestamp(startedAt,now);
+  ensureTurnProcessHeader();
+  turnProcessElapsedLabel=document.createElement('div');
+  turnProcessElapsedLabel.className='liveProcessElapsed';
+  turnProcessElapsedLabel.dataset.messageKind='live_elapsed';
+  turnProcessElapsedTurnId=String(turnId||'');
+  updateTurnProcessElapsed(now);
+  turnProcessHeader.insertBefore(turnProcessElapsedLabel,turnProcessTimeline);
+  turnProcessElapsedTimer=setInterval(updateTurnProcessElapsed,1000);
+  return turnProcessElapsedLabel;
+}
+function ensureTurnProcessElapsedRunning(startedAt='',now=Date.now(),turnId=''){
+  if(!turnProcessElapsedMatches(turnId))return null;
+  return turnProcessElapsedLabel?resumeTurnProcessElapsed(now):startTurnProcessElapsed(startedAt,now,turnId);
+}
+function clearLiveTurnProgress(){
+  liveTurnPlan=[];
+  if(liveEditedFilesResult?.parentNode)liveEditedFilesResult.remove();
+  liveEditedFilesResult=null;
+}
 function clearTurnProcessHeader(){
+  clearTurnReasoningStatus();
+  clearTurnProcessElapsed();
+  clearLiveTurnProgress();
   if(turnProcessHeader?.parentNode)turnProcessHeader.remove();
   turnProcessHeader=null;
   turnProcessTimeline=null;
@@ -5874,32 +7308,76 @@ function resetTurnProcessCollection(){
   clearTurnProcessHeader();
   turnProcessElements=[];
   currentActivityCluster=null;
-  nativeOptimisticSteering.clear();
+  currentAgentActivityGroup=null;
+  pendingAgentActivityBatches=[];
+  pendingActivityReasoning=[];
   collectingTurnProcess=false;
 }
-function beginTurnProcessCollection(){
+function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
   for(const element of turnProcessElements)if(element?.parentNode===chat)element.remove();
   clearTurnProcessHeader();
   turnProcessElements=[];
   currentActivityCluster=null;
-  nativeOptimisticSteering.clear();
+  currentAgentActivityGroup=null;
+  pendingAgentActivityBatches=[];
+  pendingActivityReasoning=[];
   collectingTurnProcess=true;
+  if(showElapsed)startTurnProcessElapsed(startedAt,Date.now(),turnId);
+}
+function collapseCurrentActivityCluster(){
+  if(currentActivityCluster?.isConnected){
+    clearActiveActivityReasoning(currentActivityCluster);
+    currentActivityCluster.open=false;
+  }
+  currentActivityCluster=null;
 }
 function activateTurnProcessElement(element){
   if(!collectingTurnProcess||!element)return;
   ensureTurnProcessHeader();
+  if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='agent_activity'){
+    collapseCurrentActivityCluster();
+    if(!currentAgentActivityGroup?.isConnected){
+      currentAgentActivityGroup=createAgentActivityGroup();
+      turnProcessElements.push(currentAgentActivityGroup);
+      turnProcessTimeline.appendChild(currentAgentActivityGroup);
+    }
+    pendingActivityReasoning=[];
+    appendAgentActivityBatch(currentAgentActivityGroup,element);
+    for(const item of element.querySelectorAll('.agentActivityItem'))if(item._subagentTrace?.autoTrack)loadSubagentTrace(item._subagentTrace);
+    queueAgentActivityBatch(element);
+    moveLiveEditedFilesResultToEnd();
+    return currentAgentActivityGroup;
+  }
+  currentAgentActivityGroup=null;
   if(element.classList.contains('activityBatch')&&element.dataset.messageKind==='tool_activity'){
     if(!currentActivityCluster?.isConnected){
-      currentActivityCluster=createActivityCluster();
+      currentActivityCluster=createActivityCluster('tools',pendingActivityReasoning);
       turnProcessElements.push(currentActivityCluster);
       turnProcessTimeline.appendChild(currentActivityCluster);
-    }
+    }else mergeActivityClusterReasoning(currentActivityCluster,pendingActivityReasoning);
+    pendingActivityReasoning=[];
     appendActivityBatchToCluster(currentActivityCluster,element);
+    moveLiveEditedFilesResultToEnd();
     return currentActivityCluster;
   }
-  currentActivityCluster=null;
+  if(element.classList.contains('browserCommentSteering')){
+    const target=String(element.dataset.browserTarget||'').trim().toLowerCase();
+    const clusters=turnProcessElements.filter((item)=>item.classList?.contains('activityCluster'));
+    const matched=[...clusters].reverse().find((cluster)=>activityClusterMatchesBrowserTarget(cluster,target));
+    if(matched?.parentNode===turnProcessTimeline){
+      const index=turnProcessElements.indexOf(matched);
+      if(!turnProcessElements.includes(element))turnProcessElements.splice(index+1,0,element);
+      turnProcessTimeline.insertBefore(element,matched.nextSibling);
+      collapseCurrentActivityCluster();
+      refreshIcons(element);
+      moveLiveEditedFilesResultToEnd();
+      return element;
+    }
+  }
+  collapseCurrentActivityCluster();
   if(!turnProcessElements.includes(element))turnProcessElements.push(element);
   turnProcessTimeline.appendChild(element);
+  moveLiveEditedFilesResultToEnd();
   return element;
 }
 function takeTurnProcessElements(){
@@ -5929,13 +7407,14 @@ function collectTurnArtifactsFromDom(anchor,elements){
   }
   return collected;
 }
-function createCompletionMessage(text,processElements=[]){
+function createCompletionMessage(text,processElements=[],turnId='',elapsedSeconds=NaN){
   const el=document.createElement('details');
   el.className='msg process completionSummary';
   el.dataset.messageText=String(text||'');
+  el.dataset.turnId=String(turnId||'');
   const summary=document.createElement('summary');
   const label=document.createElement('span');
-  label.textContent=completionMessageTitle(text);
+  label.textContent=completionMessageTitle(text,elapsedSeconds);
   const chevron=document.createElement('i');
   chevron.className='completionChevron';
   chevron.setAttribute('data-lucide','chevron-right');
@@ -5951,6 +7430,7 @@ function createCompletionMessage(text,processElements=[]){
       item.classList.remove('streaming');
       if(item.classList.contains('activityBatch'))settleTurnTool(item);
       if(item.classList.contains('activityCluster'))settleActivityCluster(item);
+      if(item.classList.contains('agentActivityGroup'))settleAgentActivityGroup(item);
       if(item.tagName==='DETAILS')item.open=false;
       timeline.appendChild(item);
     }
@@ -5961,6 +7441,230 @@ function createCompletionMessage(text,processElements=[]){
   el.appendChild(summary);
   el.appendChild(content);
   return el;
+}
+function editedFilesFromTurnArtifacts(elements){
+  const files=new Map();
+  for(const element of elements){
+    const items=element.matches?.('.activityItem')?[element]:[...(element.querySelectorAll?.('.activityItem')||[])];
+    for(const item of items){
+      const verb=String(item.querySelector?.('.activityVerb')?.dataset?.completedVerb||'');
+      if(!['已编辑','已新增','已删除'].includes(verb))continue;
+      const name=String(item.dataset?.filePath||item.querySelector?.('.activityTarget')?.textContent||'').trim();
+      if(!name)continue;
+      const meta=String(item.querySelector?.('.activityMeta')?.textContent||'');
+      const added=Number(meta.match(/\\+(\\d+)/)?.[1])||0;
+      const removed=Number(meta.match(/-(\\d+)/)?.[1])||0;
+      const current=files.get(name)||{name,verb,added:0,removed:0};
+      current.added+=added;
+      current.removed+=removed;
+      if(current.verb!==verb)current.verb='已编辑';
+      files.set(name,current);
+    }
+  }
+  return[...files.values()];
+}
+function browserPreviewFromTurnArtifacts(elements){
+  const raw=[];
+  let inspected=false;
+  for(const element of elements){
+    const elementText=String(element.dataset?.messageText||'');
+    raw.push(elementText);
+    if(/(?:\\.goto\\s*\\(|\\.reload\\s*\\(|\\.screenshot\\s*\\(|\\.playwright\\.(?:domSnapshot|evaluate)\\s*\\(|\\.dev\\.logs\\s*\\()/i.test(elementText))inspected=true;
+    for(const item of element.querySelectorAll?.('.activityItem')||[]){
+      const itemText=String(item.dataset?.messageText||'');
+      raw.push(itemText);
+      const icon=item.querySelector?.('.activityItemIcon [data-lucide]')?.getAttribute('data-lucide');
+      if(icon==='panel-top'&&/(?:\\.goto\\s*\\(|\\.reload\\s*\\(|\\.screenshot\\s*\\(|\\.playwright\\.(?:domSnapshot|evaluate)\\s*\\(|\\.dev\\.logs\\s*\\()/i.test(itemText))inspected=true;
+    }
+  }
+  const source=raw.join('\\n');
+  if(!inspected)return null;
+  const urls=[];
+  const patterns=[
+    /(?:getForUrl|goto)\\s*\\(\\s*["'](https?:\\/\\/[^"'\\s]+)/gi,
+    /(?:url\\s*===|startsWith\\s*\\()\\s*["'](https?:\\/\\/[^"'\\s]+)/gi,
+  ];
+  for(const pattern of patterns){for(const match of source.matchAll(pattern))urls.push(match[1])}
+  const url=urls.map((value)=>value.replace(/[.,;:!?]+$/,'')).reverse().find((value)=>{
+    try{return['http:','https:'].includes(new URL(value).protocol)}catch(e){return false}
+  })||'';
+  let label='浏览器页面已完成检查';
+  if(url){try{const parsed=new URL(url);label=parsed.hostname+(parsed.port?':'+parsed.port:'')+parsed.pathname}catch(e){label=url}}
+  return{url,label};
+}
+function createResultCardButton(iconName,label,handler,{danger=false}={}){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='turnResultAction'+(danger?' danger':'');
+  setIconLabel(button,iconName,label);
+  button.addEventListener('click',handler);
+  return button;
+}
+function reviewTurnArtifacts(turnId){
+  const id=String(turnId||'');
+  const completion=[...chat.querySelectorAll('.completionSummary')].reverse().find((item)=>!id||item.dataset.turnId===id);
+  if(!completion)return;
+  completion.open=true;
+  completion.scrollIntoView({block:'center',behavior:'smooth'});
+  requestAnimationFrame(()=>completion.querySelector('summary')?.focus());
+}
+function prepareUndoEditedFiles(files){
+  const names=files.map((file)=>file.name);
+  if(!names.length)return;
+  if(!confirm('准备撤销上一轮对 '+names.length+' 个文件的修改？\\n\\n系统会把撤销要求放入输入框，发送前仍可检查。'))return;
+  showChatView();
+  const request='请撤销上一轮仅对以下文件所做的修改，并保留其他改动：\\n'+names.map((name)=>'- '+name).join('\\n');
+  input.value=request;
+  input.style.height='auto';
+  input.style.height=Math.min(input.scrollHeight,180)+'px';
+  applyConversationMode();
+  statusEl.textContent='撤销请求已准备，请检查后发送';
+  input.focus();
+}
+function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
+  const progress=turnPlanProgress(plan);
+  const hasPlan=progress.total>0;
+  const hasFiles=files.length>0;
+  const card=document.createElement(hasFiles?'details':'div');
+  card.className='turnResultCard editedFilesResult'+(live?' live':'')+(hasPlan?' withPlan':'')+(!hasFiles?' planOnly':'');
+  const ariaParts=[];
+  if(hasPlan)ariaParts.push('第 '+progress.current+' / '+progress.total+' 步');
+  if(hasFiles)ariaParts.push(files.length+' 个文件已更改');
+  card.setAttribute('aria-label',ariaParts.join('，'));
+  if(live){card.setAttribute('role','status');card.setAttribute('aria-live','polite')}
+  if(hasPlan){card.dataset.planCurrent=String(progress.current);card.dataset.planTotal=String(progress.total)}
+  const head=document.createElement(hasFiles?'summary':'div');
+  head.className='turnResultHead';
+  if(hasPlan){
+    const ring=document.createElement('span');
+    ring.className='turnPlanProgressRing';
+    ring.setAttribute('style','--turn-plan-progress:'+progress.percent+'%');
+    ring.setAttribute('aria-hidden','true');
+    const progressLabel=document.createElement('strong');
+    progressLabel.className='turnPlanProgressLabel';
+    progressLabel.textContent='第 '+progress.current+' / '+progress.total+' 步';
+    head.appendChild(ring);
+    head.appendChild(progressLabel);
+    if(hasFiles){const divider=document.createElement('span');divider.className='turnResultDivider';divider.textContent='·';divider.setAttribute('aria-hidden','true');head.appendChild(divider)}
+  }
+  const title=document.createElement('strong');
+  title.className='turnResultFileLabel';
+  title.textContent=files.length+' 个文件已更改';
+  const added=files.reduce((total,file)=>total+file.added,0);
+  const removed=files.reduce((total,file)=>total+file.removed,0);
+  const stats=document.createElement('span');
+  stats.className='turnResultStats';
+  if(added){
+    const value=document.createElement('span');
+    value.className='turnResultStat added';
+    value.textContent='+'+added;
+    stats.appendChild(value);
+  }
+  if(removed){
+    const value=document.createElement('span');
+    value.className='turnResultStat removed';
+    value.textContent='-'+removed;
+    stats.appendChild(value);
+  }
+  if(!added&&!removed)stats.textContent='已完成';
+  if(hasFiles){head.appendChild(title);head.appendChild(stats)}
+  card.appendChild(head);
+  if(!hasFiles)return card;
+  const content=document.createElement('div');
+  content.className='editedFilesContent';
+  const actions=document.createElement('div');
+  actions.className='turnResultActions';
+  if(!live){
+    actions.appendChild(createResultCardButton('undo-2','撤销',()=>prepareUndoEditedFiles(files)));
+    actions.appendChild(createResultCardButton('list-tree','审查更改',()=>reviewTurnArtifacts(turnId)));
+    content.appendChild(actions);
+  }
+  const list=document.createElement('div');
+  list.className='editedFilesList';
+  for(const file of files){
+    const row=document.createElement('div');
+    row.className='editedFileRow';
+    const statusIcon=document.createElement('i');
+    statusIcon.setAttribute('data-lucide',file.verb==='已新增'?'file-plus-2':file.verb==='已删除'?'file-x-2':'file-pen-line');
+    statusIcon.setAttribute('aria-hidden','true');
+    const name=document.createElement('span');
+    name.className='editedFileName';
+    name.textContent=file.name;
+    name.title=file.name;
+    const meta=document.createElement('span');
+    meta.className='editedFileMeta';
+    meta.textContent=[file.added?'+'+file.added:'',file.removed?'-'+file.removed:''].filter(Boolean).join(' ');
+    row.appendChild(statusIcon);
+    row.appendChild(name);
+    row.appendChild(meta);
+    list.appendChild(row);
+  }
+  content.appendChild(list);
+  card.appendChild(content);
+  return card;
+}
+function moveLiveEditedFilesResultToEnd(){
+  if(!liveEditedFilesResult?.isConnected||!composer||!dropZone)return;
+  const anchor=promptQueuePanel?.parentNode===composer?promptQueuePanel:dropZone;
+  if(liveEditedFilesResult.parentNode!==composer||liveEditedFilesResult.nextSibling!==anchor)composer.insertBefore(liveEditedFilesResult,anchor);
+}
+function refreshLiveEditedFilesResult(){
+  if(!turnProcessTimeline)return null;
+  const files=editedFilesFromTurnArtifacts(turnProcessElements);
+  const hasPlan=liveTurnPlan.length>0;
+  if(!files.length&&!hasPlan){
+    liveEditedFilesResult?.remove();
+    liveEditedFilesResult=null;
+    return null;
+  }
+  const previous=liveEditedFilesResult;
+  const next=createEditedFilesResultCard(files,'',{live:true,plan:liveTurnPlan});
+  if(previous?.parentNode)previous.parentNode.replaceChild(next,previous);
+  else turnProcessTimeline.appendChild(next);
+  liveEditedFilesResult=next;
+  moveLiveEditedFilesResultToEnd();
+  refreshIcons(next);
+  return next;
+}
+function createWebPreviewResultCard(preview,turnId){
+  const card=document.createElement('section');
+  card.className='turnResultCard webPreviewResult';
+  card.setAttribute('aria-label','网页预览');
+  const iconWrap=document.createElement('span');
+  iconWrap.className='turnResultIcon preview';
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','panel-top');
+  icon.setAttribute('aria-hidden','true');
+  iconWrap.appendChild(icon);
+  const copy=document.createElement('div');
+  copy.className='webPreviewCopy';
+  const title=document.createElement('strong');
+  title.textContent='网页预览';
+  const detail=document.createElement('span');
+  detail.textContent=preview.label;
+  detail.title=preview.url||preview.label;
+  copy.appendChild(title);
+  copy.appendChild(detail);
+  const action=createResultCardButton(preview.url?'external-link':'list-tree',preview.url?'打开':'查看',()=>{
+    if(preview.url)window.open(preview.url,'_blank','noopener,noreferrer');
+    else reviewTurnArtifacts(turnId);
+  });
+  card.appendChild(iconWrap);
+  card.appendChild(copy);
+  card.appendChild(action);
+  return card;
+}
+function createTurnResultArtifacts(elements,turnId){
+  const files=editedFilesFromTurnArtifacts(elements);
+  const preview=browserPreviewFromTurnArtifacts(elements);
+  if(!files.length&&!preview)return null;
+  const container=document.createElement('div');
+  container.className='turnResultArtifacts';
+  container.dataset.turnId=String(turnId||'');
+  if(preview)container.appendChild(createWebPreviewResultCard(preview,turnId));
+  if(files.length)container.appendChild(createEditedFilesResultCard(files,turnId));
+  refreshIcons(container);
+  return container;
 }
 function appendInputImageToUser(userElement,source,at){
   if(!userElement?.isConnected||!userElement._messageBody)return null;
@@ -5992,47 +7696,121 @@ function appendInputImageToUser(userElement,source,at){
   userElement.classList.add('hasInputImage');
   return item;
 }
-function consumeNativeOptimisticSteering(text,at){
+function completionTimelineForTurn(turnId){
+  const id=String(turnId||'');
+  if(!id)return null;
+  const completion=[...chat.querySelectorAll('.completionSummary')].reverse().find((item)=>item.dataset.turnId===id);
+  if(!completion)return null;
+  let timeline=completion.querySelector(':scope > .completionContent > .completionTimeline');
+  if(!timeline){
+    timeline=document.createElement('div');
+    timeline.className='completionTimeline';
+    const content=completion.querySelector(':scope > .completionContent');
+    if(content){content.textContent='';content.appendChild(timeline)}
+  }
+  return timeline;
+}
+function consumeNativeOptimisticSteering(text,at,turnId){
   const expected=String(text||'').trim();
+  const expectedTurnId=String(turnId||'');
   for(const [id,element] of nativeOptimisticSteering){
     if(!element?.isConnected){nativeOptimisticSteering.delete(id);continue}
     if(String(element.dataset.messageText||'').trim()!==expected)continue;
+    if(expectedTurnId&&element.dataset.turnId&&element.dataset.turnId!==expectedTurnId)continue;
     nativeOptimisticSteering.delete(id);
     element.classList.remove('optimistic');
     delete element.dataset.optimisticQueueId;
     element.dataset.messageAt=String(at||element.dataset.messageAt||'');
+    if(expectedTurnId)element.dataset.turnId=expectedTurnId;
+    const completedTimeline=completionTimelineForTurn(expectedTurnId);
+    if(completedTimeline&&!completedTimeline.contains(element))completedTimeline.appendChild(element);
     latestUserElement=element;
     return element;
   }
   return null;
 }
+function browserCommentParts(text){return String(text||'').split(/\\n{2,}/).map((item)=>item.trim()).filter(Boolean)}
+function createBrowserCommentDetails(text,count){
+  const comments=browserCommentParts(text);
+  const total=Math.max(1,Number(count)||comments.length||1);
+  const details=document.createElement('details');
+  details.className='browserCommentDetails';
+  const summary=document.createElement('summary');
+  summary.className='browserCommentChip';
+  summary.setAttribute('aria-label','查看 '+total+' 条注释');
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','message-square');
+  icon.setAttribute('aria-hidden','true');
+  const label=document.createElement('span');
+  label.textContent=total+' 条注释';
+  summary.appendChild(icon);
+  summary.appendChild(label);
+  const content=document.createElement('div');
+  content.className='browserCommentContent';
+  for(const comment of comments){const item=document.createElement('p');item.textContent=comment;content.appendChild(item)}
+  details.appendChild(summary);
+  details.appendChild(content);
+  return details;
+}
 function addMsg(role,text,options={}){
   const kind=String(options.kind||'');
-  const steeringUser=role==='user'&&kind==='steering_user';
+  const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
+  const steeringUser=role==='user'&&['steering_user','steering_browser_comment'].includes(kind);
+  const completedSteeringTimeline=steeringUser?completionTimelineForTurn(options.turnId):null;
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   if(role!=='user'&&!inputImage)latestUserElement=null;
   if(role==='thinking')return null;
-  if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
+  const terminalProcess=role==='process'&&['task_complete','task_error','turn_aborted','error'].includes(kind);
+  if(terminalProcess&&!turnProcessElapsedMatches(options.turnId))return null;
+  const activeTurnMessage=webRunActive&&options.turnId&&activeNativeTurnId&&String(options.turnId)===String(activeNativeTurnId);
+  if(activeTurnMessage&&kind!=='task_started'){
+    if(!collectingTurnProcess||!turnProcessElapsedMatches(options.turnId))beginTurnProcessCollection(options.at,true,options.turnId);
+    else if(!turnProcessElapsedLabel)ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);
+  }
+  if(role==='process'&&kind==='reasoning_summary'){
+    if(!collectingTurnProcess)beginTurnProcessCollection(options.at,webRunActive,options.turnId);
+    else if(webRunActive)ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);
+    const clean=shortActivityText(text,160);
+    if(clean&&!pendingActivityReasoning.includes(clean))pendingActivityReasoning.push(clean);
+    const reasoning=updateTurnReasoningStatus(clean);
+    if(options.autoScroll!==false)scrollChatToLatest();
+    return reasoning;
+  }
+  if(shouldClearTurnReasoningStatus(role,kind))clearTurnReasoningStatus(browserCommentUser);
+  if(shouldClearPendingActivityReasoning(role,kind,steeringUser))pendingActivityReasoning=[];
+  if(role==='process'&&['task_error','turn_aborted','error'].includes(kind)){
+    freezeTurnProcessElapsed(options.at,options.turnId);
+    clearLiveTurnProgress();
     settleTurnTool(latestToolElement);
+    collapseCurrentActivityCluster();
+  }
+  if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
+    const batch=isAgentActivityOutput(text)?takePendingAgentActivityBatch():latestToolElement;
+    settleTurnTool(batch||latestToolElement);
     return null;
   }
   if(role==='process'&&kind==='task_started'){
-    beginTurnProcessCollection(options.at);
+    if(!options.hydrating&&currentConversationSource==='codex'&&webRunActive&&options.turnId&&activeNativeTurnId&&String(options.turnId)!==String(activeNativeTurnId))return null;
+    const showElapsed=options.autoTrackAgent||(currentConversationSource!=='codex'&&webRunActive);
+    if(showElapsed&&collectingTurnProcess&&turnProcessElapsedLabel&&options.turnId&&turnProcessElapsedMatches(options.turnId)){ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);return null}
+    beginTurnProcessCollection(options.at,showElapsed,options.turnId);
     latestToolElement=null;
     latestAssistantElement=null;
     latestFinalAssistantElement=null;
     return null;
   }
   if(role==='process'&&kind==='context_compacted'){
-    if(!collectingTurnProcess)beginTurnProcessCollection();
+    if(!collectingTurnProcess)beginTurnProcessCollection(options.at,webRunActive,options.turnId);
+    else if(webRunActive)ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);
     chat.querySelector('.empty')?.remove();
     const activity=appendTurnProcessActivity(text,kind);
+    moveTurnReasoningStatusToEnd();
     if(options.autoScroll!==false)scrollChatToLatest();
     return activity;
   }
   if(role==='user'){
     if(steeringUser){
-      if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
+      if(!completedSteeringTimeline&&!collectingTurnProcess)beginTurnProcessCollection(options.at);
     }else{
       if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
       latestToolElement=null;
@@ -6043,25 +7821,30 @@ function addMsg(role,text,options={}){
   const empty=chat.querySelector('.empty');
   if(empty)empty.remove();
   if(steeringUser&&!options.optimisticQueueId){
-    const optimistic=consumeNativeOptimisticSteering(text,options.at);
+    const optimistic=consumeNativeOptimisticSteering(text,options.at,options.turnId);
     if(optimistic){
       if(options.autoScroll!==false)scrollChatToLatest();
       return optimistic;
     }
   }
   if(role==='process'&&kind==='task_complete'){
+    const completedAt=turnProcessStartTimestamp(options.at);
+    const elapsedSeconds=turnProcessStartedAt>0?Math.max(0,(completedAt-turnProcessStartedAt)/1000):NaN;
     const anchor=latestFinalAssistantElement?.parentNode===chat?latestFinalAssistantElement:null;
     const artifacts=collectTurnArtifactsFromDom(anchor,takeTurnProcessElements());
     const visibleActivities=artifacts.filter((item)=>item.dataset?.messageKind==='image_view_activity');
     const foldedActivities=artifacts.filter((item)=>item.dataset?.messageKind!=='image_view_activity');
+    const resultArtifacts=createTurnResultArtifacts(artifacts,options.turnId);
     for(const item of visibleActivities)settleTurnTool(item);
-    const completion=createCompletionMessage(text,foldedActivities);
+    const completion=createCompletionMessage(text,foldedActivities,options.turnId,elapsedSeconds);
     if(anchor){
       chat.insertBefore(completion,anchor);
       for(const item of visibleActivities)chat.insertBefore(item,anchor);
+      if(resultArtifacts)chat.insertBefore(resultArtifacts,anchor.nextSibling);
     }else{
       chat.appendChild(completion);
       for(const item of visibleActivities)chat.appendChild(item);
+      if(resultArtifacts)chat.appendChild(resultArtifacts);
     }
     latestToolElement=null;
     refreshIcons(chat);
@@ -6090,6 +7873,8 @@ function addMsg(role,text,options={}){
   el.dataset.messageText=String(text||'');
   el.dataset.messageKind=kind;
   el.dataset.messageAt=String(options.at||'');
+  el.dataset.turnId=String(options.turnId||'');
+  if(browserCommentUser){el.classList.add('browserCommentSteering');el.dataset.browserTarget=String(options.browserTarget||'')}
   if(steeringUser){
     el.classList.add('steeringUser');
     if(options.optimisticQueueId){
@@ -6215,13 +8000,15 @@ function addMsg(role,text,options={}){
       el._messageLabel=label;
     }else{
       el.appendChild(body);
+      if(browserCommentUser){body.classList.add('browserCommentSource');el.appendChild(createBrowserCommentDetails(text,options.annotationCount))}
       el.appendChild(actions);
     }
     el._messageBody=body;
   }
   if(role==='tool'&&latestToolElement?.parentNode)latestToolElement.remove();
   chat.appendChild(el);
-  if(steeringUser||isTurnProcessMessage(role,kind))activateTurnProcessElement(el);
+  if(steeringUser&&completedSteeringTimeline)completedSteeringTimeline.appendChild(el);
+  else if(steeringUser||isTurnProcessMessage(role,kind))activateTurnProcessElement(el);
   refreshIcons(el);
   if(role==='tool')latestToolElement=el;
   if(role==='assistant'){
@@ -6232,17 +8019,52 @@ function addMsg(role,text,options={}){
   if(options.autoScroll!==false)scrollChatToLatest();
   return el;
 }
+function isNativeSnapshotStreamingMessage(message,conversation){
+  const activeTurnId=String(conversation?.activeTurnId||'');
+  return conversation?.status==='running'
+    && !nativeCompletionSync
+    && message?.role==='assistant'
+    && String(message.kind||'')==='commentary'
+    && Boolean(activeTurnId)
+    && String(message.turnId||'')===activeTurnId;
+}
+function nativeSnapshotLiveKey(message,conversation){
+  return 'snapshot:'+String(conversation?.generation||nativeGeneration||0)+':'+String(message?.seq||'');
+}
+function upsertNativeSnapshotLiveMessage(message,conversation){
+  const key=nativeSnapshotLiveKey(message,conversation);
+  if(!message?.seq||!String(message.content||''))return null;
+  if(nativeRenderedMessageKeys.has(key))return null;
+  let live=nativeLiveItems.get(key);
+  if(!live){
+    const element=addMsg('assistant','',{nativeMessageSeq:message.seq,turnId:message.turnId,autoTrackAgent:true,autoScroll:false,streaming:true,kind:message.kind,at:message.at,annotationCount:message.annotationCount,browserTarget:message.browserTarget,fileChanges:message.fileChanges});
+    if(!element)return null;
+    live={key,source:'snapshot',turnId:String(message.turnId||''),messageSeq:message.seq,role:'assistant',element,text:'',targetText:'',complete:true,renderTimer:null};
+    nativeLiveItems.set(key,live);
+  }
+  const targetText=String(message.content||'');
+  if(!targetText.startsWith(live.text))live.text='';
+  live.targetText=targetText;
+  live.complete=true;
+  if(live.text.length<live.targetText.length)scheduleNativeLiveRender(live);else settleNativeLiveItem(live);
+  return live;
+}
+function nativeRuntimeLiveKey(itemId,turnId){return 'runtime:'+String(turnId||activeNativeTurnId||'')+':'+String(itemId||'')}
 function updateNativeLiveDelta(runtime){
   const itemId=String(runtime.itemId||'');
   const delta=String(runtime.delta||'');
   if(!itemId||!delta)return;
   removeNativeRunningElement();
-  if(!collectingTurnProcess)beginTurnProcessCollection();
-  let live=nativeLiveItems.get(itemId);
+  const runtimeTurnId=String(runtime.turnId||activeNativeTurnId||'');
+  if(!collectingTurnProcess||!turnProcessElapsedMatches(runtimeTurnId))beginTurnProcessCollection(runtime.updatedAt,true,runtimeTurnId);
+  else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),runtimeTurnId);
+  const key=nativeRuntimeLiveKey(itemId,runtimeTurnId);
+  let live=nativeLiveItems.get(key);
   if(!live){
     const element=addMsg('assistant','',{streaming:true,kind:'live_progress'});
-    live={role:'assistant',element,text:'',targetText:'',complete:false,renderTimer:null};
-    nativeLiveItems.set(itemId,live);
+    live={key,source:'runtime',turnId:runtimeTurnId,itemId,role:'assistant',element,text:'',targetText:'',complete:false,renderTimer:null};
+    nativeLiveItems.set(key,live);
+    if(runtimeTurnId)nativeRuntimeStreamTurnIds.add(runtimeTurnId);
     statusEl.textContent='Codex App · 正在处理';
     statusEl.classList.add('running');
   }
@@ -6257,10 +8079,14 @@ function scheduleNativeLiveRender(live){
     pumpNativeLiveRender(live);
   },32);
 }
+function nativeLiveRenderStep(live,remaining){
+  if(live.source==='snapshot')return remaining>1200?96:remaining>480?32:remaining>160?12:remaining>60?6:3;
+  return remaining>1500?240:remaining>600?120:remaining>180?48:remaining>60?18:6;
+}
 function pumpNativeLiveRender(live){
   const remaining=live.targetText.length-live.text.length;
   if(remaining>0){
-    const step=remaining>1500?240:remaining>600?120:remaining>180?48:remaining>60?18:6;
+    const step=nativeLiveRenderStep(live,remaining);
     live.text=live.targetText.slice(0,live.text.length+step);
     renderNativeLiveItem(live);
   }
@@ -6277,9 +8103,14 @@ function renderNativeLiveItem(live){
 }
 function settleNativeLiveItem(live){
   live.element.classList.remove('streaming');
+  if(live.source==='snapshot'){
+    nativeRenderedMessageKeys.add(live.key);
+    nativeLiveItems.delete(live.key);
+  }
 }
-function finishNativeLiveItem(itemId){
-  const live=nativeLiveItems.get(String(itemId||''));
+function finishNativeLiveItem(itemId,turnId=''){
+  const key=nativeRuntimeLiveKey(itemId,turnId);
+  const live=nativeLiveItems.get(key)||[...nativeLiveItems.values()].find((item)=>item.source==='runtime'&&item.itemId===String(itemId||''));
   if(!live)return;
   live.complete=true;
   if(live.text.length<live.targetText.length)scheduleNativeLiveRender(live);else settleNativeLiveItem(live);
@@ -6292,6 +8123,12 @@ function finishAllNativeLiveItems(){
     if(live.text!==live.targetText){live.text=live.targetText;renderNativeLiveItem(live)}
     settleNativeLiveItem(live);
   }
+}
+function clearNativeLiveItems(){
+  for(const live of nativeLiveItems.values())if(live.renderTimer)clearTimeout(live.renderTimer);
+  nativeLiveItems.clear();
+  nativeRuntimeStreamTurnIds.clear();
+  nativeRenderedMessageKeys.clear();
 }
 async function copyText(text,button){try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text)}else{const tmp=document.createElement('textarea');tmp.value=text;tmp.setAttribute('readonly','');tmp.style.position='fixed';tmp.style.left='-9999px';document.body.appendChild(tmp);tmp.select();document.execCommand('copy');tmp.remove()}setIconLabel(button,'check','复制成功',false);setTimeout(()=>setIconLabel(button,'copy','复制此消息',false),1200)}catch(e){setIconLabel(button,'circle-alert','复制失败',false);setTimeout(()=>setIconLabel(button,'copy','复制此消息',false),1200)}}
 function hasFileDrag(e){return [...(e.dataTransfer?.items||[])].some((item)=>item.kind==='file')}
@@ -6343,7 +8180,7 @@ async function respondNativeRequest(payload){if(!currentNativeRequest)return;for
 function updateSafetyHint(){const mode=sandbox.value;safetyHint.className='safety '+(mode==='read-only'?'safe':mode==='workspace-write'?'warn':'danger');safetyHint.textContent=mode==='read-only'?'只读 · 不写入文件':mode==='workspace-write'?'工作区写入 · 当前目录':'高危全权限 · 首次发送需确认'}
 let completeAudioCtx;
 function playTaskCompleteSound(){try{const AudioContext=window.AudioContext||window.webkitAudioContext;if(!AudioContext)return;if(!completeAudioCtx)completeAudioCtx=new AudioContext();completeAudioCtx.resume?.();const now=completeAudioCtx.currentTime;const master=completeAudioCtx.createGain();master.gain.setValueAtTime(1.15,now);master.connect(completeAudioCtx.destination);[[660,0,.12],[880,.13,.22]].forEach(([freq,offset,duration])=>{const osc=completeAudioCtx.createOscillator();const gain=completeAudioCtx.createGain();osc.type='triangle';osc.frequency.value=freq;gain.gain.setValueAtTime(0.0001,now+offset);gain.gain.exponentialRampToValueAtTime(0.55,now+offset+0.006);gain.gain.exponentialRampToValueAtTime(0.0001,now+offset+duration);osc.connect(gain);gain.connect(master);osc.start(now+offset);osc.stop(now+offset+duration+.02)})}catch(e){}}
-async function cancelRun(){closeComposerPopovers();if(currentConversationSource!=='codex'||!currentConversationId)return;cancelBtn.disabled=true;statusEl.textContent='正在取消...';try{const res=await fetch('/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/interrupt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({turnId:activeNativeTurnId})});const data=await res.json();if(!res.ok)throw new Error(data.error||'取消失败');addMsg('log','已请求取消当前任务。');webRunActive=false;activeNativeTurnId='';removeNativeRunningElement();statusEl.textContent='Cancelled';applyConversationMode();setTimeout(syncCurrentNativeConversation,180);refreshHistory()}catch(e){statusEl.textContent=e.message;cancelBtn.disabled=false}}
+async function cancelRun(){closeComposerPopovers();if(currentConversationSource!=='codex'||!currentConversationId)return;cancelBtn.disabled=true;statusEl.textContent='正在取消...';try{const res=await fetch('/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/interrupt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({turnId:activeNativeTurnId})});const data=await res.json();if(!res.ok)throw new Error(data.error||'取消失败');addMsg('log','已请求取消当前任务。');freezeTurnProcessElapsed('',activeNativeTurnId);clearLiveTurnProgress();webRunActive=false;activeNativeTurnId='';removeNativeRunningElement();statusEl.textContent='Cancelled';applyConversationMode();setTimeout(syncCurrentNativeConversation,180);refreshHistory()}catch(e){statusEl.textContent=e.message;cancelBtn.disabled=false}}
 async function send(){
   closeComposerPopovers();
   const text=input.value.trim();
