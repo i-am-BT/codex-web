@@ -630,6 +630,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.composerModelMenuRow\.active\s*\{[^}]*background:\s*var\(--surface-hover\)/s);
     assert.match(uiStyles, /\.composerModelSubmenu\s*\{[^}]*left:\s*calc\(100% \+ 8px\);[^}]*right:\s*auto;[^}]*max-height:/s);
     assert.match(uiStyles, /\.composerModelPanel\[data-submenu\] \.composerModelMainMenu\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /body \.composer > \.box\s*\{[^}]*width:\s*min\(380px, calc\(100% - 20px\)\)/s);
     assert.match(uiStyles, /\.composerModelOption\[aria-selected="true"\]/);
     assert.match(uiStyles, /body \.box\.runActive > \.send:not\(\.cancelButton\):disabled\s*\{[^}]*display:\s*none/s);
     assert.match(uiStyles, /body \.cancelButton \.lucide\s*\{[^}]*fill:\s*currentColor;[^}]*stroke:\s*none/s);

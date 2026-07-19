@@ -7411,6 +7411,10 @@ body[data-chat-bg="skin"] .hist.active {
 }
 
 @media (max-width: 460px) {
+  body .composer > .box {
+    width: min(380px, calc(100% - 20px));
+  }
+
   .editedFilesResult.withPlan > .turnResultHead {
     gap: 6px;
     padding-inline: 9px;
