@@ -3620,7 +3620,7 @@ const dropZone = document.getElementById('dropZone'), attachFile = document.getE
 const provider = document.getElementById('provider'), model = document.getElementById('model'), reasoningEffort = document.getElementById('reasoningEffort'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
 const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
-const menuBtn = document.getElementById('menuBtn');
+const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
 const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
 const modeLabel = document.getElementById('modeLabel'), nativeNotice = document.getElementById('nativeNotice');
@@ -3725,6 +3725,15 @@ let imagePreviewReturnFocus = null;
 let appearance = {theme:'light',chatBackground:'default',customBackgrounds:[]};
 const desktopSidebarMedia=window.matchMedia('(min-width: 821px)');
 const SIDEBAR_STORAGE_KEY='codexWeb.sidebarCollapsed';
+const SIDEBAR_WIDTH_STORAGE_KEY='codexWeb.sidebarWidth.v1';
+const SIDEBAR_WIDTH_MIN=240;
+const SIDEBAR_WIDTH_MAX=480;
+const SIDEBAR_WIDTH_DEFAULT=316;
+const SIDEBAR_MAIN_MIN=480;
+let sidebarResizeHandle=null;
+let sidebarPreferredWidth=SIDEBAR_WIDTH_DEFAULT;
+let sidebarRenderedWidth=SIDEBAR_WIDTH_DEFAULT;
+let sidebarResizePointerId=null;
 const HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsCollapsed';
 const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
@@ -4697,6 +4706,7 @@ function enhanceInterface(){
   deleteBackground?.setAttribute('title','删除背景');
   setIconLabel(document.getElementById('logout'),'log-out','退出登录');
   menuBtn?.setAttribute('aria-controls','sidePanel');
+  enhanceSidebarResize();
   enhanceComposer();
   setIconLabel(loginForm?.querySelector('.primary'),'log-in','登录');
   if(titleEl)titleEl.textContent='新任务';
@@ -4725,7 +4735,7 @@ function enhanceInterface(){
     historyTitle.after(search);
   }
   history?.addEventListener('scroll',()=>hideHistoryProjectPreview(),{passive:true});
-  window.addEventListener('resize',()=>hideHistoryProjectPreview(),{passive:true});
+  window.addEventListener('resize',()=>{hideHistoryProjectPreview();renderSidebarWidth()},{passive:true});
   desktopSidebarMedia.addEventListener('change',()=>hideHistoryProjectPreview());
   const empty=document.querySelector('.empty');
   if(empty){
@@ -4754,7 +4764,7 @@ settingsToggle?.addEventListener('click', toggleSettings);
 menuBtn?.addEventListener('click', toggleMenu);
 document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
-desktopSidebarMedia.addEventListener?.('change',()=>{app.classList.remove('menuOpen');syncMenuButton()});
+desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();app.classList.remove('menuOpen');renderSidebarWidth();syncMenuButton()});
 document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
@@ -5571,8 +5581,22 @@ async function renameConversation(id,title,source='codex'){const next=prompt('�
 async function deleteConversation(id,title,source='codex'){const verb=source==='codex'?'归档':'删除';if(!confirm(verb+'会话：'+title+'？'))return;const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});const data=await res.json().catch(()=>({}));if(!res.ok){statusEl.textContent=data.error||verb+'失败';return}if(currentConversationId===id)newChat();await refreshHistory();statusEl.textContent=verb+'完成'}
 function sidebarCollapsedPreference(){try{return localStorage.getItem(SIDEBAR_STORAGE_KEY)==='1'}catch{return false}}
 function storeSidebarCollapsed(collapsed){try{localStorage.setItem(SIDEBAR_STORAGE_KEY,collapsed?'1':'0')}catch{}}
-function syncMenuButton(){if(!menuBtn)return;const desktop=desktopSidebarMedia.matches;const expanded=desktop?!app.classList.contains('sideCollapsed'):app.classList.contains('menuOpen');const label=desktop?(expanded?'收起侧栏':'展开侧栏'):(expanded?'关闭菜单':'打开菜单');const icon=desktop?(expanded?'panel-left-close':'panel-left-open'):(expanded?'x':'menu');setIconLabel(menuBtn,icon,label,false);menuBtn.setAttribute('aria-label',label);menuBtn.setAttribute('title',label);menuBtn.setAttribute('aria-expanded',String(expanded))}
-function restoreSidebarState(){app.classList.toggle('sideCollapsed',sidebarCollapsedPreference());app.classList.remove('menuOpen');syncMenuButton()}
+function sidebarWidthLimit(viewportWidth=window.innerWidth){const width=Number(viewportWidth);const viewport=Number.isFinite(width)?width:window.innerWidth;return Math.max(SIDEBAR_WIDTH_MIN,Math.min(SIDEBAR_WIDTH_MAX,Math.round(viewport-SIDEBAR_MAIN_MIN)))}
+function clampSidebarWidth(value,viewportWidth=window.innerWidth){const width=Number(value);const normalized=Number.isFinite(width)?Math.round(width):SIDEBAR_WIDTH_DEFAULT;return Math.max(SIDEBAR_WIDTH_MIN,Math.min(sidebarWidthLimit(viewportWidth),normalized))}
+function sidebarWidthPreference(){try{const stored=localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);if(stored===null)return SIDEBAR_WIDTH_DEFAULT;const width=Number(stored);if(!Number.isFinite(width)||width<=0)return SIDEBAR_WIDTH_DEFAULT;return Math.max(SIDEBAR_WIDTH_MIN,Math.min(SIDEBAR_WIDTH_MAX,Math.round(width)))}catch{return SIDEBAR_WIDTH_DEFAULT}}
+function storeSidebarWidth(width=sidebarRenderedWidth){try{localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY,String(Math.max(SIDEBAR_WIDTH_MIN,Math.min(SIDEBAR_WIDTH_MAX,Math.round(Number(width)||SIDEBAR_WIDTH_DEFAULT)))))}catch{}}
+function sidebarResizeEnabled(){return Boolean(sidebarResizeHandle&&desktopSidebarMedia.matches&&!app.classList.contains('sideCollapsed'))}
+function syncSidebarResizeHandle(){if(!sidebarResizeHandle)return;const enabled=sidebarResizeEnabled();sidebarResizeHandle.tabIndex=enabled?0:-1;sidebarResizeHandle.setAttribute('aria-disabled',String(!enabled));sidebarResizeHandle.setAttribute('aria-hidden',String(!enabled));sidebarResizeHandle.setAttribute('aria-valuemin',String(SIDEBAR_WIDTH_MIN));sidebarResizeHandle.setAttribute('aria-valuemax',String(sidebarWidthLimit()));sidebarResizeHandle.setAttribute('aria-valuenow',String(sidebarRenderedWidth));sidebarResizeHandle.setAttribute('aria-valuetext',sidebarRenderedWidth+' 像素')}
+function renderSidebarWidth(){sidebarRenderedWidth=clampSidebarWidth(sidebarPreferredWidth);document.documentElement.style.setProperty('--sidebar-width',sidebarRenderedWidth+'px');syncSidebarResizeHandle();return sidebarRenderedWidth}
+function setSidebarWidth(value,{persist=false}={}){sidebarPreferredWidth=clampSidebarWidth(value);const width=renderSidebarWidth();if(persist)storeSidebarWidth(width);return width}
+function resetSidebarWidth(){sidebarPreferredWidth=SIDEBAR_WIDTH_DEFAULT;const width=renderSidebarWidth();try{localStorage.removeItem(SIDEBAR_WIDTH_STORAGE_KEY)}catch{}return width}
+function beginSidebarResize(event){if(!sidebarResizeEnabled()||event.button!==0||event.isPrimary===false)return;sidebarResizePointerId=event.pointerId;app.classList.add('sidebarResizing');hideHistoryProjectPreview();closeHistoryProjectMenu();sidebarResizeHandle.focus({preventScroll:true});try{sidebarResizeHandle.setPointerCapture(event.pointerId)}catch{}event.preventDefault()}
+function updateSidebarResize(event){if(sidebarResizePointerId===null||event.pointerId!==sidebarResizePointerId)return;const left=app.getBoundingClientRect().left;setSidebarWidth(event.clientX-left)}
+function finishSidebarResize(event){if(sidebarResizePointerId===null)return;const pointerId=sidebarResizePointerId;if(event?.pointerId!==undefined&&event.pointerId!==pointerId)return;sidebarResizePointerId=null;app.classList.remove('sidebarResizing');try{if(sidebarResizeHandle?.hasPointerCapture?.(pointerId))sidebarResizeHandle.releasePointerCapture(pointerId)}catch{}storeSidebarWidth(sidebarRenderedWidth)}
+function handleSidebarResizeKey(event){if(!sidebarResizeEnabled())return;const step=event.shiftKey?32:8;let next=null;if(event.key==='ArrowLeft')next=sidebarRenderedWidth-step;else if(event.key==='ArrowRight')next=sidebarRenderedWidth+step;else if(event.key==='Home')next=SIDEBAR_WIDTH_MIN;else if(event.key==='End')next=sidebarWidthLimit();if(next===null)return;event.preventDefault();setSidebarWidth(next,{persist:true})}
+function enhanceSidebarResize(){if(!app||!sidePanel||sidebarResizeHandle)return;sidebarResizeHandle=document.createElement('div');sidebarResizeHandle.id='sidebarResizeHandle';sidebarResizeHandle.className='sidebarResizeHandle';sidebarResizeHandle.setAttribute('role','separator');sidebarResizeHandle.setAttribute('aria-label','调整侧栏宽度');sidebarResizeHandle.setAttribute('aria-orientation','vertical');sidebarResizeHandle.setAttribute('aria-controls','sidePanel');sidebarResizeHandle.title='拖动调整侧栏宽度，双击恢复默认';sidebarResizeHandle.addEventListener('pointerdown',beginSidebarResize);sidebarResizeHandle.addEventListener('pointermove',updateSidebarResize);sidebarResizeHandle.addEventListener('pointerup',finishSidebarResize);sidebarResizeHandle.addEventListener('pointercancel',finishSidebarResize);sidebarResizeHandle.addEventListener('lostpointercapture',finishSidebarResize);sidebarResizeHandle.addEventListener('keydown',handleSidebarResizeKey);sidebarResizeHandle.addEventListener('dblclick',(event)=>{if(!sidebarResizeEnabled())return;event.preventDefault();resetSidebarWidth()});window.addEventListener('blur',()=>finishSidebarResize());app.appendChild(sidebarResizeHandle)}
+function syncMenuButton(){if(!menuBtn)return;const desktop=desktopSidebarMedia.matches;const expanded=desktop?!app.classList.contains('sideCollapsed'):app.classList.contains('menuOpen');const label=desktop?(expanded?'收起侧栏':'展开侧栏'):(expanded?'关闭菜单':'打开菜单');const icon=desktop?(expanded?'panel-left-close':'panel-left-open'):(expanded?'x':'menu');setIconLabel(menuBtn,icon,label,false);menuBtn.setAttribute('aria-label',label);menuBtn.setAttribute('title',label);menuBtn.setAttribute('aria-expanded',String(expanded));syncSidebarResizeHandle()}
+function restoreSidebarState(){sidebarPreferredWidth=sidebarWidthPreference();renderSidebarWidth();app.classList.toggle('sideCollapsed',sidebarCollapsedPreference());app.classList.remove('menuOpen');syncMenuButton()}
 function toggleMenu(){if(desktopSidebarMedia.matches){const collapsed=app.classList.toggle('sideCollapsed');storeSidebarCollapsed(collapsed)}else{app.classList.toggle('menuOpen')}syncMenuButton()}
 function closeMenu(){if(!desktopSidebarMedia.matches)app.classList.remove('menuOpen');syncMenuButton()}
 function toggleSettings(){if(settingsOverlay?.classList.contains('hidden'))openSettings();else closeSettings()}

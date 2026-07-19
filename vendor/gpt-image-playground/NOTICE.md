@@ -46,6 +46,13 @@ on the image profile, so multi-image requests are split into concurrent
 single-image calls instead of sending an unsupported `n` parameter to
 Codex-compatible image gateways.
 
+In hybrid Agent mode, an explicit image request now falls back to the paired
+Images API profile when the initial text-planning request fails before any
+tool output is produced. Text-only prompts keep their original error behavior,
+and nested `response.failed.response.error` messages are surfaced instead of a
+generic streaming failure. The embedded build also relies on the host browser's
+native module-preload support, avoiding the iframe MutationObserver polyfill.
+
 The Codex Web build enables the Playground API proxy. Proxied requests include
 the normalized browser-configured API URL as `codex_upstream`; Codex Web only
 forwards supported image and Responses API paths to configured Provider origins

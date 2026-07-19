@@ -270,8 +270,13 @@ body .miniPrimary:hover {
 }
 
 body .app {
+  position: relative;
   height: 100dvh;
   background: var(--canvas);
+}
+
+.sidebarResizeHandle {
+  display: none;
 }
 
 body .side {
@@ -5413,13 +5418,60 @@ body[data-chat-bg="skin"] .hist.active {
 @media (min-width: 821px) {
   body .app {
     display: grid;
-    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+    grid-template-columns: clamp(240px, var(--sidebar-width), min(480px, calc(100vw - 480px))) minmax(0, 1fr);
     overflow: hidden;
     transition: grid-template-columns 180ms var(--ease);
   }
 
+  .sidebarResizeHandle {
+    position: absolute;
+    z-index: 20;
+    top: 0;
+    bottom: 0;
+    left: var(--sidebar-width);
+    display: block;
+    width: 14px;
+    cursor: col-resize;
+    outline: none;
+    touch-action: none;
+    transform: translateX(-50%);
+  }
+
+  .sidebarResizeHandle::before {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 1px;
+    background: transparent;
+    content: "";
+    transform: translateX(-50%);
+    transition: background 140ms var(--ease), box-shadow 140ms var(--ease);
+  }
+
+  .sidebarResizeHandle:hover::before,
+  .sidebarResizeHandle:focus-visible::before,
+  body .app.sidebarResizing .sidebarResizeHandle::before {
+    background: var(--primary);
+    box-shadow: 0 0 0 2px var(--primary-soft);
+  }
+
+  body .app.sidebarResizing {
+    cursor: col-resize;
+    user-select: none;
+    transition: none;
+  }
+
+  body .app.sidebarResizing .side {
+    transition: none;
+  }
+
   body .app.sideCollapsed {
     grid-template-columns: 0 minmax(0, 1fr);
+  }
+
+  body .app.sideCollapsed .sidebarResizeHandle {
+    display: none;
   }
 
   body .side {

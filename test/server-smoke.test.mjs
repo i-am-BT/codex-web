@@ -785,6 +785,8 @@ if (args[0] === 'app-server') {
     assert.match(playgroundAssetScript, /codex-web-agent/);
     assert.match(playgroundAssetScript, /agentApiConfigMode/);
     assert.match(playgroundAssetScript, /codex_upstream/);
+    assert.match(playgroundAssetScript, /Agent 规划服务暂时不可用，已切换为直接生图/);
+    assert.match(playgroundAssetScript, /上游 Agent 流式请求失败/);
     assert.match(playgroundAssetScript, /请求将通过 Codex Web 同源代理转发到此 URL/);
     assert.doesNotMatch(playgroundAssetScript, /此处设置被忽略/);
     const playgroundPatchSource = await readFile(
@@ -793,6 +795,9 @@ if (args[0] === 'app-server') {
     );
     assert.match(playgroundPatchSource, /baseUrl: existing\?\.baseUrl\?\.trim\(\) \|\| profile\.baseUrl/);
     assert.match(playgroundPatchSource, /apiKey: existing\?\.apiKey\?\.trim\(\) \|\| profile\.apiKey/);
+    assert.match(playgroundPatchSource, /responseError = getErrorMessageFromValue\(response\?\.error\)/);
+    assert.match(playgroundPatchSource, /isDirectAgentImageFallbackPrompt/);
+    assert.match(playgroundPatchSource, /modulePreload: \{ polyfill: false \}/);
     assert.match(playgroundAssetScript, /输入 @ 选择或上传参考图/);
     assert.match(playgroundAssetScript, /上传新的参考图/);
     const playgroundServiceWorker = await fetch(`${baseUrl}/playground/sw.js`, {
@@ -2062,13 +2067,15 @@ if (args[0] === 'app-server') {
         return previous;
       },
     };
+    const livePromptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
+    const liveAttachmentTray = { kind: 'attachment-tray', parentNode: null, isConnected: true };
     const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true };
     let liveComposerInsertCalls = 0;
     const liveComposer = {
-      children: [liveDropZone],
+      children: [livePromptQueuePanel, liveAttachmentTray, liveDropZone],
       insertBefore(node, reference) {
         liveComposerInsertCalls += 1;
-        assert.strictEqual(reference, liveDropZone);
+        assert.strictEqual(reference, livePromptQueuePanel);
         detachLiveNode(node);
         const index = this.children.indexOf(reference);
         assert.notEqual(index, -1);
@@ -2088,6 +2095,8 @@ if (args[0] === 'app-server') {
         return previous;
       },
     };
+    livePromptQueuePanel.parentNode = liveComposer;
+    liveAttachmentTray.parentNode = liveComposer;
     liveDropZone.parentNode = liveComposer;
     const toolArtifact = { kind: 'tool-artifact' };
     const liveElements = [toolArtifact];
@@ -2124,6 +2133,7 @@ if (args[0] === 'app-server') {
       'initialPlan',
       'composer',
       'dropZone',
+      'promptQueuePanel',
       `
         let liveEditedFilesResult = null;
         let liveTurnPlan = initialPlan;
@@ -2145,20 +2155,22 @@ if (args[0] === 'app-server') {
       referencePlan,
       liveComposer,
       liveDropZone,
+      livePromptQueuePanel,
     );
     const firstLivePill = liveResultApi.refresh();
     const secondLivePill = liveResultApi.refresh();
     assert.notStrictEqual(firstLivePill, secondLivePill);
     assert.deepEqual(liveTimeline.children, []);
-    assert.deepEqual(liveComposer.children, [secondLivePill, liveDropZone]);
+    assert.deepEqual(liveComposer.children, [secondLivePill, livePromptQueuePanel, liveAttachmentTray, liveDropZone]);
     assert.strictEqual(secondLivePill.parentNode, liveComposer);
+    assert.strictEqual(secondLivePill.nextSibling, livePromptQueuePanel);
     assert.strictEqual(liveComposer.children.at(-1), liveDropZone);
     assert.equal(liveComposerInsertCalls, 1);
     assert.deepEqual(liveResultApi.state().turnProcessElements, [toolArtifact]);
     assert.equal(liveResultApi.state().turnProcessElements.includes(secondLivePill), false);
     assert.equal(createdLiveCards.length, 2);
     assert.deepEqual(createdLiveCards.at(-1).options, { live: true, plan: referencePlan });
-    assert.match(inlineScript, /composer\.insertBefore\(liveEditedFilesResult,dropZone\)/);
+    assert.match(inlineScript, /const anchor=promptQueuePanel\?\.parentNode===composer\?promptQueuePanel:dropZone/);
     assert.match(inlineScript, /if\(files\.length\)container\.appendChild\(createEditedFilesResultCard\(files,turnId\)\)/);
 
     const searchActivity = createToolActivityItem({
