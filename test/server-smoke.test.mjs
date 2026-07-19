@@ -629,6 +629,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.msg\.user:hover \.msgActions/);
     assert.match(uiStyles, /\.msg\.user::after\s*\{[^}]*width:\s*min\(124px, 100%\);[^}]*height:\s*6px/s);
     assert.match(uiStyles, /\.msg\.user \.msgActions\s*\{[^}]*top:\s*calc\(100% - 1px\);[^}]*padding:\s*5px 0 0 8px/s);
+    assert.match(uiStyles, /\.msg\.user\.hasInputImage > \.msgBody\s*\{[^}]*border-radius:\s*16px;[^}]*background:\s*color-mix\(in oklab, var\(--text\) 5%, transparent\);[^}]*padding:\s*8px 12px/s);
     assert.match(uiStyles, /\.completionTimeline > \.activityBatch \+ \.activityBatch/);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.completionTimeline\s*\{[^}]*--text:\s*#ffffff;[^}]*--text-muted:\s*#acacac;[^}]*--text-subtle:\s*#7b7b7b/s);
     assert.match(uiStyles, /body \.msg\.process\.completionSummary\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
@@ -644,7 +645,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /--reasoning-flow-muted:\s*#b0b0b1/);
     assert.match(uiStyles, /\.reasoningStatus\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /> \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*var\(--reasoning-flow-muted\)[^}]*var\(--reasoning-flow-strong\)/s);
-    assert.match(uiStyles, /\.browserCommentChip\s*\{/);
+    assert.match(uiStyles, /\.browserCommentSteering > \.browserCommentSource\s*\{[^}]*display:\s*block;[^}]*background:\s*color-mix\(in oklab, var\(--text\) 5%, transparent\)/s);
     assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
     assert.match(uiStyles, /\.agentActivityItem\[open\] > \.agentActivityRow \.agentActivityChevron/);
@@ -1259,7 +1260,7 @@ updated_at = 1784422800000
     assert.match(page, /function showNativeSteerOptimistically/);
     assert.match(page, /kind:'steering_user'/);
     assert.match(page, /steering_browser_comment/);
-    assert.match(page, /function createBrowserCommentDetails/);
+    assert.doesNotMatch(page, /createBrowserCommentDetails/);
     assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><button id="automationToggle"[^>]*>自动化安排<\/button><\/div><button id="settingsToggle"/);
     assert.match(page, /function enhanceSubQuota/);
     assert.match(page, /subQuotaToggle\.id='subQuotaToggle'/);

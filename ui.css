@@ -3244,10 +3244,10 @@ body .msg.user.hasInputImage {
 body .msg.user.hasInputImage > .msgBody {
   width: fit-content;
   max-width: 100%;
-  border-radius: var(--radius);
-  background: var(--surface-active);
+  border-radius: 16px;
+  background: color-mix(in oklab, var(--text) 5%, transparent);
   color: var(--text);
-  padding: 9px 12px;
+  padding: 8px 12px;
 }
 
 body .msg.user.hasInputImage > .msgBody:empty {
@@ -4145,6 +4145,7 @@ body .msg.user.hasInputImage.browserCommentSteering {
   display: flex;
   width: 100%;
   max-width: 100%;
+  flex-direction: column;
   align-items: flex-end;
   margin: 3px 0 5px;
   overflow: visible;
@@ -4184,74 +4185,22 @@ body .msg.user.browserCommentSteering::after {
   object-fit: cover;
 }
 
-.browserCommentSource,
 .browserCommentSteering .msgActions {
   display: none;
 }
 
-.browserCommentDetails {
-  position: relative;
-  align-self: flex-end;
+.browserCommentSteering > .browserCommentSource {
+  display: block;
+  width: fit-content;
+  max-width: 77%;
   margin-top: 8px;
-}
-
-.browserCommentDetails > summary::marker,
-.browserCommentDetails > summary::-webkit-details-marker {
-  display: none;
-  content: "";
-}
-
-.browserCommentChip {
-  display: inline-flex;
-  min-height: 32px;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface);
+  border-radius: 16px;
+  background: color-mix(in oklab, var(--text) 5%, transparent);
   color: var(--text);
-  padding: 0 11px;
-  cursor: pointer;
+  padding: 8px 12px;
   font-size: 13px;
-  list-style: none;
-}
-
-.browserCommentChip:hover,
-.browserCommentDetails[open] > .browserCommentChip {
-  border-color: var(--border-strong);
-  background: var(--surface-raised);
-}
-
-.browserCommentChip .lucide {
-  width: 14px;
-  height: 14px;
-  color: var(--text-muted);
-}
-
-.browserCommentContent {
-  position: absolute;
-  z-index: 8;
-  top: calc(100% + 6px);
-  right: 0;
-  width: min(280px, calc(100vw - 32px));
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface-raised);
-  box-shadow: var(--shadow-md);
-  color: var(--text);
-  padding: 9px 11px;
-  font-size: 12px;
   line-height: 1.55;
-}
-
-.browserCommentContent p {
-  margin: 0;
-}
-
-.browserCommentContent p + p {
-  margin-top: 7px;
-  border-top: 1px solid var(--border);
-  padding-top: 7px;
+  white-space: pre-wrap;
 }
 
 .turnResultArtifacts {

@@ -8746,29 +8746,6 @@ function consumeNativeOptimisticSteering(text,at,turnId){
   }
   return null;
 }
-function browserCommentParts(text){return String(text||'').split(/\\n{2,}/).map((item)=>item.trim()).filter(Boolean)}
-function createBrowserCommentDetails(text,count){
-  const comments=browserCommentParts(text);
-  const total=Math.max(1,Number(count)||comments.length||1);
-  const details=document.createElement('details');
-  details.className='browserCommentDetails';
-  const summary=document.createElement('summary');
-  summary.className='browserCommentChip';
-  summary.setAttribute('aria-label','查看 '+total+' 条注释');
-  const icon=document.createElement('i');
-  icon.setAttribute('data-lucide','message-square');
-  icon.setAttribute('aria-hidden','true');
-  const label=document.createElement('span');
-  label.textContent=total+' 条注释';
-  summary.appendChild(icon);
-  summary.appendChild(label);
-  const content=document.createElement('div');
-  content.className='browserCommentContent';
-  for(const comment of comments){const item=document.createElement('p');item.textContent=comment;content.appendChild(item)}
-  details.appendChild(summary);
-  details.appendChild(content);
-  return details;
-}
 function appendConversationElement(element,role){
   if(role==='user'&&turnProcessHeader?.parentNode===chat)chat.insertBefore(element,turnProcessHeader);
   else chat.appendChild(element);
@@ -9022,7 +8999,7 @@ function addMsg(role,text,options={}){
       el._messageLabel=label;
     }else{
       el.appendChild(body);
-      if(browserCommentUser){body.classList.add('browserCommentSource');el.appendChild(createBrowserCommentDetails(text,options.annotationCount))}
+      if(browserCommentUser)body.classList.add('browserCommentSource');
       el.appendChild(actions);
     }
     el._messageBody=body;
