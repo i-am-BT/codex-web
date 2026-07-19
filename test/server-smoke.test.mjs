@@ -126,6 +126,14 @@ experimental_bearer_token = "test-token"
           },
         }),
         JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.929Z',
+          type: 'turn_context',
+          payload: {
+            cwd: temporary,
+            model: 'test-model',
+          },
+        }),
+        JSON.stringify({
           timestamp: '2026-07-11T04:52:31.990Z',
           type: 'event_msg',
           payload: { type: 'task_started', turn_id: nativeFirstTurnId },
@@ -446,6 +454,24 @@ if (args[0] === 'app-server') {
         send({ id: message.id, result: { data, nextCursor: null, backwardsCursor: null } });
       }
       else if (message.method === 'thread/start') send({ id: message.id, result: { thread: thread(createdThreadId) } });
+      else if (message.method === 'thread/read') {
+        const control = archiveControl();
+        const result = thread(message.params.threadId || fixtureThreadId);
+        const inProgress = control.inProgressThreadId === result.id;
+        result.status = inProgress ? { type: 'active', activeFlags: [] } : { type: 'idle' };
+        result.turns = inProgress
+          ? [{ id: control.inProgressTurnId, status: 'inProgress', items: [] }]
+          : [
+            { id: '${nativeSecondTurnId}', status: 'completed', items: [] },
+            {
+              id: '019f4f84-ea9f-73c2-b997-deba7b4aa799',
+              status: 'interrupted',
+              completedAt: null,
+              items: [],
+            },
+          ];
+        send({ id: message.id, result: { thread: result } });
+      }
       else if (message.method === 'thread/fork') send({ id: message.id, result: { thread: thread(forkedThreadId) } });
       else if (message.method === 'thread/resume') send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
       else if (message.method === 'turn/start') {
@@ -1169,7 +1195,7 @@ if (args[0] === 'app-server') {
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
     assert.match(page, /<option value="ultra">ultra<\/option>/);
     assert.match(page, /\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)/);
-    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\s*\{ preserveProviderModel: true \}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -2609,6 +2635,118 @@ if (args[0] === 'app-server') {
     });
     assert.equal(desktopInterrupted.status, 200);
 
+    const forksBeforeActiveSwitch = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'thread/fork').length;
+    await writeFile(appServerControlFile, JSON.stringify({
+      inProgressThreadId: nativeSessionId,
+      inProgressTurnId: nativeSecondTurnId,
+    }));
+    const activeSwitch = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'switch while active',
+        provider: 'alternate',
+        model: 'alternate-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(activeSwitch.status, 409);
+    assert.match((await activeSwitch.json()).error, /当前任务仍在运行/);
+    const forksAfterActiveSwitch = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'thread/fork').length;
+    assert.equal(forksAfterActiveSwitch, forksBeforeActiveSwitch);
+    await writeFile(appServerControlFile, '{}');
+
+    const desktopStartsBeforeProviderSwitch = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-follower-start-turn',
+    ).length;
+    desktopIpc.ownerAvailable = false;
+    const switchedProvider = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'switch provider',
+        provider: 'alternate',
+        model: 'alternate-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(switchedProvider.status, 202);
+    const switchedProviderPayload = await switchedProvider.json();
+    assert.ok(switchedProviderPayload.turnId);
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-start-turn').length,
+      desktopStartsBeforeProviderSwitch,
+    );
+    const switchedProviderMessages = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    const switchedProviderFork = switchedProviderMessages.findLast((message) => message.method === 'thread/fork');
+    assert.equal(switchedProviderFork.params.threadId, nativeSessionId);
+    assert.equal(switchedProviderFork.params.lastTurnId, nativeSecondTurnId);
+    assert.equal(switchedProviderFork.params.modelProvider, 'alternate');
+    assert.equal(switchedProviderFork.params.model, 'alternate-model');
+    assert.equal(switchedProviderPayload.threadId, forkedNativeSessionId);
+    assert.equal(switchedProviderPayload.sourceThreadId, nativeSessionId);
+    const interruptedProviderSwitch = await fetch(`${baseUrl}/api/native-sessions/${switchedProviderPayload.threadId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: switchedProviderPayload.turnId }),
+    });
+    assert.equal(interruptedProviderSwitch.status, 200);
+    desktopIpc.ownerAvailable = true;
+
+    const desktopStartsBeforeModelSwitch = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-follower-start-turn',
+    ).length;
+    const switchedModel = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'switch model',
+        provider: 'fake',
+        model: 'new-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(switchedModel.status, 202);
+    const switchedModelPayload = await switchedModel.json();
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-start-turn').length,
+      desktopStartsBeforeModelSwitch,
+    );
+    const modelSwitchMessages = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    const switchedModelFork = modelSwitchMessages.findLast((message) => message.method === 'thread/fork');
+    assert.equal(switchedModelFork.params.threadId, nativeSessionId);
+    assert.equal(switchedModelFork.params.lastTurnId, nativeSecondTurnId);
+    assert.equal(switchedModelFork.params.modelProvider, 'fake');
+    assert.equal(switchedModelFork.params.model, 'new-model');
+    assert.equal(switchedModelPayload.threadId, forkedNativeSessionId);
+    assert.equal(switchedModelPayload.sourceThreadId, nativeSessionId);
+    const interruptedModelSwitch = await fetch(`${baseUrl}/api/native-sessions/${switchedModelPayload.threadId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: switchedModelPayload.turnId }),
+    });
+    assert.equal(interruptedModelSwitch.status, 200);
+
     desktopIpc.startTurnMode = 'echo-only';
     desktopIpc.onStartTurn = async (message) => {
       const text = message.params.turnStartParams.input.find((item) => item.type === 'text')?.text || '';
@@ -2806,6 +2944,7 @@ if (args[0] === 'app-server') {
       text_elements: [],
     }]);
     assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
+    assert.equal(desktopStart.params.turnStartParams.modelProvider, 'fake');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-steer-turn'));
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
@@ -3062,8 +3201,9 @@ if (args[0] === 'app-server') {
         .length,
       createdDeleteCountBeforeBulkRace,
     );
-    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 1);
-    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 2);
+    const resumeMessages = protocolMessages.filter((message) => message.method === 'thread/resume');
+    assert.equal(resumeMessages.length, 1);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 4);
     const restartFromFirstMessage = protocolMessages.find((message) => (
       message.method === 'thread/start'
       && message.params.sandbox === 'read-only'
@@ -3071,16 +3211,34 @@ if (args[0] === 'app-server') {
     ));
     assert.ok(restartFromFirstMessage);
     const forkMessages = protocolMessages.filter((message) => message.method === 'thread/fork');
-    assert.equal(forkMessages.length, 2);
-    const forkMessage = forkMessages[0];
+    assert.equal(forkMessages.length, 4);
+    const forkMessage = forkMessages.find((message) => (
+      message.params.threadId === nativeSessionId
+      && message.params.lastTurnId === nativeFirstTurnId
+      && message.params.modelProvider === 'fake'
+    ));
+    assert.ok(forkMessage);
     assert.equal(forkMessage.params.threadId, nativeSessionId);
     assert.equal(forkMessage.params.lastTurnId, nativeFirstTurnId);
     assert.equal(forkMessage.params.sandbox, 'workspace-write');
     assert.equal(forkMessage.params.approvalPolicy, 'on-request');
+    assert.ok(forkMessages.some((message) => (
+      message.params.threadId === nativeSessionId
+      && message.params.lastTurnId === nativeSecondTurnId
+      && message.params.modelProvider === 'alternate'
+      && message.params.model === 'alternate-model'
+    )));
+    assert.ok(forkMessages.some((message) => (
+      message.params.threadId === nativeSessionId
+      && message.params.lastTurnId === nativeSecondTurnId
+      && message.params.modelProvider === 'fake'
+      && message.params.model === 'new-model'
+    )));
     const turnStartMessages = protocolMessages.filter((message) => message.method === 'turn/start');
-    assert.equal(turnStartMessages[0].params.sandboxPolicy.type, 'workspaceWrite');
-    assert.deepEqual(turnStartMessages[0].params.sandboxPolicy.writableRoots, [temporary]);
-    assert.equal(turnStartMessages[1].params.sandboxPolicy.type, 'readOnly');
+    const workspaceWriteTurn = turnStartMessages.find((message) => message.params.sandboxPolicy.type === 'workspaceWrite');
+    assert.ok(workspaceWriteTurn);
+    assert.deepEqual(workspaceWriteTurn.params.sandboxPolicy.writableRoots, [temporary]);
+    assert.ok(turnStartMessages.some((message) => message.params.sandboxPolicy.type === 'readOnly'));
     const steerMessage = protocolMessages.find((message) => message.method === 'turn/steer');
     assert.equal(steerMessage.params.expectedTurnId, continuedPayload.turnId);
     assert.deepEqual(steerMessage.params.input, [{ type: 'text', text: 'change direction while running' }]);

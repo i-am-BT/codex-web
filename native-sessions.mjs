@@ -939,6 +939,9 @@ function applyNativeRecord(cache, record, maxMessages) {
 function applyMetadataRecord(cache, record) {
   const payload = record?.payload || {};
   if (record?.type === 'session_meta') {
+    const metadataId = String(payload.id || '').trim().toLowerCase();
+    const cacheId = String(cache.id || '').trim().toLowerCase();
+    if (metadataId && cacheId && metadataId !== cacheId) return;
     cache.metadata = {
       ...cache.metadata,
       id: payload.id || cache.id,

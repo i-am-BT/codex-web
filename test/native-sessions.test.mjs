@@ -38,6 +38,16 @@ test('native session store lists, parses, and incrementally follows Codex JSONL'
         },
       },
       {
+        timestamp: '2026-07-11T04:52:31.929Z',
+        type: 'session_meta',
+        payload: {
+          id: '019f4f84-ea9f-73c2-b997-deba7b4aa730',
+          cwd: '/other-workspace',
+          model_provider: 'other-provider',
+          cli_version: 'other-cli',
+        },
+      },
+      {
         timestamp: '2026-07-11T04:52:31.999Z',
         type: 'turn_context',
         payload: { turn_id: 'turn-1' },
