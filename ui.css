@@ -3113,6 +3113,7 @@ body .history {
 }
 
 body .hist {
+  position: relative;
   grid-template-columns: minmax(0, 1fr) auto auto auto;
   min-height: 34px;
   gap: 2px;
@@ -3130,7 +3131,7 @@ body .hist.native {
 }
 
 body .hist.native.running {
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
 }
 
 body .hist:hover {
@@ -3216,14 +3217,19 @@ body .histDelete .lucide {
 }
 
 .histRunning {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: -4px;
   display: block;
   width: 9px;
   height: 9px;
-  flex: 0 0 9px;
   border: 1.5px solid var(--success);
   border-radius: 50%;
   background: var(--surface);
   box-shadow: 0 0 0 2px var(--success-soft);
+  pointer-events: none;
+  transform: translateY(-50%);
 }
 
 body .histSource {
@@ -5967,13 +5973,19 @@ body[data-theme="light"] .composer:has(> .composerProjectPicker:not(.hidden)) {
 }
 
 body[data-theme="light"] .composerProjectToggle {
-  border-color: #e2e4e8;
-  background: #f5f6f7;
+  border-color: transparent;
+  background: #f6f6f6;
+  box-shadow: none;
+}
+
+body[data-theme="light"] .composerProjectToggle:hover,
+body[data-theme="light"] .composerProjectToggle[aria-expanded="true"] {
+  background: #f6f6f6;
 }
 
 body[data-theme="light"] .box,
 body[data-theme="light"] .box:focus-within {
-  border-color: #e1e3e6;
+  border-color: #e2e2e2;
   background: #ffffff;
   box-shadow: 0 4px 14px rgba(31, 35, 41, 0.06);
 }
@@ -6276,7 +6288,7 @@ body[data-theme="dark"] .composerProjectToggle {
 }
 
 body[data-theme="light"] .composerProjectToggle {
-  background: #f5f6f7;
+  background: #f6f6f6;
 }
 
 body[data-theme] .box textarea:focus {
@@ -6496,8 +6508,9 @@ body .cancelButton .lucide {
   margin-bottom: -18px;
   overflow: hidden auto;
   border: 1px solid var(--border);
+  border-bottom-color: transparent;
   border-radius: 18px 18px 0 0;
-  background: var(--surface);
+  background: var(--surface-raised);
   padding-bottom: 18px;
   box-shadow: none;
 }
@@ -6529,7 +6542,8 @@ body .cancelButton .lucide {
   grid-template-columns: 18px minmax(0, 1fr) auto 30px 30px;
   align-items: center;
   gap: 4px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 42%, transparent);
+  background: transparent;
   padding: 5px 7px 5px 10px;
   transition: background 140ms var(--ease), opacity 140ms var(--ease);
 }
@@ -6539,15 +6553,21 @@ body .cancelButton .lucide {
 }
 
 .promptQueueRow:hover {
-  background: var(--surface-hover);
+  background: transparent;
 }
 
 .promptQueueRow.sending {
-  background: var(--primary-soft);
+  background: transparent;
 }
 
 .promptQueueRow.failed {
-  background: var(--danger-soft);
+  background: transparent;
+}
+
+body[data-theme="dark"] .promptQueue {
+  border-color: #454545;
+  border-bottom-color: transparent;
+  background: #2b2b2b;
 }
 
 .promptQueueLead {
@@ -6852,6 +6872,165 @@ body .attachmentChip button {
   overscroll-behavior: contain;
 }
 
+.composerReasoningSlider {
+  display: grid;
+  gap: 8px;
+  padding: 7px 10px 12px;
+}
+
+.composerReasoningDefault {
+  display: grid;
+  width: 100%;
+  min-height: 36px;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 7px 8px;
+  font-size: 12px;
+  text-align: left;
+}
+
+.composerReasoningDefault:hover,
+.composerReasoningDefault:focus-visible,
+.composerReasoningDefault[aria-checked="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.composerReasoningDefault .lucide {
+  width: 16px;
+  height: 16px;
+  opacity: 0;
+}
+
+.composerReasoningDefault[aria-checked="true"] .lucide {
+  opacity: 1;
+}
+
+.composerReasoningCurrent {
+  min-height: 20px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 20px;
+  text-align: center;
+}
+
+.composerReasoningRangeWrap {
+  position: relative;
+  display: grid;
+  height: 34px;
+  align-items: center;
+  padding-inline: 7px;
+}
+
+.composerReasoningRange {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  height: 34px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.composerReasoningRange::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--text) 0 var(--reasoning-progress), var(--border-strong) var(--reasoning-progress) 100%);
+}
+
+.composerReasoningRange::-webkit-slider-thumb {
+  width: 15px;
+  height: 15px;
+  margin-top: -6px;
+  border: 2px solid var(--text);
+  border-radius: 50%;
+  appearance: none;
+  background: var(--surface);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.composerReasoningRange::-moz-range-track {
+  height: 3px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--border-strong);
+}
+
+.composerReasoningRange::-moz-range-progress {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--text);
+}
+
+.composerReasoningRange::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--text);
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.composerReasoningRange:focus-visible {
+  box-shadow: none;
+}
+
+.composerReasoningRange:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 5px var(--primary-soft);
+}
+
+.composerReasoningMarks {
+  position: absolute;
+  z-index: 1;
+  right: 7px;
+  left: 7px;
+  display: grid;
+  grid-template-columns: repeat(var(--reasoning-step-count), 1fr);
+  align-items: center;
+  pointer-events: none;
+}
+
+.composerReasoningMark {
+  width: 4px;
+  height: 4px;
+  justify-self: center;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+
+.composerReasoningMark:first-child {
+  justify-self: start;
+}
+
+.composerReasoningMark:last-child {
+  justify-self: end;
+}
+
+.composerReasoningMark.active {
+  background: var(--text);
+}
+
+.composerReasoningSlider.default .composerReasoningRange,
+.composerReasoningSlider.default .composerReasoningMarks {
+  opacity: 0.62;
+}
+
+.composerReasoningEndpoints {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-subtle);
+  padding-inline: 6px;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
 .composerModelOption {
   width: 100%;
   min-height: 42px;
@@ -7101,13 +7280,24 @@ body[data-chat-bg="skin"] .top {
   backdrop-filter: blur(16px) saturate(1.08);
 }
 
-body[data-chat-bg="skin"] .box,
-body[data-chat-bg="skin"] .promptQueue,
 body[data-chat-bg="skin"] .composerPopover,
 body[data-chat-bg="skin"] .composerProjectPanel {
   background: var(--skin-surface-strong);
   border-color: var(--primary-line);
   backdrop-filter: blur(18px) saturate(1.08);
+}
+
+body[data-chat-bg="skin"] .box {
+  border-color: var(--primary-line);
+  background: transparent;
+  backdrop-filter: none;
+}
+
+body[data-chat-bg="skin"] .promptQueue {
+  border-color: var(--primary-line);
+  border-bottom-color: transparent;
+  background: transparent;
+  backdrop-filter: none;
 }
 
 body[data-chat-bg="skin"] .msg.image,

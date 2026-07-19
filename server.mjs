@@ -4085,6 +4085,85 @@ function renderComposerModelMenuState(){
   }
   composerModelRunHint?.classList.toggle('hidden',!webRunActive||currentConversationSource!=='codex');
 }
+function renderComposerReasoningSlider(source){
+  const entries=[...source.options]
+    .filter((option)=>!option.disabled)
+    .map((option)=>({value:option.value,label:composerEffortLabel(option.value)}));
+  const defaultEntry=entries.find((entry)=>entry.value==='');
+  const levels=entries.filter((entry)=>entry.value);
+  if(!levels.length)return;
+  const container=document.createElement('div');
+  container.className='composerReasoningSlider';
+  const defaultButton=document.createElement('button');
+  defaultButton.type='button';
+  defaultButton.className='composerReasoningDefault';
+  defaultButton.setAttribute('role','radio');
+  const defaultLabel=document.createElement('span');
+  defaultLabel.textContent='使用模型默认';
+  const defaultCheck=document.createElement('i');
+  defaultCheck.setAttribute('data-lucide','check');
+  defaultCheck.setAttribute('aria-hidden','true');
+  defaultButton.append(defaultLabel,defaultCheck);
+  const current=document.createElement('strong');
+  current.className='composerReasoningCurrent';
+  const rangeWrap=document.createElement('div');
+  rangeWrap.className='composerReasoningRangeWrap';
+  const range=document.createElement('input');
+  range.type='range';
+  range.className='composerReasoningRange';
+  range.min='0';
+  range.max=String(levels.length-1);
+  range.step='1';
+  range.setAttribute('aria-label','推理强度');
+  const marks=document.createElement('div');
+  marks.className='composerReasoningMarks';
+  marks.style.setProperty('--reasoning-step-count',String(levels.length));
+  for(const entry of levels){
+    const mark=document.createElement('span');
+    mark.className='composerReasoningMark';
+    mark.dataset.value=entry.value;
+    mark.title=entry.label;
+    marks.appendChild(mark);
+  }
+  const endpoints=document.createElement('div');
+  endpoints.className='composerReasoningEndpoints';
+  const low=document.createElement('span');
+  low.textContent=levels[0].label;
+  const high=document.createElement('span');
+  high.textContent=levels.at(-1).label;
+  endpoints.append(low,high);
+  rangeWrap.append(range,marks);
+  container.append(defaultButton,current,rangeWrap,endpoints);
+  composerModelSubmenuOptions.appendChild(container);
+  let sliderIndex=levels.findIndex((entry)=>entry.value===source.value);
+  if(sliderIndex<0)sliderIndex=Math.max(0,levels.findIndex((entry)=>entry.value==='medium'));
+  const sync=()=>{
+    const explicitIndex=levels.findIndex((entry)=>entry.value===source.value);
+    if(explicitIndex>=0)sliderIndex=explicitIndex;
+    range.value=String(sliderIndex);
+    const label=source.value===''?(defaultEntry?.label||'默认'):composerEffortLabel(source.value);
+    current.textContent=label;
+    defaultButton.setAttribute('aria-checked',String(source.value===''));
+    container.classList.toggle('default',source.value==='');
+    range.setAttribute('aria-valuetext',label);
+    const progress=levels.length>1?(sliderIndex/(levels.length-1))*100:100;
+    range.style.setProperty('--reasoning-progress',progress.toFixed(2)+'%');
+    [...marks.children].forEach((mark,index)=>mark.classList.toggle('active',source.value!==''&&index===sliderIndex));
+  };
+  const selectValue=(value)=>{
+    source.value=value;
+    source.dispatchEvent(new Event('change',{bubbles:true}));
+    sync();
+  };
+  defaultButton.addEventListener('click',()=>selectValue(''));
+  range.addEventListener('input',()=>{
+    sliderIndex=Math.max(0,Math.min(levels.length-1,Number(range.value)||0));
+    selectValue(levels[sliderIndex].value);
+  });
+  sync();
+  refreshIcons(container);
+  range.focus();
+}
 function openComposerModelSubmenu(kind){
   const source=composerModelMenuSource(kind);
   if(!source||source.disabled||!composerModelSubmenuOptions)return;
@@ -4094,6 +4173,10 @@ function openComposerModelSubmenu(kind){
   renderComposerModelMenuState();
   composerModelSubmenuTitle.textContent=kind==='model'?'模型':kind==='reasoning'?'推理强度':'高级';
   composerModelSubmenuOptions.replaceChildren();
+  if(kind==='reasoning'){
+    renderComposerReasoningSlider(source);
+    return;
+  }
   for(const option of source.options){
     if(option.disabled)continue;
     const button=document.createElement('button');
