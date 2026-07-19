@@ -1426,13 +1426,34 @@ body[data-theme] .automationSettingRow input {
   text-align: right;
 }
 
-body[data-theme] .automationSettingRow input[type="time"] {
-  max-width: 112px;
+.automationTimeControl {
+  position: relative;
+  min-width: 92px;
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  justify-self: end;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 460;
 }
 
-body[data-theme] .automationSettingRow input[type="time"]::-webkit-calendar-picker-indicator {
-  margin-left: 8px;
-  opacity: 0.56;
+.automationTimeControl .lucide {
+  width: 14px;
+  height: 14px;
+  color: var(--text-subtle);
+}
+
+body[data-theme] .automationTimeControl input[type="time"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  min-height: 100%;
+  max-width: none;
+  cursor: pointer;
+  opacity: 0;
 }
 
 body[data-theme] .automationSettingRow select {
@@ -6425,6 +6446,10 @@ body[data-chat-bg="skin"] .hist.active {
     overflow: hidden;
     font-size: 13px;
     text-overflow: ellipsis;
+  }
+
+  .automationTimeControl {
+    min-height: 46px;
   }
 
   .automationFormMessage {

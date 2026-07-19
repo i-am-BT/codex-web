@@ -1186,7 +1186,8 @@ updated_at = 1784422800000
     assert.match(page, /id="automationFrequency"[^>]*>.*<option value="hourly">每隔数小时/s);
     assert.match(page, /id="automationDayField" class="automationSettingRow hidden"/);
     assert.match(page, /id="automationIntervalField" class="automationSettingRow hidden"/);
-    assert.match(page, /id="automationTime" type="time" value="09:00"/);
+    assert.match(page, /class="automationTimeControl"[^>]*>.*id="automationTimeDisplay">9:00.*id="automationTime" type="time" value="09:00"/s);
+    assert.match(page, /getElementById\('automationTime'\)\?\.addEventListener\('input',syncAutomationTimeDisplay\)/);
     assert.match(page, /id="automationNotification"[^>]*><option value="always">所有运行/);
     assert.match(page, /automationFrequency\?\.addEventListener\('change',syncAutomationScheduleFields\)/);
     assert.match(page, /notificationPolicy:document\.getElementById\('automationNotification'\)\?\.value\|\|'always'/);
