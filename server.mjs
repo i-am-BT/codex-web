@@ -27,6 +27,11 @@ import {
   ImagePromptLibrary,
 } from './image-prompt-library.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
+import {
+  AutomationStore,
+  buildAutomationRrule,
+  decorateAutomation,
+} from './automation-store.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -166,6 +171,7 @@ const nativeSessions = new NativeSessionStore(CODEX_HOME, {
   maxSessions: NATIVE_SESSION_MAX_ITEMS,
   pollIntervalMs: NATIVE_SESSION_POLL_MS,
 });
+const automationStore = new AutomationStore(CODEX_HOME);
 const appServerClient = new CodexAppServerClient({
   bin: CODEX_BIN,
   cwd: CODEX_PROCESS_HOME,
@@ -494,6 +500,46 @@ app.get('/api/image-prompts', requireAuth, (_req, res) => {
     res.json(imagePromptLibrary.getLibrary());
   } catch (err) {
     res.status(500).json({ error: `读取提示词库失败: ${err.message}` });
+  }
+});
+
+app.get('/api/automations', requireAuth, (_req, res) => {
+  try {
+    const automations = automationStore.list().map(decorateAutomation);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ automations, count: automations.length });
+  } catch (err) {
+    res.status(500).json({ error: `读取自动化安排失败: ${err.message}` });
+  }
+});
+
+app.post('/api/automations', requireAuth, async (req, res) => {
+  try {
+    const automation = automationStore.create({
+      name: req.body?.name,
+      prompt: req.body?.prompt,
+      rrule: buildAutomationRrule(req.body?.schedule),
+      cwd: req.body?.cwd,
+      model: req.body?.model,
+      reasoningEffort: req.body?.reasoningEffort,
+      notificationPolicy: req.body?.notificationPolicy,
+      status: req.body?.status,
+    });
+    await notifyDesktopAutomationsChanged();
+    res.status(201).json({ ok: true, automation: decorateAutomation(automation) });
+  } catch (err) {
+    res.status(400).json({ error: `创建自动化安排失败: ${err.message}` });
+  }
+});
+
+app.patch('/api/automations/:id/status', requireAuth, async (req, res) => {
+  try {
+    const automation = automationStore.setStatus(String(req.params.id || ''), String(req.body?.status || ''));
+    if (!automation) return res.status(404).json({ error: '自动化安排不存在' });
+    await notifyDesktopAutomationsChanged();
+    res.json({ ok: true, automation: decorateAutomation(automation) });
+  } catch (err) {
+    res.status(400).json({ error: `更新自动化安排失败: ${err.message}` });
   }
 });
 
@@ -2802,6 +2848,15 @@ async function notifyDesktopArchivedThreadsChanged() {
   }
 }
 
+async function notifyDesktopAutomationsChanged() {
+  try {
+    await desktopIpcClient.invalidateQueryCache(['list-automations']);
+    await desktopIpcClient.invalidateQueryCache(['inbox-items']);
+  } catch (error) {
+    console.warn(`Codex Desktop IPC 自动化列表刷新失败: ${error.message}`);
+  }
+}
+
 async function startNativeTurn(threadId, turn) {
   const result = await appServerClient.request('turn/start', compactObject({
     threadId,
@@ -3608,7 +3663,7 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button><button id="automationToggle" class="automationToggle" type="button">自动化安排</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="automationView" class="automationView hidden" aria-labelledby="automationViewTitle"><div class="automationViewInner"><header class="automationViewHeader"><div><h1 id="automationViewTitle">已安排的任务</h1><p>让 Codex 安排任务、设置提醒或监测更新</p></div><button id="automationCreate" class="automationCreate" type="button"><i data-lucide="plus" aria-hidden="true"></i><span>新建自动化</span></button></header><div class="automationToolbar"><label class="automationSearch"><span class="srOnly">搜索已安排任务</span><i data-lucide="search" aria-hidden="true"></i><input id="automationSearch" type="search" placeholder="搜索已安排任务" autocomplete="off"></label><label class="automationFilter"><span class="srOnly">状态</span><select id="automationFilter"><option value="">全部状态</option><option value="ACTIVE">运行中</option><option value="PAUSED">已暂停</option></select></label><button id="automationRefresh" class="automationRefresh" type="button"><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button></div><div id="automationStatus" class="automationStatus" role="status" aria-live="polite"></div><div id="automationList" class="automationList"></div></div><div id="automationEditor" class="automationEditor hidden" role="presentation"><form id="automationForm" class="automationForm" aria-labelledby="automationFormTitle"><div class="automationFormHead"><div><div class="automationFormEyebrow">Codex 自动化</div><h2 id="automationFormTitle">新建自动化安排</h2><p>保存后会写入 Codex App 正式自动化目录，并同步刷新 App。</p></div><button id="automationFormClose" class="automationIconButton" type="button" aria-label="关闭"><i data-lucide="x" aria-hidden="true"></i></button></div><div class="automationFormGrid"><label class="automationField automationFieldWide"><span>名称</span><input id="automationName" maxlength="120" required placeholder="例如：每日项目简报"></label><label class="automationField automationFieldWide"><span>任务说明</span><textarea id="automationPrompt" rows="5" maxlength="12000" required placeholder="告诉 Codex 每次运行时要完成什么"></textarea></label><label class="automationField"><span>频率</span><select id="automationFrequency"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option><option value="hourly">每隔数小时</option></select></label><label id="automationTimeField" class="automationField"><span>时间</span><input id="automationTime" type="time" value="09:00" required></label><label id="automationDayField" class="automationField hidden"><span>星期</span><select id="automationDay"><option value="MO">周一</option><option value="TU">周二</option><option value="WE">周三</option><option value="TH">周四</option><option value="FR">周五</option><option value="SA">周六</option><option value="SU">周日</option></select></label><label id="automationIntervalField" class="automationField hidden"><span>间隔小时</span><input id="automationInterval" type="number" min="1" max="24" value="3"></label><label class="automationField automationFieldWide"><span>项目目录</span><input id="automationCwd" placeholder="留空则作为无项目任务"></label><label class="automationField"><span>模型</span><input id="automationModel" placeholder="使用当前默认模型"></label><label class="automationField"><span>思考档位</span><select id="automationReasoning"><option value="">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option><option value="ultra">超高</option></select></label><label class="automationField automationCheckbox"><input id="automationStartPaused" type="checkbox"><span>先暂停，稍后手动启用</span></label></div><div id="automationFormMessage" class="automationFormMessage" role="alert"></div><div class="automationFormActions"><button id="automationFormCancel" class="automationSecondary" type="button">取消</button><button id="automationFormSubmit" class="automationPrimary" type="submit"><i data-lucide="calendar-plus" aria-hidden="true"></i><span>创建自动化</span></button></div></form></div></section><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
 <div id="nativeRequestModal" class="requestOverlay hidden" role="presentation"><div class="requestPanel" role="dialog" aria-modal="true" aria-labelledby="nativeRequestTitle"><div class="requestHead"><div><div id="nativeRequestTitle" class="requestTitle">Codex 请求确认</div><div id="nativeRequestMeta" class="requestMeta"></div></div></div><pre id="nativeRequestDetail" class="requestDetail"></pre><form id="nativeRequestForm"><div id="nativeRequestFields" class="requestFields"></div><div id="nativeRequestActions" class="requestActions"></div></form></div></div>
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
@@ -3620,6 +3675,7 @@ const dropZone = document.getElementById('dropZone'), attachFile = document.getE
 const provider = document.getElementById('provider'), model = document.getElementById('model'), reasoningEffort = document.getElementById('reasoningEffort'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
 const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
+const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
 const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
 const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
@@ -3634,6 +3690,9 @@ let activeMainView = 'chat';
 let archivedItems = [];
 let archivedLoading = false;
 let archiveNotice = '';
+let automationItems = [];
+let automationLoading = false;
+let automationNotice = '';
 let conversationLoadSeq = 0;
 let nativeCursor = 0;
 let nativeGeneration = 0;
@@ -4694,6 +4753,9 @@ function enhanceInterface(){
   setIconLabel(archiveToggle,'archive','已归档任务',false);
   archiveToggle?.setAttribute('title','已归档任务');
   archiveToggle?.setAttribute('aria-pressed','false');
+  setIconLabel(automationToggle,'calendar-clock','自动化安排',false);
+  automationToggle?.setAttribute('title','自动化安排');
+  automationToggle?.setAttribute('aria-pressed','false');
   setIconLabel(archiveRefresh,'refresh-cw','刷新');
   setIconLabel(archiveDeleteAll,'trash-2','永久删除全部');
   setIconLabel(settingsToggle,'settings','设置',false);
@@ -4759,6 +4821,16 @@ archiveSearch?.addEventListener('input',renderArchivedTasks);
 archiveProjectFilter?.addEventListener('change',renderArchivedTasks);
 archiveRefresh?.addEventListener('click',()=>loadArchivedTasks({force:true}));
 archiveDeleteAll?.addEventListener('click',deleteAllArchivedTasks);
+automationToggle?.addEventListener('click',openAutomationView);
+automationSearch?.addEventListener('input',renderAutomations);
+automationFilter?.addEventListener('change',renderAutomations);
+automationRefresh?.addEventListener('click',()=>loadAutomations({force:true}));
+automationCreate?.addEventListener('click',openAutomationEditor);
+document.getElementById('automationFormClose')?.addEventListener('click',closeAutomationEditor);
+document.getElementById('automationFormCancel')?.addEventListener('click',closeAutomationEditor);
+automationEditor?.addEventListener('click',(event)=>{if(event.target===automationEditor)closeAutomationEditor()});
+automationFrequency?.addEventListener('change',syncAutomationScheduleFields);
+automationForm?.addEventListener('submit',createAutomation);
 document.getElementById('refreshProviderModels')?.addEventListener('click', refreshProviderModels);
 document.getElementById('saveDefault')?.addEventListener('click', saveDefaultModel);
 document.getElementById('deleteProvider')?.addEventListener('click', deleteSelectedProvider);
@@ -4767,7 +4839,7 @@ menuBtn?.addEventListener('click', toggleMenu);
 document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();app.classList.remove('menuOpen');renderSidebarWidth();syncMenuButton()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',async()=>{await loadModels(provider.value);syncComposerChrome()});
@@ -4937,17 +5009,26 @@ function partitionHistoryItems(items){
 }
 function setMainView(view){
   const archived=view==='archive';
-  activeMainView=archived?'archive':'chat';
+  const automated=view==='automation';
+  activeMainView=archived?'archive':automated?'automation':'chat';
   archiveView?.classList.toggle('hidden',!archived);
-  chat?.classList.toggle('hidden',archived);
-  composer?.classList.toggle('hidden',archived);
+  automationView?.classList.toggle('hidden',!automated);
+  chat?.classList.toggle('hidden',archived||automated);
+  composer?.classList.toggle('hidden',archived||automated);
   archiveToggle?.setAttribute('aria-pressed',String(archived));
   archiveToggle?.classList.toggle('active',archived);
+  automationToggle?.setAttribute('aria-pressed',String(automated));
+  automationToggle?.classList.toggle('active',automated);
   if(archived){
     closeComposerPopovers();
     if(titleEl)titleEl.textContent='已归档任务';
     statusEl.textContent=archivedLoading?'正在读取归档列表...':'Codex App · 已归档';
     setIconLabel(modeLabel,'archive','已归档');
+  }else if(automated){
+    closeComposerPopovers();
+    if(titleEl)titleEl.textContent='自动化安排';
+    statusEl.textContent=automationLoading?'正在读取自动化...':'Codex App · 自动化';
+    setIconLabel(modeLabel,'calendar-clock','自动化');
   }else applyConversationMode();
 }
 function showChatView(){if(activeMainView!=='chat')setMainView('chat')}
@@ -4957,6 +5038,245 @@ async function openArchivedView(){
   closeMenu();
   await loadArchivedTasks({force:true});
   archiveSearch?.focus();
+}
+async function openAutomationView(){
+  closeSettings();
+  setMainView('automation');
+  closeMenu();
+  await loadAutomations({force:true});
+  automationSearch?.focus();
+}
+function openAutomationEditor(template={}){
+  const name=document.getElementById('automationName');
+  const prompt=document.getElementById('automationPrompt');
+  const frequency=document.getElementById('automationFrequency');
+  const time=document.getElementById('automationTime');
+  const day=document.getElementById('automationDay');
+  if(name)name.value=template.name||'';
+  if(prompt)prompt.value=template.prompt||'';
+  if(frequency)frequency.value=template.frequency||'daily';
+  if(time)time.value=template.time||'09:00';
+  if(day)day.value=template.day||'MO';
+  const automationCwd=document.getElementById('automationCwd');
+  if(automationCwd)automationCwd.value=template.cwd??cwd?.value??defaultComposerCwd??'';
+  const automationModel=document.getElementById('automationModel');
+  if(automationModel)automationModel.value=model?.value||'';
+  const automationReasoning=document.getElementById('automationReasoning');
+  if(automationReasoning)automationReasoning.value=reasoningEffort?.value||'';
+  const startPaused=document.getElementById('automationStartPaused');
+  if(startPaused)startPaused.checked=false;
+  automationFormMessage.textContent='';
+  syncAutomationScheduleFields();
+  automationEditor?.classList.remove('hidden');
+  refreshIcons(automationEditor);
+  requestAnimationFrame(()=>name?.focus());
+}
+function closeAutomationEditor(){
+  automationEditor?.classList.add('hidden');
+  automationFormMessage.textContent='';
+}
+function syncAutomationScheduleFields(){
+  const value=automationFrequency?.value||'daily';
+  document.getElementById('automationTimeField')?.classList.toggle('hidden',value==='hourly');
+  document.getElementById('automationDayField')?.classList.toggle('hidden',value!=='weekly');
+  document.getElementById('automationIntervalField')?.classList.toggle('hidden',value!=='hourly');
+}
+async function createAutomation(event){
+  event.preventDefault();
+  const submit=document.getElementById('automationFormSubmit');
+  submit.disabled=true;
+  automationFormMessage.textContent='正在创建...';
+  const frequency=automationFrequency?.value||'daily';
+  const payload={
+    name:document.getElementById('automationName')?.value||'',
+    prompt:document.getElementById('automationPrompt')?.value||'',
+    schedule:{
+      frequency,
+      time:document.getElementById('automationTime')?.value||'09:00',
+      day:document.getElementById('automationDay')?.value||'MO',
+      interval:Number(document.getElementById('automationInterval')?.value||3),
+    },
+    cwd:document.getElementById('automationCwd')?.value||'',
+    model:document.getElementById('automationModel')?.value||'',
+    reasoningEffort:document.getElementById('automationReasoning')?.value||'',
+    notificationPolicy:'failed_runs_only',
+    status:document.getElementById('automationStartPaused')?.checked?'PAUSED':'ACTIVE',
+  };
+  try{
+    const res=await fetch('/api/automations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'创建自动化失败');
+    closeAutomationEditor();
+    automationNotice='已创建「'+data.automation.name+'」';
+    await loadAutomations({force:true});
+  }catch(error){
+    automationFormMessage.textContent=error.message;
+  }finally{
+    submit.disabled=false;
+  }
+}
+async function loadAutomations(){
+  if(automationLoading)return;
+  automationLoading=true;
+  if(!automationNotice)automationNotice='正在读取自动化安排...';
+  if(automationRefresh)automationRefresh.disabled=true;
+  renderAutomations();
+  try{
+    const res=await fetch('/api/automations',{headers:{Accept:'application/json'}});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'读取自动化安排失败');
+    automationItems=Array.isArray(data.automations)?data.automations:[];
+    if(automationNotice==='正在读取自动化安排...')automationNotice='';
+  }catch(error){
+    automationNotice=error.message;
+  }finally{
+    automationLoading=false;
+    if(automationRefresh)automationRefresh.disabled=false;
+    renderAutomations();
+    if(activeMainView==='automation')statusEl.textContent=automationNotice||'Codex App · '+automationItems.length+' 个自动化';
+  }
+}
+function automationRelativeTime(value){
+  const timestamp=Number(value||0);
+  if(!timestamp)return'';
+  const difference=timestamp-Date.now();
+  if(difference<=0)return'即将运行';
+  const minutes=Math.round(difference/60000);
+  if(minutes<60)return minutes+' 分钟后';
+  const hours=Math.round(minutes/60);
+  if(hours<24)return hours+' 小时后';
+  return new Date(timestamp).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+function automationIconName(item){
+  const prompt=(item?.name+' '+item?.prompt).toLowerCase();
+  if(/监控|监测|monitor|watch/.test(prompt))return'radar';
+  if(/简报|brief|总结|summary/.test(prompt))return'notebook-text';
+  return'calendar-clock';
+}
+function createAutomationRow(item){
+  const row=document.createElement('article');
+  row.className='automationRow';
+  row.dataset.automationId=item.id;
+  const icon=document.createElement('span');
+  icon.className='automationRowIcon';
+  const iconNode=document.createElement('i');
+  iconNode.setAttribute('data-lucide',automationIconName(item));
+  iconNode.setAttribute('aria-hidden','true');
+  icon.appendChild(iconNode);
+  const content=document.createElement('div');
+  content.className='automationRowContent';
+  const heading=document.createElement('div');
+  heading.className='automationRowHeading';
+  const name=document.createElement('strong');
+  name.textContent=item.name;
+  const schedule=document.createElement('span');
+  schedule.textContent=item.scheduleLabel||item.rrule;
+  heading.append(name,schedule);
+  const description=document.createElement('p');
+  description.textContent=item.prompt;
+  const meta=document.createElement('div');
+  meta.className='automationRowMeta';
+  const project=document.createElement('span');
+  project.textContent=item.kind==='heartbeat'?'关联当前任务':item.cwds?.[0]||'无项目任务';
+  meta.appendChild(project);
+  if(item.status==='ACTIVE'&&item.nextRunAt){
+    const next=document.createElement('span');
+    next.textContent='下次 '+automationRelativeTime(item.nextRunAt);
+    meta.appendChild(next);
+  }
+  content.append(heading,description,meta);
+  const toggle=document.createElement('button');
+  toggle.type='button';
+  toggle.className='automationStateToggle '+(item.status==='ACTIVE'?'active':'');
+  toggle.setAttribute('role','switch');
+  toggle.setAttribute('aria-checked',String(item.status==='ACTIVE'));
+  toggle.setAttribute('aria-label',(item.status==='ACTIVE'?'暂停':'启用')+item.name);
+  toggle.title=item.status==='ACTIVE'?'暂停':'启用';
+  toggle.addEventListener('click',()=>setAutomationStatus(item,toggle));
+  row.append(icon,content,toggle);
+  return row;
+}
+async function setAutomationStatus(item,button){
+  button.disabled=true;
+  const status=item.status==='ACTIVE'?'PAUSED':'ACTIVE';
+  automationNotice=status==='ACTIVE'?'正在启用...':'正在暂停...';
+  renderAutomations();
+  try{
+    const res=await fetch('/api/automations/'+encodeURIComponent(item.id)+'/status',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'更新自动化失败');
+    automationItems=automationItems.map((entry)=>entry.id===item.id?data.automation:entry);
+    automationNotice=status==='ACTIVE'?'已启用「'+item.name+'」':'已暂停「'+item.name+'」';
+  }catch(error){
+    automationNotice=error.message;
+  }finally{
+    renderAutomations();
+  }
+}
+function createAutomationSuggestions(){
+  const section=document.createElement('section');
+  section.className='automationSuggestions';
+  const title=document.createElement('h2');
+  title.textContent='建议';
+  section.appendChild(title);
+  const templates=[
+    {icon:'bell',name:'每日简报',schedule:'工作日 08:00',description:'汇总项目最新进展、待办和需要关注的事项',frequency:'weekdays',time:'08:00',prompt:'检查这个项目的最新进展和待办事项，生成一份简洁的每日工作简报。'},
+    {icon:'notebook-text',name:'每周回顾',schedule:'周五 16:00',description:'总结本周完成的工作并整理成简短状态更新',frequency:'weekly',day:'FR',time:'16:00',prompt:'回顾我本周完成的工作，整理关键成果、未完成事项和下周重点。'},
+    {icon:'radar',name:'跟进监控',schedule:'工作日 09:00',description:'定期检查项目状态，并标记需要关注的变化',frequency:'weekdays',time:'09:00',prompt:'检查项目中的最新变化、失败任务和待跟进事项，只汇报需要我关注的内容。'},
+  ];
+  for(const template of templates){
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='automationSuggestion';
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide',template.icon);
+    icon.setAttribute('aria-hidden','true');
+    const copy=document.createElement('span');
+    const heading=document.createElement('strong');
+    heading.textContent=template.name;
+    const schedule=document.createElement('small');
+    schedule.textContent=template.schedule;
+    heading.appendChild(schedule);
+    const description=document.createElement('span');
+    description.textContent=template.description;
+    copy.append(heading,description);
+    const add=document.createElement('i');
+    add.setAttribute('data-lucide','plus');
+    add.setAttribute('aria-hidden','true');
+    button.append(icon,copy,add);
+    button.addEventListener('click',()=>openAutomationEditor(template));
+    section.appendChild(button);
+  }
+  return section;
+}
+function renderAutomations(){
+  if(!automationList)return;
+  automationList.replaceChildren();
+  const query=(automationSearch?.value||'').trim().toLowerCase();
+  const status=automationFilter?.value||'';
+  const visible=automationItems.filter((item)=>{
+    if(status&&item.status!==status)return false;
+    return !query||[item.name,item.prompt,item.rrule,item.scheduleLabel,...(item.cwds||[])].join(' ').toLowerCase().includes(query);
+  });
+  automationStatus.textContent=automationNotice||(!automationLoading?(visible.length===automationItems.length?automationItems.length+' 个自动化':visible.length+' / '+automationItems.length+' 个自动化'):'');
+  if(automationLoading&&!automationItems.length){
+    const loading=document.createElement('div');
+    loading.className='automationEmpty';
+    loading.textContent='正在读取自动化安排...';
+    automationList.appendChild(loading);
+  }else if(visible.length){
+    const rows=document.createElement('div');
+    rows.className='automationRows';
+    visible.forEach((item)=>rows.appendChild(createAutomationRow(item)));
+    automationList.appendChild(rows);
+  }else if(automationItems.length){
+    const empty=document.createElement('div');
+    empty.className='automationEmpty';
+    empty.textContent='没有匹配的自动化安排';
+    automationList.appendChild(empty);
+  }
+  if(!query&&!status)automationList.appendChild(createAutomationSuggestions());
+  refreshIcons(automationList);
 }
 function archivedTaskTimestamp(item){
   const value=item?.recencyAt||item?.updatedAt||item?.createdAt;
@@ -5665,6 +5985,10 @@ function applyConversationMode(){
     statusEl.classList.remove('running');
     statusEl.textContent=archiveNotice||'Codex App · '+archivedItems.length+' 个已归档任务';
     setIconLabel(modeLabel,'archive','已归档');
+  }else if(activeMainView==='automation'){
+    statusEl.classList.remove('running');
+    statusEl.textContent=automationNotice||'Codex App · '+automationItems.length+' 个自动化';
+    setIconLabel(modeLabel,'calendar-clock','自动化');
   }
 }
 function resetStandaloneComposerCwd(){

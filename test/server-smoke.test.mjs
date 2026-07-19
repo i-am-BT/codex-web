@@ -630,7 +630,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
-    assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 36px 36px/s);
+    assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) repeat\(3, 36px\)/s);
     assert.match(uiStyles, /\.archiveView\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*auto/s);
     assert.match(uiStyles, /\.archiveTaskRestore,[^}]*\.archiveTaskDelete\s*\{/s);
     assert.match(uiStyles, /body\[data-theme\] \.archiveProjectFilter select\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
@@ -713,6 +713,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedDreamSkin.status, 401);
     const unauthorizedArchivedTasks = await fetch(`${baseUrl}/api/native-archived-sessions`);
     assert.equal(unauthorizedArchivedTasks.status, 401);
+    const unauthorizedAutomations = await fetch(`${baseUrl}/api/automations`);
+    assert.equal(unauthorizedAutomations.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
@@ -723,6 +725,44 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    const emptyAutomations = await fetch(`${baseUrl}/api/automations`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(emptyAutomations.status, 200);
+    assert.equal((await emptyAutomations.json()).count, 0);
+    const createdAutomation = await fetch(`${baseUrl}/api/automations`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Daily project brief',
+        prompt: 'Summarize the latest project work.',
+        cwd: temporary,
+        model: 'test-model',
+        reasoningEffort: 'max',
+        schedule: { frequency: 'weekdays', time: '08:00' },
+      }),
+    });
+    assert.equal(createdAutomation.status, 201);
+    const createdAutomationPayload = await createdAutomation.json();
+    assert.equal(createdAutomationPayload.automation.id, 'daily-project-brief');
+    assert.equal(createdAutomationPayload.automation.scheduleLabel, '工作日 08:00');
+    const automationToml = await readFile(
+      path.join(codexHome, 'automations', 'daily-project-brief', 'automation.toml'),
+      'utf8',
+    );
+    assert.match(automationToml, /cwds = \[".+"\]/);
+    assert.doesNotMatch(automationToml, /target =/);
+    const pausedAutomation = await fetch(
+      `${baseUrl}/api/automations/daily-project-brief/status`,
+      {
+        method: 'PATCH',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'PAUSED' }),
+      },
+    );
+    assert.equal(pausedAutomation.status, 200);
+    assert.equal((await pausedAutomation.json()).automation.status, 'PAUSED');
 
     const archivedTasks = await fetch(`${baseUrl}/api/native-archived-sessions`, {
       headers: { Cookie: cookie },
@@ -1104,8 +1144,11 @@ if (args[0] === 'app-server') {
     assert.match(page, /kind:'steering_user'/);
     assert.match(page, /steering_browser_comment/);
     assert.match(page, /function createBrowserCommentDetails/);
-    assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><\/div><button id="settingsToggle"/);
+    assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><button id="automationToggle"[^>]*>自动化安排<\/button><\/div><button id="settingsToggle"/);
     assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
+    assert.match(page, /id="automationView"[^>]*aria-labelledby="automationViewTitle"/);
+    assert.match(page, /function openAutomationView/);
+    assert.match(page, /function renderAutomations/);
     assert.match(page, /function openArchivedView/);
     assert.match(page, /function renderArchivedTasks/);
     assert.match(page, /永久删除全部已归档任务/);
