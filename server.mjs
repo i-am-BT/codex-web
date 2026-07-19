@@ -32,6 +32,7 @@ import {
   buildAutomationRrule,
   decorateAutomation,
 } from './automation-store.mjs';
+import { SubQuotaService } from './sub-quota.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -172,6 +173,13 @@ const nativeSessions = new NativeSessionStore(CODEX_HOME, {
   pollIntervalMs: NATIVE_SESSION_POLL_MS,
 });
 const automationStore = new AutomationStore(CODEX_HOME);
+let subQuotaBaseUrl = String(process.env.SUB2API_BASE_URL || '').trim().replace(/\/+$/, '');
+let subQuotaService;
+{
+  const startupApiKey = String(process.env.SUB2API_API_KEY || '').trim();
+  delete process.env.SUB2API_API_KEY;
+  subQuotaService = createSubQuotaService(subQuotaBaseUrl, startupApiKey);
+}
 const appServerClient = new CodexAppServerClient({
   bin: CODEX_BIN,
   cwd: CODEX_PROCESS_HOME,
@@ -512,6 +520,62 @@ app.get('/api/automations', requireAuth, (_req, res) => {
     res.json({ automations, count: automations.length });
   } catch (err) {
     res.status(500).json({ error: `读取自动化安排失败: ${err.message}` });
+  }
+});
+
+app.get('/api/sub-quotas', requireAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    res.json(await subQuotaService.list({ refresh: req.query.refresh === '1' }));
+  } catch (err) {
+    res.status(502).json({ error: `读取 Sub2API 额度失败: ${err.message}` });
+  }
+});
+
+app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({
+    baseUrl: subQuotaBaseUrl,
+    keyConfigured: Boolean(getSubQuotaApiKey()),
+    configured: Boolean(subQuotaBaseUrl && getSubQuotaApiKey()),
+  });
+});
+
+app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  const suppliedApiKey = String(req.body?.apiKey || '').trim();
+  const apiKey = suppliedApiKey;
+  if (!isHttpUrl(subQuotaBaseUrl)) return res.status(503).json({ error: 'Sub2API 地址尚未配置' });
+  if (!apiKey) return res.status(400).json({ error: 'Sub2API API Key 不能为空' });
+  if (apiKey.length > 4096 || /[\r\n\0]/.test(apiKey)) {
+    return res.status(400).json({ error: 'Sub2API API Key 包含无效字符' });
+  }
+
+  try {
+    const candidate = createSubQuotaService(subQuotaBaseUrl, apiKey);
+    const result = await candidate.list({ refresh: true });
+    const quota = result.quotas[0];
+    if (!quota || quota.error) {
+      return res.status(502).json({ error: `Sub2API 检测失败: ${quota?.error || '未返回额度数据'}` });
+    }
+    if (quota.valid === false) return res.status(422).json({ error: 'Sub2API API Key 已失效' });
+
+    updateEnvVar(ENV_FILE, 'SUB2API_API_KEY', apiKey);
+    subQuotaService = candidate;
+    res.json({
+      ok: true,
+      baseUrl: subQuotaBaseUrl,
+      keyConfigured: true,
+      configured: true,
+      quota: {
+        planName: quota.planName,
+        mode: quota.mode,
+        status: quota.status,
+        valid: quota.valid,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: `保存 Sub2API 设置失败: ${err.message}` });
   }
 });
 
@@ -3097,6 +3161,26 @@ function isHttpUrl(value) {
   }
 }
 
+function createSubQuotaService(baseUrl, apiKey) {
+  return SubQuotaService.fromEnvironment({
+    SUB2API_API_KEY: apiKey,
+    SUB_QUOTA_TIMEOUT_MS: process.env.SUB_QUOTA_TIMEOUT_MS,
+    SUB_QUOTA_CACHE_SECONDS: process.env.SUB_QUOTA_CACHE_SECONDS,
+    SUB_QUOTA_SOURCES: baseUrl && apiKey
+      ? JSON.stringify([{
+        id: 'sub2api',
+        name: 'Sub2API',
+        baseUrl,
+        apiKeyEnv: 'SUB2API_API_KEY',
+      }])
+      : '',
+  });
+}
+
+function getSubQuotaApiKey() {
+  return String(subQuotaService?.sources?.[0]?.apiKey || '');
+}
+
 async function proxyPlaygroundRequest(req, res) {
   if (!['GET', 'POST'].includes(req.method)) {
     res.setHeader('Allow', 'GET, POST');
@@ -3704,6 +3788,8 @@ const provider = document.getElementById('provider'), model = document.getElemen
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
 const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
 const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
+let subQuotaToggle = null, subQuotaPopover = null, subQuotaStatus = null, subQuotaContent = null;
+let subQuotaSettingsForm = null, subQuotaApiKeyInput = null, subQuotaEndpoint = null, subQuotaSettingsStatus = null;
 const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
 const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
@@ -3721,6 +3807,7 @@ let archiveNotice = '';
 let automationItems = [];
 let automationLoading = false;
 let automationNotice = '';
+let subQuotaRequestSeq = 0;
 let conversationLoadSeq = 0;
 let nativeCursor = 0;
 let nativeGeneration = 0;
@@ -3790,8 +3877,11 @@ const syncCurrentNativeConversation = createTrailingSingleFlight(syncCurrentNati
 let settingsOverlay = null;
 let settingsDialog = null;
 let settingsClose = null;
+let settingsReturnFocus = null;
 let passwordForm = null;
 let passwordStatus = null;
+let subQuotaHoverTimer = null;
+let suppressSubQuotaFocusPreview = false;
 let dreamSkinPanel = null;
 let dreamSkinIdea = null;
 let dreamSkinMode = null;
@@ -4607,6 +4697,45 @@ function enhanceSettingsModal(){
     createDreamSkinGenerator(general);
   }
   providerManager?.classList.add('settingsSection','providerSettings');
+  const subQuotaSection=document.createElement('section');
+  subQuotaSection.id='subQuotaSettings';
+  subQuotaSection.className='settingsSection subQuotaSettings';
+  subQuotaSection.appendChild(settingsSectionTitle('Sub2API 额度监控'));
+  const subQuotaDescription=document.createElement('p');
+  subQuotaDescription.className='subQuotaSettingsDescription';
+  subQuotaDescription.textContent='悬停侧栏额度图标可直接查看；在这里更新 API Key 并立即检测。';
+  subQuotaEndpoint=document.createElement('div');
+  subQuotaEndpoint.className='subQuotaEndpoint';
+  subQuotaEndpoint.textContent='正在读取服务地址…';
+  subQuotaSettingsForm=document.createElement('form');
+  subQuotaSettingsForm.id='subQuotaSettingsForm';
+  subQuotaSettingsForm.className='subQuotaSettingsForm';
+  const subQuotaKeyField=document.createElement('label');
+  subQuotaKeyField.className='field';
+  const subQuotaKeyLabel=document.createElement('span');
+  subQuotaKeyLabel.textContent='API Key';
+  subQuotaApiKeyInput=document.createElement('input');
+  subQuotaApiKeyInput.id='subQuotaApiKey';
+  subQuotaApiKeyInput.name='apiKey';
+  subQuotaApiKeyInput.type='password';
+  subQuotaApiKeyInput.maxLength=4096;
+  subQuotaApiKeyInput.autocomplete='new-password';
+  subQuotaApiKeyInput.placeholder='输入 Sub2API API Key';
+  subQuotaKeyField.appendChild(subQuotaKeyLabel);
+  subQuotaKeyField.appendChild(subQuotaApiKeyInput);
+  const subQuotaSave=document.createElement('button');
+  subQuotaSave.type='submit';
+  subQuotaSave.className='miniPrimary subQuotaSettingsSubmit';
+  setIconLabel(subQuotaSave,'badge-check','保存并检测');
+  subQuotaSettingsStatus=document.createElement('div');
+  subQuotaSettingsStatus.className='errorText subQuotaSettingsStatus';
+  subQuotaSettingsStatus.setAttribute('role','status');
+  subQuotaSettingsForm.appendChild(subQuotaKeyField);
+  subQuotaSettingsForm.appendChild(subQuotaSave);
+  subQuotaSettingsForm.appendChild(subQuotaSettingsStatus);
+  subQuotaSection.appendChild(subQuotaDescription);
+  subQuotaSection.appendChild(subQuotaEndpoint);
+  subQuotaSection.appendChild(subQuotaSettingsForm);
   const passwordSection=document.createElement('section');
   passwordSection.className='settingsSection passwordSettings';
   passwordSection.appendChild(settingsSectionTitle('Web 密码'));
@@ -4645,6 +4774,7 @@ function enhanceSettingsModal(){
   passwordForm.appendChild(passwordStatus);
   passwordSection.appendChild(passwordForm);
   settingsPanel.classList.remove('open');
+  settingsPanel.appendChild(subQuotaSection);
   settingsPanel.appendChild(passwordSection);
   body.appendChild(settingsPanel);
   settingsDialog.appendChild(head);
@@ -4655,17 +4785,51 @@ function enhanceSettingsModal(){
   settingsClose.addEventListener('click',closeSettings);
   settingsOverlay.addEventListener('click',(event)=>{if(event.target===settingsOverlay)closeSettings()});
   settingsDialog.addEventListener('keydown',trapSettingsFocus);
+  subQuotaSettingsForm.addEventListener('submit',submitSubQuotaSettings);
   passwordForm.addEventListener('submit',submitPasswordChange);
 }
-function openSettings(){
+async function syncSubQuotaSettings(){
+  if(!subQuotaEndpoint||!subQuotaSettingsStatus)return;
+  subQuotaSettingsStatus.textContent='';
+  subQuotaSettingsStatus.classList.remove('success');
+  try{
+    const response=await fetch('/api/sub-quota-config',{headers:{Accept:'application/json'}});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||'读取设置失败');
+    subQuotaEndpoint.textContent=(data.baseUrl||'未配置服务地址')+' · '+(data.keyConfigured?'Key 已配置':'Key 未配置');
+  }catch(error){subQuotaEndpoint.textContent=String(error?.message||'读取设置失败')}
+}
+async function submitSubQuotaSettings(event){
+  event.preventDefault();
+  if(!subQuotaSettingsForm||!subQuotaApiKeyInput||!subQuotaSettingsStatus)return;
+  const submit=subQuotaSettingsForm.querySelector('[type="submit"]');
+  submit.disabled=true;
+  subQuotaSettingsStatus.classList.remove('success');
+  subQuotaSettingsStatus.textContent='正在检测 Sub2API…';
+  try{
+    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({apiKey:subQuotaApiKeyInput.value})});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||'检测失败');
+    subQuotaApiKeyInput.value='';
+    subQuotaSettingsStatus.classList.add('success');
+    subQuotaSettingsStatus.textContent='检测通过，已启用 '+(data.quota?.planName||'Sub2API 额度监控');
+    await syncSubQuotaSettings();
+    await loadSubQuota({refresh:true});
+  }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'检测失败')}
+  finally{submit.disabled=false}
+}
+function openSettings({returnFocus=settingsToggle,focusTarget=settingsClose}={}){
   if(!settingsOverlay)return;
   closeComposerPopovers();
+  hideSubQuotaPreview();
+  settingsReturnFocus=returnFocus;
   settingsOverlay.classList.remove('hidden');
   syncModalOpenState();
   settingsToggle.setAttribute('aria-expanded','true');
   settingsToggle.title='关闭设置';
   if(findDreamSkinConcept(appearance.chatBackground))openDreamSkinGenerator();
-  requestAnimationFrame(()=>settingsClose?.focus());
+  syncSubQuotaSettings();
+  requestAnimationFrame(()=>focusTarget?.focus());
 }
 function closeSettings(){
   if(!settingsOverlay||settingsOverlay.classList.contains('hidden'))return;
@@ -4675,8 +4839,15 @@ function closeSettings(){
   settingsToggle.title='设置';
   passwordForm?.reset();
   if(passwordStatus){passwordStatus.textContent='';passwordStatus.classList.remove('success')}
+  subQuotaSettingsForm?.reset();
+  if(subQuotaSettingsStatus){subQuotaSettingsStatus.textContent='';subQuotaSettingsStatus.classList.remove('success')}
   closeDreamSkinGenerator();
-  settingsToggle.focus();
+  const returnFocus=settingsReturnFocus||settingsToggle;
+  settingsReturnFocus=null;
+  const suppressPreview=returnFocus===subQuotaToggle;
+  if(suppressPreview)suppressSubQuotaFocusPreview=true;
+  returnFocus?.focus();
+  if(suppressPreview)setTimeout(()=>{suppressSubQuotaFocusPreview=false},0);
 }
 function syncModalOpenState(){
   const settingsOpen=settingsOverlay&&!settingsOverlay.classList.contains('hidden');
@@ -4797,6 +4968,190 @@ function enhanceAutomationView(){
   toolbar.after(tabs);
   syncAutomationFilterTabs();
 }
+function enhanceSubQuota(sideActions){
+  if(!sideActions||subQuotaToggle)return;
+  subQuotaToggle=document.createElement('button');
+  subQuotaToggle.id='subQuotaToggle';
+  subQuotaToggle.className='subQuotaToggle';
+  subQuotaToggle.type='button';
+  subQuotaToggle.title='悬停查看 Sub2API 额度，点击设置 Key';
+  subQuotaToggle.setAttribute('aria-label','悬停查看 Sub2API 额度，点击设置 Key');
+  subQuotaToggle.setAttribute('aria-haspopup','dialog');
+  subQuotaToggle.setAttribute('aria-controls','subQuotaSettings');
+  subQuotaToggle.setAttribute('aria-describedby','subQuotaPopover');
+  subQuotaToggle.setAttribute('aria-expanded','false');
+  setIconLabel(subQuotaToggle,'gauge','Sub2API 额度',false);
+  sideActions.appendChild(subQuotaToggle);
+
+  subQuotaPopover=document.createElement('section');
+  subQuotaPopover.id='subQuotaPopover';
+  subQuotaPopover.className='subQuotaPopover hidden';
+  subQuotaPopover.setAttribute('role','tooltip');
+  const head=document.createElement('header');
+  head.className='subQuotaHead';
+  const title=document.createElement('h2');
+  title.id='subQuotaTitle';
+  title.className='subQuotaTitle';
+  title.textContent='Sub2API 额度';
+  head.appendChild(title);
+  subQuotaStatus=document.createElement('div');
+  subQuotaStatus.className='subQuotaStatus';
+  subQuotaStatus.setAttribute('role','status');
+  subQuotaStatus.setAttribute('aria-live','polite');
+  subQuotaContent=document.createElement('div');
+  subQuotaContent.className='subQuotaContent';
+  subQuotaPopover.appendChild(head);
+  subQuotaPopover.appendChild(subQuotaStatus);
+  subQuotaPopover.appendChild(subQuotaContent);
+  sideActions.appendChild(subQuotaPopover);
+
+  subQuotaToggle.addEventListener('pointerenter',showSubQuotaPreview);
+  subQuotaToggle.addEventListener('mouseenter',showSubQuotaPreview);
+  subQuotaToggle.addEventListener('pointerleave',scheduleSubQuotaPreviewHide);
+  subQuotaToggle.addEventListener('mouseleave',scheduleSubQuotaPreviewHide);
+  subQuotaToggle.addEventListener('focus',()=>{if(!suppressSubQuotaFocusPreview)showSubQuotaPreview()});
+  subQuotaToggle.addEventListener('blur',(event)=>{if(!subQuotaPopover.contains(event.relatedTarget))scheduleSubQuotaPreviewHide()});
+  subQuotaToggle.addEventListener('click',()=>openSettings({returnFocus:subQuotaToggle,focusTarget:subQuotaApiKeyInput}));
+  subQuotaPopover.addEventListener('pointerenter',cancelSubQuotaPreviewHide);
+  subQuotaPopover.addEventListener('pointerleave',scheduleSubQuotaPreviewHide);
+  refreshIcons(subQuotaPopover);
+}
+function showSubQuotaPreview(){
+  if(!subQuotaPopover||!subQuotaToggle)return;
+  cancelSubQuotaPreviewHide();
+  subQuotaPopover.classList.remove('hidden');
+  subQuotaToggle.setAttribute('aria-expanded','true');
+  loadSubQuota();
+}
+function hideSubQuotaPreview(){
+  if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
+  subQuotaPopover.classList.add('hidden');
+  subQuotaToggle?.setAttribute('aria-expanded','false');
+}
+function cancelSubQuotaPreviewHide(){if(subQuotaHoverTimer){clearTimeout(subQuotaHoverTimer);subQuotaHoverTimer=null}}
+function scheduleSubQuotaPreviewHide(){cancelSubQuotaPreviewHide();subQuotaHoverTimer=setTimeout(()=>{subQuotaHoverTimer=null;hideSubQuotaPreview()},180)}
+async function loadSubQuota({refresh=false}={}){
+  if(!subQuotaContent||!subQuotaStatus)return;
+  const requestSeq=++subQuotaRequestSeq;
+  subQuotaStatus.dataset.state='loading';
+  subQuotaStatus.textContent='正在读取 Sub2API 额度…';
+  try{
+    const response=await fetch('/api/sub-quotas'+(refresh?'?refresh=1':''),{headers:{Accept:'application/json'}});
+    const data=await response.json().catch(()=>({}));
+    if(requestSeq!==subQuotaRequestSeq)return;
+    if(!response.ok)throw new Error(data.error||'额度请求失败');
+    renderSubQuota(data);
+  }catch(error){
+    if(requestSeq!==subQuotaRequestSeq)return;
+    renderSubQuotaError(String(error?.message||'额度请求失败'));
+  }
+}
+function renderSubQuota(data){
+  subQuotaContent.replaceChildren();
+  if(data?.configurationError){renderSubQuotaError(data.configurationError);return}
+  if(!data?.configured){renderSubQuotaError('尚未配置 Sub2API 额度渠道');return}
+  const quota=Array.isArray(data.quotas)?data.quotas[0]:null;
+  if(!quota){renderSubQuotaError('Sub2API 未返回额度数据');return}
+  if(quota.error){renderSubQuotaError('Sub2API 暂不可用：'+quota.error);return}
+  if(quota.valid===false){renderSubQuotaError('Sub2API API Key 已失效'+(quota.status?'：'+quota.status:''));return}
+
+  const source=document.createElement('article');
+  source.className='subQuotaSource';
+  const plan=document.createElement('div');
+  plan.className='subQuotaPlan';
+  const planName=document.createElement('span');
+  planName.textContent=quota.planName||(quota.mode==='quota_limited'?'API Key 限额':'Sub2API');
+  const sourceName=document.createElement('span');
+  sourceName.textContent=quota.name||'Sub2API';
+  plan.appendChild(planName);
+  plan.appendChild(sourceName);
+  source.appendChild(plan);
+  const unit=quota.unit||quota.quota?.unit||'USD';
+  let detailCount=0;
+  if(quota.subscription){
+    detailCount+=appendSubQuotaWindow(source,'每日',quota.subscription.daily,unit)?1:0;
+    detailCount+=appendSubQuotaWindow(source,'每周',quota.subscription.weekly,unit)?1:0;
+    detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit)?1:0;
+  }
+  if(quota.quota)detailCount+=appendSubQuotaWindow(source,'总额度',quota.quota,unit)?1:0;
+  for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
+    detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,unit)?1:0;
+  }
+  const walletBalance=finiteSubQuotaNumber(quota.balance??quota.remaining);
+  if(!detailCount&&walletBalance!==null){
+    detailCount+=appendSubQuotaWindow(source,'可用余额',{remaining:walletBalance},unit)?1:0;
+  }
+  const meta=document.createElement('div');
+  meta.className='subQuotaMeta';
+  const todayCost=quota.today?.actualCost??quota.today?.cost;
+  if(Number.isFinite(Number(todayCost)))appendSubQuotaMeta(meta,'今日 '+formatSubQuotaAmount(todayCost,unit));
+  if(Number.isFinite(Number(quota.today?.requests)))appendSubQuotaMeta(meta,'请求 '+Number(quota.today.requests).toLocaleString('zh-CN')+' 次');
+  const expiresAt=quota.expiresAt||quota.subscription?.expiresAt;
+  if(expiresAt)appendSubQuotaMeta(meta,'到期 '+formatSubQuotaDate(expiresAt));
+  if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
+  for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
+    if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit.window)+'重置 '+formatSubQuotaTime(rateLimit.resetAt));
+  }
+  if(!detailCount&&!meta.childElementCount){renderSubQuotaError('Sub2API 未返回可显示的额度数据');return}
+  if(meta.childElementCount)source.appendChild(meta);
+  subQuotaContent.appendChild(source);
+  delete subQuotaStatus.dataset.state;
+  subQuotaStatus.textContent=data.fetchedAt?'更新于 '+formatSubQuotaTime(data.fetchedAt):'';
+}
+function appendSubQuotaWindow(parent,label,windowData,unit){
+  if(!windowData)return false;
+  const used=finiteSubQuotaNumber(windowData.used);
+  const limit=finiteSubQuotaNumber(windowData.limit);
+  const remaining=finiteSubQuotaNumber(windowData.remaining);
+  if(used===null&&limit===null&&remaining===null)return false;
+  const row=document.createElement('div');
+  row.className='subQuotaWindow';
+  const head=document.createElement('div');
+  head.className='subQuotaWindowHead';
+  const title=document.createElement('span');
+  title.textContent=label;
+  const value=document.createElement('span');
+  if(limit!==null&&limit>0){
+    if(remaining!==null)value.textContent='剩余 '+formatSubQuotaAmount(remaining,unit)+' / '+formatSubQuotaAmount(limit,unit);
+    else if(used!==null)value.textContent='已用 '+formatSubQuotaAmount(used,unit)+' / '+formatSubQuotaAmount(limit,unit);
+    else value.textContent='限额 '+formatSubQuotaAmount(limit,unit);
+  }else if(remaining!==null){
+    value.textContent='剩余 '+formatSubQuotaAmount(remaining,unit);
+  }else{
+    value.textContent='不限额'+(used===null?'':' · 已用 '+formatSubQuotaAmount(used,unit));
+  }
+  head.appendChild(title);
+  head.appendChild(value);
+  row.appendChild(head);
+  if(limit!==null&&limit>0&&used!==null){
+    const progress=document.createElement('div');
+    progress.className='subQuotaProgress';
+    const bar=document.createElement('span');
+    bar.className='subQuotaProgressBar';
+    const percent=Math.min(100,Math.max(0,(used/limit)*100));
+    bar.style.setProperty('--sub-quota-percent',percent.toFixed(2)+'%');
+    progress.appendChild(bar);
+    row.appendChild(progress);
+  }
+  parent.appendChild(row);
+  return true;
+}
+function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item)}
+function finiteSubQuotaNumber(value){if(value===null||value===undefined||value==='')return null;const number=Number(value);return Number.isFinite(number)&&number>=0?number:null}
+function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'7 天'})[String(value||'').toLowerCase()]||String(value||'限速')}
+function formatSubQuotaStatus(value){return({active:'正常',quota_exhausted:'额度耗尽',expired:'已过期'})[String(value||'').toLowerCase()]||String(value||'')}
+function formatSubQuotaAmount(value,unit){const number=finiteSubQuotaNumber(value)||0;const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:0,maximumFractionDigits:2});return unit==='USD'?'$'+formatted:formatted+' '+unit}
+function formatSubQuotaDate(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'}):String(value||'')}
+function formatSubQuotaTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
+function renderSubQuotaError(message){
+  subQuotaContent.replaceChildren();
+  const error=document.createElement('div');
+  error.className='subQuotaError';
+  error.textContent=message;
+  subQuotaContent.appendChild(error);
+  subQuotaStatus.dataset.state='error';
+  subQuotaStatus.textContent='仅监控 Sub2API 渠道';
+}
 function enhanceInterface(){
   const sideBrand=document.querySelector('.side > div:first-child');
   sideBrand?.classList.add('sideBrand');
@@ -4819,6 +5174,7 @@ function enhanceInterface(){
   const protectedPill=document.querySelector('.pill');
   setIconLabel(protectedPill,'shield-check','Protected');
   const sideActions=document.querySelector('.sideActions');
+  enhanceSubQuota(sideActions);
   if(sideActions&&settingsToggle)sideActions.appendChild(settingsToggle);
   enhanceSettingsModal();
   setIconLabel(document.getElementById('newChat'),'plus','新建任务');
@@ -4895,6 +5251,9 @@ archiveProjectFilter?.addEventListener('change',renderArchivedTasks);
 archiveRefresh?.addEventListener('click',()=>loadArchivedTasks({force:true}));
 archiveDeleteAll?.addEventListener('click',deleteAllArchivedTasks);
 automationToggle?.addEventListener('click',openAutomationView);
+document.addEventListener('click',(event)=>{
+  if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')&&!subQuotaPopover.contains(event.target)&&!subQuotaToggle?.contains(event.target))hideSubQuotaPreview();
+});
 automationSearch?.addEventListener('input',renderAutomations);
 automationFilter?.addEventListener('change',renderAutomations);
 automationRefresh?.addEventListener('click',()=>loadAutomations({force:true}));
@@ -4911,7 +5270,7 @@ menuBtn?.addEventListener('click', toggleMenu);
 document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();app.classList.remove('menuOpen');renderSidebarWidth();syncMenuButton()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',async()=>{await loadModels(provider.value);syncComposerChrome()});

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -49,6 +49,35 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
         body,
       });
       res.setHeader('Content-Type', 'application/json');
+      if (req.url === '/v1/usage') {
+        if (req.headers.authorization === 'Bearer bad-sub-key') {
+          res.end(JSON.stringify({ isValid: false, status: 'invalid_key' }));
+          return;
+        }
+        res.end(JSON.stringify({
+          isValid: true,
+          mode: 'unrestricted',
+          planName: 'GPT-20x-300',
+          unit: 'USD',
+          remaining: 70,
+          subscription: {
+            weekly_limit_usd: 100,
+            weekly_usage_usd: 30,
+            monthly_limit_usd: 400,
+            monthly_usage_usd: 50,
+            expires_at: '2026-08-01T00:00:00Z',
+          },
+          rate_limits: [{
+            window: '5h',
+            limit: 50,
+            used: 10,
+            remaining: 40,
+            reset_at: '2026-07-19T05:00:00Z',
+          }],
+          usage: { today: { requests: 4, actual_cost: 3 } },
+        }));
+        return;
+      }
       if (req.url === '/v1/models') {
         res.end(JSON.stringify({ data: [{ id: 'gpt-image-2' }] }));
         return;
@@ -393,6 +422,10 @@ if (args.includes('--version')) {
   process.exit(0);
 }
 if (args[0] === 'app-server') {
+  appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify({
+    type: 'process_env',
+    sub2ApiKey: process.env.SUB2API_API_KEY,
+  }) + '\\n');
   const createdThreadId = '${createdNativeSessionId}';
   const forkedThreadId = '${forkedNativeSessionId}';
   const fixtureThreadId = '${nativeSessionId}';
@@ -511,7 +544,8 @@ if (args[0] === 'app-server') {
     args,
     input,
     home: process.env.HOME,
-    codexHome: process.env.CODEX_HOME
+    codexHome: process.env.CODEX_HOME,
+    sub2ApiKey: process.env.SUB2API_API_KEY
   }, null, 2));
   console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'FAKE_OK' } }));
 }
@@ -530,6 +564,8 @@ if (args[0] === 'app-server') {
       desktopIpcEnabled: 'true',
       desktopIpcSocket: desktopIpc.socketPath,
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
+      sub2ApiBaseUrl: providerBaseUrl,
+      sub2ApiKey: 'test-sub-key',
     });
     let port = await waitForServer(child, runtime);
     const baseUrl = `http://127.0.0.1:${port}`;
@@ -635,7 +671,9 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
-    assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) repeat\(3, 36px\)/s);
+    assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) repeat\(4, 36px\)/s);
+    assert.match(uiStyles, /\.subQuotaPopover\s*\{/);
+    assert.match(uiStyles, /@container sidebar \(max-width: 264px\)/);
     assert.match(uiStyles, /\.archiveView\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*auto/s);
     assert.match(uiStyles, /\.archiveTaskRestore,[^}]*\.archiveTaskDelete\s*\{/s);
     assert.match(uiStyles, /body\[data-theme\] \.archiveProjectFilter select\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%/s);
@@ -720,6 +758,10 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedArchivedTasks.status, 401);
     const unauthorizedAutomations = await fetch(`${baseUrl}/api/automations`);
     assert.equal(unauthorizedAutomations.status, 401);
+    const unauthorizedSubQuotas = await fetch(`${baseUrl}/api/sub-quotas`);
+    assert.equal(unauthorizedSubQuotas.status, 401);
+    const unauthorizedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`);
+    assert.equal(unauthorizedSubQuotaConfig.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
@@ -730,6 +772,52 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    const subQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(subQuotaConfig.status, 200);
+    const subQuotaConfigPayload = await subQuotaConfig.json();
+    assert.equal(subQuotaConfigPayload.baseUrl, providerBaseUrl);
+    assert.equal(subQuotaConfigPayload.keyConfigured, true);
+    assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
+
+    const rejectedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: 'bad-sub-key' }),
+    });
+    assert.equal(rejectedSubQuotaKey.status, 422);
+    assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /bad-sub-key/);
+
+    const updatedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: 'new-sub-key' }),
+    });
+    assert.equal(updatedSubQuotaKey.status, 200);
+    assert.doesNotMatch(await updatedSubQuotaKey.text(), /new-sub-key/);
+    assert.match(await readFile(webEnv, 'utf8'), /^SUB2API_API_KEY="new-sub-key"$/m);
+    assert.equal((await stat(webEnv)).mode & 0o777, 0o600);
+    assert.equal(providerRequests.at(-1).authorization, 'Bearer new-sub-key');
+
+    const subQuotas = await fetch(`${baseUrl}/api/sub-quotas`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(subQuotas.status, 200);
+    assert.match(subQuotas.headers.get('cache-control'), /private, no-store/);
+    const subQuotaPayload = await subQuotas.json();
+    assert.equal(subQuotaPayload.configured, true);
+    assert.equal(subQuotaPayload.count, 1);
+    assert.equal(subQuotaPayload.quotas[0].planName, 'GPT-20x-300');
+    assert.equal(subQuotaPayload.quotas[0].subscription.weekly.remaining, 70);
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[0].window, '5h');
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[0].remaining, 40);
+    assert.doesNotMatch(JSON.stringify(subQuotaPayload), /test-sub-key/);
+    const refreshedSubQuotas = await fetch(`${baseUrl}/api/sub-quotas?refresh=1`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(refreshedSubQuotas.status, 200);
 
     const emptyAutomations = await fetch(`${baseUrl}/api/automations`, {
       headers: { Cookie: cookie },
@@ -1173,6 +1261,16 @@ updated_at = 1784422800000
     assert.match(page, /steering_browser_comment/);
     assert.match(page, /function createBrowserCommentDetails/);
     assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><button id="automationToggle"[^>]*>自动化安排<\/button><\/div><button id="settingsToggle"/);
+    assert.match(page, /function enhanceSubQuota/);
+    assert.match(page, /subQuotaToggle\.id='subQuotaToggle'/);
+    assert.match(page, /setIconLabel\(subQuotaToggle,'gauge','Sub2API 额度',false\)/);
+    assert.match(page, /subQuotaPopover\.id='subQuotaPopover'/);
+    assert.match(page, /pointerenter.*showSubQuotaPreview/);
+    assert.match(page, /openSettings\(\{returnFocus:subQuotaToggle,focusTarget:subQuotaApiKeyInput\}\)/);
+    assert.match(page, /id='subQuotaSettings'/);
+    assert.match(page, /fetch\('\/api\/sub-quota-config'/);
+    assert.match(page, /fetch\('\/api\/sub-quotas'/);
+    assert.match(page, /!subQuotaToggle\?\.contains\(event\.target\)/);
     assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
     assert.match(page, /id="automationView"[^>]*aria-labelledby="automationViewTitle"/);
     assert.match(page, /让 ChatGPT 安排任务、设置提醒或监测更新/);
@@ -2899,6 +2997,7 @@ updated_at = 1784422800000
     assert.ok(trace.args.includes('model_reasoning_effort="max"'));
     assert.equal(trace.codexHome, codexHome);
     assert.equal(trace.home, temporary);
+    assert.equal(trace.sub2ApiKey, undefined);
 
     const created = await fetch(`${baseUrl}/api/native-sessions`, {
       method: 'POST',
@@ -3043,6 +3142,7 @@ updated_at = 1784422800000
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
+    assert.ok(protocolMessages.some((message) => message.type === 'process_env' && message.sub2ApiKey === undefined));
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
     assert.ok(protocolMessages.some((message) => (
@@ -3201,10 +3301,22 @@ updated_at = 1784422800000
     child = undefined;
     await unlink(path.join(runtime, 'port'));
 
-    child = await startServer({ temporary, runtime, codexHome, fakeCodex, traceFile, appServerTraceFile, webEnv });
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+      webEnv,
+      sub2ApiBaseUrl: providerBaseUrl,
+    });
     port = await waitForServer(child, runtime);
     const restored = await fetch(`http://127.0.0.1:${port}/api/config`, { headers: { Cookie: cookie } });
     assert.equal(restored.status, 200);
+    const restoredSubQuotaConfig = await fetch(`http://127.0.0.1:${port}/api/sub-quota-config`, { headers: { Cookie: cookie } });
+    assert.equal(restoredSubQuotaConfig.status, 200);
+    assert.equal((await restoredSubQuotaConfig.json()).keyConfigured, true);
   } finally {
     if (child) await stopServer(child);
     if (desktopIpc) await desktopIpc.close();
@@ -3343,10 +3455,10 @@ function startServer({
   desktopIpcEnabled = 'false',
   desktopIpcSocket = '',
   playgroundProxyAllowedOrigins = '',
+  sub2ApiBaseUrl,
+  sub2ApiKey,
 }) {
-  return spawn(process.execPath, [path.join(ROOT, 'server.mjs')], {
-    cwd: ROOT,
-    env: {
+  const env = {
       ...process.env,
       APP_NAME: 'Codex Web Test',
       CODEX_WEB_PASSWORD: 'test-password',
@@ -3373,7 +3485,14 @@ function startServer({
       FAKE_CODEX_TRACE: traceFile,
       FAKE_APP_SERVER_TRACE: appServerTraceFile,
       FAKE_APP_SERVER_CONTROL: appServerControlFile,
-    },
+  };
+  delete env.SUB2API_BASE_URL;
+  delete env.SUB2API_API_KEY;
+  if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;
+  if (sub2ApiKey !== undefined) env.SUB2API_API_KEY = sub2ApiKey;
+  return spawn(process.execPath, [path.join(ROOT, 'server.mjs')], {
+    cwd: ROOT,
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }

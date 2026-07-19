@@ -284,6 +284,8 @@ body .side {
   min-height: 0;
   flex-direction: column;
   gap: 12px;
+  container-name: sidebar;
+  container-type: inline-size;
   border-right: 1px solid var(--border);
   background: var(--surface);
   padding: 14px 12px 12px;
@@ -391,13 +393,16 @@ body .pill {
 }
 
 .sideActions {
+  position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(3, 36px);
+  grid-template-columns: minmax(0, 1fr) repeat(4, 36px);
   gap: 8px;
 }
 
 .sideActions .miniPrimary {
+  min-width: 0;
   width: 100%;
+  overflow: hidden;
   min-height: 36px;
   padding: 0 12px;
   font-size: 13px;
@@ -408,8 +413,16 @@ body .pill {
   height: 14px;
 }
 
+.sideActions .miniPrimary .buttonLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 body .archiveToggle,
 body .automationToggle,
+body .subQuotaToggle,
 body .settingsToggle {
   display: inline-grid;
   width: 36px;
@@ -427,6 +440,8 @@ body .archiveToggle:hover,
 body .archiveToggle.active,
 body .automationToggle:hover,
 body .automationToggle.active,
+body .subQuotaToggle:hover,
+body .subQuotaToggle[aria-expanded="true"],
 body .settingsToggle:hover,
 body .settingsToggle[aria-expanded="true"] {
   border-color: var(--border-strong);
@@ -436,15 +451,283 @@ body .settingsToggle[aria-expanded="true"] {
 
 .archiveToggle .buttonLabel,
 .automationToggle .buttonLabel,
+.subQuotaToggle .buttonLabel,
 .settingsToggle .buttonLabel {
   display: none;
 }
 
 .archiveToggle .lucide,
 .automationToggle .lucide,
+.subQuotaToggle .lucide,
 .settingsToggle .lucide {
   width: 16px;
   height: 16px;
+}
+
+.subQuotaPopover {
+  position: absolute;
+  z-index: 45;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  width: min(320px, 100%);
+  max-height: min(480px, calc(100dvh - 140px));
+  gap: 12px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 14px;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.2);
+}
+
+.subQuotaPopover:not(.hidden) {
+  animation: subQuotaPopoverIn 140ms var(--ease) both;
+}
+
+@keyframes subQuotaPopoverIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.subQuotaHead {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+}
+
+.subQuotaTitle {
+  min-width: 0;
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 720;
+}
+
+body .subQuotaClose {
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0;
+}
+
+body .subQuotaClose:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.subQuotaClose .lucide {
+  width: 15px;
+  height: 15px;
+}
+
+.subQuotaStatus {
+  min-height: 18px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.subQuotaStatus:empty {
+  display: none;
+}
+
+.subQuotaStatus[data-state="error"],
+.subQuotaError {
+  color: var(--danger);
+}
+
+.subQuotaContent {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+}
+
+.subQuotaSource {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+}
+
+.subQuotaSource:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.subQuotaPlan {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.subQuotaPlan > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaWindow {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.subQuotaWindowHead {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.subQuotaWindowHead > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaProgress {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-active);
+}
+
+.subQuotaProgressBar {
+  display: block;
+  width: var(--sub-quota-percent, 0%);
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+  transition: width 180ms var(--ease);
+}
+
+.subQuotaMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.subQuotaRefresh {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.subQuotaRefresh:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.subQuotaRefresh .lucide {
+  width: 14px;
+  height: 14px;
+}
+
+.subQuotaSettingsDescription {
+  margin: -3px 0 10px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.subQuotaEndpoint {
+  min-width: 0;
+  overflow: hidden;
+  margin-bottom: 10px;
+  color: var(--text-subtle);
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaSettingsForm {
+  display: grid;
+  gap: 10px;
+}
+
+.subQuotaSettingsForm .field {
+  margin: 0;
+}
+
+.subQuotaSettingsSubmit {
+  width: max-content;
+  min-width: 132px;
+  justify-self: end;
+}
+
+.subQuotaSettingsStatus {
+  min-height: 18px;
+  margin: -2px 0 0;
+}
+
+.subQuotaSettingsStatus.success {
+  color: var(--success);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .subQuotaPopover:not(.hidden) {
+    animation: none;
+  }
+}
+
+@container sidebar (max-width: 264px) {
+  .sideActions {
+    grid-template-columns: repeat(5, 36px);
+    justify-content: space-between;
+  }
+
+  .sideActions .miniPrimary {
+    width: 36px;
+    min-width: 36px;
+    padding: 0;
+  }
+
+  .sideActions .miniPrimary .buttonLabel {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
 }
 
 .archiveView {
@@ -6137,6 +6420,7 @@ body[data-chat-bg="skin"] .send:hover:not(:disabled) {
 body[data-chat-bg="skin"] .logoMark,
 body[data-chat-bg="skin"] .archiveToggle,
 body[data-chat-bg="skin"] .automationToggle,
+body[data-chat-bg="skin"] .subQuotaToggle,
 body[data-chat-bg="skin"] .settingsToggle,
 body[data-chat-bg="skin"] .themeToggle,
 body[data-chat-bg="skin"] .attachBtn,
@@ -6145,6 +6429,13 @@ body[data-chat-bg="skin"] .composerModelToggle {
   border-color: var(--primary-line);
   background: color-mix(in srgb, var(--primary) 9%, transparent);
   color: var(--primary);
+}
+
+body[data-chat-bg="skin"] .subQuotaPopover {
+  border-color: var(--primary-line);
+  background: var(--skin-surface-strong);
+  box-shadow: 0 16px 42px var(--skin-accent-glow);
+  backdrop-filter: blur(18px) saturate(1.08);
 }
 
 body[data-chat-bg="skin"] .hist.active {
