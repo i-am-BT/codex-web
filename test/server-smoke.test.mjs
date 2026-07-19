@@ -2235,6 +2235,11 @@ updated_at = 1784422800000
     assert.equal(planOnlyProgressCard.tagName, 'DIV');
     assert.equal(planOnlyProgressCard.className, 'turnResultCard editedFilesResult live withPlan planOnly');
     assert.equal(planOnlyProgressCard.children.length, 1);
+    assert.equal(planOnlyProgressCard.children[0].tabIndex, 0);
+    const planTooltip = planOnlyProgressCard.children[0].children.find((node) => node.className === 'turnPlanTooltip');
+    assert.ok(planTooltip);
+    assert.equal(planTooltip.attributes.get('role'), 'tooltip');
+    assert.deepEqual(planTooltip.children.map((node) => node.children.find((child) => child.className === 'turnPlanTooltipText')?.textContent), referencePlan.map((item) => item.step));
 
     const liveResultHelpers = inlineScript.match(
       /(function moveLiveEditedFilesResultToEnd[\s\S]*?)(?=function createWebPreviewResultCard)/,

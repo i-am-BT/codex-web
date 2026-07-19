@@ -4311,9 +4311,11 @@ body .msg.user.browserCommentSteering::after {
 .editedFilesResult.withPlan {
   width: max-content;
   max-width: 100%;
+  overflow: visible;
 }
 
 .editedFilesResult.withPlan > .turnResultHead {
+  position: relative;
   display: inline-flex;
   width: max-content;
   min-height: 36px;
@@ -4353,6 +4355,78 @@ body .msg.user.browserCommentSteering::after {
   font-size: 14px;
   font-weight: 600;
   text-overflow: clip;
+}
+
+.turnPlanTooltip {
+  position: absolute;
+  z-index: 30;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  display: grid;
+  width: max-content;
+  min-width: 270px;
+  max-width: min(360px, calc(100vw - 32px));
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+  color: var(--text);
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 4px);
+  transition: opacity 140ms ease, transform 140ms ease;
+  visibility: hidden;
+}
+
+.editedFilesResult.withPlan:hover .turnPlanTooltip,
+.editedFilesResult.withPlan:focus-within .turnPlanTooltip {
+  opacity: 1;
+  transform: translate(-50%, 0);
+  visibility: visible;
+}
+
+.turnPlanTooltipStep {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.turnPlanTooltipMarker {
+  width: 8px;
+  height: 8px;
+  margin-top: 3px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: transparent;
+}
+
+.turnPlanTooltipStep[data-status="completed"] .turnPlanTooltipMarker {
+  border-color: var(--success);
+  background: var(--success);
+}
+
+.turnPlanTooltipStep[data-status="in_progress"] {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.turnPlanTooltipStep[data-status="in_progress"] .turnPlanTooltipMarker {
+  border-color: var(--info);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--info) 18%, transparent);
+}
+
+.turnPlanTooltipText {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .turnResultDivider {

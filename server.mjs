@@ -8529,6 +8529,10 @@ function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
   if(hasPlan){card.dataset.planCurrent=String(progress.current);card.dataset.planTotal=String(progress.total)}
   const head=document.createElement(hasFiles?'summary':'div');
   head.className='turnResultHead';
+  if(!hasFiles&&hasPlan){
+    head.tabIndex=0;
+    head.setAttribute('aria-label','悬停查看任务步骤');
+  }
   if(hasPlan){
     const ring=document.createElement('span');
     ring.className='turnPlanProgressRing';
@@ -8539,6 +8543,25 @@ function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
     progressLabel.textContent='第 '+progress.current+' / '+progress.total+' 步';
     head.appendChild(ring);
     head.appendChild(progressLabel);
+    const tooltip=document.createElement('span');
+    tooltip.className='turnPlanTooltip';
+    tooltip.setAttribute('role','tooltip');
+    tooltip.setAttribute('aria-label','任务步骤');
+    for(const item of progress.items){
+      const row=document.createElement('span');
+      row.className='turnPlanTooltipStep';
+      row.dataset.status=item.status;
+      const marker=document.createElement('span');
+      marker.className='turnPlanTooltipMarker';
+      marker.setAttribute('aria-hidden','true');
+      const label=document.createElement('span');
+      label.className='turnPlanTooltipText';
+      label.textContent=item.step;
+      row.appendChild(marker);
+      row.appendChild(label);
+      tooltip.appendChild(row);
+    }
+    head.appendChild(tooltip);
     if(hasFiles){const divider=document.createElement('span');divider.className='turnResultDivider';divider.textContent='·';divider.setAttribute('aria-hidden','true');head.appendChild(divider)}
   }
   const title=document.createElement('strong');
