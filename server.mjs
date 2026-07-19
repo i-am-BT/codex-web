@@ -411,6 +411,7 @@ app.delete('/api/appearance/background', requireAuth, (req, res) => {
 
 app.get('/api/config', requireAuth, (req, res) => {
   const defaults = readCodexDefaults();
+  const pinnedThreadIds = nativeSessions.listPinnedThreadIds();
   res.json({
     defaults: {
       model: defaults.model || DEFAULT_MODEL,
@@ -421,7 +422,8 @@ app.get('/api/config', requireAuth, (req, res) => {
       approval: FORCE_FULL_ACCESS ? 'never' : DEFAULT_APPROVAL,
     },
     providers: readProviders(),
-    conversations: conversationSummaries(),
+    conversations: conversationSummaries(pinnedThreadIds),
+    pinnedThreadIds,
     appearance: readAppearance(),
     dreamSkinConcepts: DREAM_SKIN_CONCEPTS.map(({ prompt: _prompt, ...concept }) => concept),
     capabilities: {
@@ -2456,8 +2458,8 @@ function nativeTurnStatus(status) {
   return 'done';
 }
 
-function nativeSessionSummaries() {
-  return nativeSessions.list().map((session) => {
+function nativeSessionSummaries(includeIds = []) {
+  return nativeSessions.list(NATIVE_SESSION_MAX_ITEMS, { includeIds }).map((session) => {
     const active = activeNativeTurns.get(session.id);
     return {
       ...session,
@@ -3690,8 +3692,34 @@ function saveConversations() {
   writeFileSync(CONVERSATIONS_FILE, JSON.stringify(conversations.slice(0, 100), null, 2), { mode: 0o600 });
 }
 
-function conversationSummaries() {
-  return nativeSessionSummaries()
+function automationSummariesByThreadId() {
+  const byThreadId = new Map();
+  try {
+    for (const item of automationStore.list()) {
+      const threadId = String(item?.targetThreadId || '').trim().toLowerCase();
+      if (item?.kind !== 'heartbeat' || !NATIVE_THREAD_ID_PATTERN.test(threadId) || byThreadId.has(threadId)) continue;
+      const decorated = decorateAutomation(item);
+      byThreadId.set(threadId, {
+        id: decorated.id,
+        kind: decorated.kind,
+        name: decorated.name,
+        status: decorated.status,
+        rrule: decorated.rrule,
+        scheduleLabel: decorated.scheduleLabel,
+        nextRunAt: decorated.nextRunAt,
+      });
+    }
+  } catch {}
+  return byThreadId;
+}
+
+function conversationSummaries(pinnedThreadIds = nativeSessions.listPinnedThreadIds()) {
+  const automationByThreadId = automationSummariesByThreadId();
+  return nativeSessionSummaries(pinnedThreadIds)
+    .map((session) => {
+      const automation = automationByThreadId.get(session.id);
+      return automation ? { ...session, automation } : session;
+    })
     .sort((left, right) => Date.parse(right.updatedAt || right.createdAt || 0) - Date.parse(left.updatedAt || left.createdAt || 0))
     .slice(0, 160);
 }
@@ -3728,7 +3756,7 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button><button id="automationToggle" class="automationToggle" type="button">自动化安排</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="automationView" class="automationView hidden" aria-labelledby="automationViewTitle"><div class="automationViewInner"><header class="automationViewHeader"><div><h1 id="automationViewTitle">已安排的任务</h1><p>让 Codex 安排任务、设置提醒或监测更新</p></div><button id="automationCreate" class="automationCreate" type="button"><i data-lucide="plus" aria-hidden="true"></i><span>新建自动化</span></button></header><div class="automationToolbar"><label class="automationSearch"><span class="srOnly">搜索已安排任务</span><i data-lucide="search" aria-hidden="true"></i><input id="automationSearch" type="search" placeholder="搜索已安排任务" autocomplete="off"></label><label class="automationFilter"><span class="srOnly">状态</span><select id="automationFilter"><option value="">全部状态</option><option value="ACTIVE">运行中</option><option value="PAUSED">已暂停</option></select></label><button id="automationRefresh" class="automationRefresh" type="button"><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button></div><div id="automationStatus" class="automationStatus" role="status" aria-live="polite"></div><div id="automationList" class="automationList"></div></div><div id="automationEditor" class="automationEditor hidden" role="presentation"><form id="automationForm" class="automationForm" aria-labelledby="automationFormTitle"><div class="automationFormHead"><div><div class="automationFormEyebrow">Codex 自动化</div><h2 id="automationFormTitle">新建自动化安排</h2><p>保存后会写入 Codex App 正式自动化目录，并同步刷新 App。</p></div><button id="automationFormClose" class="automationIconButton" type="button" aria-label="关闭"><i data-lucide="x" aria-hidden="true"></i></button></div><div class="automationFormGrid"><label class="automationField automationFieldWide"><span>名称</span><input id="automationName" maxlength="120" required placeholder="例如：每日项目简报"></label><label class="automationField automationFieldWide"><span>任务说明</span><textarea id="automationPrompt" rows="5" maxlength="12000" required placeholder="告诉 Codex 每次运行时要完成什么"></textarea></label><label class="automationField"><span>频率</span><select id="automationFrequency"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option><option value="hourly">每隔数小时</option></select></label><label id="automationTimeField" class="automationField"><span>时间</span><input id="automationTime" type="time" value="09:00" required></label><label id="automationDayField" class="automationField hidden"><span>星期</span><select id="automationDay"><option value="MO">周一</option><option value="TU">周二</option><option value="WE">周三</option><option value="TH">周四</option><option value="FR">周五</option><option value="SA">周六</option><option value="SU">周日</option></select></label><label id="automationIntervalField" class="automationField hidden"><span>间隔小时</span><input id="automationInterval" type="number" min="1" max="24" value="3"></label><label class="automationField automationFieldWide"><span>项目目录</span><input id="automationCwd" placeholder="留空则作为无项目任务"></label><label class="automationField"><span>模型</span><input id="automationModel" placeholder="使用当前默认模型"></label><label class="automationField"><span>思考档位</span><select id="automationReasoning"><option value="">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option><option value="ultra">超高</option></select></label><label class="automationField automationCheckbox"><input id="automationStartPaused" type="checkbox"><span>先暂停，稍后手动启用</span></label></div><div id="automationFormMessage" class="automationFormMessage" role="alert"></div><div class="automationFormActions"><button id="automationFormCancel" class="automationSecondary" type="button">取消</button><button id="automationFormSubmit" class="automationPrimary" type="submit"><i data-lucide="calendar-plus" aria-hidden="true"></i><span>创建自动化</span></button></div></form></div></section><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button><button id="automationToggle" class="automationToggle" type="button">自动化安排</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="automationView" class="automationView hidden" aria-labelledby="automationViewTitle"><div class="automationViewInner"><header class="automationViewHeader"><div><h1 id="automationViewTitle">已安排的任务</h1><p>让 Codex 安排任务、设置提醒或监测更新</p></div><button id="automationCreate" class="automationCreate" type="button"><i data-lucide="plus" aria-hidden="true"></i><span>新建自动化</span></button></header><div class="automationToolbar"><label class="automationSearch"><span class="srOnly">搜索已安排任务</span><i data-lucide="search" aria-hidden="true"></i><input id="automationSearch" type="search" placeholder="搜索已安排任务" autocomplete="off"></label><label class="automationFilter"><span class="srOnly">状态</span><select id="automationFilter"><option value="">全部状态</option><option value="ACTIVE">运行中</option><option value="PAUSED">已暂停</option></select></label><button id="automationRefresh" class="automationRefresh" type="button"><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button></div><div id="automationStatus" class="automationStatus" role="status" aria-live="polite"></div><div id="automationList" class="automationList"></div></div><div id="automationEditor" class="automationEditor hidden" role="presentation"><form id="automationForm" class="automationForm" aria-label="新建自动化安排"><div class="automationFormBody"><label class="automationTitleField"><span class="srOnly">已安排任务标题</span><input id="automationName" maxlength="120" required placeholder="已安排任务标题" autocomplete="off"></label><label class="automationPromptField"><span class="srOnly">任务说明</span><textarea id="automationPrompt" rows="3" maxlength="12000" required placeholder="描述 ChatGPT 应该做什么"></textarea></label><section class="automationFormSection" aria-labelledby="automationDetailsTitle"><h3 id="automationDetailsTitle">详情</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>运行于</span><select id="automationRunAt" aria-label="运行于"><option value="new-task">新任务</option></select></label><label class="automationSettingRow"><span>项目</span><select id="automationCwd" aria-label="项目"><option value="">无</option></select></label><label class="automationSettingRow"><span>模型</span><select id="automationModel" aria-label="模型"><option value="">默认模型</option></select></label><label class="automationSettingRow"><span>推理</span><select id="automationReasoning" aria-label="推理"><option value="">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option><option value="ultra">极高</option></select></label></div></section><section class="automationFormSection" aria-labelledby="automationFrequencyTitle"><h3 id="automationFrequencyTitle">频率</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>重复</span><select id="automationFrequency" aria-label="重复"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option><option value="hourly">每隔数小时</option></select></label><label id="automationDayField" class="automationSettingRow hidden"><span>星期</span><select id="automationDay" aria-label="星期"><option value="MO">周一</option><option value="TU">周二</option><option value="WE">周三</option><option value="TH">周四</option><option value="FR">周五</option><option value="SA">周六</option><option value="SU">周日</option></select></label><label id="automationIntervalField" class="automationSettingRow hidden"><span>间隔</span><select id="automationInterval" aria-label="间隔小时"><option value="1">每小时</option><option value="2">每 2 小时</option><option value="3" selected>每 3 小时</option><option value="4">每 4 小时</option><option value="6">每 6 小时</option><option value="8">每 8 小时</option><option value="12">每 12 小时</option><option value="24">每 24 小时</option></select></label><label id="automationTimeField" class="automationSettingRow"><span>时间</span><span class="automationTimeControl"><span id="automationTimeDisplay">9:00</span><i data-lucide="chevron-down" aria-hidden="true"></i><input id="automationTime" type="time" value="09:00" required aria-label="时间"></span></label><label class="automationSettingRow"><span>通知</span><select id="automationNotification" aria-label="通知"><option value="always">所有运行</option><option value="failed_runs_only">仅失败时</option></select></label></div></section><input id="automationStartPaused" type="checkbox" class="hidden" aria-hidden="true" tabindex="-1"><div class="automationFormActions"><div id="automationFormMessage" class="automationFormMessage" role="alert"></div><button id="automationFormClose" class="automationEditorBack" type="button">取消</button><button id="automationFormSubmit" class="automationEditorSave" type="submit"><i data-lucide="calendar-plus" aria-hidden="true"></i><span>创建自动化</span></button></div></div></form></div></section><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>选择目录和模型，然后发送任务。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box"><textarea id="input" rows="1" placeholder="输入任务，可拖入附件"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
 <div id="nativeRequestModal" class="requestOverlay hidden" role="presentation"><div class="requestPanel" role="dialog" aria-modal="true" aria-labelledby="nativeRequestTitle"><div class="requestHead"><div><div id="nativeRequestTitle" class="requestTitle">Codex 请求确认</div><div id="nativeRequestMeta" class="requestMeta"></div></div></div><pre id="nativeRequestDetail" class="requestDetail"></pre><form id="nativeRequestForm"><div id="nativeRequestFields" class="requestFields"></div><div id="nativeRequestActions" class="requestActions"></div></form></div></div>
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
@@ -3859,6 +3887,8 @@ let sidebarPreferredWidth=SIDEBAR_WIDTH_DEFAULT;
 let sidebarRenderedWidth=SIDEBAR_WIDTH_DEFAULT;
 let sidebarResizePointerId=null;
 const HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsCollapsed';
+const HISTORY_PINNED_COLLAPSED_STORAGE_KEY='codexWeb.historyPinnedCollapsed';
+const HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY='codexWeb.historySidebarCollapsed';
 const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb.historyTasksCollapsed';
 const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
@@ -3866,7 +3896,10 @@ const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 const NATIVE_INITIAL_MESSAGE_LIMIT=60;
 const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
+let historyPinnedCollapsed=readHistoryPinnedCollapsed();
+let historySidebarCollapsed=readHistorySidebarCollapsed();
 let historyTasksCollapsed=readHistoryTasksCollapsed();
+let pinnedThreadIds=[];
 let hiddenHistoryProjects=readHiddenHistoryProjects();
 let renamedHistoryProjects=readRenamedHistoryProjects();
 let activeHistoryProjectMenu=null;
@@ -4790,6 +4823,45 @@ async function submitPasswordChange(event){
     submit.disabled=false;
   }
 }
+function syncAutomationFilterTabs(){
+  const selected=automationFilter?.value||'';
+  automationView?.querySelectorAll('.automationTab').forEach((button)=>{
+    const active=button.dataset.status===selected;
+    button.classList.toggle('active',active);
+    button.setAttribute('aria-selected',String(active));
+    button.tabIndex=active?0:-1;
+  });
+}
+function enhanceAutomationView(){
+  const subtitle=automationView?.querySelector('.automationViewHeader p');
+  if(subtitle)subtitle.textContent='让 ChatGPT 安排任务、设置提醒或监测更新';
+  const toolbar=automationView?.querySelector('.automationToolbar');
+  if(!toolbar||toolbar.nextElementSibling?.classList.contains('automationTabs'))return;
+  const tabs=document.createElement('div');
+  tabs.className='automationTabs';
+  tabs.setAttribute('role','tablist');
+  tabs.setAttribute('aria-label','筛选自动化状态');
+  for(const option of [
+    {value:'',label:'全部'},
+    {value:'ACTIVE',label:'已开启'},
+    {value:'PAUSED',label:'已暂停'},
+  ]){
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='automationTab';
+    button.dataset.status=option.value;
+    button.setAttribute('role','tab');
+    button.textContent=option.label;
+    button.addEventListener('click',()=>{
+      if(automationFilter)automationFilter.value=option.value;
+      syncAutomationFilterTabs();
+      renderAutomations();
+    });
+    tabs.appendChild(button);
+  }
+  toolbar.after(tabs);
+  syncAutomationFilterTabs();
+}
 function enhanceInterface(){
   const sideBrand=document.querySelector('.side > div:first-child');
   sideBrand?.classList.add('sideBrand');
@@ -4823,6 +4895,7 @@ function enhanceInterface(){
   automationToggle?.setAttribute('aria-pressed','false');
   setIconLabel(archiveRefresh,'refresh-cw','刷新');
   setIconLabel(archiveDeleteAll,'trash-2','永久删除全部');
+  enhanceAutomationView();
   setIconLabel(settingsToggle,'settings','设置',false);
   settingsToggle?.setAttribute('title','设置');
   settingsToggle?.setAttribute('aria-expanded','false');
@@ -4892,9 +4965,8 @@ automationFilter?.addEventListener('change',renderAutomations);
 automationRefresh?.addEventListener('click',()=>loadAutomations({force:true}));
 automationCreate?.addEventListener('click',openAutomationEditor);
 document.getElementById('automationFormClose')?.addEventListener('click',closeAutomationEditor);
-document.getElementById('automationFormCancel')?.addEventListener('click',closeAutomationEditor);
-automationEditor?.addEventListener('click',(event)=>{if(event.target===automationEditor)closeAutomationEditor()});
 automationFrequency?.addEventListener('change',syncAutomationScheduleFields);
+document.getElementById('automationTime')?.addEventListener('input',syncAutomationTimeDisplay);
 automationForm?.addEventListener('submit',createAutomation);
 document.getElementById('refreshProviderModels')?.addEventListener('click', refreshProviderModels);
 document.getElementById('saveDefault')?.addEventListener('click', saveDefaultModel);
@@ -5042,13 +5114,13 @@ async function handleChatBackgroundChange(){const value=chatBackground.value;if(
 async function handleCustomBackground(file){if(!file){await saveAppearance({chatBackground:'default'});statusEl.textContent='已恢复默认背景';return}if(!file.type.startsWith('image/')){statusEl.textContent='请选择图片文件';await saveAppearance({chatBackground:'default'});return}try{statusEl.textContent='上传背景...';const data=await readFileDataUrl(file);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:file.name,type:file.type,data})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景上传失败');appearance=body.appearance;applyAppearance();statusEl.textContent='自定义背景已应用'}catch(e){statusEl.textContent=e.message;await saveAppearance({chatBackground:'default'})}finally{chatBackgroundFile.value=''}}
 async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');cwd.value=defaultComposerCwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');cwd.value=defaultComposerCwd;sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const recent=data.conversations[0];await loadConversation(recent.id,recent.source)}}
 function flushPendingHistoryRefresh(){
   if(!historyRefreshPending||activeHistoryProjectMenu||historyProjectPreviewAnchor)return;
   historyRefreshPending=false;
   queueMicrotask(()=>refreshHistory());
 }
-async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor){historyRefreshPending=true;return}historyRefreshPending=false;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();renderHistory(data.conversations)}
+async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor){historyRefreshPending=true;return}historyRefreshPending=false;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations)}
 async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
 async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
@@ -5060,6 +5132,28 @@ function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
 function projectNameFromPath(value){const clean=String(value||'').replace(/\\\\/g,'/').replace(/\\/+$/,'');const parts=clean.split('/').filter(Boolean);return parts.length?parts[parts.length-1]:'未指定项目'}
 function isStandaloneHistoryItem(item){return String(item?.workspaceKind||'')==='projectless'}
+function isBrowserSidebarHistoryItem(item){return item?.source==='codex'&&String(item?.originator||'').trim().toLowerCase()==='codex-chrome-extension-sidepanel'}
+function partitionBrowserSidebarHistoryItems(items){
+  const sidebar=[];
+  const remaining=[];
+  for(const item of items||[])(isBrowserSidebarHistoryItem(item)?sidebar:remaining).push(item);
+  return{sidebar,remaining};
+}
+function partitionPinnedHistoryItems(items,pinnedIds=pinnedThreadIds){
+  const byId=new Map();
+  for(const item of items||[])if(item?.source==='codex'&&item.id&&!byId.has(item.id))byId.set(item.id,item);
+  const pinned=[];
+  const pinnedKeys=new Set();
+  for(const id of pinnedIds||[]){
+    const item=byId.get(String(id||''));
+    if(!item)continue;
+    const key=conversationKey(item.source,item.id);
+    if(pinnedKeys.has(key))continue;
+    pinnedKeys.add(key);
+    pinned.push(item);
+  }
+  return{pinned,remaining:(items||[]).filter((item)=>!pinnedKeys.has(conversationKey(item.source,item.id)))};
+}
 function partitionHistoryItems(items){
   const tasks=[];
   const projects=new Map();
@@ -5075,6 +5169,7 @@ function partitionHistoryItems(items){
 function setMainView(view){
   const archived=view==='archive';
   const automated=view==='automation';
+  if(!automated&&!automationEditor?.classList.contains('hidden'))closeAutomationEditor(false);
   activeMainView=archived?'archive':automated?'automation':'chat';
   archiveView?.classList.toggle('hidden',!archived);
   automationView?.classList.toggle('hidden',!automated);
@@ -5111,34 +5206,90 @@ async function openAutomationView(){
   await loadAutomations({force:true});
   automationSearch?.focus();
 }
+function fillAutomationSelect(select,options,selectedValue=''){
+  if(!select)return;
+  select.replaceChildren();
+  for(const optionData of options){
+    const option=document.createElement('option');
+    option.value=optionData.value;
+    option.textContent=optionData.label;
+    if(optionData.title)option.title=optionData.title;
+    select.appendChild(option);
+  }
+  const selected=String(selectedValue||'');
+  if(selected&&![...select.options].some((option)=>option.value===selected)){
+    const option=document.createElement('option');
+    option.value=selected;
+    option.textContent=selected;
+    select.appendChild(option);
+  }
+  select.value=[...select.options].some((option)=>option.value===selected)?selected:'';
+}
+function syncAutomationProjectOptions(selectedValue=''){
+  const paths=[];
+  for(const item of historyItems){
+    if(isStandaloneHistoryItem(item))continue;
+    const projectPath=normalizeProjectPath(item.cwd);
+    if(projectPath&&!paths.includes(projectPath))paths.push(projectPath);
+  }
+  const selected=normalizeProjectPath(selectedValue);
+  if(selected&&!paths.includes(selected))paths.unshift(selected);
+  fillAutomationSelect(document.getElementById('automationCwd'),[
+    {value:'',label:'无'},
+    ...paths.map((projectPath)=>({value:projectPath,label:historyProjectName(projectPath),title:projectPath})),
+  ],selected);
+}
+function syncAutomationModelOptions(selectedValue=''){
+  const options=[{value:'',label:'默认模型'}];
+  for(const source of [...(model?.options||[])]){
+    if(!source.value||options.some((option)=>option.value===source.value))continue;
+    const label=composerModelLabel(source.value);
+    options.push({value:source.value,label:/^gpt-/i.test(source.value)?'GPT-'+label:label});
+  }
+  fillAutomationSelect(document.getElementById('automationModel'),options,selectedValue);
+}
+function syncAutomationTimeDisplay(){
+  const time=document.getElementById('automationTime');
+  const display=document.getElementById('automationTimeDisplay');
+  const [hour='0',minute='00']=String(time?.value||'09:00').split(':');
+  if(display)display.textContent=String(Number(hour))+':'+minute;
+}
 function openAutomationEditor(template={}){
   const name=document.getElementById('automationName');
   const prompt=document.getElementById('automationPrompt');
   const frequency=document.getElementById('automationFrequency');
   const time=document.getElementById('automationTime');
   const day=document.getElementById('automationDay');
+  const interval=document.getElementById('automationInterval');
   if(name)name.value=template.name||'';
   if(prompt)prompt.value=template.prompt||'';
   if(frequency)frequency.value=template.frequency||'daily';
   if(time)time.value=template.time||'09:00';
+  syncAutomationTimeDisplay();
   if(day)day.value=template.day||'MO';
-  const automationCwd=document.getElementById('automationCwd');
-  if(automationCwd)automationCwd.value=template.cwd??cwd?.value??defaultComposerCwd??'';
-  const automationModel=document.getElementById('automationModel');
-  if(automationModel)automationModel.value=model?.value||'';
+  if(interval)interval.value=String(template.interval||3);
+  syncAutomationProjectOptions(template.cwd||'');
+  syncAutomationModelOptions(template.model??model?.value??'');
   const automationReasoning=document.getElementById('automationReasoning');
-  if(automationReasoning)automationReasoning.value=reasoningEffort?.value||'';
+  if(automationReasoning)automationReasoning.value=template.reasoningEffort??reasoningEffort?.value??'';
+  const notification=document.getElementById('automationNotification');
+  if(notification)notification.value=template.notificationPolicy||'always';
   const startPaused=document.getElementById('automationStartPaused');
-  if(startPaused)startPaused.checked=false;
+  if(startPaused)startPaused.checked=template.status==='PAUSED';
+  automationFormMessage.classList.remove('error');
   automationFormMessage.textContent='';
   syncAutomationScheduleFields();
+  automationView?.classList.add('editorOpen');
   automationEditor?.classList.remove('hidden');
   refreshIcons(automationEditor);
   requestAnimationFrame(()=>name?.focus());
 }
-function closeAutomationEditor(){
+function closeAutomationEditor(restoreFocus=true){
   automationEditor?.classList.add('hidden');
+  automationView?.classList.remove('editorOpen');
+  automationFormMessage.classList.remove('error');
   automationFormMessage.textContent='';
+  if(restoreFocus)automationSearch?.focus();
 }
 function syncAutomationScheduleFields(){
   const value=automationFrequency?.value||'daily';
@@ -5164,7 +5315,7 @@ async function createAutomation(event){
     cwd:document.getElementById('automationCwd')?.value||'',
     model:document.getElementById('automationModel')?.value||'',
     reasoningEffort:document.getElementById('automationReasoning')?.value||'',
-    notificationPolicy:'failed_runs_only',
+    notificationPolicy:document.getElementById('automationNotification')?.value||'always',
     status:document.getElementById('automationStartPaused')?.checked?'PAUSED':'ACTIVE',
   };
   try{
@@ -5207,36 +5358,36 @@ function automationRelativeTime(value){
   const difference=timestamp-Date.now();
   if(difference<=0)return'即将运行';
   const minutes=Math.round(difference/60000);
-  if(minutes<60)return minutes+' 分钟后';
+  if(minutes<60)return minutes+'分钟后';
   const hours=Math.round(minutes/60);
-  if(hours<24)return hours+' 小时后';
+  if(hours<18)return hours+'小时后';
+  const days=Math.max(1,Math.round(hours/24));
+  if(days<14)return days+'天后';
   return new Date(timestamp).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
-}
-function automationIconName(item){
-  const prompt=(item?.name+' '+item?.prompt).toLowerCase();
-  if(/监控|监测|monitor|watch/.test(prompt))return'radar';
-  if(/简报|brief|总结|summary/.test(prompt))return'notebook-text';
-  return'calendar-clock';
 }
 function createAutomationRow(item){
   const row=document.createElement('article');
   row.className='automationRow';
   row.dataset.automationId=item.id;
-  const icon=document.createElement('span');
-  icon.className='automationRowIcon';
-  const iconNode=document.createElement('i');
-  iconNode.setAttribute('data-lucide',automationIconName(item));
-  iconNode.setAttribute('aria-hidden','true');
-  icon.appendChild(iconNode);
+  const toggle=document.createElement('button');
+  toggle.type='button';
+  toggle.className='automationStateToggle '+(item.status==='ACTIVE'?'active':'paused');
+  toggle.setAttribute('role','switch');
+  toggle.setAttribute('aria-checked',String(item.status==='ACTIVE'));
+  toggle.setAttribute('aria-label',(item.status==='ACTIVE'?'暂停':'启用')+item.name);
+  toggle.title=item.status==='ACTIVE'?'暂停':'启用';
+  toggle.addEventListener('click',()=>setAutomationStatus(item,toggle));
   const content=document.createElement('div');
   content.className='automationRowContent';
   const heading=document.createElement('div');
   heading.className='automationRowHeading';
   const name=document.createElement('strong');
   name.textContent=item.name;
-  const schedule=document.createElement('span');
-  schedule.textContent=item.scheduleLabel||item.rrule;
-  heading.append(name,schedule);
+  heading.appendChild(name);
+  const schedule=document.createElement('div');
+  schedule.className='automationRowSchedule';
+  const scheduleLabel=String(item.scheduleLabel||item.rrule||'').replace(/\\b0(\\d):/g,'$1:');
+  schedule.textContent=scheduleLabel+(item.status==='ACTIVE'&&item.nextRunAt?' · 下次运行 '+automationRelativeTime(item.nextRunAt):'');
   const description=document.createElement('p');
   description.textContent=item.prompt;
   const meta=document.createElement('div');
@@ -5249,16 +5400,8 @@ function createAutomationRow(item){
     next.textContent='下次 '+automationRelativeTime(item.nextRunAt);
     meta.appendChild(next);
   }
-  content.append(heading,description,meta);
-  const toggle=document.createElement('button');
-  toggle.type='button';
-  toggle.className='automationStateToggle '+(item.status==='ACTIVE'?'active':'');
-  toggle.setAttribute('role','switch');
-  toggle.setAttribute('aria-checked',String(item.status==='ACTIVE'));
-  toggle.setAttribute('aria-label',(item.status==='ACTIVE'?'暂停':'启用')+item.name);
-  toggle.title=item.status==='ACTIVE'?'暂停':'启用';
-  toggle.addEventListener('click',()=>setAutomationStatus(item,toggle));
-  row.append(icon,content,toggle);
+  content.append(heading,schedule,description,meta);
+  row.append(toggle,content);
   return row;
 }
 async function setAutomationStatus(item,button){
@@ -5285,14 +5428,15 @@ function createAutomationSuggestions(){
   title.textContent='建议';
   section.appendChild(title);
   const templates=[
-    {icon:'bell',name:'每日简报',schedule:'工作日 08:00',description:'汇总项目最新进展、待办和需要关注的事项',frequency:'weekdays',time:'08:00',prompt:'检查这个项目的最新进展和待办事项，生成一份简洁的每日工作简报。'},
-    {icon:'notebook-text',name:'每周回顾',schedule:'周五 16:00',description:'总结本周完成的工作并整理成简短状态更新',frequency:'weekly',day:'FR',time:'16:00',prompt:'回顾我本周完成的工作，整理关键成果、未完成事项和下周重点。'},
-    {icon:'radar',name:'跟进监控',schedule:'工作日 09:00',description:'定期检查项目状态，并标记需要关注的变化',frequency:'weekdays',time:'09:00',prompt:'检查项目中的最新变化、失败任务和待跟进事项，只汇报需要我关注的内容。'},
+    {icon:'bell',accent:'blue',name:'每日简报',schedule:'工作日 8:00',description:'以日历、未读电子邮件和优先事项摘要开启每个工作日',frequency:'weekdays',time:'08:00',prompt:'检查这个项目的最新进展和待办事项，生成一份简洁的每日工作简报。'},
+    {icon:'notebook-text',accent:'purple',name:'每周回顾',schedule:'星期五（时间：16:00）',description:'每周五将你最近的工作整理成简明的状态更新',frequency:'weekly',day:'FR',time:'16:00',prompt:'回顾我本周完成的工作，整理关键成果、未完成事项和下周重点。'},
+    {icon:'file-search-2',accent:'green',name:'跟进监控',schedule:'工作日 9:00',description:'查看最近的电子邮箱和日历活动，并标记需要你关注的事项',frequency:'weekdays',time:'09:00',prompt:'检查项目中的最新变化、失败任务和待跟进事项，只汇报需要我关注的内容。'},
   ];
   for(const template of templates){
     const button=document.createElement('button');
     button.type='button';
     button.className='automationSuggestion';
+    button.dataset.accent=template.accent;
     const icon=document.createElement('i');
     icon.setAttribute('data-lucide',template.icon);
     icon.setAttribute('aria-hidden','true');
@@ -5305,10 +5449,7 @@ function createAutomationSuggestions(){
     const description=document.createElement('span');
     description.textContent=template.description;
     copy.append(heading,description);
-    const add=document.createElement('i');
-    add.setAttribute('data-lucide','plus');
-    add.setAttribute('aria-hidden','true');
-    button.append(icon,copy,add);
+    button.append(icon,copy);
     button.addEventListener('click',()=>openAutomationEditor(template));
     section.appendChild(button);
   }
@@ -5317,6 +5458,7 @@ function createAutomationSuggestions(){
 function renderAutomations(){
   if(!automationList)return;
   automationList.replaceChildren();
+  syncAutomationFilterTabs();
   const query=(automationSearch?.value||'').trim().toLowerCase();
   const status=automationFilter?.value||'';
   const visible=automationItems.filter((item)=>{
@@ -5683,6 +5825,10 @@ function hideHistoryProjectPreview(anchor){
 }
 function readCollapsedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
 function storeCollapsedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECTS_STORAGE_KEY,JSON.stringify([...collapsedHistoryProjects].sort()))}catch{}}
+function readHistoryPinnedCollapsed(){try{return localStorage.getItem(HISTORY_PINNED_COLLAPSED_STORAGE_KEY)==='1'}catch{return false}}
+function storeHistoryPinnedCollapsed(){try{localStorage.setItem(HISTORY_PINNED_COLLAPSED_STORAGE_KEY,historyPinnedCollapsed?'1':'0')}catch{}}
+function readHistorySidebarCollapsed(){try{return localStorage.getItem(HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY)==='1'}catch{return false}}
+function storeHistorySidebarCollapsed(){try{localStorage.setItem(HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY,historySidebarCollapsed?'1':'0')}catch{}}
 function readHistoryTasksCollapsed(){try{return localStorage.getItem(HISTORY_TASKS_COLLAPSED_STORAGE_KEY)==='1'}catch{return false}}
 function storeHistoryTasksCollapsed(){try{localStorage.setItem(HISTORY_TASKS_COLLAPSED_STORAGE_KEY,historyTasksCollapsed?'1':'0')}catch{}}
 function readHiddenHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HIDDEN_HISTORY_PROJECTS_STORAGE_KEY)||'[]');return new Set(Array.isArray(saved)?saved.filter((value)=>typeof value==='string'&&value):[])}catch{return new Set()}}
@@ -5794,6 +5940,106 @@ function setHistoryProjectExpanded(group,expanded){
   head.title=(expanded?'收起':'展开')+' '+projectName+'\\n'+projectPath;
   rows.hidden=!expanded;
 }
+function setHistoryPinnedExpanded(section,expanded){
+  const head=section?.querySelector('.historyPinnedHead');
+  const rows=section?.querySelector('.historyPinnedItems');
+  if(!head||!rows)return;
+  const itemCount=section.dataset.pinnedCount||'0';
+  const runningCount=section.dataset.pinnedRunningCount||'0';
+  section.classList.toggle('collapsed',!expanded);
+  head.setAttribute('aria-expanded',String(expanded));
+  head.setAttribute('aria-label',(expanded?'收起':'展开')+'置顶，'+itemCount+' 个对话串，'+runningCount+' 个已开启');
+  head.title=(expanded?'收起':'展开')+'置顶';
+  rows.hidden=!expanded;
+}
+function appendPinnedHistoryTasks(items,{query=false}={}){
+  if(!items.length)return;
+  const section=document.createElement('section');
+  section.className='historyPinned';
+  const runningCount=items.filter((item)=>item.status==='running').length;
+  section.dataset.pinnedCount=String(items.length);
+  section.dataset.pinnedRunningCount=String(runningCount);
+  section.setAttribute('aria-label','置顶，'+items.length+' 个对话串，'+runningCount+' 个已开启');
+  const head=document.createElement('button');
+  head.type='button';
+  head.className='historyPinnedHead';
+  head.setAttribute('aria-controls','history-pinned-items');
+  const title=document.createElement('span');
+  title.className='historyPinnedTitle';
+  title.textContent='置顶';
+  const chevron=document.createElement('span');
+  chevron.className='historyPinnedChevron';
+  setIconLabel(chevron,'chevron-right','',false);
+  head.appendChild(title);
+  head.appendChild(chevron);
+  const rows=document.createElement('div');
+  rows.className='historyPinnedItems';
+  rows.id='history-pinned-items';
+  for(const item of items)rows.appendChild(createHistoryRow(item,''));
+  section.appendChild(head);
+  section.appendChild(rows);
+  history.appendChild(section);
+  const currentKey=conversationKey(currentConversationSource,currentConversationId);
+  const containsCurrent=Boolean(currentConversationId)&&items.some((item)=>conversationKey(item.source,item.id)===currentKey);
+  setHistoryPinnedExpanded(section,Boolean(query)||containsCurrent||!historyPinnedCollapsed);
+  head.addEventListener('click',()=>{
+    const expanded=head.getAttribute('aria-expanded')==='true';
+    setHistoryPinnedExpanded(section,!expanded);
+    if(query)return;
+    historyPinnedCollapsed=expanded;
+    storeHistoryPinnedCollapsed();
+  });
+}
+function setHistorySidebarExpanded(section,expanded){
+  const head=section?.querySelector('.historySidebarHead');
+  const rows=section?.querySelector('.historySidebarItems');
+  if(!head||!rows)return;
+  const itemCount=section.dataset.sidebarCount||'0';
+  const runningCount=section.dataset.sidebarRunningCount||'0';
+  section.classList.toggle('collapsed',!expanded);
+  head.setAttribute('aria-expanded',String(expanded));
+  head.setAttribute('aria-label',(expanded?'收起':'展开')+'侧边栏，'+itemCount+' 个对话串，'+runningCount+' 个已开启');
+  head.title=(expanded?'收起':'展开')+'侧边栏';
+  rows.hidden=!expanded;
+}
+function appendBrowserSidebarHistoryTasks(items,{query=false}={}){
+  if(!items.length)return;
+  const section=document.createElement('section');
+  section.className='historySidebarTasks';
+  const runningCount=items.filter((item)=>item.status==='running').length;
+  section.dataset.sidebarCount=String(items.length);
+  section.dataset.sidebarRunningCount=String(runningCount);
+  section.setAttribute('aria-label','侧边栏，'+items.length+' 个对话串，'+runningCount+' 个已开启');
+  const head=document.createElement('button');
+  head.type='button';
+  head.className='historySidebarHead';
+  head.setAttribute('aria-controls','history-sidebar-items');
+  const title=document.createElement('span');
+  title.className='historySidebarTitle';
+  title.textContent='侧边栏';
+  const chevron=document.createElement('span');
+  chevron.className='historySidebarChevron';
+  setIconLabel(chevron,'chevron-right','',false);
+  head.appendChild(title);
+  head.appendChild(chevron);
+  const rows=document.createElement('div');
+  rows.className='historySidebarItems';
+  rows.id='history-sidebar-items';
+  for(const item of items)rows.appendChild(createHistoryRow(item,''));
+  section.appendChild(head);
+  section.appendChild(rows);
+  history.appendChild(section);
+  const currentKey=conversationKey(currentConversationSource,currentConversationId);
+  const containsCurrent=Boolean(currentConversationId)&&items.some((item)=>conversationKey(item.source,item.id)===currentKey);
+  setHistorySidebarExpanded(section,Boolean(query)||containsCurrent||!historySidebarCollapsed);
+  head.addEventListener('click',()=>{
+    const expanded=head.getAttribute('aria-expanded')==='true';
+    setHistorySidebarExpanded(section,!expanded);
+    if(query)return;
+    historySidebarCollapsed=expanded;
+    storeHistorySidebarCollapsed();
+  });
+}
 function setHistoryTasksExpanded(section,expanded){
   const head=section?.querySelector('.historyTasksHead');
   const rows=section?.querySelector('.historyTasksItems');
@@ -5863,7 +6109,11 @@ function renderHistory(items){
     history.appendChild(empty);
     return;
   }
-  const {tasks:standaloneTasks,projects:groups}=partitionHistoryItems(visibleItems);
+  const {pinned,remaining:pinnedRemaining}=partitionPinnedHistoryItems(visibleItems);
+  appendPinnedHistoryTasks(pinned,{query:Boolean(query)});
+  const {sidebar,remaining}=partitionBrowserSidebarHistoryItems(pinnedRemaining);
+  appendBrowserSidebarHistoryTasks(sidebar,{query:Boolean(query)});
+  const {tasks:standaloneTasks,projects:groups}=partitionHistoryItems(remaining);
   appendStandaloneHistoryTasks(standaloneTasks,{query:Boolean(query)});
   let groupIndex=0;
   for(const [groupKey,groupData] of groups){
@@ -5934,16 +6184,31 @@ function renderHistory(items){
 }
 function createHistoryRow(item,projectPath){
   const source=item.source==='codex'?'codex':'web';
+  const automationName=String(item.automation?.name||'').trim();
   const row=document.createElement('div');
   row.className='hist'+(source==='codex'?' native':'');
   row.dataset.key=conversationKey(source,item.id);
   if(row.dataset.key===conversationKey(currentConversationSource,currentConversationId))row.classList.add('active');
-  row.title=item.title+(projectPath?'\\n'+projectPath:'');
+  row.title=item.title+(projectPath?'\\n'+projectPath:'')+(automationName?'\\n自动化任务：'+automationName:'');
   row.addEventListener('click',()=>loadConversation(item.id,source));
   const open=document.createElement('button');
   open.type='button';
-  open.className='histOpen'+(item.status==='running'?' running':'');
-  open.textContent=item.title;
+  open.className='histOpen'+(item.status==='running'?' running':'')+(automationName?' hasAutomation':'');
+  const openLabel=document.createElement('span');
+  openLabel.className='histOpenLabel';
+  openLabel.textContent=item.title;
+  open.appendChild(openLabel);
+  if(automationName){
+    const automationIcon=document.createElement('span');
+    automationIcon.className='histAutomationIcon';
+    automationIcon.title='自动化任务：'+automationName;
+    automationIcon.setAttribute('aria-label','自动化任务：'+automationName);
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide','calendar-clock');
+    icon.setAttribute('aria-hidden','true');
+    automationIcon.appendChild(icon);
+    open.appendChild(automationIcon);
+  }
   open.title=row.title;
   open.addEventListener('click',(e)=>{e.stopPropagation();loadConversation(item.id,source)});
   if(source==='codex'){
@@ -5968,7 +6233,7 @@ function createHistoryRow(item,projectPath){
     rename.title='修改会话标题';
     rename.setAttribute('aria-label','修改会话标题');
     setIconLabel(rename,'pencil','修改会话标题',false);
-    rename.addEventListener('click',(e)=>{e.stopPropagation();renameConversation(item.id,item.title,source)});
+    rename.addEventListener('click',(e)=>{e.preventDefault();e.stopPropagation();beginHistoryRename(row,open,item,source)});
     const del=document.createElement('button');
     del.type='button';
     del.className='histDelete';
@@ -5985,7 +6250,7 @@ function createHistoryRow(item,projectPath){
     rename.title='修改会话标题';
     rename.setAttribute('aria-label','修改会话标题');
     setIconLabel(rename,'pencil','修改会话标题',false);
-    rename.addEventListener('click',(e)=>{e.stopPropagation();renameConversation(item.id,item.title,source)});
+    rename.addEventListener('click',(e)=>{e.preventDefault();e.stopPropagation();beginHistoryRename(row,open,item,source)});
     const del=document.createElement('button');
     del.type='button';
     del.className='histDelete';
@@ -5999,8 +6264,54 @@ function createHistoryRow(item,projectPath){
   refreshIcons(row);
   return row;
 }
-function updateActiveHistory(){const key=conversationKey(currentConversationSource,currentConversationId);let activeRow=null;history.querySelectorAll('.hist').forEach((row)=>{const active=row.dataset.key===key;row.classList.toggle('active',active);if(active)activeRow=row});if(activeRow)setHistoryProjectExpanded(activeRow.closest('.historyProject'),true)}
-async function renameConversation(id,title,source='codex'){const next=prompt('修改会话标题',title||'');if(next===null)return;const clean=next.trim().replace(/\s+/g,' ').slice(0,80);if(!clean){statusEl.textContent='标题不能为空';return}const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:clean})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'改名失败';return}await refreshHistory();statusEl.textContent='标题已更新'}
+function updateActiveHistory(){const key=conversationKey(currentConversationSource,currentConversationId);let activeRow=null;history.querySelectorAll('.hist').forEach((row)=>{const active=row.dataset.key===key;row.classList.toggle('active',active);if(active)activeRow=row});if(!activeRow)return;setHistoryPinnedExpanded(activeRow.closest('.historyPinned'),true);setHistorySidebarExpanded(activeRow.closest('.historySidebarTasks'),true);setHistoryTasksExpanded(activeRow.closest('.historyTasks'),true);setHistoryProjectExpanded(activeRow.closest('.historyProject'),true)}
+function beginHistoryRename(row,open,item,source='codex'){
+  if(!row||!open||row.classList.contains('renaming'))return;
+  const input=document.createElement('input');
+  input.type='text';
+  input.className='histRenameInput';
+  input.value=item.title||'';
+  input.maxLength=80;
+  input.setAttribute('aria-label','新会话标题');
+  input.title='输入新标题，按 Enter 保存，按 Escape 取消';
+  row.classList.add('renaming');
+  row.replaceChild(input,open);
+  let finished=false;
+  const restore=()=>{
+    if(input.isConnected)input.replaceWith(open);
+    row.classList.remove('renaming');
+  };
+  const commit=async()=>{
+    if(finished)return;
+    const clean=input.value.trim().replace(/\s+/g,' ').slice(0,80);
+    if(!clean){statusEl.textContent='标题不能为空';input.focus();return}
+    if(clean===String(item.title||'').trim()){finished=true;restore();return}
+    finished=true;
+    input.disabled=true;
+    const ok=await renameConversation(item.id,clean,source);
+    if(ok){await refreshHistory();statusEl.textContent='标题已更新'}
+    else{restore()}
+  };
+  input.addEventListener('keydown',(event)=>{
+    if(event.key==='Enter'){event.preventDefault();commit()}
+    else if(event.key==='Escape'){event.preventDefault();finished=true;restore()}
+  });
+  input.addEventListener('blur',()=>{if(!finished)commit()});
+  requestAnimationFrame(()=>{
+    if(!finished&&input.isConnected){input.focus();input.select()}
+  });
+}
+async function renameConversation(id,title,source='codex'){
+  const clean=String(title||'').trim().replace(/\s+/g,' ').slice(0,80);
+  if(!clean){statusEl.textContent='标题不能为空';return false}
+  const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';
+  try{
+    const res=await fetch(endpoint+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:clean})});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){statusEl.textContent=data.error||'改名失败';return false}
+    return true;
+  }catch(error){statusEl.textContent=error.message||'改名失败';return false}
+}
 async function deleteConversation(id,title,source='codex'){const verb=source==='codex'?'归档':'删除';if(!confirm(verb+'会话：'+title+'？'))return;const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});const data=await res.json().catch(()=>({}));if(!res.ok){statusEl.textContent=data.error||verb+'失败';return}if(currentConversationId===id)newChat();await refreshHistory();statusEl.textContent=verb+'完成'}
 function sidebarCollapsedPreference(){try{return localStorage.getItem(SIDEBAR_STORAGE_KEY)==='1'}catch{return false}}
 function storeSidebarCollapsed(collapsed){try{localStorage.setItem(SIDEBAR_STORAGE_KEY,collapsed?'1':'0')}catch{}}

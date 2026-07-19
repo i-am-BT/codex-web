@@ -90,6 +90,11 @@ wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "test-token"
 `);
+    await writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'pinned-thread-ids': [nativeSessionId, archivedNativeSessionId],
+      'projectless-thread-ids': [],
+      'thread-project-assignments': {},
+    }));
     const nativeSessionDir = path.join(codexHome, 'sessions', '2026', '07', '11');
     await mkdir(nativeSessionDir, { recursive: true });
     await writeFile(path.join(codexHome, 'session_index.jsonl'), [
@@ -120,7 +125,7 @@ experimental_bearer_token = "test-token"
             timestamp: '2026-07-11T04:52:31.928Z',
             cwd: temporary,
             model_provider: 'fake',
-            originator: 'Codex Desktop',
+            originator: 'codex-chrome-extension-sidepanel',
             source: 'vscode',
             cli_version: 'test',
           },
@@ -757,6 +762,19 @@ if (args[0] === 'app-server') {
     });
     assert.equal(emptyAutomations.status, 200);
     assert.equal((await emptyAutomations.json()).count, 0);
+    const heartbeatDirectory = path.join(codexHome, 'automations', 'fixture-heartbeat');
+    await mkdir(heartbeatDirectory, { recursive: true });
+    await writeFile(path.join(heartbeatDirectory, 'automation.toml'), `version = 1
+id = "fixture-heartbeat"
+kind = "heartbeat"
+name = "Fixture heartbeat"
+prompt = "Keep the fixture task moving."
+status = "ACTIVE"
+rrule = "FREQ=DAILY;BYHOUR=9;BYMINUTE=30"
+target_thread_id = "${nativeSessionId}"
+created_at = 1784422800000
+updated_at = 1784422800000
+`);
     const createdAutomation = await fetch(`${baseUrl}/api/automations`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -765,7 +783,9 @@ if (args[0] === 'app-server') {
         prompt: 'Summarize the latest project work.',
         cwd: temporary,
         model: 'test-model',
-        reasoningEffort: 'max',
+        reasoningEffort: 'xhigh',
+        notificationPolicy: 'always',
+        status: 'PAUSED',
         schedule: { frequency: 'weekdays', time: '08:00' },
       }),
     });
@@ -773,22 +793,30 @@ if (args[0] === 'app-server') {
     const createdAutomationPayload = await createdAutomation.json();
     assert.equal(createdAutomationPayload.automation.id, 'daily-project-brief');
     assert.equal(createdAutomationPayload.automation.scheduleLabel, '工作日 08:00');
+    assert.equal(createdAutomationPayload.automation.model, 'test-model');
+    assert.equal(createdAutomationPayload.automation.reasoningEffort, 'xhigh');
+    assert.equal(createdAutomationPayload.automation.notificationPolicy, 'always');
+    assert.equal(createdAutomationPayload.automation.status, 'PAUSED');
     const automationToml = await readFile(
       path.join(codexHome, 'automations', 'daily-project-brief', 'automation.toml'),
       'utf8',
     );
     assert.match(automationToml, /cwds = \[".+"\]/);
+    assert.match(automationToml, /model = "test-model"/);
+    assert.match(automationToml, /reasoning_effort = "xhigh"/);
+    assert.match(automationToml, /notification_policy = "always"/);
+    assert.match(automationToml, /status = "PAUSED"/);
     assert.doesNotMatch(automationToml, /target =/);
-    const pausedAutomation = await fetch(
+    const activatedAutomation = await fetch(
       `${baseUrl}/api/automations/daily-project-brief/status`,
       {
         method: 'PATCH',
         headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: 'PAUSED' }),
+        body: JSON.stringify({ status: 'ACTIVE' }),
       },
     );
-    assert.equal(pausedAutomation.status, 200);
-    assert.equal((await pausedAutomation.json()).automation.status, 'PAUSED');
+    assert.equal(activatedAutomation.status, 200);
+    assert.equal((await activatedAutomation.json()).automation.status, 'ACTIVE');
 
     const archivedTasks = await fetch(`${baseUrl}/api/native-archived-sessions`, {
       headers: { Cookie: cookie },
@@ -1173,6 +1201,32 @@ if (args[0] === 'app-server') {
     assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><button id="automationToggle"[^>]*>自动化安排<\/button><\/div><button id="settingsToggle"/);
     assert.match(page, /id="archiveView"[^>]*aria-labelledby="archiveViewTitle"/);
     assert.match(page, /id="automationView"[^>]*aria-labelledby="automationViewTitle"/);
+    assert.match(page, /让 ChatGPT 安排任务、设置提醒或监测更新/);
+    assert.match(page, /class="automationFormBody"/);
+    assert.match(page, /id="automationName"[^>]*placeholder="已安排任务标题"/);
+    assert.match(page, /id="automationPrompt"[^>]*placeholder="描述 ChatGPT 应该做什么"/);
+    assert.match(page, /id="automationRunAt"[^>]*><option value="new-task">新任务/);
+    assert.match(page, /id="automationCwd"[^>]*><option value="">无/);
+    assert.match(page, /id="automationModel"[^>]*><option value="">默认模型/);
+    assert.match(page, /id="automationReasoning"[^>]*>.*<option value="ultra">极高/s);
+    assert.match(page, /id="automationFrequency"[^>]*>.*<option value="hourly">每隔数小时/s);
+    assert.match(page, /id="automationDayField" class="automationSettingRow hidden"/);
+    assert.match(page, /id="automationIntervalField" class="automationSettingRow hidden"/);
+    assert.match(page, /class="automationTimeControl"[^>]*>.*id="automationTimeDisplay">9:00.*id="automationTime" type="time" value="09:00"/s);
+    assert.match(page, /getElementById\('automationTime'\)\?\.addEventListener\('input',syncAutomationTimeDisplay\)/);
+    assert.match(page, /id="automationNotification"[^>]*><option value="always">所有运行/);
+    assert.match(page, /automationFrequency\?\.addEventListener\('change',syncAutomationScheduleFields\)/);
+    assert.match(page, /notificationPolicy:document\.getElementById\('automationNotification'\)\?\.value\|\|'always'/);
+    assert.match(page, /className='automationTabs'/);
+    assert.match(page, /\{value:'',label:'全部'\}/);
+    assert.match(page, /\{value:'ACTIVE',label:'已开启'\}/);
+    assert.match(page, /\{value:'PAUSED',label:'已暂停'\}/);
+    assert.match(page, /button\.setAttribute\('role','tab'\)/);
+    assert.match(page, /toggle\.className='automationStateToggle '\+\(item\.status==='ACTIVE'\?'active':'paused'\)/);
+    assert.match(page, /schedule\.textContent=scheduleLabel\+\(item\.status==='ACTIVE'&&item\.nextRunAt\?' · 下次运行 '/);
+    assert.match(page, /button\.dataset\.accent=template\.accent/);
+    assert.match(page, /icon:'file-search-2',accent:'green'/);
+    assert.doesNotMatch(page, /add\.setAttribute\('data-lucide','plus'\)/);
     assert.match(page, /function openAutomationView/);
     assert.match(page, /function renderAutomations/);
     assert.match(page, /function openArchivedView/);
@@ -2265,6 +2319,7 @@ if (args[0] === 'app-server') {
     assert.equal(config.defaults.reasoningEffort, 'max');
     assert.equal(config.capabilities.manageProviders, false);
     assert.equal(config.appearance.chatBackground, 'default');
+    assert.deepEqual(config.pinnedThreadIds, [nativeSessionId, archivedNativeSessionId]);
 
     const playgroundConfigResponse = await fetch(`${baseUrl}/api/playground-config`, {
       headers: { Cookie: cookie },
@@ -2373,6 +2428,11 @@ if (args[0] === 'app-server') {
       && conversation.source === 'codex'
       && conversation.title === 'Codex App fixture'
       && conversation.cwd === temporary
+      && conversation.originator === 'codex-chrome-extension-sidepanel'
+      && conversation.automation?.id === 'fixture-heartbeat'
+      && conversation.automation?.kind === 'heartbeat'
+      && conversation.automation?.name === 'Fixture heartbeat'
+      && conversation.automation?.scheduleLabel === '每天 09:30'
     )));
     assert.equal(config.conversations.some((conversation) => conversation.id === archivedNativeSessionId), false);
     assert.equal(config.conversations.some((conversation) => conversation.id === automationNativeSessionId), false);

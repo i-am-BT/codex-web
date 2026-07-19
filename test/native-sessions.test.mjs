@@ -809,7 +809,13 @@ test('native session store only exposes visible, non-archived Codex App threads'
       const records = [{
         timestamp: '2026-07-11T04:52:31.928Z',
         type: 'session_meta',
-        payload: { id, source },
+        payload: {
+          id,
+          source,
+          originator: id === visibleOlder
+            ? 'codex-chrome-extension-sidepanel'
+            : id === visibleNewer ? 'Codex Desktop' : '',
+        },
       }];
       if (id === subagent) records.push(
         {
@@ -942,6 +948,7 @@ test('native session store only exposes visible, non-archived Codex App threads'
 
     const globalStateFile = path.join(codexHome, '.codex-global-state.json');
     await writeFile(globalStateFile, JSON.stringify({
+      'pinned-thread-ids': [visibleOlder.toUpperCase(), 'invalid', visibleOlder, visibleNewer],
       'projectless-thread-ids': [visibleOlder],
       'thread-project-assignments': {
         [visibleNewer]: { projectKind: 'local', projectId: 'project-newer', cwd: '/workspace/newer' },
@@ -952,7 +959,22 @@ test('native session store only exposes visible, non-archived Codex App threads'
     assert.deepEqual(store.list().map((session) => session.id), [visibleNewer, visibleOlder]);
     assert.deepEqual(store.list().map((session) => session.cwd), ['/workspace/newer', '/workspace/older']);
     assert.deepEqual(store.list().map((session) => session.title), [`Title ${visibleNewer.slice(-3)}`, '数据库回退标题']);
+    assert.deepEqual(store.list().map((session) => session.originator), [
+      'Codex Desktop',
+      'codex-chrome-extension-sidepanel',
+    ]);
+    assert.equal(store.sessionMetadataCache.size, 2);
+    const cachedSidepanelMetadata = store.sessionMetadataCache.get(visibleOlder);
+    store.refresh();
+    assert.strictEqual(store.sessionMetadataCache.get(visibleOlder), cachedSidepanelMetadata);
     assert.deepEqual(store.list().map((session) => session.workspaceKind), ['project', 'projectless']);
+    assert.deepEqual(store.listPinnedThreadIds(), [visibleOlder, visibleNewer]);
+    assert.deepEqual(store.list(1).map((session) => session.id), [visibleNewer]);
+    assert.deepEqual(
+      store.list(1, { includeIds: [visibleOlder.toUpperCase(), 'invalid', visibleOlder] })
+        .map((session) => session.id),
+      [visibleNewer, visibleOlder],
+    );
     assert.equal(store.get(visibleOlder).metadata.workspaceKind, 'projectless');
     assert.equal(store.get(archived), null);
     assert.equal(store.get(execSession), null);
@@ -979,8 +1001,23 @@ test('native session store only exposes visible, non-archived Codex App threads'
     assert.equal(store.get(modernAutomation), null);
     assert.equal(store.get(legacyAutomation), null);
 
+    const pinnedChanged = once(store, 'change');
+    await writeFile(globalStateFile, JSON.stringify({
+      'pinned-thread-ids': [visibleNewer, visibleOlder],
+      'projectless-thread-ids': [visibleOlder],
+      'thread-project-assignments': {
+        [visibleNewer]: { projectKind: 'local', projectId: 'project-newer', cwd: '/workspace/newer' },
+      },
+    }));
+    store.refresh();
+    const [pinnedChange] = await pinnedChanged;
+    assert.deepEqual(store.listPinnedThreadIds(), [visibleNewer, visibleOlder]);
+    assert.ok(pinnedChange.changedIds.includes(visibleNewer));
+    assert.ok(pinnedChange.changedIds.includes(visibleOlder));
+
     const workspaceChanged = once(store, 'change');
     await writeFile(globalStateFile, JSON.stringify({
+      'pinned-thread-ids': [visibleNewer, visibleOlder],
       'projectless-thread-ids': { [visibleNewer]: true },
       'thread-project-assignments': {
         [visibleOlder]: { projectKind: 'local', projectId: 'project-older', cwd: '/workspace/older' },
@@ -995,6 +1032,7 @@ test('native session store only exposes visible, non-archived Codex App threads'
     await writeFile(globalStateFile, '{invalid');
     store.refresh();
     assert.deepEqual(store.list().map((session) => session.workspaceKind), ['projectless', 'project']);
+    assert.deepEqual(store.listPinnedThreadIds(), [visibleNewer, visibleOlder]);
 
     const changed = once(store, 'change');
     const writer = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
@@ -1004,6 +1042,7 @@ test('native session store only exposes visible, non-archived Codex App threads'
     const [change] = await changed;
     assert.ok(change.changedIds.includes(visibleNewer));
     assert.deepEqual(store.list().map((session) => session.id), [visibleOlder]);
+    assert.deepEqual([...store.sessionMetadataCache.keys()], [visibleOlder]);
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });
@@ -1029,6 +1068,7 @@ test('native session store applies projectless state without a state database an
       }]));
     }
     await writeFile(globalStateFile, JSON.stringify({
+      'pinned-thread-ids': [projectId, projectlessId],
       'projectless-thread-ids': { [projectlessId]: true, [projectId]: true },
       'thread-project-assignments': { [projectId]: { projectId: 'explicit-project' } },
     }));
@@ -1037,6 +1077,7 @@ test('native session store applies projectless state without a state database an
     assert.equal(store.workspaceKindForThread(projectlessId.toUpperCase()), 'projectless');
     assert.equal(store.workspaceKindForThread(projectId), 'project');
     assert.equal(store.workspaceKindForThread('invalid'), '');
+    assert.deepEqual(store.listPinnedThreadIds(), [projectId, projectlessId]);
     assert.deepEqual(
       Object.fromEntries(store.list().map((session) => [session.id, session.workspaceKind])),
       { [projectlessId]: 'projectless', [projectId]: 'project' },
@@ -1046,14 +1087,17 @@ test('native session store applies projectless state without a state database an
     await writeFile(globalStateFile, '{invalid');
     store.refresh();
     assert.equal(store.workspaceKindForThread(projectlessId), 'projectless');
+    assert.deepEqual(store.listPinnedThreadIds(), [projectId, projectlessId]);
 
     await rm(globalStateFile);
     store.refresh();
     assert.equal(store.workspaceKindForThread(projectlessId), 'projectless');
+    assert.deepEqual(store.listPinnedThreadIds(), [projectId, projectlessId]);
 
     await writeFile(globalStateFile, JSON.stringify({ unrelated: true }));
     store.refresh();
     assert.equal(store.workspaceKindForThread(projectlessId), '');
+    assert.deepEqual(store.listPinnedThreadIds(), []);
     assert.deepEqual(store.list().map((session) => session.workspaceKind), ['', '']);
     assert.equal(store.get(projectlessId).metadata.workspaceKind, '');
   } finally {

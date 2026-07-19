@@ -52,10 +52,12 @@ export class NativeSessionStore extends EventEmitter {
     this.subagentThreads = new Map();
     this.titles = new Map();
     this.details = new Map();
+    this.sessionMetadataCache = new Map();
     this.indexStamp = '';
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
     this.projectThreadIds = new Set();
+    this.pinnedThreadIds = [];
     this.appThreads = null;
     this.stateDb = null;
     this.stateDbIno = 0;
@@ -121,23 +123,26 @@ export class NativeSessionStore extends EventEmitter {
 
   refresh() {
     this.refreshTitles();
-    this.refreshWorkspaceState();
+    const pinnedChangedIds = this.refreshWorkspaceState();
     this.refreshAppThreads();
     const nextEntries = scanSessionFiles(
       this.sessionsDir,
       this.titles,
       this.appThreads,
       (id) => this.workspaceKindForThread(id),
+      this.sessionMetadataCache,
     );
     const nextSubagentEntries = scanSessionFiles(this.sessionsDir, this.titles, this.subagentThreads);
     const changedIds = [
       ...new Set([
         ...changedSessionIds(this.entries, nextEntries),
         ...changedSessionIds(this.subagentEntries, nextSubagentEntries),
+        ...pinnedChangedIds,
       ]),
     ];
     this.entries = nextEntries;
     this.subagentEntries = nextSubagentEntries;
+    pruneSessionMetadataCache(this.sessionMetadataCache, nextEntries);
 
     for (const id of [...this.details.keys()]) {
       if (!this.entries.has(id) && !this.subagentEntries.has(id)) this.details.delete(id);
@@ -157,8 +162,14 @@ export class NativeSessionStore extends EventEmitter {
     } catch {
       // Codex Desktop replaces this file atomically. Keep the last valid
       // snapshot while it is temporarily missing or incomplete.
-      return;
+      return [];
     }
+
+    const previousPinnedThreadIds = this.pinnedThreadIds;
+    this.pinnedThreadIds = normalizePinnedThreadIds(state?.['pinned-thread-ids']);
+    const pinnedChangedIds = equalStringArrays(previousPinnedThreadIds, this.pinnedThreadIds)
+      ? []
+      : [...new Set([...previousPinnedThreadIds, ...this.pinnedThreadIds])];
 
     const hasProjectlessIds = state
       && typeof state === 'object'
@@ -168,7 +179,7 @@ export class NativeSessionStore extends EventEmitter {
       this.projectlessThreadIds = new Set();
       this.projectThreadIds = new Set();
       this.workspaceStateAvailable = false;
-      return;
+      return pinnedChangedIds;
     }
 
     const value = state?.['projectless-thread-ids'];
@@ -177,7 +188,7 @@ export class NativeSessionStore extends EventEmitter {
       : value && typeof value === 'object'
         ? Object.keys(value)
         : null;
-    if (!ids) return;
+    if (!ids) return pinnedChangedIds;
 
     this.projectlessThreadIds = new Set(ids
       .map((id) => String(id || '').trim().toLowerCase())
@@ -189,6 +200,11 @@ export class NativeSessionStore extends EventEmitter {
       .map((id) => String(id || '').trim().toLowerCase())
       .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
     this.workspaceStateAvailable = true;
+    return pinnedChangedIds;
+  }
+
+  listPinnedThreadIds() {
+    return [...this.pinnedThreadIds];
   }
 
   workspaceKindForThread(id) {
@@ -282,11 +298,19 @@ export class NativeSessionStore extends EventEmitter {
     this.titles = readSessionIndex(this.indexFile);
   }
 
-  list(limit = this.maxSessions) {
+  list(limit = this.maxSessions, { includeIds = [] } = {}) {
     const now = Date.now();
-    return [...this.entries.values()]
-      .sort((left, right) => right.recencyMs - left.recencyMs)
+    const sortedEntries = [...this.entries.values()]
+      .sort((left, right) => right.recencyMs - left.recencyMs);
+    const selectedIds = new Set(sortedEntries
       .slice(0, positiveNumber(limit, this.maxSessions))
+      .map((entry) => entry.id));
+    for (const id of includeIds) {
+      const cleanId = String(id || '').trim().toLowerCase();
+      if (this.entries.has(cleanId)) selectedIds.add(cleanId);
+    }
+    return sortedEntries
+      .filter((entry) => selectedIds.has(entry.id))
       .map((entry) => {
         let cached = this.details.get(entry.id);
         let cacheIsCurrent = cached
@@ -524,7 +548,13 @@ export function readSessionIndex(file) {
   return titles;
 }
 
-function scanSessionFiles(root, titles, appThreads = null, workspaceKindForThread = null) {
+function scanSessionFiles(
+  root,
+  titles,
+  appThreads = null,
+  workspaceKindForThread = null,
+  sessionMetadataCache = null,
+) {
   const entries = new Map();
   if (!existsSync(root)) return entries;
   const pending = [root];
@@ -556,11 +586,14 @@ function scanSessionFiles(root, titles, appThreads = null, workspaceKindForThrea
         const title = titles.get(id)?.title || appThread?.title || `Codex ${id.slice(0, 8)}`;
         const createdAtMs = appThread?.createdAtMs || stat.birthtimeMs || stat.ctimeMs || stat.mtimeMs;
         const recencyMs = appThread?.recencyAtMs || appThread?.updatedAtMs || stat.mtimeMs;
-        const firstRecord = appThread?.cwd ? null : readFirstRecord(filePath);
+        const sessionMetadata = sessionMetadataCache
+          ? cachedSessionMetadata(sessionMetadataCache, id, filePath, stat.ino)
+          : appThread?.cwd ? null : sessionMetadataFromFirstRecord(readFirstRecord(filePath));
         const entry = {
           id,
           title,
-          cwd: appThread?.cwd || String(firstRecord?.payload?.cwd || '').trim(),
+          cwd: appThread?.cwd || sessionMetadata?.cwd || '',
+          originator: sessionMetadata?.originator || '',
           workspaceKind: appThread?.workspaceKind || workspaceKindForThread?.(id) || '',
           filePath,
           size: stat.size,
@@ -613,7 +646,7 @@ function changedSessionIds(previous, next) {
 }
 
 function entrySignature(entry) {
-  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
+  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.originator || ''}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
 }
 
 function sessionSummary(entry, status) {
@@ -622,12 +655,38 @@ function sessionSummary(entry, status) {
     source: 'codex',
     title: entry.title,
     cwd: entry.cwd || '',
+    originator: entry.originator || '',
     workspaceKind: entry.workspaceKind || '',
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     status,
     readOnly: false,
   };
+}
+
+function cachedSessionMetadata(cache, id, filePath, ino) {
+  const previous = cache.get(id);
+  if (previous?.filePath === filePath && previous.ino === ino) return previous.metadata;
+
+  const metadata = sessionMetadataFromFirstRecord(readFirstRecord(filePath));
+  if (metadata) cache.set(id, { filePath, ino, metadata });
+  else cache.delete(id);
+  return metadata;
+}
+
+function sessionMetadataFromFirstRecord(record) {
+  if (record?.type !== 'session_meta' || !record.payload || typeof record.payload !== 'object') return null;
+  return {
+    cwd: String(record.payload.cwd || '').trim(),
+    originator: String(record.payload.originator || '').trim(),
+  };
+}
+
+function pruneSessionMetadataCache(cache, entries) {
+  for (const [id, cached] of cache) {
+    const entry = entries.get(id);
+    if (!entry || entry.filePath !== cached.filePath || entry.ino !== cached.ino) cache.delete(id);
+  }
 }
 
 function createDetailCache(entry, options) {
@@ -1540,6 +1599,23 @@ function limitText(value, limit) {
   const text = String(value || '');
   if (text.length <= limit) return text;
   return `${text.slice(0, limit)}\n\n[内容过长，已截断 ${text.length - limit} 字符]`;
+}
+
+function normalizePinnedThreadIds(value) {
+  if (!Array.isArray(value)) return [];
+  const ids = [];
+  const seen = new Set();
+  for (const item of value) {
+    const id = String(item || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(`${id}.jsonl`) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+function equalStringArrays(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function positiveNumber(value, fallback) {
