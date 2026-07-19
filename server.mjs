@@ -1217,6 +1217,7 @@ app.post('/api/providers', requireAuth, requireConfigWrite, (req, res) => {
     process.env[envKey] = apiKey;
     process.env.DEFAULT_PROVIDER = name;
     process.env.DEFAULT_MODEL = model;
+    restartAppServerForConfigChange(`provider:${name}`);
     res.json({ ok: true, provider: name, model, providers: readProviders() });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1229,6 +1230,7 @@ app.delete('/api/providers/:name', requireAuth, requireConfigWrite, (req, res) =
 
   try {
     const result = deleteProvider(name);
+    restartAppServerForConfigChange(`delete-provider:${name}`);
     res.json({ ok: true, ...result, providers: readProviders() });
   } catch (err) {
     const status = err.statusCode || 500;
@@ -1251,6 +1253,7 @@ app.post('/api/defaults', requireAuth, requireConfigWrite, (req, res) => {
     updateEnvVar(ENV_FILE, 'DEFAULT_MODEL', model);
     process.env.DEFAULT_PROVIDER = provider;
     process.env.DEFAULT_MODEL = model;
+    restartAppServerForConfigChange(`defaults:${provider}/${model}`);
     res.json({ ok: true, provider, model, reasoningEffort });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2288,6 +2291,16 @@ function handleAppServerError(params = {}) {
     message,
     updatedAt: new Date().toISOString(),
   });
+}
+
+function restartAppServerForConfigChange(reason = '') {
+  const label = String(reason || 'config-change').slice(0, 120);
+  try {
+    appServerClient.close();
+    console.warn(`codex app-server restart scheduled: ${label}`);
+  } catch (error) {
+    console.warn(`codex app-server restart failed: ${error.message}`);
+  }
 }
 
 function handleAppServerNotification(event) {
@@ -5976,12 +5989,12 @@ function flushPendingHistoryRefresh(){
   queueMicrotask(()=>refreshHistory());
 }
 async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor){historyRefreshPending=true;return}historyRefreshPending=false;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations)}
-async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
-async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
+async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){const fallback=selected||'';if(fallback)fillSelect(model,[fallback],fallback);else model.innerHTML='<option value="">无可用模型</option>';statusEl.textContent=data.error;return}const preferred=selected&&data.models.includes(selected)?selected:(data.models[0]||'');fillSelect(model,data.models,preferred)}
+async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}const preferred=selected&&data.models.includes(selected)?selected:(data.models[0]||'');fillSelect(model,data.models,preferred);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
 async function deleteSelectedProvider(){const name=provider.value;if(!name){defaultMsg.textContent='请选择要删除的具体服务商';return}if(!confirm('删除服务商 '+name+'？该操作会移除对应配置和 API Key。'))return;defaultMsg.textContent='删除中...';const res=await fetch('/api/providers/'+encodeURIComponent(name),{method:'DELETE'});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'删除失败';return}defaultMsg.textContent='已删除服务商 '+name;await boot();if(data.provider){provider.value=data.provider;await loadModels(data.provider,data.model)}statusEl.textContent='Provider deleted'}
 async function requestModels(payload){try{const res=await fetch('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();return res.ok?data:{error:data.error||'获取模型失败'}}catch(e){return{error:e.message}}}
-function fillSelect(select,items,selected){select.innerHTML='';const list=[...new Set((items||[]).filter(Boolean))];if(!list.length)list.push(selected||'gpt-5.5');for(const item of list){const opt=document.createElement('option');opt.value=item;opt.textContent=item;select.appendChild(opt)}select.value=list.includes(selected)?selected:list[0];syncComposerChrome()}
+function fillSelect(select,items,selected){select.innerHTML='';const list=[...new Set((items||[]).filter(Boolean))];if(!list.length&&selected)list.push(selected);for(const item of list){const opt=document.createElement('option');opt.value=item;opt.textContent=item;select.appendChild(opt)}if(!list.length){const opt=document.createElement('option');opt.value='';opt.textContent='无可用模型';select.appendChild(opt);select.value='';syncComposerChrome();return}select.value=list.includes(selected)?selected:list[0];syncComposerChrome()}
 function conversationKey(source,id){return (source==='codex'?'codex':'web')+':'+id}
 function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown__'}
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
