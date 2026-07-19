@@ -7305,6 +7305,55 @@ body[data-chat-bg="skin"] .hist.active {
     height: 38px;
     flex: 0 0 38px;
   }
+
+  body .composer:has(> .composerProjectPicker.hidden) {
+    padding-bottom: 14px;
+  }
+
+  body .composer:has(> .composerProjectPicker.hidden) > .box {
+    width: min(calc(var(--composer-width) - 22px), calc(100% - 60px));
+    grid-template-columns: 32px max-content minmax(0, 1fr) max-content 34px;
+    border-radius: 24px;
+    padding: 6px 7px 5px;
+  }
+
+  body .composer:has(> .composerProjectPicker.hidden) > .box.runActive {
+    grid-template-columns: 32px max-content minmax(0, 1fr) max-content 30px;
+  }
+
+  body .composer:has(> .composerProjectPicker.hidden) > .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
+    grid-template-columns: 32px max-content minmax(0, 1fr) max-content 30px 30px;
+  }
+
+  body .composer:has(> .composerProjectPicker.hidden) > .box.runActive > .cancelButton,
+  body .composer:has(> .composerProjectPicker.hidden) > .box.runActive > .send:not(.cancelButton) {
+    width: 30px;
+    min-width: 30px;
+    height: 30px;
+  }
+
+  body .composer:has(> .composerProjectPicker.hidden) .composerModelToggle.running .composerModelState {
+    width: 14px;
+    height: 14px;
+    flex-basis: 14px;
+  }
+
+  body .composer:has(> .composerProjectPicker.hidden) .composerEffortName {
+    color: var(--thinking);
+    font-weight: 600;
+  }
+
+  body[data-theme="light"] .composer:has(> .composerProjectPicker.hidden) > .box {
+    border-color: #e1e3e6;
+    background: var(--surface-raised);
+    box-shadow: 0 2px 8px rgba(31, 35, 41, 0.05);
+  }
+
+  body[data-theme="dark"] .composer:has(> .composerProjectPicker.hidden) > .box {
+    border-color: #454545;
+    background: #2b2b2b;
+    box-shadow: none;
+  }
 }
 
 @media (max-width: 820px) {
