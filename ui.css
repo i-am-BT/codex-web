@@ -4425,14 +4425,14 @@ body[data-theme="dark"] .liveProcessElapsed {
 
 body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-child,
 body .liveProcessTimeline > .activityCluster.streaming > summary .activityClusterText {
-  background: linear-gradient(90deg, var(--text-muted) 0%, var(--text-muted) 36%, var(--text) 50%, var(--text-muted) 64%, var(--text-muted) 100%);
-  background-position: 100% 50%;
-  background-size: 190% 100%;
+  background: linear-gradient(105deg, var(--text-subtle) 0%, var(--text-muted) 28%, var(--text) 43%, var(--primary) 50%, var(--text) 57%, var(--text-muted) 72%, var(--text-subtle) 100%);
+  background-position: 120% 50%;
+  background-size: 260% 100%;
   background-clip: text;
   color: transparent;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: liveProcessFlow 1.8s linear infinite;
+  animation: liveProcessFlow 1.15s linear infinite;
   will-change: background-position;
 }
 
@@ -7008,6 +7008,29 @@ body .attachmentChip button {
   padding: 7px 10px 12px;
 }
 
+.composerReasoningInline {
+  min-width: 0;
+  margin: -4px 4px 3px;
+}
+
+.composerReasoningInline .composerReasoningSlider {
+  gap: 1px;
+  padding: 0 8px 7px;
+}
+
+.composerReasoningInline :is(.composerReasoningDefault, .composerReasoningCurrent) {
+  display: none;
+}
+
+.composerReasoningInline .composerReasoningRangeWrap,
+.composerReasoningInline .composerReasoningRange {
+  height: 28px;
+}
+
+.composerReasoningInline .composerReasoningEndpoints {
+  margin-top: -2px;
+}
+
 .composerReasoningDefault {
   display: grid;
   width: 100%;
@@ -7537,10 +7560,10 @@ body .composer > .box:focus-within {
 
 @keyframes liveProcessFlow {
   from {
-    background-position: 100% 50%;
+    background-position: 120% 50%;
   }
   to {
-    background-position: -100% 50%;
+    background-position: -120% 50%;
   }
 }
 

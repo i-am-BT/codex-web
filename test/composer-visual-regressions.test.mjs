@@ -84,11 +84,17 @@ test('running history dots stay before App without changing the row grid', () =>
 });
 
 test('reasoning effort uses an accessible six-step slider and keeps select synchronization', () => {
+  assert.match(serverSource, /let composerReasoningInline = null/);
+  assert.match(serverSource, /composerReasoningInline\.className='composerReasoningInline'/);
+  assert.match(
+    serverSource,
+    /renderComposerReasoningSlider\(composerReasoningSelect,composerReasoningInline,\{focus:false,compact:true\}\)/,
+  );
   assert.match(
     serverSource,
     /function openComposerModelSubmenu\(kind\)[\s\S]*composerModelMainMenu\?\.classList\.add\('hidden'\);[\s\S]*composerModelSubmenu\.classList\.remove\('hidden'\)/,
   );
-  assert.match(serverSource, /function renderComposerReasoningSlider\(source\)/);
+  assert.match(serverSource, /function renderComposerReasoningSlider\(source,target=/);
   assert.match(
     serverSource,
     /range\.type='range';\s*range\.className='composerReasoningRange';\s*range\.min='0';\s*range\.max=String\(levels\.length-1\);\s*range\.step='1'/,
@@ -124,6 +130,10 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   assert.match(
     uiStyles,
     /\.composerModelPanel\[data-submenu\] \.composerModelMainMenu\s*\{[^}]*display:\s*none/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.composerReasoningInline \.composerReasoningSlider\s*\{[^}]*gap:\s*1px;[^}]*padding:\s*0 8px 7px/s,
   );
 });
 

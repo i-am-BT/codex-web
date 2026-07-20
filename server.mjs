@@ -4020,6 +4020,7 @@ let composerModelName = null;
 let composerEffortName = null;
 let composerModelState = null;
 let composerModelMainMenu = null;
+let composerReasoningInline = null;
 let composerModelSubmenu = null;
 let composerModelSubmenuTitle = null;
 let composerModelSubmenuOptions = null;
@@ -4148,6 +4149,10 @@ function showComposerModelMainMenu({focus=false}={}){
   composerModelMainMenu?.classList.remove('hidden');
   composerModelSubmenu?.classList.add('hidden');
   composerModelPanel?.removeAttribute('data-submenu');
+  if(composerReasoningInline&&composerReasoningSelect){
+    composerReasoningInline.replaceChildren();
+    renderComposerReasoningSlider(composerReasoningSelect,composerReasoningInline,{focus:false,compact:true});
+  }
   renderComposerModelMenuState();
   if(focus)composerModelMainMenu?.querySelector('button:not(:disabled)')?.focus();
 }
@@ -4163,7 +4168,7 @@ function renderComposerModelMenuState(){
   }
   composerModelRunHint?.classList.toggle('hidden',!webRunActive||currentConversationSource!=='codex');
 }
-function renderComposerReasoningSlider(source){
+function renderComposerReasoningSlider(source,target=composerModelSubmenuOptions,{focus=true,compact=false}={}){
   const entries=[...source.options]
     .filter((option)=>!option.disabled)
     .map((option)=>({value:option.value,label:composerEffortLabel(option.value)}));
@@ -4172,6 +4177,7 @@ function renderComposerReasoningSlider(source){
   if(!levels.length)return;
   const container=document.createElement('div');
   container.className='composerReasoningSlider';
+  container.classList.toggle('compact',compact);
   const defaultButton=document.createElement('button');
   defaultButton.type='button';
   defaultButton.className='composerReasoningDefault';
@@ -4212,7 +4218,7 @@ function renderComposerReasoningSlider(source){
   endpoints.append(low,high);
   rangeWrap.append(range,marks);
   container.append(defaultButton,current,rangeWrap,endpoints);
-  composerModelSubmenuOptions.appendChild(container);
+  target?.appendChild(container);
   let sliderIndex=levels.findIndex((entry)=>entry.value===source.value);
   if(sliderIndex<0)sliderIndex=Math.max(0,levels.findIndex((entry)=>entry.value==='medium'));
   const sync=()=>{
@@ -4240,7 +4246,8 @@ function renderComposerReasoningSlider(source){
   });
   sync();
   refreshIcons(container);
-  range.focus();
+  if(focus)range.focus();
+  return range;
 }
 function openComposerModelSubmenu(kind){
   const source=composerModelMenuSource(kind);
@@ -4976,6 +4983,10 @@ function enhanceComposer(){
   composerModelMainMenu.className='composerModelMainMenu';
   composerModelMainMenu.appendChild(createComposerModelMenuRow('model','模型'));
   composerModelMainMenu.appendChild(createComposerModelMenuRow('reasoning','推理强度'));
+  composerReasoningInline=document.createElement('div');
+  composerReasoningInline.className='composerReasoningInline';
+  composerReasoningInline.setAttribute('aria-label','推理强度滑条');
+  composerModelMainMenu.appendChild(composerReasoningInline);
   const modelMenuDivider=document.createElement('div');
   modelMenuDivider.className='composerModelMenuDivider';
   composerModelMainMenu.appendChild(modelMenuDivider);

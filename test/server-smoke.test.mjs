@@ -678,7 +678,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body\[data-theme="dark"\] \.liveProcessElapsed\s*\{[^}]*border-bottom-color:\s*#303030;[^}]*color:\s*#acacac/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
     assert.doesNotMatch(uiStyles, /\.turnPlanPanel|\.turnPlanList|\.turnPlanStep/);
-    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary\.streaming \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming > summary \.activityClusterText[^}]*animation:\s*liveProcessFlow 1\.8s linear infinite/s);
+    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary\.streaming \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming > summary \.activityClusterText[^}]*var\(--primary\)[^}]*background-size:\s*260% 100%;[^}]*animation:\s*liveProcessFlow 1\.15s linear infinite/s);
     assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
