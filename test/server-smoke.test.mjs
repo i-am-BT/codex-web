@@ -630,7 +630,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.composerModelPanel\s*\{[^}]*width:\s*min\(244px,[^}]*border-radius:\s*18px/s);
     assert.match(uiStyles, /\.composerModelMenuRow\s*\{[^}]*min-height:\s*44px;[^}]*grid-template-columns:/s);
     assert.match(uiStyles, /\.composerModelMenuRow\.active\s*\{[^}]*background:\s*var\(--surface-hover\)/s);
-    assert.match(uiStyles, /\.composerModelSubmenu\s*\{[^}]*left:\s*calc\(100% \+ 8px\);[^}]*right:\s*auto;[^}]*max-height:/s);
+    assert.match(uiStyles, /\.composerModelSubmenu\s*\{[^}]*position:\s*static;[^}]*width:\s*auto;[^}]*max-height:[^}]*border:\s*0;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /\.composerModelPanel\[data-submenu\] \.composerModelMainMenu\s*\{[^}]*display:\s*none/s);
     assert.match(uiStyles, /body \.composer > \.box\s*\{[^}]*width:\s*min\(380px, calc\(100% - 20px\)\)/s);
     assert.match(uiStyles, /\.composerModelOption\[aria-selected="true"\]/);
@@ -729,7 +729,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer\s*\{[^}]*border-top:\s*0;[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /body\[data-theme="light"\] \.composer\s*\{[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /body\[data-theme="light"\] \.box,\s*body\[data-theme="light"\] \.box:focus-within\s*\{[^}]*background:\s*#ffffff/s);
-    assert.match(uiStyles, /body \.composer > \.box,\s*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body \.composer > \.box,\s*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*var\(--surface\);[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /--composer-width:\s*var\(--conversation-width\)/);
     assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 60px\)\)/s);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);

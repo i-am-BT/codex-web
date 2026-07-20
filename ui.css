@@ -6038,7 +6038,7 @@ body .nativeHistoryLoad:hover {
   position: relative;
   z-index: 1;
   width: min(var(--composer-width), calc(100% - 60px));
-  margin-bottom: -7px;
+  margin-bottom: -14px;
 }
 
 body .composer:has(> .composerProjectPicker:not(.hidden)) > .composerProjectPicker {
@@ -6938,18 +6938,19 @@ body .attachmentChip button {
 }
 
 .composerModelSubmenu {
-  position: absolute;
-  left: calc(100% + 8px);
-  right: auto;
-  bottom: 0;
-  width: min(264px, calc(100vw - 40px));
+  position: static;
+  width: auto;
   max-height: min(420px, calc(100vh - 96px));
   overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  background: var(--surface);
-  padding: 6px;
-  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.22);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  box-shadow: none;
+}
+
+.composerModelPanel[data-submenu] .composerModelMainMenu {
+  display: none;
 }
 
 .composerModelSubmenuHead {
@@ -7485,7 +7486,7 @@ body[data-chat-bg="skin"] .hist.active {
 /* Keep the composer surface visually continuous with the conversation canvas. */
 body .composer > .box,
 body .composer > .box:focus-within {
-  background: transparent;
+  background: var(--surface);
   box-shadow: none;
 }
 

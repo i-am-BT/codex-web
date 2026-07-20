@@ -4245,7 +4245,7 @@ function renderComposerReasoningSlider(source){
 function openComposerModelSubmenu(kind){
   const source=composerModelMenuSource(kind);
   if(!source||source.disabled||!composerModelSubmenuOptions)return;
-  composerModelMainMenu?.classList.remove('hidden');
+  composerModelMainMenu?.classList.add('hidden');
   composerModelSubmenu.classList.remove('hidden');
   composerModelPanel.dataset.submenu=kind;
   renderComposerModelMenuState();

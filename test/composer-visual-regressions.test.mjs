@@ -51,7 +51,7 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /body \.composer > \.box,[^}]*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s,
+    /body \.composer > \.box,[^}]*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*var\(--surface\);[^}]*box-shadow:\s*none/s,
   );
   assert.match(
     uiStyles,
@@ -84,6 +84,10 @@ test('running history dots stay before App without changing the row grid', () =>
 });
 
 test('reasoning effort uses an accessible six-step slider and keeps select synchronization', () => {
+  assert.match(
+    serverSource,
+    /function openComposerModelSubmenu\(kind\)[\s\S]*composerModelMainMenu\?\.classList\.add\('hidden'\);[\s\S]*composerModelSubmenu\.classList\.remove\('hidden'\)/,
+  );
   assert.match(serverSource, /function renderComposerReasoningSlider\(source\)/);
   assert.match(
     serverSource,
@@ -112,6 +116,14 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   assert.match(
     uiStyles,
     /\.composerReasoningMarks\s*\{[^}]*grid-template-columns:\s*repeat\(var\(--reasoning-step-count\), 1fr\)/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.composerModelSubmenu\s*\{[^}]*position:\s*static;[^}]*width:\s*auto;[^}]*border:\s*0;[^}]*box-shadow:\s*none/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.composerModelPanel\[data-submenu\] \.composerModelMainMenu\s*\{[^}]*display:\s*none/s,
   );
 });
 
