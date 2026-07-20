@@ -984,6 +984,11 @@ app.post('/api/native-sessions/:id/interrupt', requireAuth, async (req, res) => 
     setNativeTurnState(threadId, { turnId, status: 'interrupted', transport: result.transport });
     res.json({ ok: true, threadId, turnId });
   } catch (err) {
+    if (isNativeThreadNotFoundError(err)) {
+      setNativeTurnState(threadId, { turnId: requestedTurnId, status: 'interrupted', transport: 'app-server' });
+      nativeSessions.scheduleRefresh();
+      return res.json({ ok: true, threadId, turnId: requestedTurnId, recovered: true });
+    }
     res.status(nativeAppErrorStatus(err)).json({ error: `取消 Codex App 任务失败: ${err.message}` });
   }
 });
@@ -2295,6 +2300,12 @@ function handleAppServerError(params = {}) {
 
 function restartAppServerForConfigChange(reason = '') {
   const label = String(reason || 'config-change').slice(0, 120);
+  for (const [threadId, active] of activeNativeTurns) {
+    if (active?.status === 'running') {
+      console.warn(`codex app-server restart skipped: ${label} (thread ${threadId} still running)`);
+      return;
+    }
+  }
   try {
     appServerClient.close();
     console.warn(`codex app-server restart scheduled: ${label}`);
@@ -10040,7 +10051,7 @@ function updateSafetyHint(){
 }
 let completeAudioCtx;
 function playTaskCompleteSound(){try{const AudioContext=window.AudioContext||window.webkitAudioContext;if(!AudioContext)return;if(!completeAudioCtx)completeAudioCtx=new AudioContext();completeAudioCtx.resume?.();const now=completeAudioCtx.currentTime;const master=completeAudioCtx.createGain();master.gain.setValueAtTime(1.15,now);master.connect(completeAudioCtx.destination);[[660,0,.12],[880,.13,.22]].forEach(([freq,offset,duration])=>{const osc=completeAudioCtx.createOscillator();const gain=completeAudioCtx.createGain();osc.type='triangle';osc.frequency.value=freq;gain.gain.setValueAtTime(0.0001,now+offset);gain.gain.exponentialRampToValueAtTime(0.55,now+offset+0.006);gain.gain.exponentialRampToValueAtTime(0.0001,now+offset+duration);osc.connect(gain);gain.connect(master);osc.start(now+offset);osc.stop(now+offset+duration+.02)})}catch(e){}}
-async function cancelRun(){closeComposerPopovers();if(currentConversationSource!=='codex'||!currentConversationId)return;cancelBtn.disabled=true;statusEl.textContent='正在取消...';try{const res=await fetch('/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/interrupt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({turnId:activeNativeTurnId})});const data=await res.json();if(!res.ok)throw new Error(data.error||'取消失败');addMsg('log','已请求取消当前任务。');freezeTurnProcessElapsed('',activeNativeTurnId);clearLiveTurnProgress();webRunActive=false;activeNativeTurnId='';removeNativeRunningElement();statusEl.textContent='Cancelled';applyConversationMode();setTimeout(syncCurrentNativeConversation,180);refreshHistory()}catch(e){statusEl.textContent=e.message;cancelBtn.disabled=false}}
+async function cancelRun(){closeComposerPopovers();if(currentConversationSource!=='codex'||!currentConversationId)return;cancelBtn.disabled=true;statusEl.textContent='正在取消...';try{const res=await fetch('/api/native-sessions/'+encodeURIComponent(currentConversationId)+'/interrupt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({turnId:activeNativeTurnId})});const data=await res.json();if(!res.ok)throw new Error(data.error||'取消失败');addMsg('log','已请求取消当前任务。');freezeTurnProcessElapsed('',activeNativeTurnId);clearLiveTurnProgress();webRunActive=false;activeNativeTurnId='';removeNativeRunningElement();statusEl.textContent='Cancelled';applyConversationMode();setTimeout(syncCurrentNativeConversation,180);refreshHistory()}catch(e){statusEl.textContent=e.message;cancelBtn.disabled=false;setTimeout(syncCurrentNativeConversation,200)}}
 async function send(){
   closeComposerPopovers();
   const text=input.value.trim();
