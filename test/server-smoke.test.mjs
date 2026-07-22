@@ -710,7 +710,12 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.box\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /body \.box\s*\{[^}]*grid-template-rows:\s*minmax\(50px, auto\) 34px;[^}]*gap:\s*2px;[^}]*border-radius:\s*20px/s);
     assert.match(uiStyles, /body\[data-theme\] \.box textarea\s*\{[^}]*min-height:\s*50px;[^}]*max-height:\s*180px;[^}]*font-size:\s*14px/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)\s*\{[\s\S]*?body\[data-theme\] \.box textarea\s*\{[^}]*font-size:\s*16px/s);
     assert.match(uiStyles, /\.turnResultStatus\s*\{[^}]*color:\s*var\(--success\)/s);
+    assert.match(uiStyles, /\.turnResultStatus\s*\{[^}]*display:\s*inline-flex;[^}]*min-height:\s*22px;[^}]*border-radius:\s*999px;[^}]*background:\s*var\(--success-soft\)/s);
+    assert.match(uiStyles, /\.turnResultStatus::before\s*\{[^}]*width:\s*5px;[^}]*border-radius:\s*50%;[^}]*background:\s*currentColor/s);
+    assert.match(uiStyles, /\.editedFilesResult\[open\] > \.turnResultHead\s*\{[^}]*min-height:\s*44px;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto auto;[^}]*column-gap:\s*10px;[^}]*padding:\s*0 12px/s);
+    assert.match(uiStyles, /\.editedFilesResult\.withPlan\[open\] > \.turnResultHead\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*nowrap/s);
     assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult:not\(\[open\]\)\s*\{[^}]*border-color:\s*#383838;[^}]*background:\s*#272727/s);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.editedFilesResult\.withPlan \.turnPlanProgressRing\s*\{[^}]*conic-gradient\(#339cff var\(--turn-plan-progress\), #2b3c4f 0\)/s);
