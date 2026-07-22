@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  normalizeCpaCodexQuota,
   normalizeSubQuota,
   normalizeSubQuotaBaseUrl,
   parseSubQuotaSources,
   SubQuotaService,
 } from '../sub-quota.mjs';
+// CPA Codex + Sub2API quota adapters
 
 test('normalizes editable Sub2API URLs and rejects unsafe values', () => {
   assert.equal(normalizeSubQuotaBaseUrl(' https://sub.example.test/ '), 'https://sub.example.test');
@@ -19,6 +21,108 @@ test('normalizes editable Sub2API URLs and rejects unsafe values', () => {
   assert.throws(() => normalizeSubQuotaBaseUrl(`https://sub.example.test/${'a'.repeat(2048)}`), /过长/);
 });
 
+
+test('normalizes editable CPA Management URLs and rejects unsafe values', () => {
+  assert.equal(normalizeSubQuotaBaseUrl(' http://127.0.0.1:8327/ ', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
+  assert.equal(normalizeSubQuotaBaseUrl('http://127.0.0.1:8327/v0/management', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
+  assert.equal(normalizeSubQuotaBaseUrl('http://127.0.0.1:8327/v0/management/auth-files', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
+  assert.equal(normalizeSubQuotaBaseUrl('http://127.0.0.1:8327/v1/usage', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
+  assert.throws(() => normalizeSubQuotaBaseUrl('', { provider: 'cpa-codex' }), /不能为空/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('file:///tmp/cpa', { provider: 'cpa-codex' }), /http\/https/);
+});
+
+test('normalizes CPA Codex usage windows into percent rate limits', () => {
+  const quota = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    email: 'plus@example.com',
+    rate_limit: {
+      allowed: true,
+      limit_reached: false,
+      primary_window: {
+        used_percent: 18,
+        limit_window_seconds: 604800,
+        reset_after_seconds: 100,
+        reset_at: 1785141573,
+      },
+      secondary_window: null,
+    },
+    rate_limit_reset_credits: { available_count: 2 },
+  }, { email: 'plus@example.com' });
+  assert.equal(quota.planName, 'Plus');
+  assert.equal(quota.unit, '%');
+  assert.equal(quota.valid, true);
+  assert.equal(quota.rateLimitResetCredits, 2);
+  assert.equal(quota.rateLimits.length, 1);
+  assert.equal(quota.rateLimits[0].window, '7d');
+  assert.equal(quota.rateLimits[0].used, 18);
+  assert.equal(quota.rateLimits[0].remaining, 82);
+  assert.equal(quota.rateLimits[0].limit, 100);
+  assert.equal(quota.rateLimits[0].resetAt, '2026-07-27T08:39:33.000Z');
+});
+
+test('keeps valid free accounts and normalizes daily and relative resets safely', () => {
+  const now = Date.parse('2026-07-29T00:00:00Z');
+  const quota = normalizeCpaCodexQuota({
+    plan_type: 'free',
+    account_id: 'private-account-id',
+    rate_limit: {
+      allowed: true,
+      primary_window: {
+        used_percent: 40,
+        limit_window_seconds: 86400,
+        reset_after_seconds: 3600,
+      },
+    },
+    rate_limit_reset_credits: {
+      available_count: 4,
+      applicable_available_count: 1,
+    },
+  }, { account_type: 'oauth' }, now);
+  assert.equal(quota.planName, 'Free');
+  assert.equal(quota.valid, true);
+  assert.equal(quota.status, 'active');
+  assert.equal(quota.rateLimitResetCredits, 1);
+  assert.equal(quota.rateLimits[0].window, '1d');
+  assert.equal(quota.rateLimits[0].remaining, 60);
+  assert.equal(quota.rateLimits[0].resetAt, '2026-07-29T01:00:00.000Z');
+  assert.equal(Object.hasOwn(quota, 'accountId'), false);
+
+  const noAccess = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    codex_access: false,
+    rate_limit: { allowed: true },
+  });
+  assert.equal(noAccess.valid, false);
+  assert.equal(noAccess.status, 'no_access');
+  assert.equal(normalizeCpaCodexQuota({
+    rate_limit: { allowed: true },
+  }, { account_type: 'oauth' }).planName, 'Codex');
+
+  const extremeReset = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    rate_limit: {
+      allowed: true,
+      primary_window: {
+        used_percent: 10,
+        limit_window_seconds: 18000,
+        reset_at: Number.MAX_VALUE,
+      },
+    },
+  });
+  assert.equal(extremeReset.rateLimits[0].resetAt, '');
+
+  const unknownWindow = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    rate_limit: {
+      allowed: true,
+      primary_window: {
+        used_percent: 10,
+        limit_window_seconds: 7200,
+      },
+    },
+  });
+  assert.deepEqual(unknownWindow.rateLimits, []);
+});
 test('parses server-side Sub quota sources without embedding credentials', () => {
   const sources = parseSubQuotaSources(JSON.stringify([{
     id: 'main-sub',
@@ -30,8 +134,10 @@ test('parses server-side Sub quota sources without embedding credentials', () =>
   assert.deepEqual(sources, [{
     id: 'main-sub',
     name: 'Main Sub',
+    provider: 'sub2api',
     apiKeyEnv: 'SUB_MAIN_API_KEY',
     apiKey: 'secret-key',
+    baseUrl: 'https://sub.example.test',
     usageUrl: 'https://sub.example.test/v1/usage',
   }]);
   const fullUsageUrl = parseSubQuotaSources(JSON.stringify([{
@@ -42,6 +148,13 @@ test('parses server-side Sub quota sources without embedding credentials', () =>
   }]), { SUB_MAIN_API_KEY: 'secret-key' });
   assert.equal(fullUsageUrl[0].usageUrl, 'https://sub.example.test/v1/usage');
   assert.throws(() => parseSubQuotaSources('[{"baseUrl":"file:///tmp/key"}]'), /apiKeyEnv/);
+  assert.throws(() => parseSubQuotaSources(JSON.stringify([{
+    id: 'typo',
+    name: 'Typo',
+    provider: 'cpa-cdoex',
+    baseUrl: 'http://127.0.0.1:8327',
+    apiKeyEnv: 'TYPO_KEY',
+  }]), { TYPO_KEY: 'secret' }), /不支持的额度来源 provider/);
 });
 
 test('normalizes Sub2API subscription and quota-limited responses', () => {
@@ -143,6 +256,14 @@ test('normalizes Sub2API subscription and quota-limited responses', () => {
       windowStart: '',
       resetAt: '',
     },
+    {
+      window: '30d',
+      used: 1,
+      limit: 10,
+      remaining: 9,
+      windowStart: '',
+      resetAt: '',
+    },
   ]);
   assert.equal(limited.expiresAt, '2026-08-02T00:00:00Z');
   assert.equal(limited.daysUntilExpiry, 14);
@@ -238,7 +359,123 @@ test('normalizes wallet balances and rejects invalid negative quota values', () 
       windowStart: '',
       resetAt: '',
     },
+    {
+      window: '30d',
+      used: 1,
+      limit: 2,
+      remaining: 1,
+      windowStart: '',
+      resetAt: '',
+    },
   ]);
+});
+
+test('fetches CPA Codex accounts through Management and isolates account errors', async () => {
+  const requests = [];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      apiKeyEnv: 'CPA_KEY',
+      apiKey: 'management-key',
+      baseUrl: 'http://cpa.test',
+      usageUrl: '',
+    }],
+    now: () => Date.parse('2026-07-29T00:00:00Z'),
+    fetchImpl: async (url, options = {}) => {
+      requests.push({ url, options });
+      assert.equal(options.headers['X-Management-Key'], 'management-key');
+      if (url.endsWith('/v0/management/auth-files')) {
+        return new Response(JSON.stringify({
+          files: [
+            {
+              id: 'codex-plus.json',
+              name: 'codex-plus.json',
+              type: 'codex',
+              email: 'plus@example.com',
+              auth_index: 'auth-plus',
+              account_id: 'account-plus',
+            },
+            {
+              id: 'codex-broken.json',
+              name: 'codex-broken.json',
+              type: 'codex',
+              email: 'broken@example.com',
+              auth_index: 'auth-broken',
+            },
+            { id: 'codex-disabled.json', type: 'codex', disabled: true },
+            { id: 'other.json', type: 'openai' },
+          ],
+        }), { status: 200 });
+      }
+      if (url.includes('/v0/management/auth-files/download')) {
+        assert.match(url, /name=codex-broken\.json/);
+        return new Response(JSON.stringify({ account_id: 'account-broken' }), { status: 200 });
+      }
+      if (url.endsWith('/v0/management/api-call')) {
+        const payload = JSON.parse(options.body);
+        assert.equal(payload.method, 'GET');
+        assert.equal(payload.url, 'https://chatgpt.com/backend-api/wham/usage');
+        assert.equal(payload.header.Authorization, 'Bearer $TOKEN$');
+        if (payload.auth_index === 'auth-plus') {
+          assert.equal(payload.header['Chatgpt-Account-Id'], 'account-plus');
+          return new Response(JSON.stringify({
+            status_code: 200,
+            body: JSON.stringify({
+              plan_type: 'plus',
+              rate_limit: {
+                allowed: true,
+                primary_window: {
+                  used_percent: 25,
+                  limit_window_seconds: 604800,
+                  reset_at: 1785312000,
+                },
+              },
+            }),
+          }), { status: 200 });
+        }
+        assert.equal(payload.auth_index, 'auth-broken');
+        assert.equal(payload.header['Chatgpt-Account-Id'], 'account-broken');
+        return new Response(JSON.stringify({
+          status_code: 401,
+          body: JSON.stringify({ error: 'expired' }),
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    },
+  });
+
+  const result = await service.list();
+  assert.equal(result.count, 2);
+  assert.equal(result.availableCount, 1);
+  assert.equal(result.quotas[0].name, 'plus@example.com');
+  assert.equal(result.quotas[0].planName, 'Plus');
+  assert.equal(result.quotas[0].rateLimits[0].remaining, 75);
+  assert.equal(result.quotas[1].name, 'broken@example.com');
+  assert.match(result.quotas[1].error, /HTTP 401: expired/);
+  assert.equal(requests.filter((item) => item.url.endsWith('/v0/management/api-call')).length, 2);
+});
+
+test('rejects CPA Management error and empty usage bodies without status codes', async () => {
+  const responses = [
+    { body: { error: 'expired' } },
+    {},
+  ];
+  const service = new SubQuotaService({
+    fetchImpl: async () => new Response(JSON.stringify(responses.shift()), { status: 200 }),
+  });
+  const source = { apiKey: 'management-key', baseUrl: 'http://cpa.test' };
+  const file = { auth_index: 'auth-plus' };
+
+  await assert.rejects(
+    service.fetchCpaCodexUsage(source, file, 'account-plus'),
+    /expired/,
+  );
+  await assert.rejects(
+    service.fetchCpaCodexUsage(source, file, 'account-plus'),
+    /Codex 额度响应无效/,
+  );
 });
 
 test('fetches all sources, isolates errors, and caches the result', async () => {

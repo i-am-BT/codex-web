@@ -528,7 +528,7 @@ app.get('/api/sub-quotas', requireAuth, async (req, res) => {
   try {
     res.json(await subQuotaService.list({ refresh: req.query.refresh === '1' }));
   } catch (err) {
-    res.status(502).json({ error: `读取 Sub2API 额度失败: ${err.message}` });
+    res.status(502).json({ error: `读取 CPA Codex 额度失败: ${err.message}` });
   }
 });
 
@@ -547,25 +547,29 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
   try {
     candidateBaseUrl = normalizeSubQuotaBaseUrl(
       req.body?.baseUrl === undefined ? subQuotaBaseUrl : req.body.baseUrl,
+      { provider: 'cpa-codex' },
     );
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
   const suppliedApiKey = String(req.body?.apiKey || '').trim();
   const apiKey = suppliedApiKey || getSubQuotaApiKey();
-  if (!apiKey) return res.status(400).json({ error: 'Sub2API API Key 不能为空' });
+  if (!apiKey) return res.status(400).json({ error: 'CPA Management Key 不能为空' });
   if (apiKey.length > 4096 || /[\r\n\0]/.test(apiKey)) {
-    return res.status(400).json({ error: 'Sub2API API Key 包含无效字符' });
+    return res.status(400).json({ error: 'CPA Management Key 包含无效字符' });
   }
 
   try {
     const candidate = createSubQuotaService(candidateBaseUrl, apiKey);
     const result = await candidate.list({ refresh: true });
-    const quota = result.quotas[0];
+    const quotas = Array.isArray(result.quotas) ? result.quotas : [];
+    const quota = quotas.find((item) => !item.error && item.valid !== false)
+      || quotas.find((item) => !item.error)
+      || quotas[0];
     if (!quota || quota.error) {
-      return res.status(502).json({ error: `Sub2API 检测失败: ${quota?.error || '未返回额度数据'}` });
+      return res.status(502).json({ error: `CPA Codex 检测失败: ${quota?.error || '未返回额度数据'}` });
     }
-    if (quota.valid === false) return res.status(422).json({ error: 'Sub2API API Key 已失效' });
+    if (quota.valid === false) return res.status(422).json({ error: 'Codex 凭证无效或无访问权限' });
 
     updateEnvVars(ENV_FILE, {
       SUB2API_BASE_URL: candidateBaseUrl,
@@ -586,7 +590,7 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ error: `保存 Sub2API 设置失败: ${err.message}` });
+    res.status(500).json({ error: `保存 CPA Codex 设置失败: ${err.message}` });
   }
 });
 
@@ -3289,8 +3293,9 @@ function createSubQuotaService(baseUrl, apiKey) {
     SUB_QUOTA_CACHE_SECONDS: process.env.SUB_QUOTA_CACHE_SECONDS,
     SUB_QUOTA_SOURCES: baseUrl && apiKey
       ? JSON.stringify([{
-        id: 'sub2api',
-        name: 'Sub2API',
+        id: 'cpa-codex',
+        name: 'CPA Codex',
+        provider: 'cpa-codex',
         baseUrl,
         apiKeyEnv: 'SUB2API_API_KEY',
       }])
@@ -5204,20 +5209,20 @@ function ensureSubQuotaSettingsDialog(){
   head.className='settingsDialogHead subQuotaSettingsDialogHead';
   const title=document.createElement('h2');
   title.id='subQuotaSettingsTitle';
-  title.textContent='Sub2API 额度监控';
+  title.textContent='CPA Codex 额度监控';
   subQuotaSettingsClose=document.createElement('button');
   subQuotaSettingsClose.type='button';
   subQuotaSettingsClose.className='settingsDialogClose';
-  subQuotaSettingsClose.title='关闭 Sub2API 设置';
-  subQuotaSettingsClose.setAttribute('aria-label','关闭 Sub2API 设置');
-  setIconLabel(subQuotaSettingsClose,'x','关闭 Sub2API 设置',false);
+  subQuotaSettingsClose.title='关闭 CPA Codex 设置';
+  subQuotaSettingsClose.setAttribute('aria-label','关闭 CPA Codex 设置');
+  setIconLabel(subQuotaSettingsClose,'x','关闭 CPA Codex 设置',false);
   head.appendChild(title);
   head.appendChild(subQuotaSettingsClose);
   const body=document.createElement('div');
   body.className='subQuotaSettingsBody';
   const subQuotaDescription=document.createElement('p');
   subQuotaDescription.className='subQuotaSettingsDescription';
-  subQuotaDescription.textContent='填写 API URL 与 API Key，保存后会立即检测，仅用于 Sub2API 额度监控。';
+  subQuotaDescription.textContent='填写 CPA Management URL 与 Management Key，保存后会立即检测本地 CLIProxyAPI 中的 Codex 额度。';
   subQuotaSettingsForm=document.createElement('form');
   subQuotaSettingsForm.id='subQuotaSettingsForm';
   subQuotaSettingsForm.className='subQuotaSettingsForm';
@@ -5234,7 +5239,7 @@ function ensureSubQuotaSettingsDialog(){
   subQuotaBaseUrlInput.autocomplete='url';
   subQuotaBaseUrlInput.inputMode='url';
   subQuotaBaseUrlInput.spellcheck=false;
-  subQuotaBaseUrlInput.placeholder='https://sub2api.example.com';
+  subQuotaBaseUrlInput.placeholder='http://127.0.0.1:8327';
   subQuotaUrlField.appendChild(subQuotaUrlLabel);
   subQuotaUrlField.appendChild(subQuotaBaseUrlInput);
   const subQuotaKeyField=document.createElement('label');
@@ -5247,7 +5252,7 @@ function ensureSubQuotaSettingsDialog(){
   subQuotaApiKeyInput.type='password';
   subQuotaApiKeyInput.maxLength=4096;
   subQuotaApiKeyInput.autocomplete='new-password';
-  subQuotaApiKeyInput.placeholder='输入 Sub2API API Key';
+  subQuotaApiKeyInput.placeholder='输入 CPA Management Key';
   subQuotaKeyField.appendChild(subQuotaKeyLabel);
   subQuotaKeyField.appendChild(subQuotaApiKeyInput);
   subQuotaCredentialHint=document.createElement('small');
@@ -5370,7 +5375,7 @@ async function syncSubQuotaSettings(){
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'读取设置失败');
     subQuotaBaseUrlInput.value=data.baseUrl||'';
-    subQuotaApiKeyInput.placeholder=data.keyConfigured?'Key 已配置，留空保留':'输入 Sub2API API Key';
+    subQuotaApiKeyInput.placeholder=data.keyConfigured?'Key 已配置，留空保留':'输入 CPA Management Key';
     if(subQuotaCredentialHint)subQuotaCredentialHint.textContent=data.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，首次保存时必须填写';
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'读取设置失败')}
 }
@@ -5380,7 +5385,7 @@ async function submitSubQuotaSettings(event){
   const submit=subQuotaSettingsForm.querySelector('[type="submit"]');
   submit.disabled=true;
   subQuotaSettingsStatus.classList.remove('success');
-  subQuotaSettingsStatus.textContent='正在检测 Sub2API…';
+  subQuotaSettingsStatus.textContent='正在检测 CPA Codex…';
   try{
     const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({baseUrl:subQuotaBaseUrlInput.value,apiKey:subQuotaApiKeyInput.value})});
     const data=await response.json().catch(()=>({}));
@@ -5388,7 +5393,7 @@ async function submitSubQuotaSettings(event){
     subQuotaApiKeyInput.value='';
     await syncSubQuotaSettings();
     subQuotaSettingsStatus.classList.add('success');
-    subQuotaSettingsStatus.textContent='检测通过，已启用 '+(data.quota?.planName||'Sub2API 额度监控');
+    subQuotaSettingsStatus.textContent='检测通过，已启用 '+(data.quota?.planName||data.quota?.name||'CPA Codex 额度监控');
     await loadSubQuota({refresh:true});
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'检测失败')}
   finally{submit.disabled=false}
@@ -5571,13 +5576,13 @@ function enhanceSubQuota(sideActions){
   subQuotaToggle.id='subQuotaToggle';
   subQuotaToggle.className='subQuotaToggle';
   subQuotaToggle.type='button';
-  subQuotaToggle.title='悬停查看 Sub2API 额度，点击设置 API URL 与 Key';
-  subQuotaToggle.setAttribute('aria-label','悬停查看 Sub2API 额度，点击设置 API URL 与 Key');
+  subQuotaToggle.title='悬停查看 CPA Codex 额度，点击设置 Management URL 与 Key';
+  subQuotaToggle.setAttribute('aria-label','悬停查看 CPA Codex 额度，点击设置 Management URL 与 Key');
   subQuotaToggle.setAttribute('aria-haspopup','dialog');
   subQuotaToggle.setAttribute('aria-controls','subQuotaSettingsDialog');
   subQuotaToggle.setAttribute('aria-describedby','subQuotaPopover');
   subQuotaToggle.setAttribute('aria-expanded','false');
-  setIconLabel(subQuotaToggle,'gauge','Sub2API 额度',false);
+  setIconLabel(subQuotaToggle,'gauge','CPA Codex 额度',false);
   sideActions.appendChild(subQuotaToggle);
 
   subQuotaPopover=document.createElement('section');
@@ -5589,7 +5594,7 @@ function enhanceSubQuota(sideActions){
   const title=document.createElement('h2');
   title.id='subQuotaTitle';
   title.className='subQuotaTitle';
-  title.textContent='Sub2API 额度';
+  title.textContent='CPA Codex 额度';
   head.appendChild(title);
   subQuotaStatus=document.createElement('div');
   subQuotaStatus.className='subQuotaStatus';
@@ -5630,7 +5635,7 @@ async function loadSubQuota({refresh=false}={}){
   if(!subQuotaContent||!subQuotaStatus)return;
   const requestSeq=++subQuotaRequestSeq;
   subQuotaStatus.dataset.state='loading';
-  subQuotaStatus.textContent='正在读取 Sub2API 额度…';
+  subQuotaStatus.textContent='正在读取 CPA Codex 额度…';
   try{
     const response=await fetch('/api/sub-quotas'+(refresh?'?refresh=1':''),{headers:{Accept:'application/json'}});
     const data=await response.json().catch(()=>({}));
@@ -5645,54 +5650,83 @@ async function loadSubQuota({refresh=false}={}){
 function renderSubQuota(data){
   subQuotaContent.replaceChildren();
   if(data?.configurationError){renderSubQuotaError(data.configurationError);return}
-  if(!data?.configured){renderSubQuotaError('尚未配置 Sub2API 额度渠道');return}
-  const quota=Array.isArray(data.quotas)?data.quotas[0]:null;
-  if(!quota){renderSubQuotaError('Sub2API 未返回额度数据');return}
-  if(quota.error){renderSubQuotaError('Sub2API 暂不可用：'+quota.error);return}
-  if(quota.valid===false){renderSubQuotaError('Sub2API API Key 已失效'+(quota.status?'：'+quota.status:''));return}
-
-  const source=document.createElement('article');
-  source.className='subQuotaSource';
-  const plan=document.createElement('div');
-  plan.className='subQuotaPlan';
-  const planName=document.createElement('span');
-  planName.textContent=quota.planName||(quota.mode==='quota_limited'?'API Key 限额':'Sub2API');
-  const sourceName=document.createElement('span');
-  sourceName.textContent=quota.name||'Sub2API';
-  plan.appendChild(planName);
-  plan.appendChild(sourceName);
-  source.appendChild(plan);
-  const unit=quota.unit||quota.quota?.unit||'USD';
-  let detailCount=0;
-  if(quota.subscription){
-    detailCount+=appendSubQuotaWindow(source,'每日',quota.subscription.daily,unit)?1:0;
-    detailCount+=appendSubQuotaWindow(source,'每周',quota.subscription.weekly,unit)?1:0;
-    detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit)?1:0;
+  if(!data?.configured){renderSubQuotaError('尚未配置 CPA Codex 额度渠道');return}
+  const quotas=Array.isArray(data.quotas)?data.quotas:[];
+  if(!quotas.length){renderSubQuotaError('CPA 未返回 Codex 额度数据');return}
+  let rendered=0;
+  for(const quota of quotas){
+    if(quota.error){
+      const error=document.createElement('div');
+      error.className='subQuotaError';
+      error.textContent=(quota.name?quota.name+'：':'')+'CPA Codex 暂不可用：'+quota.error;
+      subQuotaContent.appendChild(error);
+      continue;
+    }
+    if(quota.valid===false){
+      const error=document.createElement('div');
+      error.className='subQuotaError';
+      error.textContent=(quota.name?quota.name+'：':'')+'Codex 凭证无效或无访问权限'+(quota.status?'：'+quota.status:'');
+      subQuotaContent.appendChild(error);
+      continue;
+    }
+    const source=document.createElement('article');
+    source.className='subQuotaSource';
+    const plan=document.createElement('div');
+    plan.className='subQuotaPlan';
+    const planName=document.createElement('span');
+    planName.textContent=quota.planName||(quota.mode==='cpa_codex'?'Codex':quota.mode==='quota_limited'?'API Key 限额':'额度');
+    const sourceName=document.createElement('span');
+    sourceName.textContent=quota.name||quota.sourceName||'CPA Codex';
+    plan.appendChild(planName);
+    plan.appendChild(sourceName);
+    source.appendChild(plan);
+    const unit=quota.unit||quota.quota?.unit||(quota.mode==='cpa_codex'?'%':'USD');
+    let detailCount=0;
+    if(quota.subscription){
+      detailCount+=appendSubQuotaWindow(source,'每日',quota.subscription.daily,unit)?1:0;
+      detailCount+=appendSubQuotaWindow(source,'每周',quota.subscription.weekly,unit)?1:0;
+      detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit)?1:0;
+    }
+    if(quota.quota)detailCount+=appendSubQuotaWindow(source,'总额度',quota.quota,unit)?1:0;
+    for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
+      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,unit)?1:0;
+    }
+    const walletBalance=finiteSubQuotaNumber(quota.balance??quota.remaining);
+    if(!detailCount&&walletBalance!==null){
+      detailCount+=appendSubQuotaWindow(source,'可用余额',{remaining:walletBalance},unit==='%'?'USD':unit)?1:0;
+    }
+    const meta=document.createElement('div');
+    meta.className='subQuotaMeta';
+    const todayCost=quota.today?.actualCost??quota.today?.cost;
+    if(Number.isFinite(Number(todayCost)))appendSubQuotaMeta(meta,'今日 '+formatSubQuotaAmount(todayCost,unit==='%'?'USD':unit));
+    if(Number.isFinite(Number(quota.today?.requests)))appendSubQuotaMeta(meta,'请求 '+Number(quota.today.requests).toLocaleString('zh-CN')+' 次');
+    const expiresAt=quota.expiresAt||quota.subscription?.expiresAt;
+    if(expiresAt)appendSubQuotaMeta(meta,'到期 '+formatSubQuotaDate(expiresAt));
+    if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
+    const rateLimitResetCredits=finiteSubQuotaNumber(quota.rateLimitResetCredits);
+    if(rateLimitResetCredits!==null)appendSubQuotaMeta(meta,'主动重置 '+rateLimitResetCredits.toLocaleString('zh-CN')+' 次');
+    for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
+      if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit.window)+'重置 '+formatSubQuotaDateTime(rateLimit.resetAt));
+    }
+    if(!detailCount&&!meta.childElementCount)continue;
+    if(meta.childElementCount)source.appendChild(meta);
+    subQuotaContent.appendChild(source);
+    rendered+=1;
   }
-  if(quota.quota)detailCount+=appendSubQuotaWindow(source,'总额度',quota.quota,unit)?1:0;
-  for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
-    detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,unit)?1:0;
+  if(!rendered){
+    if(!subQuotaContent.childElementCount)renderSubQuotaError('CPA 未返回可显示的 Codex 额度数据');
+    else{subQuotaStatus.dataset.state='error';subQuotaStatus.textContent='仅监控 CPA 中的 Codex 账号'}
+    return;
   }
-  const walletBalance=finiteSubQuotaNumber(quota.balance??quota.remaining);
-  if(!detailCount&&walletBalance!==null){
-    detailCount+=appendSubQuotaWindow(source,'可用余额',{remaining:walletBalance},unit)?1:0;
-  }
-  const meta=document.createElement('div');
-  meta.className='subQuotaMeta';
-  const todayCost=quota.today?.actualCost??quota.today?.cost;
-  if(Number.isFinite(Number(todayCost)))appendSubQuotaMeta(meta,'今日 '+formatSubQuotaAmount(todayCost,unit));
-  if(Number.isFinite(Number(quota.today?.requests)))appendSubQuotaMeta(meta,'请求 '+Number(quota.today.requests).toLocaleString('zh-CN')+' 次');
-  const expiresAt=quota.expiresAt||quota.subscription?.expiresAt;
-  if(expiresAt)appendSubQuotaMeta(meta,'到期 '+formatSubQuotaDate(expiresAt));
-  if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
-  for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
-    if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit.window)+'重置 '+formatSubQuotaTime(rateLimit.resetAt));
-  }
-  if(!detailCount&&!meta.childElementCount){renderSubQuotaError('Sub2API 未返回可显示的额度数据');return}
-  if(meta.childElementCount)source.appendChild(meta);
-  subQuotaContent.appendChild(source);
   delete subQuotaStatus.dataset.state;
   subQuotaStatus.textContent=data.fetchedAt?'更新于 '+formatSubQuotaTime(data.fetchedAt):'';
+}
+function subQuotaProgressPercent(used,limit,remaining,unit){
+  const progressAmount=remaining!==null?remaining:used;
+  if(progressAmount===null)return null;
+  if(unit==='%')return Math.min(100,Math.max(0,progressAmount));
+  if(limit===null||limit<=0)return null;
+  return Math.min(100,Math.max(0,(progressAmount/limit)*100));
 }
 function appendSubQuotaWindow(parent,label,windowData,unit){
   if(!windowData)return false;
@@ -5707,7 +5741,10 @@ function appendSubQuotaWindow(parent,label,windowData,unit){
   const title=document.createElement('span');
   title.textContent=label;
   const value=document.createElement('span');
-  if(limit!==null&&limit>0){
+  if(unit==='%'&&(used!==null||remaining!==null)){
+    if(remaining!==null)value.textContent='剩余 '+formatSubQuotaAmount(remaining,'%');
+    else value.textContent='已用 '+formatSubQuotaAmount(used,'%');
+  }else if(limit!==null&&limit>0){
     if(remaining!==null)value.textContent='剩余 '+formatSubQuotaAmount(remaining,unit)+' / '+formatSubQuotaAmount(limit,unit);
     else if(used!==null)value.textContent='已用 '+formatSubQuotaAmount(used,unit)+' / '+formatSubQuotaAmount(limit,unit);
     else value.textContent='限额 '+formatSubQuotaAmount(limit,unit);
@@ -5719,12 +5756,12 @@ function appendSubQuotaWindow(parent,label,windowData,unit){
   head.appendChild(title);
   head.appendChild(value);
   row.appendChild(head);
-  if(limit!==null&&limit>0&&used!==null){
+  const percent=subQuotaProgressPercent(used,limit,remaining,unit);
+  if(percent!==null){
     const progress=document.createElement('div');
     progress.className='subQuotaProgress';
     const bar=document.createElement('span');
     bar.className='subQuotaProgressBar';
-    const percent=Math.min(100,Math.max(0,(used/limit)*100));
     bar.style.setProperty('--sub-quota-percent',percent.toFixed(2)+'%');
     progress.appendChild(bar);
     row.appendChild(progress);
@@ -5734,10 +5771,11 @@ function appendSubQuotaWindow(parent,label,windowData,unit){
 }
 function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item)}
 function finiteSubQuotaNumber(value){if(value===null||value===undefined||value==='')return null;const number=Number(value);return Number.isFinite(number)&&number>=0?number:null}
-function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'7 天'})[String(value||'').toLowerCase()]||String(value||'限速')}
-function formatSubQuotaStatus(value){return({active:'正常',quota_exhausted:'额度耗尽',expired:'已过期'})[String(value||'').toLowerCase()]||String(value||'')}
-function formatSubQuotaAmount(value,unit){const number=finiteSubQuotaNumber(value)||0;const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:0,maximumFractionDigits:2});return unit==='USD'?'$'+formatted:formatted+' '+unit}
+function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[String(value||'').toLowerCase()]||String(value||'限速')}
+function formatSubQuotaStatus(value){return({active:'正常',quota_exhausted:'额度耗尽',expired:'已过期',no_access:'无访问权限',blocked:'已限制'})[String(value||'').toLowerCase()]||String(value||'')}
+function formatSubQuotaAmount(value,unit){const number=finiteSubQuotaNumber(value)||0;if(unit==='%')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+'%';const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:0,maximumFractionDigits:2});return unit==='USD'?'$'+formatted:formatted+(unit?' '+unit:'')}
 function formatSubQuotaDate(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'}):String(value||'')}
+function formatSubQuotaDateTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}):''}
 function formatSubQuotaTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
 function renderSubQuotaError(message){
   subQuotaContent.replaceChildren();
@@ -5746,7 +5784,7 @@ function renderSubQuotaError(message){
   error.textContent=message;
   subQuotaContent.appendChild(error);
   subQuotaStatus.dataset.state='error';
-  subQuotaStatus.textContent='仅监控 Sub2API 渠道';
+  subQuotaStatus.textContent='仅监控 CPA 中的 Codex 账号';
 }
 function enhanceInterface(){
   const sideBrand=document.querySelector('.side > div:first-child');
