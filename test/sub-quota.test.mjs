@@ -122,6 +122,30 @@ test('keeps valid free accounts and normalizes daily and relative resets safely'
     },
   });
   assert.deepEqual(unknownWindow.rateLimits, []);
+
+  const zeroAbsoluteReset = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    rate_limit: {
+      allowed: true,
+      primary_window: {
+        used_percent: 20,
+        limit_window_seconds: 18000,
+        reset_at: 0,
+        reset_after_seconds: 7200,
+      },
+    },
+  }, {}, now);
+  assert.equal(zeroAbsoluteReset.rateLimits[0].resetAt, '2026-07-29T02:00:00.000Z');
+
+  const slightlyDriftedWindows = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    rate_limit: {
+      allowed: true,
+      primary_window: { used_percent: 1, limit_window_seconds: 18030 },
+      secondary_window: { used_percent: 2, limit_window_seconds: 604830 },
+    },
+  });
+  assert.deepEqual(slightlyDriftedWindows.rateLimits.map((item) => item.window), ['5h', '7d']);
 });
 test('parses server-side Sub quota sources without embedding credentials', () => {
   const sources = parseSubQuotaSources(JSON.stringify([{
@@ -406,12 +430,18 @@ test('fetches CPA Codex accounts through Management and isolates account errors'
             },
             { id: 'codex-disabled.json', type: 'codex', disabled: true },
             { id: 'other.json', type: 'openai' },
+            {
+              id: 'codex-misleading.json',
+              name: 'codex-misleading.json',
+              provider: 'claude',
+              auth_index: 'must-not-be-used',
+            },
           ],
         }), { status: 200 });
       }
       if (url.includes('/v0/management/auth-files/download')) {
         assert.match(url, /name=codex-broken\.json/);
-        return new Response(JSON.stringify({ account_id: 'account-broken' }), { status: 200 });
+        return new Response(JSON.stringify({ chatgpt_account_id: 'account-broken' }), { status: 200 });
       }
       if (url.endsWith('/v0/management/api-call')) {
         const payload = JSON.parse(options.body);
@@ -457,10 +487,121 @@ test('fetches CPA Codex accounts through Management and isolates account errors'
   assert.equal(requests.filter((item) => item.url.endsWith('/v0/management/api-call')).length, 2);
 });
 
+test('uses embedded CPA account claims without downloading runtime-only credentials', async () => {
+  const observedAccountIds = [];
+  let downloadRequests = 0;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      apiKeyEnv: 'CPA_KEY',
+      apiKey: 'management-key',
+      baseUrl: 'http://cpa.test',
+      usageUrl: '',
+    }],
+    fetchImpl: async (url, options = {}) => {
+      if (url.endsWith('/v0/management/auth-files')) {
+        return new Response(JSON.stringify({
+          files: [
+            {
+              id: 'runtime-snake',
+              type: 'codex',
+              runtime_only: true,
+              auth_index: 'auth-snake',
+              id_token: { chatgpt_account_id: 'account-snake' },
+            },
+            {
+              id: 'runtime-camel',
+              provider: 'codex',
+              runtime_only: true,
+              authIndex: 'auth-camel',
+              id_token: { chatgptAccountId: 'account-camel' },
+            },
+          ],
+        }), { status: 200 });
+      }
+      if (url.includes('/v0/management/auth-files/download')) {
+        downloadRequests += 1;
+        return new Response('{}', { status: 500 });
+      }
+      if (url.endsWith('/v0/management/api-call')) {
+        const payload = JSON.parse(options.body);
+        observedAccountIds.push(payload.header['Chatgpt-Account-Id']);
+        return new Response(JSON.stringify({
+          status_code: 200,
+          body: { plan_type: 'plus' },
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    },
+  });
+
+  const result = await service.list();
+  assert.equal(result.availableCount, 2);
+  assert.equal(downloadRequests, 0);
+  assert.deepEqual(observedAccountIds.sort(), ['account-camel', 'account-snake']);
+  assert.deepEqual(result.quotas.map((quota) => quota.id), ['runtime-snake', 'runtime-camel']);
+});
+
+test('bounds concurrent CPA account requests while preserving account order and errors', async () => {
+  let activeRequests = 0;
+  let maxActiveRequests = 0;
+  const files = Array.from({ length: 9 }, (_, index) => ({
+    id: `codex-${index}`,
+    type: 'codex',
+    auth_index: `auth-${index}`,
+    account_id: `account-${index}`,
+  }));
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      apiKeyEnv: 'CPA_KEY',
+      apiKey: 'management-key',
+      baseUrl: 'http://cpa.test',
+      usageUrl: '',
+    }],
+    fetchImpl: async (url, options = {}) => {
+      if (url.endsWith('/v0/management/auth-files')) {
+        return new Response(JSON.stringify({ files }), { status: 200 });
+      }
+      if (!url.endsWith('/v0/management/api-call')) return new Response('{}', { status: 404 });
+      const payload = JSON.parse(options.body);
+      const index = Number(payload.auth_index.replace('auth-', ''));
+      activeRequests += 1;
+      maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+      await new Promise((resolve) => setTimeout(resolve, 5 + ((8 - index) % 3)));
+      activeRequests -= 1;
+      if (index === 4) {
+        return new Response(JSON.stringify({
+          status_code: 429,
+          body: { error: 'rate limited' },
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        status_code: 200,
+        body: { plan_type: index % 2 ? 'free' : 'plus' },
+      }), { status: 200 });
+    },
+  });
+
+  const result = await service.list();
+  assert.equal(maxActiveRequests, 4);
+  assert.equal(result.count, 9);
+  assert.equal(result.availableCount, 8);
+  assert.deepEqual(result.quotas.map((quota) => quota.id), files.map((file) => file.id));
+  assert.match(result.quotas[4].error, /HTTP 429: rate limited/);
+});
+
 test('rejects CPA Management error and empty usage bodies without status codes', async () => {
   const responses = [
     { body: { error: 'expired' } },
     {},
+    { body: { plan_type: null, rate_limit: null, credits: null } },
+    { body: { rate_limit: {} } },
+    { body: { plan_type: 'plus' } },
   ];
   const service = new SubQuotaService({
     fetchImpl: async () => new Response(JSON.stringify(responses.shift()), { status: 200 }),
@@ -475,6 +616,40 @@ test('rejects CPA Management error and empty usage bodies without status codes',
   await assert.rejects(
     service.fetchCpaCodexUsage(source, file, 'account-plus'),
     /Codex 额度响应无效/,
+  );
+  await assert.rejects(
+    service.fetchCpaCodexUsage(source, file, 'account-plus'),
+    /Codex 额度响应无效/,
+  );
+  await assert.rejects(
+    service.fetchCpaCodexUsage(source, file, 'account-plus'),
+    /Codex 额度响应无效/,
+  );
+  assert.deepEqual(
+    await service.fetchCpaCodexUsage(source, file, 'account-plus'),
+    { plan_type: 'plus' },
+  );
+});
+
+test('does not expose arbitrary CPA error response fields', async () => {
+  const secret = 'private-account-and-token';
+  const responses = [
+    { status_code: 502, body: { account_id: secret, debug: { token: secret } } },
+    { status_code: 401, body: { error: { account_id: secret } } },
+  ];
+  const service = new SubQuotaService({
+    fetchImpl: async () => new Response(JSON.stringify(responses.shift()), { status: 200 }),
+  });
+  const source = { apiKey: 'management-key', baseUrl: 'http://cpa.test' };
+  const file = { auth_index: 'auth-plus' };
+
+  await assert.rejects(
+    service.fetchCpaCodexUsage(source, file, 'account-plus'),
+    (error) => error.message === 'HTTP 502' && !error.message.includes(secret),
+  );
+  await assert.rejects(
+    service.fetchCpaCodexUsage(source, file, 'account-plus'),
+    (error) => error.message === 'HTTP 401: Codex 额度请求失败' && !error.message.includes(secret),
   );
 });
 
