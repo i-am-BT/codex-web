@@ -5,6 +5,8 @@ const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 const ENV_KEY_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
 const RATE_LIMIT_WINDOWS = new Set(['5h', '1d', '7d', '30d']);
 const MAX_BASE_URL_LENGTH = 2048;
+const CPA_ACCOUNT_CONCURRENCY = 4;
+const WINDOW_SECONDS_TOLERANCE = 60;
 const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const CODEX_USAGE_HEADERS = {
   Authorization: 'Bearer $TOKEN$',
@@ -104,8 +106,7 @@ export class SubQuotaService {
         return [{ ...base, error: 'CPA 中暂无可用的 Codex 认证' }];
       }
 
-      const quotas = [];
-      for (const file of codexFiles) {
+      return mapWithConcurrency(codexFiles, CPA_ACCOUNT_CONCURRENCY, async (file) => {
         const accountBase = {
           id: cleanText(file.id || file.name || file.auth_index || `${source.id}-codex`, 120) || `${source.id}-codex`,
           name: cleanText(file.email || file.label || file.account || file.name || 'Codex', 100) || 'Codex',
@@ -116,12 +117,11 @@ export class SubQuotaService {
         try {
           const accountId = await this.resolveCpaAccountId(source, file);
           const usage = await this.fetchCpaCodexUsage(source, file, accountId);
-          quotas.push({ ...accountBase, ...normalizeCpaCodexQuota(usage, file, this.now()) });
+          return { ...accountBase, ...normalizeCpaCodexQuota(usage, file, this.now()) };
         } catch (error) {
-          quotas.push({ ...accountBase, error: formatFetchError(error) });
+          return { ...accountBase, error: formatFetchError(error) };
         }
-      }
-      return quotas;
+      });
     } catch (error) {
       return [{ ...base, error: formatFetchError(error) }];
     }
@@ -137,7 +137,7 @@ export class SubQuotaService {
   }
 
   async resolveCpaAccountId(source, file) {
-    const direct = cleanText(file.account_id || file.accountId || file.chatgpt_account_id, 80);
+    const direct = extractCpaAccountId(file);
     if (direct) return direct;
     const name = cleanText(file.name || file.id, 240);
     if (!name) throw new Error('Codex 凭证缺少文件名');
@@ -145,7 +145,7 @@ export class SubQuotaService {
       `${source.baseUrl}/v0/management/auth-files/download?name=${encodeURIComponent(name)}`,
       { headers: managementHeaders(source.apiKey) },
     );
-    const accountId = cleanText(auth?.account_id || auth?.accountId, 80);
+    const accountId = extractCpaAccountId(auth);
     if (!accountId) throw new Error('Codex 凭证缺少 ChatGPT 账号 ID');
     return accountId;
   }
@@ -172,15 +172,11 @@ export class SubQuotaService {
     });
     const statusCode = Number(outer?.status_code ?? outer?.statusCode ?? 0);
     const body = parseMaybeJson(outer?.body ?? outer?.bodyText ?? outer);
-    const bodyError = isRecord(body) && ['error', 'detail', 'message'].some((key) => Object.hasOwn(body, key));
-    const detail = bodyError
-      ? cleanText(body.error || body.detail || body.message || 'Codex 额度请求失败', 120)
-      : '';
+    const bodyError = extractCpaUsageError(body);
     if (statusCode && (statusCode < 200 || statusCode >= 300)) {
-      const responseDetail = detail || cleanText(JSON.stringify(body || {}), 120);
-      throw new Error(responseDetail ? `HTTP ${statusCode}: ${responseDetail}` : `HTTP ${statusCode}`);
+      throw new Error(bodyError.detail ? `HTTP ${statusCode}: ${bodyError.detail}` : `HTTP ${statusCode}`);
     }
-    if (bodyError) throw new Error(detail);
+    if (bodyError.present) throw new Error(bodyError.detail || 'Codex 额度请求失败');
     if (!isCpaCodexUsageResponse(body)) throw new Error('Codex 额度响应无效');
     return body;
   }
@@ -399,9 +395,9 @@ function pickCodexWindows(group) {
   for (const [index, item] of [primary, secondary].entries()) {
     if (!item) continue;
     const seconds = nonNegativeNumber(item.limit_window_seconds ?? item.limitWindowSeconds);
-    if (seconds === 18000 && !fiveHour) fiveHour = item;
-    else if (seconds === 86400 && !daily) daily = item;
-    else if ((seconds === 604800 || isMonthlyWindowSeconds(seconds)) && !weekly) weekly = item;
+    if (isWindowSeconds(seconds, 18000) && !fiveHour) fiveHour = item;
+    else if (isWindowSeconds(seconds, 86400) && !daily) daily = item;
+    else if ((isWindowSeconds(seconds, 604800) || isMonthlyWindowSeconds(seconds)) && !weekly) weekly = item;
     else if (seconds === null && index === 0 && !fiveHour) fiveHour = item;
     else if (seconds === null && index === 1 && !weekly) weekly = item;
   }
@@ -415,7 +411,7 @@ function codexWindowToRateLimit(id, window, data, now = Date.now()) {
   const resetAtSeconds = nonNegativeNumber(data.reset_at ?? data.resetAt);
   const resetAfterSeconds = nonNegativeNumber(data.reset_after_seconds ?? data.resetAfterSeconds);
   let resetAt = '';
-  if (resetAtSeconds !== null) resetAt = safeIsoDate(resetAtSeconds * 1000);
+  if (resetAtSeconds !== null && resetAtSeconds > 0) resetAt = safeIsoDate(resetAtSeconds * 1000);
   else if (resetAfterSeconds !== null) resetAt = safeIsoDate(now + resetAfterSeconds * 1000);
   return {
     id,
@@ -426,6 +422,10 @@ function codexWindowToRateLimit(id, window, data, now = Date.now()) {
     windowStart: '',
     resetAt,
   };
+}
+
+function isWindowSeconds(seconds, target) {
+  return seconds !== null && Math.abs(seconds - target) <= WINDOW_SECONDS_TOLERANCE;
 }
 
 function isMonthlyWindowSeconds(seconds) {
@@ -446,30 +446,71 @@ function formatCodexPlanName(planType) {
 
 function isCodexAuthFile(file) {
   if (!isRecord(file)) return false;
-  const type = cleanText(file.type || file.provider, 40).toLowerCase();
+  const provider = cleanText(file.provider, 40).toLowerCase();
+  if (provider) return provider === 'codex';
+  const type = cleanText(file.type, 40).toLowerCase();
+  if (type) return type === 'codex';
   const name = cleanText(file.name || file.id, 120).toLowerCase();
-  return type === 'codex' || name.includes('codex');
+  return name.includes('codex');
 }
 
 function isCpaCodexUsageResponse(value) {
   if (!isRecord(value)) return false;
+  const planType = value.plan_type ?? value.planType;
+  if (typeof planType === 'string' && planType.trim()) return true;
+
+  if ([value.rate_limit, value.rateLimit, value.code_review_rate_limit, value.codeReviewRateLimit]
+    .some((group) => isCpaRateLimitGroup(group))) return true;
+
+  const additional = value.additional_rate_limits ?? value.additionalRateLimits;
+  if (Array.isArray(additional) && additional.some((item) => {
+    if (!isRecord(item)) return false;
+    return isCpaRateLimitGroup(item.rate_limit ?? item.rateLimit ?? item);
+  })) return true;
+
+  if (isCpaCredits(value.credits)) return true;
+  if ([value.codex_access, value.codexAccess, value.has_access, value.hasAccess]
+    .some((flag) => typeof flag === 'boolean')) return true;
+  return isCpaResetCredits(value.rate_limit_reset_credits ?? value.rateLimitResetCredits);
+}
+
+function isCpaRateLimitGroup(value) {
+  if (!isRecord(value)) return false;
+  if (typeof value.allowed === 'boolean') return true;
+  if (typeof (value.limit_reached ?? value.limitReached) === 'boolean') return true;
+  return [value.primary_window, value.primaryWindow, value.secondary_window, value.secondaryWindow]
+    .some((window) => isCpaRateLimitWindow(window));
+}
+
+function isCpaRateLimitWindow(value) {
+  if (!isRecord(value)) return false;
   return [
-    'plan_type',
-    'planType',
-    'rate_limit',
-    'rateLimit',
-    'code_review_rate_limit',
-    'codeReviewRateLimit',
-    'additional_rate_limits',
-    'additionalRateLimits',
-    'credits',
-    'codex_access',
-    'codexAccess',
-    'has_access',
-    'hasAccess',
-    'rate_limit_reset_credits',
-    'rateLimitResetCredits',
-  ].some((key) => Object.hasOwn(value, key));
+    value.used_percent,
+    value.usedPercent,
+    value.limit_window_seconds,
+    value.limitWindowSeconds,
+    value.reset_at,
+    value.resetAt,
+    value.reset_after_seconds,
+    value.resetAfterSeconds,
+  ].some((item) => nonNegativeNumber(item) !== null);
+}
+
+function isCpaCredits(value) {
+  if (!isRecord(value)) return false;
+  if (nonNegativeNumber(value.balance) !== null) return true;
+  return [value.has_credits, value.hasCredits, value.unlimited]
+    .some((flag) => typeof flag === 'boolean');
+}
+
+function isCpaResetCredits(value) {
+  if (!isRecord(value)) return false;
+  return [
+    value.applicable_available_count,
+    value.applicableAvailableCount,
+    value.available_count,
+    value.availableCount,
+  ].some((item) => nonNegativeInteger(item) !== null);
 }
 
 function normalizeProvider(value) {
@@ -482,6 +523,43 @@ function normalizeProvider(value) {
 function safeIsoDate(value) {
   const date = new Date(value);
   return Number.isFinite(date.getTime()) ? date.toISOString() : '';
+}
+
+function extractCpaAccountId(value) {
+  if (!isRecord(value)) return '';
+  return cleanText(
+    value.account_id
+    || value.accountId
+    || value.chatgpt_account_id
+    || value.chatgptAccountId
+    || value.id_token?.chatgpt_account_id
+    || value.id_token?.chatgptAccountId
+    || value.idToken?.chatgpt_account_id
+    || value.idToken?.chatgptAccountId,
+    80,
+  );
+}
+
+function extractCpaUsageError(value) {
+  if (!isRecord(value)) return { present: false, detail: '' };
+  for (const key of ['error', 'detail', 'message']) {
+    if (!Object.hasOwn(value, key)) continue;
+    const detail = cleanErrorText(value[key], 120);
+    return {
+      present: true,
+      detail: detail || 'Codex 额度请求失败',
+    };
+  }
+  return { present: false, detail: '' };
+}
+
+function cleanErrorText(value, maxLength) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
 }
 
 function managementHeaders(apiKey) {
@@ -595,6 +673,21 @@ function cleanDate(value) {
 function positiveNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
 }
 
 async function readLimitedBody(response, maxBytes) {

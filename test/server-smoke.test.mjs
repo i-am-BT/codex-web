@@ -910,10 +910,33 @@ if (args[0] === 'app-server') {
     assert.equal(managementRequests.at(-1).managementKey, 'new-sub-key');
     assert.equal(providerRequests.at(-1).host, new URL(customProviderBaseUrl).host);
 
-    const updatedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
+    const providerRequestCountBeforeRejectedOriginChange = providerRequests.length;
+    const rejectedSubQuotaOriginChange = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ baseUrl: `${providerBaseUrl}/v1/usage`, apiKey: '' }),
+    });
+    assert.equal(rejectedSubQuotaOriginChange.status, 400);
+    assert.match((await rejectedSubQuotaOriginChange.json()).error, /URL 已变更.*重新输入 Management Key/);
+    assert.equal(providerRequests.length, providerRequestCountBeforeRejectedOriginChange);
+    persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
+    assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(customProviderBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+    assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
+
+    const retainedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl: `${customProviderBaseUrl}/v0/management/auth-files`, apiKey: '' }),
+    });
+    assert.equal(retainedSubQuotaKey.status, 200);
+    assert.equal((await retainedSubQuotaKey.json()).baseUrl, customProviderBaseUrl);
+    assert.equal(providerRequests.at(-1).host, new URL(customProviderBaseUrl).host);
+    assert.equal(providerRequests.at(-1).managementKey, 'new-sub-key');
+
+    const updatedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl: `${providerBaseUrl}/v1/usage`, apiKey: 'new-sub-key' }),
     });
     assert.equal(updatedSubQuotaUrl.status, 200);
     assert.equal((await updatedSubQuotaUrl.json()).baseUrl, providerBaseUrl);
@@ -1428,7 +1451,15 @@ updated_at = 1784422800000
     assert.match(page, /subQuotaPopover\.id='subQuotaPopover'/);
     assert.match(page, /pointerenter.*showSubQuotaPreview/);
     assert.match(page, /subQuotaToggle\.addEventListener\('click',openSubQuotaSettings\)/);
-    assert.match(page, /重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
+    assert.match(page, /appendSubQuotaWindow\(source,subQuotaRateLimitLabel\(rateLimit\),rateLimit,unit\)/);
+    assert.match(page, /subQuotaRateLimitLabel\(rateLimit\)\+'重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
+    const subQuotaRateLimitLabelSource = page.match(/function subQuotaRateLimitLabel\(rateLimit\)\{[\s\S]*?(?=function formatSubQuotaStatus)/)?.[0];
+    assert.ok(subQuotaRateLimitLabelSource);
+    const subQuotaRateLimitLabel = Function(`${subQuotaRateLimitLabelSource};return subQuotaRateLimitLabel`)();
+    assert.equal(subQuotaRateLimitLabel({ id: '5h', window: '5h' }), '5 小时');
+    assert.equal(subQuotaRateLimitLabel({ id: 'code-review-5h', window: '5h' }), '代码审查 · 5 小时');
+    assert.equal(subQuotaRateLimitLabel({ id: 'spark-5h', window: '5h' }), 'Spark · 5 小时');
+    assert.equal(subQuotaRateLimitLabel({ id: 'extra-2-7d', window: '7d' }), '附加额度 2 · 周限额');
     assert.match(page, /const rateLimitResetCredits=finiteSubQuotaNumber\(quota\.rateLimitResetCredits\)/);
     assert.doesNotMatch(page, /Number\.isFinite\(Number\(quota\.rateLimitResetCredits\)\)/);
     assert.match(page, /if\(!rendered\)\{\s*if\(!subQuotaContent\.childElementCount\)renderSubQuotaError\('CPA 未返回可显示的 Codex 额度数据'\);\s*else\{subQuotaStatus\.dataset\.state='error';subQuotaStatus\.textContent='仅监控 CPA 中的 Codex 账号'\}/);

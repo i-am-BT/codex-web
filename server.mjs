@@ -553,6 +553,9 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
     return res.status(400).json({ error: err.message });
   }
   const suppliedApiKey = String(req.body?.apiKey || '').trim();
+  if (!suppliedApiKey && subQuotaBaseUrl && !sameSubQuotaCredentialOrigin(candidateBaseUrl, subQuotaBaseUrl)) {
+    return res.status(400).json({ error: 'CPA Management URL 已变更，请重新输入 Management Key' });
+  }
   const apiKey = suppliedApiKey || getSubQuotaApiKey();
   if (!apiKey) return res.status(400).json({ error: 'CPA Management Key 不能为空' });
   if (apiKey.length > 4096 || /[\r\n\0]/.test(apiKey)) {
@@ -3307,6 +3310,14 @@ function getSubQuotaApiKey() {
   return String(subQuotaService?.sources?.[0]?.apiKey || '');
 }
 
+function sameSubQuotaCredentialOrigin(left, right) {
+  try {
+    return new URL(left).origin === new URL(right).origin;
+  } catch {
+    return false;
+  }
+}
+
 async function proxyPlaygroundRequest(req, res) {
   if (!['GET', 'POST'].includes(req.method)) {
     res.setHeader('Allow', 'GET, POST');
@@ -5689,7 +5700,7 @@ function renderSubQuota(data){
     }
     if(quota.quota)detailCount+=appendSubQuotaWindow(source,'总额度',quota.quota,unit)?1:0;
     for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
-      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,unit)?1:0;
+      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit),rateLimit,unit)?1:0;
     }
     const walletBalance=finiteSubQuotaNumber(quota.balance??quota.remaining);
     if(!detailCount&&walletBalance!==null){
@@ -5706,7 +5717,7 @@ function renderSubQuota(data){
     const rateLimitResetCredits=finiteSubQuotaNumber(quota.rateLimitResetCredits);
     if(rateLimitResetCredits!==null)appendSubQuotaMeta(meta,'主动重置 '+rateLimitResetCredits.toLocaleString('zh-CN')+' 次');
     for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
-      if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit.window)+'重置 '+formatSubQuotaDateTime(rateLimit.resetAt));
+      if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit)+'重置 '+formatSubQuotaDateTime(rateLimit.resetAt));
     }
     if(!detailCount&&!meta.childElementCount)continue;
     if(meta.childElementCount)source.appendChild(meta);
@@ -5771,7 +5782,23 @@ function appendSubQuotaWindow(parent,label,windowData,unit){
 }
 function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item)}
 function finiteSubQuotaNumber(value){if(value===null||value===undefined||value==='')return null;const number=Number(value);return Number.isFinite(number)&&number>=0?number:null}
-function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[String(value||'').toLowerCase()]||String(value||'限速')}
+function subQuotaRateLimitLabel(rateLimit){
+  const value=rateLimit&&typeof rateLimit==='object'?rateLimit.window:rateLimit;
+  const window=String(value||'').trim().toLowerCase();
+  const label=({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[window]||String(value||'限速');
+  if(!rateLimit||typeof rateLimit!=='object')return label;
+  const id=String(rateLimit.id||'').trim().toLowerCase();
+  if(!id||id===window)return label;
+  const suffix=window&&id.endsWith('-'+window)?'-'+window:'';
+  const group=suffix?id.slice(0,-suffix.length):id;
+  if(!group)return label;
+  const groupLabel=group==='code-review'
+    ?'代码审查'
+    :/^extra-\\d+$/.test(group)
+      ?'附加额度 '+group.slice(6)
+      :group.split('-').filter(Boolean).map((part)=>part.charAt(0).toUpperCase()+part.slice(1)).join(' ');
+  return (groupLabel||'附加额度')+' · '+label;
+}
 function formatSubQuotaStatus(value){return({active:'正常',quota_exhausted:'额度耗尽',expired:'已过期',no_access:'无访问权限',blocked:'已限制'})[String(value||'').toLowerCase()]||String(value||'')}
 function formatSubQuotaAmount(value,unit){const number=finiteSubQuotaNumber(value)||0;if(unit==='%')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+'%';const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:0,maximumFractionDigits:2});return unit==='USD'?'$'+formatted:formatted+(unit?' '+unit:'')}
 function formatSubQuotaDate(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'}):String(value||'')}
