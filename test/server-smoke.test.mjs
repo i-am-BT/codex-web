@@ -46,10 +46,60 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
         url: req.url,
         host: req.headers.host || '',
         authorization: req.headers.authorization || '',
+        managementKey: req.headers['x-management-key'] || '',
         contentType: req.headers['content-type'] || '',
         body,
       });
       res.setHeader('Content-Type', 'application/json');
+      if (req.url === '/v0/management/auth-files') {
+        if (req.headers['x-management-key'] === 'bad-sub-key') {
+          res.statusCode = 401;
+          res.end(JSON.stringify({ error: 'unauthorized' }));
+          return;
+        }
+        res.end(JSON.stringify({
+          files: [{
+            id: 'codex-plus.json',
+            name: 'codex-plus.json',
+            type: 'codex',
+            email: 'plus@example.com',
+            auth_index: 'auth-index-1',
+            account_id: 'acct-1',
+            disabled: false,
+          }],
+        }));
+        return;
+      }
+      if (req.url === '/v0/management/api-call') {
+        if (req.headers['x-management-key'] === 'bad-sub-key') {
+          res.statusCode = 401;
+          res.end(JSON.stringify({ error: 'unauthorized' }));
+          return;
+        }
+        res.end(JSON.stringify({
+          status_code: 200,
+          body: {
+            plan_type: 'plus',
+            email: 'plus@example.com',
+            rate_limit: {
+              allowed: true,
+              limit_reached: false,
+              primary_window: {
+                used_percent: 30,
+                limit_window_seconds: 18000,
+                reset_at: 1785141573,
+              },
+              secondary_window: {
+                used_percent: 18,
+                limit_window_seconds: 604800,
+                reset_at: 1785741573,
+              },
+            },
+            rate_limit_reset_credits: { available_count: 1 },
+          },
+        }));
+        return;
+      }
       if (req.url === '/v1/usage') {
         if (req.headers.authorization === 'Bearer bad-sub-key') {
           res.end(JSON.stringify({ isValid: false, status: 'invalid_key' }));
@@ -828,9 +878,9 @@ if (args[0] === 'app-server') {
     const rejectedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baseUrl: `${customProviderBaseUrl}/`, apiKey: 'bad-sub-key' }),
+      body: JSON.stringify({ baseUrl: customProviderBaseUrl, apiKey: 'bad-sub-key' }),
     });
-    assert.equal(rejectedSubQuotaKey.status, 422);
+    assert.equal(rejectedSubQuotaKey.status, 502);
     assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /bad-sub-key/);
     assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), new RegExp(customProviderBaseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 
@@ -847,7 +897,17 @@ if (args[0] === 'app-server') {
     assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(customProviderBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
     assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
     assert.equal((await stat(webEnv)).mode & 0o777, 0o600);
-    assert.equal(providerRequests.at(-1).authorization, 'Bearer new-sub-key');
+    const managementRequests = providerRequests.filter((item) => String(item.url || '').startsWith('/v0/management/'));
+    assert.ok(managementRequests.some((item) => item.url === '/v0/management/auth-files'));
+    const managementApiCall = managementRequests.find((item) => item.url === '/v0/management/api-call');
+    assert.ok(managementApiCall);
+    const managementApiCallPayload = JSON.parse(managementApiCall.body);
+    assert.equal(managementApiCallPayload.auth_index, 'auth-index-1');
+    assert.equal(managementApiCallPayload.method, 'GET');
+    assert.equal(managementApiCallPayload.url, 'https://chatgpt.com/backend-api/wham/usage');
+    assert.equal(managementApiCallPayload.header.Authorization, 'Bearer $TOKEN$');
+    assert.equal(managementApiCallPayload.header['Chatgpt-Account-Id'], 'acct-1');
+    assert.equal(managementRequests.at(-1).managementKey, 'new-sub-key');
     assert.equal(providerRequests.at(-1).host, new URL(customProviderBaseUrl).host);
 
     const updatedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
@@ -860,7 +920,6 @@ if (args[0] === 'app-server') {
     persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
     assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(providerBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
     assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
-    assert.equal(providerRequests.at(-1).authorization, 'Bearer new-sub-key');
     assert.equal(providerRequests.at(-1).host, new URL(providerBaseUrl).host);
 
     const refreshedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
@@ -880,10 +939,14 @@ if (args[0] === 'app-server') {
     const subQuotaPayload = await subQuotas.json();
     assert.equal(subQuotaPayload.configured, true);
     assert.equal(subQuotaPayload.count, 1);
-    assert.equal(subQuotaPayload.quotas[0].planName, 'GPT-20x-300');
-    assert.equal(subQuotaPayload.quotas[0].subscription.weekly.remaining, 70);
+    assert.equal(subQuotaPayload.quotas[0].planName, 'Plus');
+    assert.equal(subQuotaPayload.quotas[0].name, 'plus@example.com');
     assert.equal(subQuotaPayload.quotas[0].rateLimits[0].window, '5h');
-    assert.equal(subQuotaPayload.quotas[0].rateLimits[0].remaining, 40);
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[0].remaining, 70);
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[0].resetAt, '2026-07-27T08:39:33.000Z');
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[1].window, '7d');
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[1].remaining, 82);
+    assert.equal(subQuotaPayload.quotas[0].rateLimits[1].resetAt, '2026-08-03T07:19:33.000Z');
     assert.doesNotMatch(JSON.stringify(subQuotaPayload), /test-sub-key/);
     const refreshedSubQuotas = await fetch(`${baseUrl}/api/sub-quotas?refresh=1`, {
       headers: { Cookie: cookie },
@@ -1360,11 +1423,15 @@ updated_at = 1784422800000
     assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><button id="automationToggle"[^>]*>自动化安排<\/button><\/div><button id="settingsToggle"/);
     assert.match(page, /function enhanceSubQuota/);
     assert.match(page, /subQuotaToggle\.id='subQuotaToggle'/);
-    assert.match(page, /setIconLabel\(subQuotaToggle,'gauge','Sub2API 额度',false\)/);
+    assert.match(page, /setIconLabel\(subQuotaToggle,'gauge','CPA Codex 额度',false\)/);
     assert.match(page, /subQuotaToggle\.setAttribute\('aria-controls','subQuotaSettingsDialog'\)/);
     assert.match(page, /subQuotaPopover\.id='subQuotaPopover'/);
     assert.match(page, /pointerenter.*showSubQuotaPreview/);
     assert.match(page, /subQuotaToggle\.addEventListener\('click',openSubQuotaSettings\)/);
+    assert.match(page, /重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
+    assert.match(page, /const rateLimitResetCredits=finiteSubQuotaNumber\(quota\.rateLimitResetCredits\)/);
+    assert.doesNotMatch(page, /Number\.isFinite\(Number\(quota\.rateLimitResetCredits\)\)/);
+    assert.match(page, /if\(!rendered\)\{\s*if\(!subQuotaContent\.childElementCount\)renderSubQuotaError\('CPA 未返回可显示的 Codex 额度数据'\);\s*else\{subQuotaStatus\.dataset\.state='error';subQuotaStatus\.textContent='仅监控 CPA 中的 Codex 账号'\}/);
     assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
     assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
     assert.match(page, /subQuotaSettingsDialog\.setAttribute\('aria-modal','true'\)/);
@@ -1372,7 +1439,7 @@ updated_at = 1784422800000
     assert.match(page, /subQuotaBaseUrlInput\.required=true/);
     assert.match(page, /subQuotaBaseUrlInput\.autocomplete='url'/);
     assert.match(page, /subQuotaBaseUrlInput\.value=data\.baseUrl\|\|''/);
-    assert.match(page, /data\.keyConfigured\?'Key 已配置，留空保留':'输入 Sub2API API Key'/);
+    assert.match(page, /data\.keyConfigured\?'Key 已配置，留空保留':'输入 CPA Management Key'/);
     assert.match(page, /JSON\.stringify\(\{baseUrl:subQuotaBaseUrlInput\.value,apiKey:subQuotaApiKeyInput\.value\}\)/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);
@@ -1493,6 +1560,22 @@ updated_at = 1784422800000
     assert.equal(isCompletedNativeRuntimeTurn('turn-new', 'turn-old', 'turn-old'), false);
     assert.equal(isCompletedNativeRuntimeTurn('', 'turn-old', 'turn-old'), false);
     assert.doesNotThrow(() => new Function(inlineScript));
+    const subQuotaProgressHelper = inlineScript.match(/(function subQuotaProgressPercent[\s\S]*?)(?=function appendSubQuotaWindow)/)?.[1];
+    assert.ok(subQuotaProgressHelper);
+    const subQuotaProgressPercent = new Function(
+      subQuotaProgressHelper + '; return subQuotaProgressPercent;',
+    )();
+    assert.equal(subQuotaProgressPercent(74, 100, 26, '%'), 26);
+    assert.equal(subQuotaProgressPercent(74, 100, null, '%'), 74);
+    assert.equal(subQuotaProgressPercent(75, 100, 25, 'USD'), 25);
+    assert.equal(subQuotaProgressPercent(null, 100, null, 'USD'), null);
+    const subQuotaDateTimeHelper = inlineScript.match(/(function formatSubQuotaDateTime[\s\S]*?)(?=function formatSubQuotaTime)/)?.[1];
+    assert.ok(subQuotaDateTimeHelper);
+    const formatSubQuotaDateTime = new Function(
+      subQuotaDateTimeHelper + '; return formatSubQuotaDateTime;',
+    )();
+    assert.equal(formatSubQuotaDateTime('2026-07-29T14:08:28'), '07/29 14:08');
+    assert.equal(formatSubQuotaDateTime('invalid'), '');
     const singleFlightHelper = inlineScript.match(/(function createTrailingSingleFlight[\s\S]*?)(?=function readPromptQueues)/)?.[1];
     assert.ok(singleFlightHelper);
     const createTrailingSingleFlight = new Function(

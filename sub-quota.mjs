@@ -3,8 +3,15 @@ const DEFAULT_CACHE_TTL_MS = 30000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 const ENV_KEY_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
-const RATE_LIMIT_WINDOWS = new Set(['5h', '1d', '7d']);
+const RATE_LIMIT_WINDOWS = new Set(['5h', '1d', '7d', '30d']);
 const MAX_BASE_URL_LENGTH = 2048;
+const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const CODEX_USAGE_HEADERS = {
+  Authorization: 'Bearer $TOKEN$',
+  'Content-Type': 'application/json',
+  Accept: 'application/json',
+  'User-Agent': 'codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal',
+};
 
 export class SubQuotaService {
   constructor(options = {}) {
@@ -24,7 +31,7 @@ export class SubQuotaService {
     try {
       sources = parseSubQuotaSources(env.SUB_QUOTA_SOURCES, env);
     } catch (error) {
-      configurationError = String(error?.message || 'Sub 额度配置无效');
+      configurationError = String(error?.message || '额度配置无效');
     }
     return new SubQuotaService({
       ...options,
@@ -53,7 +60,7 @@ export class SubQuotaService {
 
   async load() {
     const fetchedAt = new Date(this.now()).toISOString();
-    const quotas = await Promise.all(this.sources.map((source) => this.fetchSource(source, fetchedAt)));
+    const quotas = (await Promise.all(this.sources.map((source) => this.fetchSource(source, fetchedAt)))).flat();
     return {
       configured: this.sources.length > 0,
       count: quotas.length,
@@ -65,17 +72,125 @@ export class SubQuotaService {
   }
 
   async fetchSource(source, fetchedAt) {
-    const base = { id: source.id, name: source.name, fetchedAt };
-    if (!source.apiKey) return { ...base, error: `缺少环境变量 ${source.apiKeyEnv}` };
+    if (source.provider === 'cpa-codex') return this.fetchCpaCodexSource(source, fetchedAt);
+    return this.fetchSub2ApiSource(source, fetchedAt);
+  }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+  async fetchSub2ApiSource(source, fetchedAt) {
+    const base = { id: source.id, name: source.name, provider: 'sub2api', fetchedAt };
+    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+
     try {
-      const response = await this.fetchImpl(source.usageUrl, {
+      const data = await this.requestJson(source.usageUrl, {
         headers: {
           Accept: 'application/json',
           Authorization: `Bearer ${source.apiKey}`,
         },
+      });
+      return [{ ...base, ...normalizeSubQuota(data) }];
+    } catch (error) {
+      return [{ ...base, error: formatFetchError(error) }];
+    }
+  }
+
+  async fetchCpaCodexSource(source, fetchedAt) {
+    const base = { id: source.id, name: source.name, provider: 'cpa-codex', fetchedAt };
+    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+
+    try {
+      const authFiles = await this.listCpaAuthFiles(source);
+      const codexFiles = authFiles.filter((file) => isCodexAuthFile(file) && !file.disabled);
+      if (!codexFiles.length) {
+        return [{ ...base, error: 'CPA 中暂无可用的 Codex 认证' }];
+      }
+
+      const quotas = [];
+      for (const file of codexFiles) {
+        const accountBase = {
+          id: cleanText(file.id || file.name || file.auth_index || `${source.id}-codex`, 120) || `${source.id}-codex`,
+          name: cleanText(file.email || file.label || file.account || file.name || 'Codex', 100) || 'Codex',
+          provider: 'cpa-codex',
+          fetchedAt,
+          sourceName: source.name,
+        };
+        try {
+          const accountId = await this.resolveCpaAccountId(source, file);
+          const usage = await this.fetchCpaCodexUsage(source, file, accountId);
+          quotas.push({ ...accountBase, ...normalizeCpaCodexQuota(usage, file, this.now()) });
+        } catch (error) {
+          quotas.push({ ...accountBase, error: formatFetchError(error) });
+        }
+      }
+      return quotas;
+    } catch (error) {
+      return [{ ...base, error: formatFetchError(error) }];
+    }
+  }
+
+  async listCpaAuthFiles(source) {
+    const data = await this.requestJson(`${source.baseUrl}/v0/management/auth-files`, {
+      headers: managementHeaders(source.apiKey),
+    });
+    const files = data?.files ?? data?.auth_files ?? data;
+    if (!Array.isArray(files)) throw new Error('CPA auth-files 响应无效');
+    return files;
+  }
+
+  async resolveCpaAccountId(source, file) {
+    const direct = cleanText(file.account_id || file.accountId || file.chatgpt_account_id, 80);
+    if (direct) return direct;
+    const name = cleanText(file.name || file.id, 240);
+    if (!name) throw new Error('Codex 凭证缺少文件名');
+    const auth = await this.requestJson(
+      `${source.baseUrl}/v0/management/auth-files/download?name=${encodeURIComponent(name)}`,
+      { headers: managementHeaders(source.apiKey) },
+    );
+    const accountId = cleanText(auth?.account_id || auth?.accountId, 80);
+    if (!accountId) throw new Error('Codex 凭证缺少 ChatGPT 账号 ID');
+    return accountId;
+  }
+
+  async fetchCpaCodexUsage(source, file, accountId) {
+    const authIndex = cleanText(file.auth_index || file.authIndex, 80);
+    if (!authIndex) throw new Error('Codex 凭证缺少 auth_index');
+    const payload = {
+      auth_index: authIndex,
+      method: 'GET',
+      url: CODEX_USAGE_URL,
+      header: {
+        ...CODEX_USAGE_HEADERS,
+        'Chatgpt-Account-Id': accountId,
+      },
+    };
+    const outer = await this.requestJson(`${source.baseUrl}/v0/management/api-call`, {
+      method: 'POST',
+      headers: {
+        ...managementHeaders(source.apiKey),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const statusCode = Number(outer?.status_code ?? outer?.statusCode ?? 0);
+    const body = parseMaybeJson(outer?.body ?? outer?.bodyText ?? outer);
+    const bodyError = isRecord(body) && ['error', 'detail', 'message'].some((key) => Object.hasOwn(body, key));
+    const detail = bodyError
+      ? cleanText(body.error || body.detail || body.message || 'Codex 额度请求失败', 120)
+      : '';
+    if (statusCode && (statusCode < 200 || statusCode >= 300)) {
+      const responseDetail = detail || cleanText(JSON.stringify(body || {}), 120);
+      throw new Error(responseDetail ? `HTTP ${statusCode}: ${responseDetail}` : `HTTP ${statusCode}`);
+    }
+    if (bodyError) throw new Error(detail);
+    if (!isCpaCodexUsageResponse(body)) throw new Error('Codex 额度响应无效');
+    return body;
+  }
+
+  async requestJson(url, options = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(url, {
+        ...options,
         redirect: 'error',
         signal: controller.signal,
       });
@@ -92,10 +207,7 @@ export class SubQuotaService {
       } catch {
         throw new Error('响应不是 JSON');
       }
-      return { ...base, ...normalizeSubQuota(data) };
-    } catch (error) {
-      const message = error?.name === 'AbortError' ? '请求超时' : String(error?.message || '请求失败');
-      return { ...base, error: message.slice(0, 160) };
+      return data;
     } finally {
       clearTimeout(timeout);
     }
@@ -119,17 +231,21 @@ export function parseSubQuotaSources(value, env = process.env) {
     const id = String(item?.id || `sub-${index + 1}`).trim();
     const name = String(item?.name || id).trim().slice(0, 80);
     const apiKeyEnv = String(item?.apiKeyEnv || '').trim();
-    if (!SOURCE_ID_PATTERN.test(id)) throw new Error(`Sub 额度来源 ${index + 1} 的 id 无效`);
-    if (ids.has(id)) throw new Error(`Sub 额度来源 id 重复: ${id}`);
-    if (!name) throw new Error(`Sub 额度来源 ${id} 缺少名称`);
-    if (!ENV_KEY_PATTERN.test(apiKeyEnv)) throw new Error(`Sub 额度来源 ${id} 的 apiKeyEnv 无效`);
+    const provider = normalizeProvider(item?.provider);
+    if (!SOURCE_ID_PATTERN.test(id)) throw new Error(`额度来源 ${index + 1} 的 id 无效`);
+    if (ids.has(id)) throw new Error(`额度来源 id 重复: ${id}`);
+    if (!name) throw new Error(`额度来源 ${id} 缺少名称`);
+    if (!ENV_KEY_PATTERN.test(apiKeyEnv)) throw new Error(`额度来源 ${id} 的 apiKeyEnv 无效`);
     ids.add(id);
+    const baseUrl = normalizeSubQuotaBaseUrl(item?.baseUrl, { provider });
     return {
       id,
       name,
+      provider,
       apiKeyEnv,
       apiKey: String(env[apiKeyEnv] || '').trim(),
-      usageUrl: normalizeSubUsageUrl(item?.baseUrl),
+      baseUrl,
+      usageUrl: provider === 'cpa-codex' ? '' : `${baseUrl}/v1/usage`,
     };
   });
 }
@@ -167,29 +283,229 @@ export function normalizeSubQuota(data) {
   };
 }
 
-export function normalizeSubQuotaBaseUrl(value) {
+export function normalizeCpaCodexQuota(data, file = {}, now = Date.now()) {
+  if (!isRecord(data)) throw new Error('Codex 额度响应格式无效');
+  const planType = cleanText(data.plan_type || data.planType || file.plan_type, 40);
+  const rateLimit = data.rate_limit || data.rateLimit || null;
+  const codeReview = data.code_review_rate_limit || data.codeReviewRateLimit || null;
+  const additional = Array.isArray(data.additional_rate_limits || data.additionalRateLimits)
+    ? (data.additional_rate_limits || data.additionalRateLimits)
+    : [];
+  const rateLimits = [
+    ...mapCodexRateLimitGroup(rateLimit, '', now),
+    ...mapCodexRateLimitGroup(codeReview, 'code-review-', now),
+    ...additional.flatMap((item, index) => {
+      const nested = item?.rate_limit || item?.rateLimit || item;
+      const prefix = cleanText(item?.limit_name || item?.limitName || item?.metered_feature || item?.meteredFeature || `extra-${index + 1}`, 40)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '') || `extra-${index + 1}`;
+      return mapCodexRateLimitGroup(nested, `${prefix}-`, now);
+    }),
+  ];
+  const allowed = rateLimit?.allowed;
+  const limitReached = rateLimit?.limit_reached ?? rateLimit?.limitReached;
+  const hasAccess = data.codex_access ?? data.codexAccess ?? data.has_access ?? data.hasAccess;
+  return {
+    valid: hasAccess !== false,
+    mode: 'cpa_codex',
+    status: hasAccess === false
+      ? 'no_access'
+      : limitReached
+        ? 'quota_exhausted'
+        : allowed === false
+          ? 'blocked'
+          : 'active',
+    planName: formatCodexPlanName(planType),
+    unit: '%',
+    remaining: null,
+    balance: nonNegativeNumber(data?.credits?.balance),
+    quota: null,
+    subscription: null,
+    rateLimits,
+    expiresAt: '',
+    daysUntilExpiry: null,
+    today: null,
+    total: null,
+    email: cleanText(data.email || file.email || file.account, 120),
+    rateLimitResetCredits: nonNegativeInteger(
+      data?.rate_limit_reset_credits?.applicable_available_count
+      ?? data?.rateLimitResetCredits?.applicableAvailableCount
+      ?? data?.rate_limit_reset_credits?.available_count
+      ?? data?.rateLimitResetCredits?.availableCount
+    ),
+  };
+}
+
+export function normalizeSubQuotaBaseUrl(value, options = {}) {
+  const provider = normalizeProvider(options.provider);
+  const label = provider === 'cpa-codex' ? 'CPA Management URL' : 'API URL';
   const text = String(value || '').trim();
-  if (!text) throw new Error('Sub2API API URL 不能为空');
+  if (!text) throw new Error(`${label} 不能为空`);
   if (text.length > MAX_BASE_URL_LENGTH || /[\r\n\0]/.test(text)) {
-    throw new Error('Sub2API API URL 包含无效字符或过长');
+    throw new Error(`${label} 包含无效字符或过长`);
   }
   let url;
   try {
     url = new URL(text);
   } catch {
-    throw new Error('Sub2API API URL 无效');
+    throw new Error(`${label} 无效`);
   }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
-    throw new Error('Sub2API API URL 必须是无凭据的 http/https 地址');
+    throw new Error(`${label} 必须是无凭据的 http/https 地址`);
   }
   url.search = '';
   url.hash = '';
-  url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/v1\/usage$/i, '').replace(/\/v1$/i, '');
+  let pathname = url.pathname.replace(/\/+$/, '');
+  if (provider === 'cpa-codex') {
+    pathname = pathname
+      .replace(/\/v0\/management(?:\/.*)?$/i, '')
+      .replace(/\/v0$/i, '')
+      .replace(/\/v1\/usage$/i, '')
+      .replace(/\/v1$/i, '');
+  } else {
+    pathname = pathname
+      .replace(/\/v1\/usage$/i, '')
+      .replace(/\/v1$/i, '');
+  }
+  url.pathname = pathname;
   return url.toString().replace(/\/+$/, '');
 }
 
-function normalizeSubUsageUrl(value) {
-  return `${normalizeSubQuotaBaseUrl(value)}/v1/usage`;
+function mapCodexRateLimitGroup(group, idPrefix = '', now = Date.now()) {
+  if (!isRecord(group)) return [];
+  const windows = pickCodexWindows(group);
+  const limits = [];
+  if (windows.fiveHour) {
+    limits.push(codexWindowToRateLimit(`${idPrefix}5h`.replace(/^-/, ''), '5h', windows.fiveHour, now));
+  }
+  if (windows.daily) {
+    limits.push(codexWindowToRateLimit(`${idPrefix}1d`.replace(/^-/, ''), '1d', windows.daily, now));
+  }
+  if (windows.weekly) {
+    const seconds = nonNegativeNumber(windows.weekly.limit_window_seconds ?? windows.weekly.limitWindowSeconds);
+    const window = isMonthlyWindowSeconds(seconds) ? '30d' : '7d';
+    limits.push(codexWindowToRateLimit(`${idPrefix}${window}`.replace(/^-/, ''), window, windows.weekly, now));
+  }
+  return limits.filter(Boolean);
+}
+
+function pickCodexWindows(group) {
+  const primary = group.primary_window || group.primaryWindow || null;
+  const secondary = group.secondary_window || group.secondaryWindow || null;
+  let fiveHour = null;
+  let daily = null;
+  let weekly = null;
+  for (const [index, item] of [primary, secondary].entries()) {
+    if (!item) continue;
+    const seconds = nonNegativeNumber(item.limit_window_seconds ?? item.limitWindowSeconds);
+    if (seconds === 18000 && !fiveHour) fiveHour = item;
+    else if (seconds === 86400 && !daily) daily = item;
+    else if ((seconds === 604800 || isMonthlyWindowSeconds(seconds)) && !weekly) weekly = item;
+    else if (seconds === null && index === 0 && !fiveHour) fiveHour = item;
+    else if (seconds === null && index === 1 && !weekly) weekly = item;
+  }
+  return { fiveHour, daily, weekly };
+}
+
+function codexWindowToRateLimit(id, window, data, now = Date.now()) {
+  if (!isRecord(data)) return null;
+  const usedPercent = nonNegativeNumber(data.used_percent ?? data.usedPercent);
+  const remainingPercent = usedPercent === null ? null : Math.max(0, 100 - usedPercent);
+  const resetAtSeconds = nonNegativeNumber(data.reset_at ?? data.resetAt);
+  const resetAfterSeconds = nonNegativeNumber(data.reset_after_seconds ?? data.resetAfterSeconds);
+  let resetAt = '';
+  if (resetAtSeconds !== null) resetAt = safeIsoDate(resetAtSeconds * 1000);
+  else if (resetAfterSeconds !== null) resetAt = safeIsoDate(now + resetAfterSeconds * 1000);
+  return {
+    id,
+    window,
+    used: usedPercent,
+    limit: usedPercent === null && remainingPercent === null ? null : 100,
+    remaining: remainingPercent,
+    windowStart: '',
+    resetAt,
+  };
+}
+
+function isMonthlyWindowSeconds(seconds) {
+  return seconds !== null && seconds >= 2419200 && seconds <= 2678400;
+}
+
+function formatCodexPlanName(planType) {
+  const value = cleanText(planType, 40).toLowerCase();
+  return ({
+    plus: 'Plus',
+    free: 'Free',
+    pro: 'Pro 20x',
+    prolite: 'Pro 5x',
+    team: 'Team',
+    enterprise: 'Enterprise',
+  })[value] || (value ? value.replace(/(^|[_\s-])([a-z])/g, (_, p1, p2) => (p1 ? ' ' : '') + p2.toUpperCase()) : 'Codex');
+}
+
+function isCodexAuthFile(file) {
+  if (!isRecord(file)) return false;
+  const type = cleanText(file.type || file.provider, 40).toLowerCase();
+  const name = cleanText(file.name || file.id, 120).toLowerCase();
+  return type === 'codex' || name.includes('codex');
+}
+
+function isCpaCodexUsageResponse(value) {
+  if (!isRecord(value)) return false;
+  return [
+    'plan_type',
+    'planType',
+    'rate_limit',
+    'rateLimit',
+    'code_review_rate_limit',
+    'codeReviewRateLimit',
+    'additional_rate_limits',
+    'additionalRateLimits',
+    'credits',
+    'codex_access',
+    'codexAccess',
+    'has_access',
+    'hasAccess',
+    'rate_limit_reset_credits',
+    'rateLimitResetCredits',
+  ].some((key) => Object.hasOwn(value, key));
+}
+
+function normalizeProvider(value) {
+  const text = cleanText(value, 40).toLowerCase();
+  if (!text || text === 'sub2api' || text === 'sub') return 'sub2api';
+  if (text === 'cpa' || text === 'cpa-codex' || text === 'codex' || text === 'cliproxyapi') return 'cpa-codex';
+  throw new Error(`不支持的额度来源 provider: ${text}`);
+}
+
+function safeIsoDate(value) {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : '';
+}
+
+function managementHeaders(apiKey) {
+  return {
+    Accept: 'application/json',
+    'X-Management-Key': apiKey,
+  };
+}
+
+function parseMaybeJson(value) {
+  if (isRecord(value) || Array.isArray(value)) return value;
+  if (typeof value !== 'string') return value;
+  const text = value.trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return value;
+  }
+}
+
+function formatFetchError(error) {
+  const message = error?.name === 'AbortError' ? '请求超时' : String(error?.message || '请求失败');
+  return message.slice(0, 160);
 }
 
 function quotaWindow(usedValue, limitValue, remainingValue) {
