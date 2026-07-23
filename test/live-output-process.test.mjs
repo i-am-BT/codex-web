@@ -710,11 +710,13 @@ test('task_complete keeps progress commentary in the completion timeline', () =>
 });
 
 test('composerCollapsed defaults to a capsule input', () => {
+  assert.match(inlineScript, /function prefersCollapsedComposer\(\)\{/);
   assert.match(inlineScript, /function composerShouldStayExpanded\(\)\{/);
+  assert.match(inlineScript, /if\(!prefersCollapsedComposer\(\)\)return true/);
   assert.match(inlineScript, /dropZone\.classList\.toggle\('composerCollapsed',!next\)/);
+  assert.match(inlineScript, /setComposerExpanded\(!prefersCollapsedComposer\(\)\|\|composerShouldStayExpanded\(\)\,\{force:true\}\)/);
   assert.match(inlineScript, /composerMicBtn/);
   assert.match(inlineScript, /function composerPopoverOpen\(\)\{/);
-  assert.match(inlineScript, /Keep the full composer open while model\/permission\/project menus are active\./);
   assert.match(inlineScript, /webRunActive&&native\?'跟进':'向 Codex 提问'/);
   assert.match(inlineScript, /向 Codex 提问/);
   assert.match(uiStyles, /body \.box\.composerCollapsed/);
