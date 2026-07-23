@@ -23,6 +23,7 @@
 - 内置 Image Prompt 案例与模板库，支持搜索、预览并发送到生图工作台
 - 内嵌 GPT Image Playground，支持生成、编辑、参考图、遮罩和浏览器本地历史
 - 提供登录保护的生图同源代理，可绕过第三方 Image API 的浏览器 CORS 限制
+- 支持 CPA Codex / Sub2API 额度监控（保存时自动识别上游）
 - 支持管理模型服务商和默认模型
 - 支持为已有服务商重新获取最新模型列表
 - 支持选择并保存模型思考档位：默认、low、medium、high、xhigh
@@ -75,7 +76,7 @@ cp .env.example .env
 | `HOMEPAGE_MODEL_CACHE_SECONDS` | Homepage 模型数量缓存秒数，默认 60 |
 | `SUB2API_BASE_URL` | 沿用历史变量名；填写 CPA Management 地址，与 Management Key 同时设置后启用 Codex 额度入口 |
 | `SUB2API_API_KEY` | 沿用历史变量名；填写 CPA Management Key，仅保存在服务端本地 `.env` |
-| `SUB_QUOTA_TIMEOUT_MS` | CPA Codex 额度请求超时，默认 10000 毫秒 |
+| `SUB_QUOTA_TIMEOUT_MS` | CPA Codex / Sub2API 额度请求超时，默认 10000 毫秒 |
 | `SUB_QUOTA_CACHE_SECONDS` | CPA Codex 额度结果缓存时间，默认 30 秒 |
 | `IMAGE_PROMPT_AUTO_SYNC` | 启动时及定时检查 `awesome-gpt-image-2` 更新，默认开启 |
 | `IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` | 提示词库自动检查间隔，默认 360 分钟 |

@@ -865,6 +865,8 @@ if (args[0] === 'app-server') {
     const subQuotaConfigPayload = await subQuotaConfig.json();
     assert.equal(subQuotaConfigPayload.baseUrl, providerBaseUrl);
     assert.equal(subQuotaConfigPayload.keyConfigured, true);
+    assert.equal(subQuotaConfigPayload.provider, 'cpa-codex');
+    assert.equal(subQuotaConfigPayload.providerLabel, 'CPA Codex');
     assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
 
     const rejectedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
@@ -880,7 +882,7 @@ if (args[0] === 'app-server') {
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ baseUrl: customProviderBaseUrl, apiKey: 'bad-sub-key' }),
     });
-    assert.equal(rejectedSubQuotaKey.status, 502);
+    assert.ok([422, 502].includes(rejectedSubQuotaKey.status));
     assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /bad-sub-key/);
     assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), new RegExp(customProviderBaseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 
@@ -892,10 +894,14 @@ if (args[0] === 'app-server') {
     assert.equal(updatedSubQuotaKey.status, 200);
     const updatedSubQuotaPayload = await updatedSubQuotaKey.json();
     assert.equal(updatedSubQuotaPayload.baseUrl, customProviderBaseUrl);
+    assert.equal(updatedSubQuotaPayload.provider, 'cpa-codex');
+    assert.equal(updatedSubQuotaPayload.providerLabel, 'CPA Codex');
+    assert.match(String(updatedSubQuotaPayload.detectDetail || ''), /CPA|CLIProxyAPI/);
     assert.doesNotMatch(JSON.stringify(updatedSubQuotaPayload), /new-sub-key/);
     let persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
     assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(customProviderBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
     assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
+    assert.match(persistedSubQuotaConfig, /^SUB_QUOTA_PROVIDER="?cpa-codex"?$/m);
     assert.equal((await stat(webEnv)).mode & 0o777, 0o600);
     const managementRequests = providerRequests.filter((item) => String(item.url || '').startsWith('/v0/management/'));
     assert.ok(managementRequests.some((item) => item.url === '/v0/management/auth-files'));
@@ -917,7 +923,7 @@ if (args[0] === 'app-server') {
       body: JSON.stringify({ baseUrl: `${providerBaseUrl}/v1/usage`, apiKey: '' }),
     });
     assert.equal(rejectedSubQuotaOriginChange.status, 400);
-    assert.match((await rejectedSubQuotaOriginChange.json()).error, /URL 已变更.*重新输入 Management Key/);
+    assert.match((await rejectedSubQuotaOriginChange.json()).error, /URL 已变更.*重新输入/);
     assert.equal(providerRequests.length, providerRequestCountBeforeRejectedOriginChange);
     persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
     assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(customProviderBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
@@ -1446,11 +1452,18 @@ updated_at = 1784422800000
     assert.match(page, /id="archiveToggle"[^>]*>已归档任务<\/button><button id="automationToggle"[^>]*>自动化安排<\/button><\/div><button id="settingsToggle"/);
     assert.match(page, /function enhanceSubQuota/);
     assert.match(page, /subQuotaToggle\.id='subQuotaToggle'/);
-    assert.match(page, /setIconLabel\(subQuotaToggle,'gauge','CPA Codex 额度',false\)/);
+    assert.match(page, /setIconLabel\(subQuotaToggle,'gauge','额度',false\)/);
     assert.match(page, /subQuotaToggle\.setAttribute\('aria-controls','subQuotaSettingsDialog'\)/);
     assert.match(page, /subQuotaPopover\.id='subQuotaPopover'/);
     assert.match(page, /pointerenter.*showSubQuotaPreview/);
-    assert.match(page, /subQuotaToggle\.addEventListener\('click',openSubQuotaSettings\)/);
+    assert.match(page, /subQuotaToggle\.addEventListener\('click',handleSubQuotaToggleClick\)/);
+    assert.match(page, /function handleSubQuotaToggleClick\(event\)/);
+    assert.match(page, /const coarse=isCoarsePointer\(\)\|\|event\.pointerType==='touch'/);
+    assert.match(page, /手机端点一下显示额度，再点一下打开配置/);
+    assert.match(page, /title\.textContent='额度监控'/);
+    assert.match(page, /subQuotaUrlLabel\.textContent='上游 URL'/);
+    assert.match(page, /已识别 '\+providerLabel/);
+    assert.match(page, /正在自动识别上游并检测额度/);
     assert.match(page, /appendSubQuotaWindow\(source,subQuotaRateLimitLabel\(rateLimit\),rateLimit,unit\)/);
     assert.match(page, /subQuotaRateLimitLabel\(rateLimit\)\+'重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
     const subQuotaRateLimitLabelSource = page.match(/function subQuotaRateLimitLabel\(rateLimit\)\{[\s\S]*?(?=function formatSubQuotaStatus)/)?.[0];
@@ -1470,7 +1483,7 @@ updated_at = 1784422800000
     assert.match(page, /subQuotaBaseUrlInput\.required=true/);
     assert.match(page, /subQuotaBaseUrlInput\.autocomplete='url'/);
     assert.match(page, /subQuotaBaseUrlInput\.value=data\.baseUrl\|\|''/);
-    assert.match(page, /data\.keyConfigured\?'Key 已配置，留空保留':'输入 CPA Management Key'/);
+    assert.match(page, /data\.keyConfigured\?'Key 已配置，留空保留':'CPA Management Key 或 Sub2API API Key'/);
     assert.match(page, /JSON\.stringify\(\{baseUrl:subQuotaBaseUrlInput\.value,apiKey:subQuotaApiKeyInput\.value\}\)/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);

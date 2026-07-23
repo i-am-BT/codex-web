@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  detectSubQuotaProvider,
   normalizeCpaCodexQuota,
   normalizeSubQuota,
   normalizeSubQuotaBaseUrl,
@@ -707,3 +708,62 @@ test('reports optional configuration errors without breaking service startup', a
   assert.equal(result.count, 0);
   assert.match(result.configurationError, /JSON/);
 });
+
+test('detects CPA Management before Sub2API on shared host', async () => {
+  const calls = [];
+  const detected = await detectSubQuotaProvider('http://127.0.0.1:8327/', 'mg-key', {
+    timeoutMs: 1000,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), headers: init?.headers || {} });
+      if (String(url).endsWith('/v0/management/auth-files')) {
+        return new Response(JSON.stringify({ files: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response('not found', { status: 404 });
+    },
+  });
+  assert.equal(detected.provider, 'cpa-codex');
+  assert.equal(detected.baseUrl, 'http://127.0.0.1:8327');
+  assert.equal(detected.label, 'CPA Codex');
+  assert.ok(calls.some((item) => item.url.endsWith('/v0/management/auth-files')));
+  const headers = calls[0].headers;
+  assert.equal(headers['X-Management-Key'] || headers['x-management-key'], 'mg-key');
+});
+
+test('detects Sub2API when only /v1/usage is available', async () => {
+  const detected = await detectSubQuotaProvider('https://sub.example.test/v1/usage', 'sub-key', {
+    timeoutMs: 1000,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith('/v0/management/auth-files')) {
+        return new Response('missing', { status: 404 });
+      }
+      if (String(url).endsWith('/v1/usage')) {
+        assert.match(init?.headers?.Authorization || '', /Bearer sub-key/);
+        return new Response(JSON.stringify({
+          plan_name: 'Pro',
+          total: { used: 10, limit: 100, remaining: 90, unit: 'USD' },
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response('nope', { status: 500 });
+    },
+  });
+  assert.equal(detected.provider, 'sub2api');
+  assert.equal(detected.baseUrl, 'https://sub.example.test');
+  assert.equal(detected.label, 'Sub2API');
+});
+
+test('rejects unknown upstream when neither provider responds', async () => {
+  await assert.rejects(
+    () => detectSubQuotaProvider('https://unknown.example.test', 'key', {
+      timeoutMs: 200,
+      fetchImpl: async () => new Response('no', { status: 404 }),
+    }),
+    /无法识别上游服务/,
+  );
+});
+

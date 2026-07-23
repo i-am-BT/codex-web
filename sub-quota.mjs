@@ -333,6 +333,88 @@ export function normalizeCpaCodexQuota(data, file = {}, now = Date.now()) {
   };
 }
 
+export async function detectSubQuotaProvider(baseUrl, apiKey, options = {}) {
+  const fetchImpl = options.fetchImpl || fetch;
+  const timeoutMs = positiveNumber(options.timeoutMs, DEFAULT_TIMEOUT_MS);
+  const key = String(apiKey || '').trim();
+  if (!key) throw new Error('API Key 不能为空');
+
+  const cpaBase = normalizeSubQuotaBaseUrl(baseUrl, { provider: 'cpa-codex' });
+  const subBase = normalizeSubQuotaBaseUrl(baseUrl, { provider: 'sub2api' });
+
+  const tryRequest = async (url, headers) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchImpl(url, {
+        method: 'GET',
+        headers,
+        redirect: 'error',
+        signal: controller.signal,
+      });
+      const text = await response.text().catch(() => '');
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      return { ok: response.ok, status: response.status, data, text };
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+
+  // Prefer CPA management probe first when the host exposes /v0/management.
+  try {
+    const cpa = await tryRequest(`${cpaBase}/v0/management/auth-files`, managementHeaders(key));
+    if (cpa.ok) {
+      return {
+        provider: 'cpa-codex',
+        baseUrl: cpaBase,
+        label: 'CPA Codex',
+        detail: '已识别为 CLIProxyAPI / CPA Management',
+      };
+    }
+  } catch {
+    // fall through to Sub2API probe
+  }
+
+  try {
+    const sub = await tryRequest(`${subBase}/v1/usage`, {
+      Accept: 'application/json',
+      Authorization: `Bearer ${key}`,
+    });
+    if (sub.ok && isRecord(sub.data)) {
+      return {
+        provider: 'sub2api',
+        baseUrl: subBase,
+        label: 'Sub2API',
+        detail: '已识别为 Sub2API /v1/usage',
+      };
+    }
+    // Some Sub2API forks return non-object but still 200 with usage body; accept JSON text.
+    if (sub.ok) {
+      return {
+        provider: 'sub2api',
+        baseUrl: subBase,
+        label: 'Sub2API',
+        detail: '已识别为 Sub2API /v1/usage',
+      };
+    }
+  } catch {
+    // fall through
+  }
+
+  // Last resort: if CPA returned auth error (reachable management), treat as CPA.
+  try {
+    const cpa = await tryRequest(`${cpaBase}/v0/management/auth-files`, managementHeaders(key));
+    if (cpa.status === 401 || cpa.status === 403) {
+      throw new Error('CPA Management Key 无效或无权限');
+    }
+  } catch (error) {
+    if (String(error?.message || '').includes('Management Key')) throw error;
+  }
+
+  throw new Error('无法识别上游服务，请确认 URL/Key 对应 CPA Management 或 Sub2API');
+}
+
 export function normalizeSubQuotaBaseUrl(value, options = {}) {
   const provider = normalizeProvider(options.provider);
   const label = provider === 'cpa-codex' ? 'CPA Management URL' : 'API URL';
