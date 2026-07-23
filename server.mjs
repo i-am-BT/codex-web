@@ -32,7 +32,7 @@ import {
   buildAutomationRrule,
   decorateAutomation,
 } from './automation-store.mjs';
-import { normalizeSubQuotaBaseUrl, SubQuotaService } from './sub-quota.mjs';
+import { detectSubQuotaProvider, normalizeSubQuotaBaseUrl, SubQuotaService } from './sub-quota.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -178,7 +178,8 @@ let subQuotaService;
 {
   const startupApiKey = String(process.env.SUB2API_API_KEY || '').trim();
   delete process.env.SUB2API_API_KEY;
-  subQuotaService = createSubQuotaService(subQuotaBaseUrl, startupApiKey);
+  const startupProvider = normalizeSubQuotaProvider(process.env.SUB_QUOTA_PROVIDER || 'cpa-codex');
+  subQuotaService = createSubQuotaService(subQuotaBaseUrl, startupApiKey, startupProvider);
 }
 const appServerClient = new CodexAppServerClient({
   bin: CODEX_BIN,
@@ -528,7 +529,7 @@ app.get('/api/sub-quotas', requireAuth, async (req, res) => {
   try {
     res.json(await subQuotaService.list({ refresh: req.query.refresh === '1' }));
   } catch (err) {
-    res.status(502).json({ error: `读取 CPA Codex 额度失败: ${err.message}` });
+    res.status(502).json({ error: `读取额度失败: ${err.message}` });
   }
 });
 
@@ -536,6 +537,8 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   res.json({
     baseUrl: subQuotaBaseUrl,
+    provider: currentSubQuotaProvider(),
+    providerLabel: currentSubQuotaProvider() === 'sub2api' ? 'Sub2API' : 'CPA Codex',
     keyConfigured: Boolean(getSubQuotaApiKey()),
     configured: Boolean(subQuotaBaseUrl && getSubQuotaApiKey()),
   });
@@ -543,46 +546,80 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
 
 app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
-  let candidateBaseUrl;
+  const rawBaseUrl = req.body?.baseUrl === undefined ? subQuotaBaseUrl : req.body.baseUrl;
+  const suppliedApiKey = String(req.body?.apiKey || '').trim();
+  // Changing host/origin without re-supplying a key is rejected to avoid silently
+  // reusing credentials against an unexpected upstream.
+  if (!suppliedApiKey && subQuotaBaseUrl) {
+    try {
+      // Origin check uses a conservative URL normalize; provider auto-detect still runs below.
+      const candidateBaseUrl = normalizeSubQuotaBaseUrl(rawBaseUrl, {
+        provider: normalizeSubQuotaProvider(req.body?.provider || process.env.SUB_QUOTA_PROVIDER || currentSubQuotaProvider()),
+      });
+      if (!sameSubQuotaCredentialOrigin(candidateBaseUrl, subQuotaBaseUrl)) {
+        return res.status(400).json({ error: 'URL 已变更，请重新输入 API Key / Management Key' });
+      }
+    } catch {
+      try {
+        if (!sameSubQuotaCredentialOrigin(String(rawBaseUrl || '').trim().replace(/\/+$/, ''), subQuotaBaseUrl)) {
+          return res.status(400).json({ error: 'URL 已变更，请重新输入 API Key / Management Key' });
+        }
+      } catch {
+        // Fall through to detect/normalize errors below.
+      }
+    }
+  }
+  const apiKey = suppliedApiKey || getSubQuotaApiKey();
+  if (!apiKey) return res.status(400).json({ error: 'API Key / Management Key 不能为空' });
+  if (apiKey.length > 4096 || /[\r\n\0]/.test(apiKey)) {
+    return res.status(400).json({ error: 'API Key 包含无效字符' });
+  }
+
+  let detected;
   try {
-    candidateBaseUrl = normalizeSubQuotaBaseUrl(
-      req.body?.baseUrl === undefined ? subQuotaBaseUrl : req.body.baseUrl,
-      { provider: 'cpa-codex' },
-    );
+    const requestedProvider = String(req.body?.provider || '').trim();
+    if (requestedProvider) {
+      const provider = normalizeSubQuotaProvider(requestedProvider);
+      const baseUrl = normalizeSubQuotaBaseUrl(rawBaseUrl, { provider });
+      detected = {
+        provider,
+        baseUrl,
+        label: provider === 'sub2api' ? 'Sub2API' : 'CPA Codex',
+        detail: provider === 'sub2api' ? '使用指定的 Sub2API' : '使用指定的 CPA Management',
+      };
+    } else {
+      detected = await detectSubQuotaProvider(rawBaseUrl, apiKey, {
+        timeoutMs: Number(process.env.SUB_QUOTA_TIMEOUT_MS || 10000),
+      });
+    }
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
-  const suppliedApiKey = String(req.body?.apiKey || '').trim();
-  if (!suppliedApiKey && subQuotaBaseUrl && !sameSubQuotaCredentialOrigin(candidateBaseUrl, subQuotaBaseUrl)) {
-    return res.status(400).json({ error: 'CPA Management URL 已变更，请重新输入 Management Key' });
-  }
-  const apiKey = suppliedApiKey || getSubQuotaApiKey();
-  if (!apiKey) return res.status(400).json({ error: 'CPA Management Key 不能为空' });
-  if (apiKey.length > 4096 || /[\r\n\0]/.test(apiKey)) {
-    return res.status(400).json({ error: 'CPA Management Key 包含无效字符' });
-  }
 
   try {
-    const candidate = createSubQuotaService(candidateBaseUrl, apiKey);
+    const candidate = createSubQuotaService(detected.baseUrl, apiKey, detected.provider);
     const result = await candidate.list({ refresh: true });
-    const quotas = Array.isArray(result.quotas) ? result.quotas : [];
-    const quota = quotas.find((item) => !item.error && item.valid !== false)
-      || quotas.find((item) => !item.error)
-      || quotas[0];
+    const quota = result.quotas.find((item) => item && !item.error) || result.quotas[0];
     if (!quota || quota.error) {
-      return res.status(502).json({ error: `CPA Codex 检测失败: ${quota?.error || '未返回额度数据'}` });
+      const label = detected.label || '额度服务';
+      return res.status(502).json({ error: `${label} 检测失败: ${quota?.error || '未返回额度数据'}` });
     }
-    if (quota.valid === false) return res.status(422).json({ error: 'Codex 凭证无效或无访问权限' });
+    if (quota.valid === false) return res.status(422).json({ error: '凭证无效或无访问权限' });
 
     updateEnvVars(ENV_FILE, {
-      SUB2API_BASE_URL: candidateBaseUrl,
+      SUB2API_BASE_URL: detected.baseUrl,
+      SUB_QUOTA_PROVIDER: detected.provider,
       ...(suppliedApiKey ? { SUB2API_API_KEY: apiKey } : {}),
     });
-    subQuotaBaseUrl = candidateBaseUrl;
+    process.env.SUB_QUOTA_PROVIDER = detected.provider;
+    subQuotaBaseUrl = detected.baseUrl;
     subQuotaService = candidate;
     res.json({
       ok: true,
-      baseUrl: candidateBaseUrl,
+      baseUrl: detected.baseUrl,
+      provider: detected.provider,
+      providerLabel: detected.label,
+      detectDetail: detected.detail,
       keyConfigured: true,
       configured: true,
       quota: {
@@ -590,10 +627,12 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
         mode: quota.mode,
         status: quota.status,
         valid: quota.valid,
+        name: quota.name,
+        provider: quota.provider || detected.provider,
       },
     });
   } catch (err) {
-    res.status(500).json({ error: `保存 CPA Codex 设置失败: ${err.message}` });
+    res.status(500).json({ error: `保存额度设置失败: ${err.message}` });
   }
 });
 
@@ -3289,21 +3328,35 @@ function isHttpUrl(value) {
   }
 }
 
-function createSubQuotaService(baseUrl, apiKey) {
+function createSubQuotaService(baseUrl, apiKey, provider = 'cpa-codex') {
+  const resolvedProvider = normalizeSubQuotaProvider(provider);
+  const sourceId = resolvedProvider === 'sub2api' ? 'sub2api' : 'cpa-codex';
+  const sourceName = resolvedProvider === 'sub2api' ? 'Sub2API' : 'CPA Codex';
   return SubQuotaService.fromEnvironment({
     SUB2API_API_KEY: apiKey,
     SUB_QUOTA_TIMEOUT_MS: process.env.SUB_QUOTA_TIMEOUT_MS,
     SUB_QUOTA_CACHE_SECONDS: process.env.SUB_QUOTA_CACHE_SECONDS,
     SUB_QUOTA_SOURCES: baseUrl && apiKey
       ? JSON.stringify([{
-        id: 'cpa-codex',
-        name: 'CPA Codex',
-        provider: 'cpa-codex',
+        id: sourceId,
+        name: sourceName,
+        provider: resolvedProvider,
         baseUrl,
         apiKeyEnv: 'SUB2API_API_KEY',
       }])
       : '',
   });
+}
+
+function normalizeSubQuotaProvider(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (text === 'sub2api' || text === 'sub' || text === 'sub2') return 'sub2api';
+  if (text === 'cpa' || text === 'cpa-codex' || text === 'codex' || text === 'cliproxyapi') return 'cpa-codex';
+  return 'cpa-codex';
+}
+
+function currentSubQuotaProvider() {
+  return normalizeSubQuotaProvider(subQuotaService?.sources?.[0]?.provider || process.env.SUB_QUOTA_PROVIDER || 'cpa-codex');
 }
 
 function getSubQuotaApiKey() {
@@ -3317,6 +3370,7 @@ function sameSubQuotaCredentialOrigin(left, right) {
     return false;
   }
 }
+
 
 async function proxyPlaygroundRequest(req, res) {
   if (!['GET', 'POST'].includes(req.method)) {
@@ -5220,27 +5274,27 @@ function ensureSubQuotaSettingsDialog(){
   head.className='settingsDialogHead subQuotaSettingsDialogHead';
   const title=document.createElement('h2');
   title.id='subQuotaSettingsTitle';
-  title.textContent='CPA Codex 额度监控';
+  title.textContent='额度监控';
   subQuotaSettingsClose=document.createElement('button');
   subQuotaSettingsClose.type='button';
   subQuotaSettingsClose.className='settingsDialogClose';
-  subQuotaSettingsClose.title='关闭 CPA Codex 设置';
-  subQuotaSettingsClose.setAttribute('aria-label','关闭 CPA Codex 设置');
-  setIconLabel(subQuotaSettingsClose,'x','关闭 CPA Codex 设置',false);
+  subQuotaSettingsClose.title='关闭额度设置';
+  subQuotaSettingsClose.setAttribute('aria-label','关闭额度设置');
+  setIconLabel(subQuotaSettingsClose,'x','关闭额度设置',false);
   head.appendChild(title);
   head.appendChild(subQuotaSettingsClose);
   const body=document.createElement('div');
   body.className='subQuotaSettingsBody';
   const subQuotaDescription=document.createElement('p');
   subQuotaDescription.className='subQuotaSettingsDescription';
-  subQuotaDescription.textContent='填写 CPA Management URL 与 Management Key，保存后会立即检测本地 CLIProxyAPI 中的 Codex 额度。';
+  subQuotaDescription.textContent='填写上游 URL 与 Key，保存时会自动识别 CPA Management 或 Sub2API，并立即检测额度。';
   subQuotaSettingsForm=document.createElement('form');
   subQuotaSettingsForm.id='subQuotaSettingsForm';
   subQuotaSettingsForm.className='subQuotaSettingsForm';
   const subQuotaUrlField=document.createElement('label');
   subQuotaUrlField.className='field';
   const subQuotaUrlLabel=document.createElement('span');
-  subQuotaUrlLabel.textContent='API URL';
+  subQuotaUrlLabel.textContent='上游 URL';
   subQuotaBaseUrlInput=document.createElement('input');
   subQuotaBaseUrlInput.id='subQuotaBaseUrl';
   subQuotaBaseUrlInput.name='baseUrl';
@@ -5250,20 +5304,20 @@ function ensureSubQuotaSettingsDialog(){
   subQuotaBaseUrlInput.autocomplete='url';
   subQuotaBaseUrlInput.inputMode='url';
   subQuotaBaseUrlInput.spellcheck=false;
-  subQuotaBaseUrlInput.placeholder='http://127.0.0.1:8327';
+  subQuotaBaseUrlInput.placeholder='http://127.0.0.1:8327 或 Sub2API 地址';
   subQuotaUrlField.appendChild(subQuotaUrlLabel);
   subQuotaUrlField.appendChild(subQuotaBaseUrlInput);
   const subQuotaKeyField=document.createElement('label');
   subQuotaKeyField.className='field';
   const subQuotaKeyLabel=document.createElement('span');
-  subQuotaKeyLabel.textContent='API Key';
+  subQuotaKeyLabel.textContent='API Key / Management Key';
   subQuotaApiKeyInput=document.createElement('input');
   subQuotaApiKeyInput.id='subQuotaApiKey';
   subQuotaApiKeyInput.name='apiKey';
   subQuotaApiKeyInput.type='password';
   subQuotaApiKeyInput.maxLength=4096;
   subQuotaApiKeyInput.autocomplete='new-password';
-  subQuotaApiKeyInput.placeholder='输入 CPA Management Key';
+  subQuotaApiKeyInput.placeholder='CPA Management Key 或 Sub2API API Key';
   subQuotaKeyField.appendChild(subQuotaKeyLabel);
   subQuotaKeyField.appendChild(subQuotaApiKeyInput);
   subQuotaCredentialHint=document.createElement('small');
@@ -5386,8 +5440,14 @@ async function syncSubQuotaSettings(){
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'读取设置失败');
     subQuotaBaseUrlInput.value=data.baseUrl||'';
-    subQuotaApiKeyInput.placeholder=data.keyConfigured?'Key 已配置，留空保留':'输入 CPA Management Key';
-    if(subQuotaCredentialHint)subQuotaCredentialHint.textContent=data.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，首次保存时必须填写';
+    const providerLabel=data.providerLabel||(data.provider==='sub2api'?'Sub2API':data.provider==='cpa-codex'?'CPA Codex':'');
+    subQuotaApiKeyInput.placeholder=data.keyConfigured?'Key 已配置，留空保留':'CPA Management Key 或 Sub2API API Key';
+    if(subQuotaCredentialHint){
+      const bits=[];
+      if(providerLabel)bits.push('已识别 '+providerLabel);
+      bits.push(data.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，首次保存时必须填写');
+      subQuotaCredentialHint.textContent=bits.join(' · ');
+    }
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'读取设置失败')}
 }
 async function submitSubQuotaSettings(event){
@@ -5396,7 +5456,7 @@ async function submitSubQuotaSettings(event){
   const submit=subQuotaSettingsForm.querySelector('[type="submit"]');
   submit.disabled=true;
   subQuotaSettingsStatus.classList.remove('success');
-  subQuotaSettingsStatus.textContent='正在检测 CPA Codex…';
+  subQuotaSettingsStatus.textContent='正在自动识别上游并检测额度…';
   try{
     const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({baseUrl:subQuotaBaseUrlInput.value,apiKey:subQuotaApiKeyInput.value})});
     const data=await response.json().catch(()=>({}));
@@ -5404,7 +5464,7 @@ async function submitSubQuotaSettings(event){
     subQuotaApiKeyInput.value='';
     await syncSubQuotaSettings();
     subQuotaSettingsStatus.classList.add('success');
-    subQuotaSettingsStatus.textContent='检测通过，已启用 '+(data.quota?.planName||data.quota?.name||'CPA Codex 额度监控');
+    subQuotaSettingsStatus.textContent='检测通过，已启用 '+(data.providerLabel||data.quota?.planName||data.quota?.name||'额度监控')+(data.detectDetail?' · '+data.detectDetail:'');
     await loadSubQuota({refresh:true});
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'检测失败')}
   finally{submit.disabled=false}
@@ -5581,19 +5641,22 @@ function enhanceAutomationView(){
   toolbar.after(tabs);
   syncAutomationFilterTabs();
 }
+function isCoarsePointer(){
+  try{return window.matchMedia('(hover: none), (pointer: coarse)').matches}catch{return false}
+}
 function enhanceSubQuota(sideActions){
   if(!sideActions||subQuotaToggle)return;
   subQuotaToggle=document.createElement('button');
   subQuotaToggle.id='subQuotaToggle';
   subQuotaToggle.className='subQuotaToggle';
   subQuotaToggle.type='button';
-  subQuotaToggle.title='悬停查看 CPA Codex 额度，点击设置 Management URL 与 Key';
-  subQuotaToggle.setAttribute('aria-label','悬停查看 CPA Codex 额度，点击设置 Management URL 与 Key');
+  subQuotaToggle.title='悬停查看额度，点击打开配置；手机端点一下显示额度，再点一下打开配置';
+  subQuotaToggle.setAttribute('aria-label','悬停查看额度，点击打开配置；手机端点一下显示额度，再点一下打开配置');
   subQuotaToggle.setAttribute('aria-haspopup','dialog');
   subQuotaToggle.setAttribute('aria-controls','subQuotaSettingsDialog');
   subQuotaToggle.setAttribute('aria-describedby','subQuotaPopover');
   subQuotaToggle.setAttribute('aria-expanded','false');
-  setIconLabel(subQuotaToggle,'gauge','CPA Codex 额度',false);
+  setIconLabel(subQuotaToggle,'gauge','额度',false);
   sideActions.appendChild(subQuotaToggle);
 
   subQuotaPopover=document.createElement('section');
@@ -5605,7 +5668,7 @@ function enhanceSubQuota(sideActions){
   const title=document.createElement('h2');
   title.id='subQuotaTitle';
   title.className='subQuotaTitle';
-  title.textContent='CPA Codex 额度';
+  title.textContent='额度';
   head.appendChild(title);
   subQuotaStatus=document.createElement('div');
   subQuotaStatus.className='subQuotaStatus';
@@ -5619,16 +5682,38 @@ function enhanceSubQuota(sideActions){
   sideActions.appendChild(subQuotaPopover);
   ensureSubQuotaSettingsDialog();
 
-  subQuotaToggle.addEventListener('pointerenter',showSubQuotaPreview);
-  subQuotaToggle.addEventListener('mouseenter',showSubQuotaPreview);
+  subQuotaToggle.addEventListener('pointerenter',(event)=>{if(!isCoarsePointer()&&event.pointerType!=='touch')showSubQuotaPreview()});
+  subQuotaToggle.addEventListener('mouseenter',()=>{if(!isCoarsePointer())showSubQuotaPreview()});
   subQuotaToggle.addEventListener('pointerleave',scheduleSubQuotaPreviewHide);
   subQuotaToggle.addEventListener('mouseleave',scheduleSubQuotaPreviewHide);
-  subQuotaToggle.addEventListener('focus',()=>{if(!suppressSubQuotaFocusPreview)showSubQuotaPreview()});
+  subQuotaToggle.addEventListener('focus',()=>{if(!suppressSubQuotaFocusPreview&&!isCoarsePointer())showSubQuotaPreview()});
   subQuotaToggle.addEventListener('blur',(event)=>{if(!subQuotaPopover.contains(event.relatedTarget))scheduleSubQuotaPreviewHide()});
-  subQuotaToggle.addEventListener('click',openSubQuotaSettings);
+  subQuotaToggle.addEventListener('click',handleSubQuotaToggleClick);
   subQuotaPopover.addEventListener('pointerenter',cancelSubQuotaPreviewHide);
   subQuotaPopover.addEventListener('pointerleave',scheduleSubQuotaPreviewHide);
+  // Outside tap closes mobile quota preview.
+  document.addEventListener('click',(event)=>{
+    if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
+    if(event.target.closest('#subQuotaToggle, #subQuotaPopover, #subQuotaSettingsOverlay'))return;
+    hideSubQuotaPreview();
+  });
   refreshIcons(subQuotaPopover);
+}
+function handleSubQuotaToggleClick(event){
+  event.preventDefault();
+  event.stopPropagation();
+  // Mobile/touch: first tap shows quota; second tap (while preview open) opens settings.
+  const coarse=isCoarsePointer()||event.pointerType==='touch';
+  if(coarse){
+    if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){
+      openSubQuotaSettings();
+      return;
+    }
+    showSubQuotaPreview();
+    return;
+  }
+  // Desktop / fine pointer: click opens configuration; hover already covers preview.
+  openSubQuotaSettings();
 }
 function showSubQuotaPreview(){
   if(!subQuotaPopover||!subQuotaToggle)return;
