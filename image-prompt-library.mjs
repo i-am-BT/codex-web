@@ -106,6 +106,68 @@ export class ImagePromptLibrary {
     };
   }
 
+  resolveAsset(relativePath) {
+    const assetPath = normalizeImagePromptAssetPath(relativePath);
+    if (!assetPath) {
+      const error = new Error('无效的提示词图片路径');
+      error.statusCode = 400;
+      throw error;
+    }
+    const revision = cleanRevision(this.library?.revision || this.syncState.revision || this.builtInRevision)
+      || this.builtInRevision;
+    return {
+      path: assetPath,
+      revision,
+      url: this.rawUrl(revision, `data/${assetPath}`),
+    };
+  }
+
+  async fetchAsset(relativePath, { fetchImpl = this.fetchImpl } = {}) {
+    if (typeof fetchImpl !== 'function') throw new Error('当前运行环境不支持 fetch');
+    const asset = this.resolveAsset(relativePath);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    timeout.unref?.();
+    try {
+      const response = await fetchImpl(asset.url, {
+        headers: {
+          Accept: 'image/*,*/*;q=0.8',
+          'User-Agent': 'codex-web-image-prompt-asset',
+        },
+        redirect: 'follow',
+        signal: controller.signal,
+      });
+      if (!response?.ok) {
+        const error = new Error(`提示词图片拉取失败 (${response?.status || 'unknown'})`);
+        error.statusCode = response?.status === 404 ? 404 : 502;
+        throw error;
+      }
+      const body = Buffer.from(await response.arrayBuffer());
+      return {
+        ...asset,
+        status: response.status,
+        contentType: normalizeImagePromptContentType(
+          response.headers?.get?.('content-type'),
+          asset.path,
+        ),
+        cacheControl: 'private, max-age=86400',
+        body,
+      };
+    } catch (error) {
+      if (error?.statusCode) throw error;
+      if (error?.name === 'AbortError') {
+        const timeoutError = new Error('提示词图片拉取超时');
+        timeoutError.statusCode = 504;
+        throw timeoutError;
+      }
+      const failed = new Error(`提示词图片拉取失败: ${cleanError(error)}`);
+      failed.statusCode = 502;
+      throw failed;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async sync({ reason = 'manual' } = {}) {
     if (this.syncPromise) return this.syncPromise;
     this.syncPromise = this.performSync(reason).finally(() => {
@@ -322,7 +384,9 @@ function createLibraryPayload(data, revision, repository) {
   return {
     version: `${revision}:${styleData.version || 1}:${cases.length}:${templates.length}`,
     revision,
-    imageBaseUrl: `https://raw.githubusercontent.com/${repository}/${revision}/data`,
+    // Browser loads thumbnails same-origin; server proxies GitHub raw assets.
+    imageBaseUrl: '/api/image-prompts/assets',
+    imageUpstreamBaseUrl: `https://raw.githubusercontent.com/${repository}/${revision}/data`,
     totalCases: cases.length,
     totalTemplates: templates.length,
     categories: Array.isArray(styleData.categories) ? styleData.categories : [],
@@ -396,4 +460,33 @@ function cleanError(error) {
 function finitePositiveNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+export function normalizeImagePromptAssetPath(value) {
+  const raw = String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .trim();
+  if (!raw) return '';
+  if (raw.includes('\0')) return '';
+  const parts = raw.split('/').filter(Boolean);
+  if (!parts.length) return '';
+  if (parts.some((part) => part === '.' || part === '..')) return '';
+  if (!parts.every((part) => /^[A-Za-z0-9._-]+$/.test(part))) return '';
+  const joined = parts.join('/');
+  if (!/^images\//.test(joined)) return '';
+  if (!/\.(?:avif|gif|jpe?g|png|webp)$/i.test(joined)) return '';
+  return joined;
+}
+
+export function normalizeImagePromptContentType(contentType, assetPath = '') {
+  const type = String(contentType || '').split(';', 1)[0].trim().toLowerCase();
+  if (type.startsWith('image/')) return type;
+  const lower = String(assetPath || '').toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.avif')) return 'image/avif';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  return 'application/octet-stream';
 }

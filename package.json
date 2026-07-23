@@ -12,6 +12,7 @@
     "test": "node --test"
   },
   "dependencies": {
+    "compression": "^1.8.1",
     "dompurify": "^3.4.11",
     "express": "^4.22.2",
     "lucide": "^1.24.0",

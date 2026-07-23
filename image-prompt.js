@@ -56,6 +56,9 @@
     checkingStatus: false,
     syncStatus: null,
     statusTimer: null,
+    playgroundLoadTimer: 0,
+    playgroundSlowTimer: 0,
+    playgroundReadyPoll: 0,
   };
 
   const elements = {};
@@ -290,7 +293,18 @@
     elements.libraryView.addEventListener('click', () => setImagePromptView('library'));
     elements.playgroundView.addEventListener('click', () => setImagePromptView('playground'));
     elements.playgroundFrame.addEventListener('load', () => {
-      elements.playgroundLoading.classList.add('hidden');
+      elements.playgroundFrame.classList.add('loaded');
+      if (elements.playgroundFrame.dataset.bridgeReady !== 'true') {
+        elements.playgroundLoading.classList.remove('hidden');
+        elements.playgroundLoading.innerHTML = '<span class="spinner"></span> 正在初始化生图工作台';
+        startPlaygroundReadyWatch();
+      }
+    });
+    elements.playgroundFrame.addEventListener('error', () => {
+      clearPlaygroundLoadTimer();
+      clearPlaygroundReadyWatch();
+      elements.playgroundLoading.textContent = '生图工作台加载失败，请刷新后重试';
+      elements.playgroundLoading.classList.remove('hidden');
       elements.playgroundFrame.classList.add('loaded');
     });
     window.addEventListener('message', handlePlaygroundBridgeMessage);
@@ -346,14 +360,21 @@
     document.getElementById('history')?.addEventListener('click', (event) => {
       if (event.target.closest('.histOpen')) setWorkspaceView('codex');
     });
+    window.addEventListener('codex-web:main-view', (event) => {
+      if (event.detail?.view !== 'chat' && state.activeView === 'image-prompts') {
+        setWorkspaceView('codex', { persist: false, focus: false });
+      }
+    });
   }
 
   function setWorkspaceView(view, options = {}) {
     state.activeView = view === 'image-prompts' ? 'image-prompts' : 'codex';
     const promptActive = state.activeView === 'image-prompts';
+    window.dispatchEvent(new CustomEvent('codex-web:workspace-view', { detail: { view: state.activeView } }));
     elements.workspace.classList.toggle('hidden', !promptActive);
     elements.chat.classList.toggle('hidden', promptActive);
     elements.composer.classList.toggle('hidden', promptActive);
+    elements.main.classList.toggle('imagePromptMain', promptActive);
     elements.codexNav.classList.toggle('active', !promptActive);
     elements.promptNav.classList.toggle('active', promptActive);
     elements.codexNav.setAttribute('aria-current', promptActive ? 'false' : 'page');
@@ -365,9 +386,68 @@
       if (typeof closeMenu === 'function') closeMenu();
       setImagePromptView(state.activePromptView, { persist: false });
       void checkLibraryStatus();
-    } else {
+    } else if (options.focus === true) {
       document.getElementById('input')?.focus();
     }
+  }
+
+  function clearPlaygroundLoadTimer() {
+    if (state.playgroundLoadTimer) {
+      clearTimeout(state.playgroundLoadTimer);
+      state.playgroundLoadTimer = 0;
+    }
+    if (state.playgroundSlowTimer) {
+      clearTimeout(state.playgroundSlowTimer);
+      state.playgroundSlowTimer = 0;
+    }
+  }
+
+  function clearPlaygroundReadyWatch() {
+    if (state.playgroundReadyPoll) {
+      clearInterval(state.playgroundReadyPoll);
+      state.playgroundReadyPoll = 0;
+    }
+  }
+
+  function playgroundFrameHasUi() {
+    try {
+      const frameDocument = elements.playgroundFrame.contentDocument;
+      const root = frameDocument?.getElementById('root');
+      return Boolean(root?.childElementCount);
+    } catch {
+      return false;
+    }
+  }
+
+  function startPlaygroundReadyWatch() {
+    clearPlaygroundLoadTimer();
+    clearPlaygroundReadyWatch();
+    if (elements.playgroundFrame.dataset.bridgeReady === 'true') return;
+
+    const checkReady = () => {
+      if (!playgroundFrameHasUi()) return;
+      markPlaygroundReady();
+      flushPlaygroundPrompt();
+    };
+    checkReady();
+    if (elements.playgroundFrame.dataset.bridgeReady === 'true') return;
+
+    state.playgroundReadyPoll = setInterval(checkReady, 100);
+    state.playgroundSlowTimer = setTimeout(() => {
+      if (elements.playgroundFrame.dataset.bridgeReady === 'true') return;
+      elements.playgroundLoading.innerHTML = '<span class="spinner"></span> 加载较慢，仍在初始化生图工作台…';
+    }, 1200);
+    state.playgroundLoadTimer = setTimeout(() => {
+      markPlaygroundReady();
+    }, 3500);
+  }
+
+  function markPlaygroundReady() {
+    clearPlaygroundLoadTimer();
+    clearPlaygroundReadyWatch();
+    elements.playgroundFrame.dataset.bridgeReady = 'true';
+    elements.playgroundLoading.classList.add('hidden');
+    elements.playgroundFrame.classList.add('loaded');
   }
 
   function setImagePromptView(view, options = {}) {
@@ -389,7 +469,16 @@
     if (elements.playgroundFrame.dataset.loaded !== 'true') {
       elements.playgroundFrame.dataset.loaded = 'true';
       elements.playgroundFrame.dataset.bridgeReady = 'false';
-      elements.playgroundFrame.src = elements.playgroundFrame.dataset.src;
+      clearPlaygroundLoadTimer();
+      elements.playgroundLoading.innerHTML = '<span class="spinner"></span> 正在载入生图工作台';
+      elements.playgroundLoading.classList.remove('hidden');
+      elements.playgroundFrame.classList.add('loaded');
+      const source = elements.playgroundFrame.dataset.src || '/playground/';
+      elements.playgroundFrame.src = source;
+      startPlaygroundReadyWatch();
+    } else if (elements.playgroundFrame.dataset.bridgeReady !== 'true') {
+      elements.playgroundLoading.classList.remove('hidden');
+      startPlaygroundReadyWatch();
     }
     flushPlaygroundPrompt();
   }
@@ -877,7 +966,7 @@
     const message = event.data;
     if (!message || typeof message !== 'object') return;
     if (message.type === 'codex-web:playground-ready') {
-      elements.playgroundFrame.dataset.bridgeReady = 'true';
+      markPlaygroundReady();
       flushPlaygroundPrompt();
       return;
     }

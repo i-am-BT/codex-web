@@ -1,11 +1,65 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  detectSubQuotaProvider,
+  normalizeCpaCodexQuota,
   normalizeSubQuota,
+  normalizeSubQuotaBaseUrl,
   parseSubQuotaSources,
   SubQuotaService,
 } from '../sub-quota.mjs';
+// CPA Codex + Sub2API quota adapters
 
+test('normalizes editable Sub2API URLs and rejects unsafe values', () => {
+  assert.equal(normalizeSubQuotaBaseUrl(' https://sub.example.test/ '), 'https://sub.example.test');
+  assert.equal(normalizeSubQuotaBaseUrl('https://sub.example.test/v1'), 'https://sub.example.test');
+  assert.equal(normalizeSubQuotaBaseUrl('https://sub.example.test/v1/usage/'), 'https://sub.example.test');
+  assert.equal(normalizeSubQuotaBaseUrl('https://sub.example.test/api/v1/usage?token=hidden#fragment'), 'https://sub.example.test/api');
+  assert.throws(() => normalizeSubQuotaBaseUrl(''), /不能为空/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('file:///tmp/sub2api'), /http\/https/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('https://user:pass@sub.example.test'), /无凭据/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('https://sub.example.test/\ninvalid'), /无效字符/);
+  assert.throws(() => normalizeSubQuotaBaseUrl(`https://sub.example.test/${'a'.repeat(2048)}`), /过长/);
+});
+
+
+test('normalizes editable CPA Management URLs and rejects unsafe values', () => {
+  assert.equal(normalizeSubQuotaBaseUrl(' http://127.0.0.1:8327/ ', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
+  assert.equal(normalizeSubQuotaBaseUrl('http://127.0.0.1:8327/v0/management', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
+  assert.equal(normalizeSubQuotaBaseUrl('http://127.0.0.1:8327/v0/management/auth-files', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
+  assert.equal(normalizeSubQuotaBaseUrl('http://127.0.0.1:8327/v1/usage', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
+  assert.throws(() => normalizeSubQuotaBaseUrl('', { provider: 'cpa-codex' }), /不能为空/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('file:///tmp/cpa', { provider: 'cpa-codex' }), /http\/https/);
+});
+
+test('normalizes CPA Codex usage windows into percent rate limits', () => {
+  const quota = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    email: 'plus@example.com',
+    rate_limit: {
+      allowed: true,
+      limit_reached: false,
+      primary_window: {
+        used_percent: 18,
+        limit_window_seconds: 604800,
+        reset_after_seconds: 100,
+        reset_at: 1785141573,
+      },
+      secondary_window: null,
+    },
+    rate_limit_reset_credits: { available_count: 2 },
+  }, { email: 'plus@example.com' });
+  assert.equal(quota.planName, 'Plus');
+  assert.equal(quota.unit, '%');
+  assert.equal(quota.valid, true);
+  assert.equal(quota.rateLimitResetCredits, 2);
+  assert.equal(quota.rateLimits.length, 1);
+  assert.equal(quota.rateLimits[0].window, '7d');
+  assert.equal(quota.rateLimits[0].used, 18);
+  assert.equal(quota.rateLimits[0].remaining, 82);
+  assert.equal(quota.rateLimits[0].limit, 100);
+  assert.equal(quota.rateLimits[0].resetAt, '2026-07-27T08:39:33.000Z');
+});
 test('parses server-side Sub quota sources without embedding credentials', () => {
   const sources = parseSubQuotaSources(JSON.stringify([{
     id: 'main-sub',
@@ -17,10 +71,19 @@ test('parses server-side Sub quota sources without embedding credentials', () =>
   assert.deepEqual(sources, [{
     id: 'main-sub',
     name: 'Main Sub',
+    provider: 'sub2api',
     apiKeyEnv: 'SUB_MAIN_API_KEY',
     apiKey: 'secret-key',
+    baseUrl: 'https://sub.example.test',
     usageUrl: 'https://sub.example.test/v1/usage',
   }]);
+  const fullUsageUrl = parseSubQuotaSources(JSON.stringify([{
+    id: 'full-url',
+    name: 'Full URL',
+    baseUrl: 'https://sub.example.test/v1/usage',
+    apiKeyEnv: 'SUB_MAIN_API_KEY',
+  }]), { SUB_MAIN_API_KEY: 'secret-key' });
+  assert.equal(fullUsageUrl[0].usageUrl, 'https://sub.example.test/v1/usage');
   assert.throws(() => parseSubQuotaSources('[{"baseUrl":"file:///tmp/key"}]'), /apiKeyEnv/);
 });
 
@@ -123,6 +186,14 @@ test('normalizes Sub2API subscription and quota-limited responses', () => {
       windowStart: '',
       resetAt: '',
     },
+    {
+      window: '30d',
+      used: 1,
+      limit: 10,
+      remaining: 9,
+      windowStart: '',
+      resetAt: '',
+    },
   ]);
   assert.equal(limited.expiresAt, '2026-08-02T00:00:00Z');
   assert.equal(limited.daysUntilExpiry, 14);
@@ -218,6 +289,14 @@ test('normalizes wallet balances and rejects invalid negative quota values', () 
       windowStart: '',
       resetAt: '',
     },
+    {
+      window: '30d',
+      used: 1,
+      limit: 2,
+      remaining: 1,
+      windowStart: '',
+      resetAt: '',
+    },
   ]);
 });
 
@@ -274,4 +353,62 @@ test('reports optional configuration errors without breaking service startup', a
   assert.equal(result.configured, false);
   assert.equal(result.count, 0);
   assert.match(result.configurationError, /JSON/);
+});
+
+test('detects CPA Management before Sub2API on shared host', async () => {
+  const calls = [];
+  const detected = await detectSubQuotaProvider('http://127.0.0.1:8327/', 'mg-key', {
+    timeoutMs: 1000,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), headers: init?.headers || {} });
+      if (String(url).endsWith('/v0/management/auth-files')) {
+        return new Response(JSON.stringify({ files: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response('not found', { status: 404 });
+    },
+  });
+  assert.equal(detected.provider, 'cpa-codex');
+  assert.equal(detected.baseUrl, 'http://127.0.0.1:8327');
+  assert.equal(detected.label, 'CPA Codex');
+  assert.ok(calls.some((item) => item.url.endsWith('/v0/management/auth-files')));
+  const headers = calls[0].headers;
+  assert.equal(headers['X-Management-Key'] || headers['x-management-key'], 'mg-key');
+});
+
+test('detects Sub2API when only /v1/usage is available', async () => {
+  const detected = await detectSubQuotaProvider('https://sub.example.test/v1/usage', 'sub-key', {
+    timeoutMs: 1000,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith('/v0/management/auth-files')) {
+        return new Response('missing', { status: 404 });
+      }
+      if (String(url).endsWith('/v1/usage')) {
+        assert.match(init?.headers?.Authorization || '', /Bearer sub-key/);
+        return new Response(JSON.stringify({
+          plan_name: 'Pro',
+          total: { used: 10, limit: 100, remaining: 90, unit: 'USD' },
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response('nope', { status: 500 });
+    },
+  });
+  assert.equal(detected.provider, 'sub2api');
+  assert.equal(detected.baseUrl, 'https://sub.example.test');
+  assert.equal(detected.label, 'Sub2API');
+});
+
+test('rejects unknown upstream when neither provider responds', async () => {
+  await assert.rejects(
+    () => detectSubQuotaProvider('https://unknown.example.test', 'key', {
+      timeoutMs: 200,
+      fetchImpl: async () => new Response('no', { status: 404 }),
+    }),
+    /无法识别上游服务/,
+  );
 });
