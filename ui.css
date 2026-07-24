@@ -2696,6 +2696,37 @@ body .backgroundDelete {
   padding: 0;
 }
 
+.providerModelField {
+  gap: 8px;
+}
+
+.providerModelRows {
+  display: grid;
+  gap: 8px;
+}
+
+.providerModelRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 8px;
+  align-items: center;
+}
+
+.providerModelRow input {
+  width: 100%;
+}
+
+body .providerModelRemove {
+  width: 36px;
+  min-width: 36px;
+  min-height: 38px;
+  padding: 0;
+}
+
+body .providerModelAdd {
+  width: 100%;
+}
+
 body[data-theme] .providerBox {
   border: 0;
   border-top: 1px solid var(--border);
