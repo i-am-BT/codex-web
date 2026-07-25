@@ -38,6 +38,16 @@ test('native session store lists, parses, and incrementally follows Codex JSONL'
         },
       },
       {
+        timestamp: '2026-07-11T04:52:31.929Z',
+        type: 'session_meta',
+        payload: {
+          id: '019f4f84-ea9f-73c2-b997-deba7b4aa730',
+          cwd: '/other-workspace',
+          model_provider: 'other-provider',
+          cli_version: 'other-cli',
+        },
+      },
+      {
         timestamp: '2026-07-11T04:52:31.999Z',
         type: 'turn_context',
         payload: { turn_id: 'turn-1' },
@@ -1052,6 +1062,9 @@ test('native session store only exposes visible, non-archived Codex App threads'
         created_at_ms, updated_at_ms, recency_at_ms
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
+    if (process.platform === 'win32') {
+      sessionFiles.set(visibleNewer, `\\\\?\\${sessionFiles.get(visibleNewer)}`);
+    }
     const rows = [
       [visibleOlder, sessionFiles.get(visibleOlder), 'vscode', '/workspace/older', '[数据库回退标题](https://example.com/fallback)', 0, 'older', 'test', null, baseTime, baseTime + 10, baseTime + 10],
       [visibleNewer, sessionFiles.get(visibleNewer), 'vscode', '/workspace/newer', '[App 数据库标题](https://example.com/thread)', 0, 'newer', 'test', 'user', baseTime, baseTime + 20, baseTime + 20],

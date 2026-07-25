@@ -884,7 +884,7 @@ function scanSessionFiles(
       if (!id) continue;
       const appThread = appThreads?.get(id);
       if (appThreads && !appThread) continue;
-      if (appThread?.rolloutPath && path.resolve(filePath) !== appThread.rolloutPath) continue;
+      if (appThread?.rolloutPath && !sameLocalPath(filePath, appThread.rolloutPath)) continue;
 
       try {
         const stat = statSync(filePath);
@@ -919,6 +919,23 @@ function scanSessionFiles(
   }
 
   return entries;
+}
+
+function sameLocalPath(left, right) {
+  const normalize = (value) => {
+    let normalized = path.resolve(value);
+    if (process.platform !== 'win32') return normalized;
+
+    const extendedUncPrefix = '\\\\?\\UNC\\';
+    const extendedPathPrefix = '\\\\?\\';
+    if (normalized.toUpperCase().startsWith(extendedUncPrefix.toUpperCase())) {
+      normalized = '\\\\' + normalized.slice(extendedUncPrefix.length);
+    } else if (normalized.startsWith(extendedPathPrefix)) {
+      normalized = normalized.slice(extendedPathPrefix.length);
+    }
+    return normalized.toLowerCase();
+  };
+  return normalize(left) === normalize(right);
 }
 
 function changedSessionIds(previous, next) {
@@ -1293,6 +1310,9 @@ function applyNativeRecord(cache, record, maxMessages) {
 function applyMetadataRecord(cache, record) {
   const payload = record?.payload || {};
   if (record?.type === 'session_meta') {
+    const metadataId = String(payload.id || '').trim().toLowerCase();
+    const cacheId = String(cache.id || '').trim().toLowerCase();
+    if (metadataId && cacheId && metadataId !== cacheId) return;
     cache.metadata = {
       ...cache.metadata,
       id: payload.id || cache.id,

@@ -9,7 +9,7 @@ export class CodexAppServerClient extends EventEmitter {
     super();
     this.bin = options.bin || 'codex';
     this.cwd = options.cwd || process.cwd();
-    this.env = { ...process.env, ...(options.env || {}) };
+    this.envOverrides = { ...(options.env || {}) };
     this.clientInfo = {
       name: options.clientName || 'codex-web',
       title: options.clientTitle || 'Codex Web',
@@ -79,12 +79,16 @@ export class CodexAppServerClient extends EventEmitter {
     }, 3000).unref();
   }
 
+  buildEnv() {
+    return { ...process.env, ...this.envOverrides };
+  }
+
   async spawnAndInitialize() {
     this.closing = false;
     this.stdoutBuffer = '';
     const child = spawn(this.bin, ['app-server', '--stdio'], {
       cwd: this.cwd,
-      env: this.env,
+      env: this.buildEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child = child;
