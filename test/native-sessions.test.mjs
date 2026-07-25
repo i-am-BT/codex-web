@@ -80,6 +80,46 @@ test('native session store lists, parses, and incrementally follows Codex JSONL'
         payload: {
           type: 'message',
           role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: '<recommended_plugins>\nHere is a list of plugins that are available but not installed.\n\n- GitHub (github@example)\n- Figma (figma@example)\n</recommended_plugins>',
+            },
+            {
+              type: 'input_text',
+              text: '# AGENTS.md instructions for /workspace\n\n<INSTRUCTIONS>\ncombined internal workspace rules\n</INSTRUCTIONS>',
+            },
+          ],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:52:32.001Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: '<recommended_plugins>\nHere is a list of plugins that are available but not installed.\n\n- Atlassian Rovo (atlassian-rovo@example)\n- Notion (notion@example)\n- Slack (slack@example)\n</recommended_plugins>',
+            },
+            {
+              type: 'input_text',
+              text: '# AGENTS.md instructions for /tmp/example-workspace\n\n<INSTRUCTIONS>\n# AGENTS.md\n\nDocker rules\n</INSTRUCTIONS>',
+            },
+            {
+              type: 'input_text',
+              text: '<environment_context>\n  <cwd>/tmp/example-workspace</cwd>\n  <current_date>2026-07-21</current_date>\n  <timezone>Asia/Shanghai</timezone>\n  <filesystem><workspace_roots><root>/tmp/example-workspace</root><root>/tmp/vis</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>\n</environment_context>',
+            },
+          ],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:52:32.001Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
           content: [{
             type: 'input_text',
             text: '<skill>\n<name>ui-ux-pro-max</name>\n<path>/tmp/SKILL.md</path>\ninternal skill instructions\n</skill>',
@@ -219,7 +259,19 @@ This block is automatically supplied ambient UI state, not part of the user's re
       {
         timestamp: '2026-07-11T04:52:32.004Z',
         type: 'event_msg',
-        payload: { type: 'token_count' },
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: {
+              input_tokens: 1200,
+              cached_input_tokens: 700,
+              output_tokens: 300,
+              reasoning_output_tokens: 80,
+              total_tokens: 1500,
+            },
+            total_token_usage: { total_tokens: 9999 },
+          },
+        },
       },
       {
         timestamp: '2026-07-11T04:52:32.004Z',
@@ -249,6 +301,23 @@ This block is automatically supplied ambient UI state, not part of the user's re
           role: 'assistant',
           phase: 'commentary',
           content: [{ type: 'output_text', text: '助手进度' }],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:52:32.008Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: {
+              input_tokens: 400,
+              cached_input_tokens: 100,
+              output_tokens: 200,
+              reasoning_output_tokens: 20,
+              total_tokens: 600,
+            },
+            total_token_usage: { total_tokens: 10599 },
+          },
         },
       },
       {
@@ -297,6 +366,23 @@ This block is automatically supplied ambient UI state, not part of the user's re
           type: 'message',
           role: 'user',
           content: [{ type: 'input_text', text: '第二轮消息' }],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:52:33.005Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: {
+              input_tokens: 50,
+              cached_input_tokens: 10,
+              output_tokens: 25,
+              reasoning_output_tokens: 5,
+              total_tokens: 75,
+            },
+            total_token_usage: { total_tokens: 10674 },
+          },
         },
       },
       {
@@ -370,7 +456,17 @@ This block is automatically supplied ambient UI state, not part of the user's re
       && message.kind === 'reasoning_summary'
       && message.content === '实现队列'
     )));
-    assert.equal(conversation.messages.some((message) => message.content.includes('Internal handoff summary')), false);
+    assert.equal(conversation.messages.some((message) => (
+      message.role === 'context'
+      && message.kind === 'handoff_summary'
+    )), false);
+    assert.equal(conversation.messages.some((message) => (
+      message.role === 'assistant'
+      && message.content.includes('Internal handoff summary')
+    )), false);
+    assert.equal(conversation.messages.some((message) => (
+      String(message.content || '').includes('Internal handoff summary')
+    )), false);
     assert.deepEqual(
       conversation.messages.filter((message) => message.kind === 'context_compacted').map((message) => ({
         role: message.role,
@@ -387,16 +483,59 @@ This block is automatically supplied ambient UI state, not part of the user's re
     )));
     assert.ok(conversation.messages.some((message) => (
       message.role === 'context'
+      && message.kind === 'workspace_context'
+      && message.content === '推荐插件 2\n工作区规则 /workspace'
+    )));
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'context'
+      && message.kind === 'workspace_context'
+      && message.content === '推荐插件 3\n工作区规则 /tmp/example-workspace'
+    )));
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'context'
+      && message.kind === 'environment_context'
+      && message.content.includes('日期 2026-07-21')
+      && message.content.includes('/tmp/example-workspace')
+    )));
+    assert.equal(conversation.messages.some((message) => message.content.includes('Atlassian Rovo (atlassian-rovo@example)')), false);
+    assert.equal(conversation.messages.some((message) => message.content.includes('Docker rules')), false);
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'context'
       && message.kind === 'turn_aborted'
       && message.content === '上个任务已中断'
     )));
     assert.equal(conversation.messages.some((message) => message.content.includes('internal only')), false);
     assert.equal(conversation.messages.some((message) => message.content.includes('internal workspace rules')), false);
+    assert.equal(conversation.messages.some((message) => message.content.includes('combined internal workspace rules')), false);
+    assert.equal(conversation.messages.some((message) => message.content.includes('GitHub (github@example)')), false);
     assert.equal(conversation.messages.some((message) => message.content.includes('<environment_context>')), false);
     assert.equal(conversation.messages.some((message) => message.content.includes('# Browser comments:')), false);
     assert.equal(conversation.messages.some((message) => message.content.includes('Untrusted page evidence')), false);
     assert.equal(conversation.messages.filter((message) => message.content === '用户消息').length, 1);
     assert.equal(conversation.messages.filter((message) => message.content === '助手进度').length, 1);
+    const completions = conversation.messages.filter((message) => message.kind === 'task_complete');
+    assert.deepEqual(completions.map((message) => ({ turnId: message.turnId, tokenUsage: message.tokenUsage })), [
+      {
+        turnId: 'turn-1',
+        tokenUsage: {
+          inputTokens: 1600,
+          cachedInputTokens: 800,
+          outputTokens: 500,
+          reasoningOutputTokens: 100,
+          totalTokens: 2100,
+        },
+      },
+      {
+        turnId: 'turn-2',
+        tokenUsage: {
+          inputTokens: 50,
+          cachedInputTokens: 10,
+          outputTokens: 25,
+          reasoningOutputTokens: 5,
+          totalTokens: 75,
+        },
+      },
+    ]);
 
     const limited = store.get(id, { limit: 3 });
     assert.equal(limited.messages.length, 3);
@@ -472,7 +611,17 @@ This block is automatically supplied ambient UI state, not part of the user's re
       generation: incremental.generation,
     });
     assert.equal(afterCompaction.reset, true);
-    assert.equal(afterCompaction.messages.some((message) => message.content.includes('Late handoff summary')), false);
+    assert.equal(afterCompaction.messages.some((message) => (
+      message.role === 'context'
+      && message.kind === 'handoff_summary'
+    )), false);
+    assert.equal(afterCompaction.messages.some((message) => (
+      message.role === 'assistant'
+      && message.content.includes('Late handoff summary')
+    )), false);
+    assert.equal(afterCompaction.messages.some((message) => (
+      String(message.content || '').includes('Late handoff summary')
+    )), false);
     assert.equal(afterCompaction.messages.filter((message) => message.kind === 'context_compacted').length, 2);
 
     const delayedCompactionChange = once(store, 'change');
@@ -1152,6 +1301,269 @@ test('native session store supports Codex state databases without recency_at_ms'
     assert.deepEqual(store.list().map((session) => session.id), [id]);
     assert.equal(store.list()[0].workspaceKind, '');
     assert.equal(store.get(id)?.metadata.cwd, '/workspace');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store merges consecutive same-turn assistant segments into one copyable message', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-assistant-merge-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f4f84-ea9f-73c2-b997-deba7b4aa801';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '22');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-22T01-00-00-${id}.jsonl`);
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-22T01:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace', source: 'vscode' },
+      },
+      {
+        timestamp: '2026-07-22T01:00:00.100Z',
+        type: 'turn_context',
+        payload: { turn_id: 'turn-merge-1' },
+      },
+      {
+        timestamp: '2026-07-22T01:00:00.200Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-merge-1' },
+      },
+      {
+        timestamp: '2026-07-22T01:00:00.300Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '合并测试' }],
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: '先定位相关代码和会话渲染路径。' }],
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:01.500Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          call_id: 'call-merge-0',
+          name: 'exec_command',
+          arguments: JSON.stringify({ cmd: 'ls' }),
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:01.600Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-merge-0',
+          output: 'ok',
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:01.700Z',
+        type: 'response_item',
+        payload: {
+          type: 'reasoning',
+          summary: [{ type: 'summary_text', text: 'checking code' }],
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: '相关代码主要在 native-sessions 和 server 的消息渲染里。' }],
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: '工作区里已经有折叠上下文和长用户消息的改动。' }],
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:04.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '最终汇总：应合并为一条可复制回复。' }],
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:05.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          call_id: 'call-merge-1',
+          name: 'exec_command',
+          arguments: JSON.stringify({ cmd: 'pwd' }),
+        },
+      },
+      {
+        timestamp: '2026-07-22T01:00:06.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '工具之后的另一条最终回复。' }],
+        },
+      },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const conversation = store.get(id);
+    const assistantMessages = conversation.messages.filter((message) => message.role === 'assistant');
+    // note A -> tools -> note B (+ consecutive note C merge) -> final -> tools -> final
+    assert.equal(assistantMessages.length, 4);
+    assert.equal(assistantMessages[0].kind, 'commentary');
+    assert.equal(assistantMessages[0].content, '先定位相关代码和会话渲染路径。');
+    // Second progress note stays after tools (not folded into the first note).
+    assert.equal(assistantMessages[1].kind, 'commentary');
+    assert.match(assistantMessages[1].content, /相关代码主要在 native-sessions/);
+    assert.match(assistantMessages[1].content, /工作区里已经有折叠上下文/);
+    assert.equal(
+      assistantMessages[1].content.includes('\n\n工作区里已经有折叠上下文'),
+      true,
+    );
+    // final_answer does not absorb earlier progress across tools.
+    assert.equal(assistantMessages[2].kind, 'final_answer');
+    assert.equal(assistantMessages[2].content, '最终汇总：应合并为一条可复制回复。');
+    assert.equal(assistantMessages[3].kind, 'final_answer');
+    assert.equal(assistantMessages[3].content, '工具之后的另一条最终回复。');
+    // Timeline: note -> tool -> note -> finals (App-style interleaving).
+    const roles = conversation.messages.map((message) => message.role + ':' + (message.kind || ''));
+    const firstProgressIndex = conversation.messages.findIndex((message) => (
+      message.role === 'assistant' && message.content.includes('先定位相关代码和会话渲染路径。')
+    ));
+    const firstToolIndex = conversation.messages.findIndex((message) => message.kind === 'function_call');
+    const secondProgressIndex = conversation.messages.findIndex((message) => (
+      message.role === 'assistant' && message.content.includes('相关代码主要在 native-sessions')
+    ));
+    assert.ok(firstProgressIndex < firstToolIndex, roles.join(' > '));
+    assert.ok(firstToolIndex < secondProgressIndex, roles.join(' > '));
+
+    // Append a long unphased summary: should stay separate from short progress chatter.
+    await appendFile(sessionFile, jsonl([{
+      timestamp: '2026-07-22T01:00:07.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: [
+          '1. **Handoff Summary -> context folding**',
+          '   - native-sessions keeps context folding',
+          '2. **keep existing logic**',
+          '   - tokenUsage remains on task_complete',
+          '3. **fix**',
+          '   - progress and final stay separate',
+        ].join('\n') }],
+      },
+    }]));
+    store.refresh();
+    const afterSummary = store.get(id);
+    const assistantsAfter = afterSummary.messages.filter((message) => message.role === 'assistant');
+    assert.equal(assistantsAfter.length, 5);
+    assert.match(assistantsAfter[4].content, /Handoff Summary/);
+    assert.equal(assistantsAfter[4].content.includes('先定位相关代码和会话渲染路径。'), false);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('hides hash-title handoff agent summaries from web history', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-handoff-hide-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f8873-f27d-70b2-8946-25f4e14e80d7';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '23');
+  const sessionFile = path.join(sessionDir, 'rollout-2026-07-23T10-00-00-' + id + '.jsonl');
+  let store;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(path.join(codexHome, 'session_index.jsonl'), [
+      JSON.stringify({ id, thread_name: 'handoff hide', updated_at: '2026-07-23T10:00:03Z' }),
+      '',
+    ].join('\n'));
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-23T10:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id,
+          timestamp: '2026-07-23T10:00:00.000Z',
+          cwd: temporary,
+          model_provider: 'custom',
+          originator: 'Codex Desktop',
+          source: 'vscode',
+          cli_version: '0.144.0-alpha.4',
+        },
+      },
+      {
+        timestamp: '2026-07-23T10:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '修复' }],
+        },
+      },
+      {
+        timestamp: '2026-07-23T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            '# Handoff: Codex Web UI 修复（格式丢失 / 空态旧 UI）',
+            '',
+            '## Goal',
+            '继续修 codex-web',
+            '',
+            '## Service / ops',
+            '- Path: /tmp/example-workspace/codex-web',
+            '',
+            '## Immediate next steps',
+            '1. fix JS',
+          ].join('\n') }],
+        },
+      },
+      {
+        timestamp: '2026-07-23T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '已隐藏交接摘要，Web 只显示用户可读结论。' }],
+        },
+      },
+    ]));
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    store.refresh();
+    const conversation = store.get(id);
+    assert.ok(conversation);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Handoff: Codex Web UI')), false);
+    assert.equal(conversation.messages.some((message) => message.kind === 'handoff_summary'), false);
+    assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content.includes('已隐藏交接摘要')));
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });

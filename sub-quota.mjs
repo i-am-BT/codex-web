@@ -5,8 +5,6 @@ const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 const ENV_KEY_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
 const RATE_LIMIT_WINDOWS = new Set(['5h', '1d', '7d', '30d']);
 const MAX_BASE_URL_LENGTH = 2048;
-const CPA_ACCOUNT_CONCURRENCY = 4;
-const WINDOW_SECONDS_TOLERANCE = 60;
 const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const CODEX_USAGE_HEADERS = {
   Authorization: 'Bearer $TOKEN$',
@@ -106,7 +104,8 @@ export class SubQuotaService {
         return [{ ...base, error: 'CPA 中暂无可用的 Codex 认证' }];
       }
 
-      return mapWithConcurrency(codexFiles, CPA_ACCOUNT_CONCURRENCY, async (file) => {
+      const quotas = [];
+      for (const file of codexFiles) {
         const accountBase = {
           id: cleanText(file.id || file.name || file.auth_index || `${source.id}-codex`, 120) || `${source.id}-codex`,
           name: cleanText(file.email || file.label || file.account || file.name || 'Codex', 100) || 'Codex',
@@ -117,11 +116,12 @@ export class SubQuotaService {
         try {
           const accountId = await this.resolveCpaAccountId(source, file);
           const usage = await this.fetchCpaCodexUsage(source, file, accountId);
-          return { ...accountBase, ...normalizeCpaCodexQuota(usage, file, this.now()) };
+          quotas.push({ ...accountBase, ...normalizeCpaCodexQuota(usage, file) });
         } catch (error) {
-          return { ...accountBase, error: formatFetchError(error) };
+          quotas.push({ ...accountBase, error: formatFetchError(error) });
         }
-      });
+      }
+      return quotas;
     } catch (error) {
       return [{ ...base, error: formatFetchError(error) }];
     }
@@ -137,7 +137,7 @@ export class SubQuotaService {
   }
 
   async resolveCpaAccountId(source, file) {
-    const direct = extractCpaAccountId(file);
+    const direct = cleanText(file.account_id || file.accountId || file.chatgpt_account_id, 80);
     if (direct) return direct;
     const name = cleanText(file.name || file.id, 240);
     if (!name) throw new Error('Codex 凭证缺少文件名');
@@ -145,7 +145,7 @@ export class SubQuotaService {
       `${source.baseUrl}/v0/management/auth-files/download?name=${encodeURIComponent(name)}`,
       { headers: managementHeaders(source.apiKey) },
     );
-    const accountId = extractCpaAccountId(auth);
+    const accountId = cleanText(auth?.account_id || auth?.accountId, 80);
     if (!accountId) throw new Error('Codex 凭证缺少 ChatGPT 账号 ID');
     return accountId;
   }
@@ -172,12 +172,11 @@ export class SubQuotaService {
     });
     const statusCode = Number(outer?.status_code ?? outer?.statusCode ?? 0);
     const body = parseMaybeJson(outer?.body ?? outer?.bodyText ?? outer);
-    const bodyError = extractCpaUsageError(body);
     if (statusCode && (statusCode < 200 || statusCode >= 300)) {
-      throw new Error(bodyError.detail ? `HTTP ${statusCode}: ${bodyError.detail}` : `HTTP ${statusCode}`);
+      const detail = cleanText(body?.error || body?.detail || body?.message || JSON.stringify(body || {}), 120);
+      throw new Error(detail ? `HTTP ${statusCode}: ${detail}` : `HTTP ${statusCode}`);
     }
-    if (bodyError.present) throw new Error(bodyError.detail || 'Codex 额度请求失败');
-    if (!isCpaCodexUsageResponse(body)) throw new Error('Codex 额度响应无效');
+    if (!isRecord(body)) throw new Error('Codex 额度响应无效');
     return body;
   }
 
@@ -279,33 +278,32 @@ export function normalizeSubQuota(data) {
   };
 }
 
-export function normalizeCpaCodexQuota(data, file = {}, now = Date.now()) {
+export function normalizeCpaCodexQuota(data, file = {}) {
   if (!isRecord(data)) throw new Error('Codex 额度响应格式无效');
-  const planType = cleanText(data.plan_type || data.planType || file.plan_type, 40);
+  const planType = cleanText(data.plan_type || data.planType || file.account_type || file.plan_type, 40);
   const rateLimit = data.rate_limit || data.rateLimit || null;
   const codeReview = data.code_review_rate_limit || data.codeReviewRateLimit || null;
   const additional = Array.isArray(data.additional_rate_limits || data.additionalRateLimits)
     ? (data.additional_rate_limits || data.additionalRateLimits)
     : [];
   const rateLimits = [
-    ...mapCodexRateLimitGroup(rateLimit, '', now),
-    ...mapCodexRateLimitGroup(codeReview, 'code-review-', now),
+    ...mapCodexRateLimitGroup(rateLimit, ''),
+    ...mapCodexRateLimitGroup(codeReview, 'code-review-'),
     ...additional.flatMap((item, index) => {
       const nested = item?.rate_limit || item?.rateLimit || item;
       const prefix = cleanText(item?.limit_name || item?.limitName || item?.metered_feature || item?.meteredFeature || `extra-${index + 1}`, 40)
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-+|-+$/g, '') || `extra-${index + 1}`;
-      return mapCodexRateLimitGroup(nested, `${prefix}-`, now);
+      return mapCodexRateLimitGroup(nested, `${prefix}-`);
     }),
   ];
   const allowed = rateLimit?.allowed;
   const limitReached = rateLimit?.limit_reached ?? rateLimit?.limitReached;
-  const hasAccess = data.codex_access ?? data.codexAccess ?? data.has_access ?? data.hasAccess;
   return {
-    valid: hasAccess !== false,
+    valid: planType.toLowerCase() !== 'free',
     mode: 'cpa_codex',
-    status: hasAccess === false
+    status: planType.toLowerCase() === 'free'
       ? 'no_access'
       : limitReached
         ? 'quota_exhausted'
@@ -324,14 +322,15 @@ export function normalizeCpaCodexQuota(data, file = {}, now = Date.now()) {
     today: null,
     total: null,
     email: cleanText(data.email || file.email || file.account, 120),
+    accountId: cleanText(data.account_id || data.accountId || file.account_id, 80),
     rateLimitResetCredits: nonNegativeInteger(
-      data?.rate_limit_reset_credits?.applicable_available_count
-      ?? data?.rateLimitResetCredits?.applicableAvailableCount
-      ?? data?.rate_limit_reset_credits?.available_count
+      data?.rate_limit_reset_credits?.available_count
       ?? data?.rateLimitResetCredits?.availableCount
+      ?? data?.rate_limit_reset_credits?.applicable_available_count,
     ),
   };
 }
+
 
 export async function detectSubQuotaProvider(baseUrl, apiKey, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
@@ -450,20 +449,17 @@ export function normalizeSubQuotaBaseUrl(value, options = {}) {
   return url.toString().replace(/\/+$/, '');
 }
 
-function mapCodexRateLimitGroup(group, idPrefix = '', now = Date.now()) {
+function mapCodexRateLimitGroup(group, idPrefix = '') {
   if (!isRecord(group)) return [];
   const windows = pickCodexWindows(group);
   const limits = [];
   if (windows.fiveHour) {
-    limits.push(codexWindowToRateLimit(`${idPrefix}5h`.replace(/^-/, ''), '5h', windows.fiveHour, now));
-  }
-  if (windows.daily) {
-    limits.push(codexWindowToRateLimit(`${idPrefix}1d`.replace(/^-/, ''), '1d', windows.daily, now));
+    limits.push(codexWindowToRateLimit(`${idPrefix}5h`.replace(/^-/, ''), '5h', windows.fiveHour));
   }
   if (windows.weekly) {
     const seconds = nonNegativeNumber(windows.weekly.limit_window_seconds ?? windows.weekly.limitWindowSeconds);
     const window = isMonthlyWindowSeconds(seconds) ? '30d' : '7d';
-    limits.push(codexWindowToRateLimit(`${idPrefix}${window}`.replace(/^-/, ''), window, windows.weekly, now));
+    limits.push(codexWindowToRateLimit(`${idPrefix}${window}`.replace(/^-/, ''), window, windows.weekly));
   }
   return limits.filter(Boolean);
 }
@@ -472,29 +468,28 @@ function pickCodexWindows(group) {
   const primary = group.primary_window || group.primaryWindow || null;
   const secondary = group.secondary_window || group.secondaryWindow || null;
   let fiveHour = null;
-  let daily = null;
   let weekly = null;
-  for (const [index, item] of [primary, secondary].entries()) {
+  for (const item of [primary, secondary]) {
     if (!item) continue;
     const seconds = nonNegativeNumber(item.limit_window_seconds ?? item.limitWindowSeconds);
-    if (isWindowSeconds(seconds, 18000) && !fiveHour) fiveHour = item;
-    else if (isWindowSeconds(seconds, 86400) && !daily) daily = item;
-    else if ((isWindowSeconds(seconds, 604800) || isMonthlyWindowSeconds(seconds)) && !weekly) weekly = item;
-    else if (seconds === null && index === 0 && !fiveHour) fiveHour = item;
-    else if (seconds === null && index === 1 && !weekly) weekly = item;
+    if (seconds === 18000 && !fiveHour) fiveHour = item;
+    else if ((seconds === 604800 || isMonthlyWindowSeconds(seconds)) && !weekly) weekly = item;
   }
-  return { fiveHour, daily, weekly };
+  if (!fiveHour && primary && primary !== weekly) fiveHour = primary;
+  if (!weekly && secondary && secondary !== fiveHour) weekly = secondary;
+  if (!fiveHour && !weekly && primary) weekly = primary;
+  return { fiveHour, weekly };
 }
 
-function codexWindowToRateLimit(id, window, data, now = Date.now()) {
+function codexWindowToRateLimit(id, window, data) {
   if (!isRecord(data)) return null;
   const usedPercent = nonNegativeNumber(data.used_percent ?? data.usedPercent);
   const remainingPercent = usedPercent === null ? null : Math.max(0, 100 - usedPercent);
   const resetAtSeconds = nonNegativeNumber(data.reset_at ?? data.resetAt);
   const resetAfterSeconds = nonNegativeNumber(data.reset_after_seconds ?? data.resetAfterSeconds);
   let resetAt = '';
-  if (resetAtSeconds !== null && resetAtSeconds > 0) resetAt = safeIsoDate(resetAtSeconds * 1000);
-  else if (resetAfterSeconds !== null) resetAt = safeIsoDate(now + resetAfterSeconds * 1000);
+  if (resetAtSeconds !== null) resetAt = new Date(resetAtSeconds * 1000).toISOString();
+  else if (resetAfterSeconds !== null) resetAt = new Date(Date.now() + resetAfterSeconds * 1000).toISOString();
   return {
     id,
     window,
@@ -504,10 +499,6 @@ function codexWindowToRateLimit(id, window, data, now = Date.now()) {
     windowStart: '',
     resetAt,
   };
-}
-
-function isWindowSeconds(seconds, target) {
-  return seconds !== null && Math.abs(seconds - target) <= WINDOW_SECONDS_TOLERANCE;
 }
 
 function isMonthlyWindowSeconds(seconds) {
@@ -528,120 +519,16 @@ function formatCodexPlanName(planType) {
 
 function isCodexAuthFile(file) {
   if (!isRecord(file)) return false;
-  const provider = cleanText(file.provider, 40).toLowerCase();
-  if (provider) return provider === 'codex';
-  const type = cleanText(file.type, 40).toLowerCase();
-  if (type) return type === 'codex';
+  const type = cleanText(file.type || file.provider, 40).toLowerCase();
   const name = cleanText(file.name || file.id, 120).toLowerCase();
-  return name.includes('codex');
-}
-
-function isCpaCodexUsageResponse(value) {
-  if (!isRecord(value)) return false;
-  const planType = value.plan_type ?? value.planType;
-  if (typeof planType === 'string' && planType.trim()) return true;
-
-  if ([value.rate_limit, value.rateLimit, value.code_review_rate_limit, value.codeReviewRateLimit]
-    .some((group) => isCpaRateLimitGroup(group))) return true;
-
-  const additional = value.additional_rate_limits ?? value.additionalRateLimits;
-  if (Array.isArray(additional) && additional.some((item) => {
-    if (!isRecord(item)) return false;
-    return isCpaRateLimitGroup(item.rate_limit ?? item.rateLimit ?? item);
-  })) return true;
-
-  if (isCpaCredits(value.credits)) return true;
-  if ([value.codex_access, value.codexAccess, value.has_access, value.hasAccess]
-    .some((flag) => typeof flag === 'boolean')) return true;
-  return isCpaResetCredits(value.rate_limit_reset_credits ?? value.rateLimitResetCredits);
-}
-
-function isCpaRateLimitGroup(value) {
-  if (!isRecord(value)) return false;
-  if (typeof value.allowed === 'boolean') return true;
-  if (typeof (value.limit_reached ?? value.limitReached) === 'boolean') return true;
-  return [value.primary_window, value.primaryWindow, value.secondary_window, value.secondaryWindow]
-    .some((window) => isCpaRateLimitWindow(window));
-}
-
-function isCpaRateLimitWindow(value) {
-  if (!isRecord(value)) return false;
-  return [
-    value.used_percent,
-    value.usedPercent,
-    value.limit_window_seconds,
-    value.limitWindowSeconds,
-    value.reset_at,
-    value.resetAt,
-    value.reset_after_seconds,
-    value.resetAfterSeconds,
-  ].some((item) => nonNegativeNumber(item) !== null);
-}
-
-function isCpaCredits(value) {
-  if (!isRecord(value)) return false;
-  if (nonNegativeNumber(value.balance) !== null) return true;
-  return [value.has_credits, value.hasCredits, value.unlimited]
-    .some((flag) => typeof flag === 'boolean');
-}
-
-function isCpaResetCredits(value) {
-  if (!isRecord(value)) return false;
-  return [
-    value.applicable_available_count,
-    value.applicableAvailableCount,
-    value.available_count,
-    value.availableCount,
-  ].some((item) => nonNegativeInteger(item) !== null);
+  return type === 'codex' || name.includes('codex');
 }
 
 function normalizeProvider(value) {
   const text = cleanText(value, 40).toLowerCase();
   if (!text || text === 'sub2api' || text === 'sub') return 'sub2api';
   if (text === 'cpa' || text === 'cpa-codex' || text === 'codex' || text === 'cliproxyapi') return 'cpa-codex';
-  throw new Error(`不支持的额度来源 provider: ${text}`);
-}
-
-function safeIsoDate(value) {
-  const date = new Date(value);
-  return Number.isFinite(date.getTime()) ? date.toISOString() : '';
-}
-
-function extractCpaAccountId(value) {
-  if (!isRecord(value)) return '';
-  return cleanText(
-    value.account_id
-    || value.accountId
-    || value.chatgpt_account_id
-    || value.chatgptAccountId
-    || value.id_token?.chatgpt_account_id
-    || value.id_token?.chatgptAccountId
-    || value.idToken?.chatgpt_account_id
-    || value.idToken?.chatgptAccountId,
-    80,
-  );
-}
-
-function extractCpaUsageError(value) {
-  if (!isRecord(value)) return { present: false, detail: '' };
-  for (const key of ['error', 'detail', 'message']) {
-    if (!Object.hasOwn(value, key)) continue;
-    const detail = cleanErrorText(value[key], 120);
-    return {
-      present: true,
-      detail: detail || 'Codex 额度请求失败',
-    };
-  }
-  return { present: false, detail: '' };
-}
-
-function cleanErrorText(value, maxLength) {
-  if (typeof value !== 'string') return '';
-  return value
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, maxLength);
+  return 'sub2api';
 }
 
 function managementHeaders(apiKey) {
@@ -755,21 +642,6 @@ function cleanDate(value) {
 function positiveNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : fallback;
-}
-
-async function mapWithConcurrency(items, concurrency, mapper) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  async function worker() {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      results[index] = await mapper(items[index], index);
-    }
-  }
-  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  return results;
 }
 
 async function readLimitedBody(response, maxBytes) {

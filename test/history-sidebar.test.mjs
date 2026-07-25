@@ -51,8 +51,9 @@ test('projectless working directories do not pollute the composer project picker
   const composerProjectPaths = new Function(
     'cwd',
     'historyItems',
+    'defaultComposerCwd',
     `${groupingSource}\n${composerProjectsSource}; return composerProjectPaths;`,
-  )({ value: projectlessPath }, historyItems);
+  )({ value: projectlessPath }, historyItems, '');
 
   assert.deepEqual(composerProjectPaths(), [explicitProjectPath]);
 });
@@ -93,6 +94,7 @@ test('the pinned section renders above tasks, collapses independently, and marks
   const rowSource = sourceBetween('function createHistoryRow', 'function updateActiveHistory');
   assert.match(pinnedRenderSource, /section\.className='historyPinned'/);
   assert.match(pinnedRenderSource, /head\.className='historyPinnedHead'/);
+  assert.match(pinnedRenderSource, /icon\.className='historyPinnedIcon';\s*setIconLabel\(icon,'pin','',false\)/);
   assert.match(pinnedRenderSource, /title\.textContent='置顶'/);
   assert.match(pinnedRenderSource, /rows\.className='historyPinnedItems'/);
   assert.match(pinnedRenderSource, /setHistoryPinnedExpanded\(section,Boolean\(query\)\|\|containsCurrent\|\|!historyPinnedCollapsed\)/);
@@ -106,24 +108,37 @@ test('the pinned section renders above tasks, collapses independently, and marks
   assert.match(rowSource, /if\(source==='codex'\)\{\s*if\(running\)row\.appendChild\(running\);[\s\S]*row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\)/);
   assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
   assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
-  assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-4px;[^}]*pointer-events:\s*none/s);
+  assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-12px;[^}]*pointer-events:\s*none/s);
   assert.match(uiStyles, /\.historyPinned,\s*\.historySidebarTasks,\s*\.historyTasks\s*\{[^}]*display:\s*grid/s);
   assert.match(uiStyles, /\.historyPinnedItems\[hidden\],\s*\.historySidebarItems\[hidden\],\s*\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
   assert.match(uiStyles, /\.historyPinnedHead\[aria-expanded="true"\] \.historyPinnedChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);
   assert.match(uiStyles, /\.histOpen\.hasAutomation\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 16px/s);
+  assert.match(uiStyles, /\.histAutomationIcon \.lucide,\s*body \.histRename \.lucide,\s*body \.histDelete \.lucide\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px/s);
+});
+
+test('history rename uses an inline editor instead of a browser prompt', () => {
+  const renameSource = sourceBetween('function beginHistoryRename', 'async function deleteConversation');
+  assert.match(renameSource, /input\.className='histRenameInput'/);
+  assert.match(renameSource, /row\.replaceChild\(input,open\)/);
+  assert.match(renameSource, /event\.key==='Enter'/);
+  assert.match(renameSource, /event\.key==='Escape'/);
+  assert.match(renameSource, /await renameConversation\(item\.id,clean,source\)/);
+  assert.doesNotMatch(renameSource, /prompt\(/);
+  assert.match(uiStyles, /\.histRenameInput\s*\{[^}]*height:\s*28px;[^}]*font-size:\s*12px/s);
 });
 
 test('the browser sidepanel section renders between pinned and regular tasks', () => {
   const sidebarRenderSource = sourceBetween('function appendBrowserSidebarHistoryTasks', 'function setHistoryTasksExpanded');
   assert.match(sidebarRenderSource, /section\.className='historySidebarTasks'/);
   assert.match(sidebarRenderSource, /head\.className='historySidebarHead'/);
+  assert.match(sidebarRenderSource, /icon\.className='historySidebarIcon';\s*setIconLabel\(icon,'panel-left','',false\)/);
   assert.match(sidebarRenderSource, /title\.textContent='侧边栏'/);
   assert.match(sidebarRenderSource, /rows\.className='historySidebarItems'/);
   assert.match(sidebarRenderSource, /setHistorySidebarExpanded\(section,Boolean\(query\)\|\|containsCurrent\|\|!historySidebarCollapsed\)/);
   assert.match(sidebarRenderSource, /historySidebarCollapsed=expanded;\s*storeHistorySidebarCollapsed\(\)/);
   assert.match(inlineScript, /const HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY='codexWeb\.historySidebarCollapsed'/);
   assert.match(inlineScript, /const \{sidebar,remaining\}=partitionBrowserSidebarHistoryItems\(pinnedRemaining\);\s*appendBrowserSidebarHistoryTasks\(sidebar,\{query:Boolean\(query\)\}\);\s*const \{tasks:standaloneTasks,projects:groups\}=partitionHistoryItems\(remaining\);/);
-  assert.match(uiStyles, /\.historySidebarHead[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\) 14px/);
+  assert.match(uiStyles, /\.historySidebarHead[\s\S]*grid-template-columns:\s*18px minmax\(0, 1fr\) 14px/);
   assert.match(uiStyles, /\.historySidebarHead\[aria-expanded="true"\] \.historySidebarChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);
 });
 
@@ -131,6 +146,7 @@ test('the task section is rendered before project groups and can collapse indepe
   const taskRenderSource = sourceBetween('function appendStandaloneHistoryTasks', 'function renderHistory');
   assert.match(taskRenderSource, /section\.className='historyTasks'/);
   assert.match(taskRenderSource, /head\.className='historyTasksHead'/);
+  assert.match(taskRenderSource, /icon\.className='historyTasksIcon';\s*setIconLabel\(icon,'list-checks','',false\)/);
   assert.match(taskRenderSource, /title\.textContent='任务'/);
   assert.match(taskRenderSource, /setIconLabel\(chevron,'chevron-right','',false\)/);
   assert.match(taskRenderSource, /rows\.className='historyTasksItems'/);
@@ -140,8 +156,9 @@ test('the task section is rendered before project groups and can collapse indepe
   assert.match(taskRenderSource, /historyTasksCollapsed=expanded;\s*storeHistoryTasksCollapsed\(\)/);
   assert.match(inlineScript, /const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb\.historyTasksCollapsed'/);
   assert.match(inlineScript, /const \{tasks:standaloneTasks,projects:groups\}=partitionHistoryItems\(remaining\);\s*appendStandaloneHistoryTasks\(standaloneTasks,\{query:Boolean\(query\)\}\);/);
-  assert.match(uiStyles, /\.historyTasksHead\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 14px/s);
-  assert.match(uiStyles, /\.historyTasksTitle\s*\{[^}]*color:\s*var\(--text-muted\);[^}]*font-size:\s*12px/s);
+  assert.match(uiStyles, /\.historyPinnedHead,[\s\S]*\.historyTasksHead\s*\{[^}]*grid-template-columns:\s*18px minmax\(0, 1fr\) 14px/s);
+  assert.match(uiStyles, /\.historyPinnedTitle,[\s\S]*\.historyTasksTitle\s*\{[^}]*color:\s*var\(--text\);[^}]*font-size:\s*12px;[^}]*font-weight:\s*650/s);
+  assert.match(uiStyles, /\.historyPinnedIcon,[\s\S]*\.historyTasksIcon\s*\{[^}]*color:\s*var\(--primary\)/s);
   assert.match(uiStyles, /\.historyTasksItems\s*\{[^}]*display:\s*grid;[^}]*gap:\s*1px/s);
   assert.match(uiStyles, /\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
   assert.match(uiStyles, /\.historyTasksHead\[aria-expanded="true"\] \.historyTasksChevron\s*\{[^}]*transform:\s*rotate\(90deg\)/s);
@@ -173,13 +190,24 @@ test('archived standalone tasks keep a separate task group and filter', () => {
 test('history refreshes deferred while a project menu or preview is open', () => {
   assert.match(inlineScript, /let historyRefreshPending=false/);
   assert.match(inlineScript, /function flushPendingHistoryRefresh/);
-  assert.match(inlineScript, /if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)\{historyRefreshPending=true;return\}/);
+  assert.match(inlineScript, /if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\)\{historyRefreshPending=true;return\}/);
   assert.match(inlineScript, /flushPendingHistoryRefresh\(\)/);
 });
 
-test('starting a new task resets a generated standalone cwd to the configured default', () => {
-  assert.match(inlineScript, /function resetStandaloneComposerCwd\(\)/);
-  assert.match(inlineScript, /currentNativeWorkspaceKind==='projectless'&&defaultComposerCwd/);
-  assert.match(inlineScript, /defaultComposerCwd=String\(data\.defaults\.cwd\|\|''\)/);
-  assert.match(inlineScript, /resetStandaloneComposerCwd\(\);clearNativeCompletionSync/);
+test('starting a new task clears inherited project selection', () => {
+  assert.match(inlineScript, /function resetNewTaskComposerCwd\(\)\{\s*cwd\.value='';\s*currentNativeWorkspaceKind='';\s*}/);
+  assert.match(inlineScript, /defaultComposerCwd=String\(data\.defaults\.cwd\|\|''\);if\(!currentConversationId\)cwd\.value='';/);
+  assert.match(inlineScript, /resetNewTaskComposerCwd\(\);clearNativeCompletionSync/);
+  assert.match(inlineScript, /<b>新任务<\/b><span>项目路径可选，直接输入即可。<\/span>/);
+});
+
+test('composer project selection includes an explicit no-project option', () => {
+  const selectionSource = sourceBetween('function selectComposerProjectPath', 'function queueActionButton');
+  assert.doesNotMatch(selectionSource, /if\(!path\)return/);
+  assert.match(selectionSource, /cwd\.value=path/);
+  assert.match(selectionSource, /noProjectName\.textContent='无项目'/);
+  assert.match(selectionSource, /noProjectDetail\.textContent='使用默认工作目录'/);
+  assert.match(selectionSource, /selectComposerProjectPath\(''\)/);
+  assert.match(inlineScript, /projectName=projectPath\?historyProjectName\(projectPath\):'选择项目（可选）'/);
+  assert.match(inlineScript, /projectTitle\.textContent='项目路径（可选）'/);
 });

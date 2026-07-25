@@ -6,8 +6,10 @@ import {
   readFileSync,
   readSync,
   readdirSync,
+  renameSync,
   statSync,
   watch,
+  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -21,7 +23,7 @@ const TURN_START_RECORD_LIMIT_BYTES = 256 * 1024;
 const DEFAULT_MAX_MESSAGES = 700;
 const DEFAULT_MAX_SESSIONS = 100;
 const DEFAULT_POLL_INTERVAL_MS = 3000;
-const DEFAULT_RUNNING_WINDOW_MS = 60000;
+const DEFAULT_RUNNING_WINDOW_MS = 6 * 60 * 60 * 1000;
 const MESSAGE_TEXT_LIMIT = 80000;
 const DETAIL_TEXT_LIMIT = 8000;
 const IMAGE_URL_LIMIT = 16 * 1024 * 1024;
@@ -36,6 +38,9 @@ export class NativeSessionStore extends EventEmitter {
     this.sessionsDir = path.join(this.codexHome, 'sessions');
     this.indexFile = path.join(this.codexHome, 'session_index.jsonl');
     this.globalStateFile = path.join(this.codexHome, '.codex-global-state.json');
+    this.sideChatStateFile = path.resolve(
+      options.sideChatStateFile || path.join(this.codexHome, 'codex-web-side-chat.json'),
+    );
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.maxReadBytes = positiveNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
     this.turnStartScanBytes = positiveNumber(
@@ -57,6 +62,8 @@ export class NativeSessionStore extends EventEmitter {
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
     this.projectThreadIds = new Set();
+    this.sideChatThreadIds = new Set();
+    this.sideChatSourceThreads = new Map();
     this.pinnedThreadIds = [];
     this.appThreads = null;
     this.stateDb = null;
@@ -179,6 +186,7 @@ export class NativeSessionStore extends EventEmitter {
       this.projectlessThreadIds = new Set();
       this.projectThreadIds = new Set();
       this.workspaceStateAvailable = false;
+      this.refreshSideChatState(state);
       return pinnedChangedIds;
     }
 
@@ -200,7 +208,109 @@ export class NativeSessionStore extends EventEmitter {
       .map((id) => String(id || '').trim().toLowerCase())
       .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
     this.workspaceStateAvailable = true;
+    this.refreshSideChatState(state);
     return pinnedChangedIds;
+  }
+
+  readLocalSideChatState() {
+    try {
+      const parsed = JSON.parse(readFileSync(this.sideChatStateFile, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ids: [], sources: {} };
+      const raw = parsed['side-chat-thread-ids'];
+      const ids = Array.isArray(raw)
+        ? raw
+        : raw && typeof raw === 'object'
+          ? Object.keys(raw)
+          : [];
+      const sources = (parsed['side-chat-source-threads']
+        && typeof parsed['side-chat-source-threads'] === 'object'
+        && !Array.isArray(parsed['side-chat-source-threads']))
+        ? parsed['side-chat-source-threads']
+        : {};
+      return { ids, sources };
+    } catch {
+      return { ids: [], sources: {} };
+    }
+  }
+
+  writeLocalSideChatState(ids, sources) {
+    const cleanIds = [...new Set((ids || [])
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter((id) => SESSION_ID_PATTERN.test(String(id) + '.jsonl')))];
+    const cleanSources = {};
+    for (const [id, source] of Object.entries(sources || {})) {
+      const threadId = String(id || '').trim().toLowerCase();
+      const sourceThreadId = String(source || '').trim().toLowerCase();
+      if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) continue;
+      if (!cleanIds.includes(threadId)) continue;
+      cleanSources[threadId] = SESSION_ID_PATTERN.test(String(sourceThreadId) + '.jsonl') ? sourceThreadId : '';
+    }
+    const payload = {
+      'side-chat-thread-ids': cleanIds,
+      'side-chat-source-threads': cleanSources,
+      updatedAt: Date.now(),
+    };
+    const temporary = this.sideChatStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    writeFileSync(temporary, JSON.stringify(payload) + String.fromCharCode(10), { mode: 0o600 });
+    renameSync(temporary, this.sideChatStateFile);
+    return payload;
+  }
+
+  refreshSideChatState(state = null) {
+    let snapshot = state;
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      try {
+        snapshot = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      } catch {
+        snapshot = {};
+      }
+    }
+
+    const globalRaw = snapshot?.['side-chat-thread-ids'];
+    const globalIds = Array.isArray(globalRaw)
+      ? globalRaw
+      : globalRaw && typeof globalRaw === 'object'
+        ? Object.keys(globalRaw)
+        : [];
+    const globalSources = (snapshot?.['side-chat-source-threads']
+      && typeof snapshot['side-chat-source-threads'] === 'object'
+      && !Array.isArray(snapshot['side-chat-source-threads']))
+      ? snapshot['side-chat-source-threads']
+      : {};
+
+    const local = this.readLocalSideChatState();
+    const mergedIds = new Set();
+    const mergedSources = new Map();
+
+    for (const list of [globalIds, local.ids]) {
+      for (const id of list || []) {
+        const threadId = String(id || '').trim().toLowerCase();
+        if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) continue;
+        mergedIds.add(threadId);
+      }
+    }
+    for (const sources of [globalSources, local.sources]) {
+      for (const [id, source] of Object.entries(sources || {})) {
+        const threadId = String(id || '').trim().toLowerCase();
+        const sourceThreadId = String(source || '').trim().toLowerCase();
+        if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) continue;
+        if (!mergedIds.has(threadId)) continue;
+        if (!mergedSources.has(threadId) || sourceThreadId) {
+          mergedSources.set(
+            threadId,
+            SESSION_ID_PATTERN.test(String(sourceThreadId) + '.jsonl') ? sourceThreadId : '',
+          );
+        }
+      }
+    }
+
+    this.sideChatThreadIds = mergedIds;
+    this.sideChatSourceThreads = mergedSources;
+
+    // Keep a durable local copy even if Codex App rewrites global state.
+    try {
+      this.writeLocalSideChatState([...mergedIds], Object.fromEntries(mergedSources));
+    } catch {}
   }
 
   listPinnedThreadIds() {
@@ -212,6 +322,196 @@ export class NativeSessionStore extends EventEmitter {
     if (!this.workspaceStateAvailable || !SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return '';
     if (this.projectThreadIds.has(threadId)) return 'project';
     return this.projectlessThreadIds.has(threadId) ? 'projectless' : 'project';
+  }
+
+  markProjectlessThread(id, options = {}) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return false;
+    let state = {};
+    try {
+      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      if (!state || typeof state !== 'object' || Array.isArray(state)) state = {};
+    } catch {
+      state = {};
+    }
+
+    const raw = state['projectless-thread-ids'];
+    let ids;
+    let asObject = false;
+    if (Array.isArray(raw)) {
+      ids = raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else if (raw && typeof raw === 'object') {
+      asObject = true;
+      ids = Object.keys(raw).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else {
+      ids = [];
+    }
+    if (!ids.includes(threadId)) ids.push(threadId);
+    state['projectless-thread-ids'] = asObject
+      ? Object.fromEntries(ids.map((value) => [value, true]))
+      : ids;
+
+    const cwd = String(options.cwd || '').trim();
+    if (cwd) {
+      const hints = (state['thread-workspace-root-hints'] && typeof state['thread-workspace-root-hints'] === 'object' && !Array.isArray(state['thread-workspace-root-hints']))
+        ? { ...state['thread-workspace-root-hints'] }
+        : {};
+      hints[threadId] = cwd;
+      state['thread-workspace-root-hints'] = hints;
+      const outputs = (state['thread-projectless-output-directories'] && typeof state['thread-projectless-output-directories'] === 'object' && !Array.isArray(state['thread-projectless-output-directories']))
+        ? { ...state['thread-projectless-output-directories'] }
+        : {};
+      outputs[threadId] = path.join(cwd, 'outputs');
+      state['thread-projectless-output-directories'] = outputs;
+    }
+
+    const assignments = (state['thread-project-assignments'] && typeof state['thread-project-assignments'] === 'object' && !Array.isArray(state['thread-project-assignments']))
+      ? { ...state['thread-project-assignments'] }
+      : {};
+    if (assignments[threadId]) {
+      delete assignments[threadId];
+      state['thread-project-assignments'] = assignments;
+    }
+
+    const temporary = this.globalStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    writeFileSync(temporary, JSON.stringify(state) + String.fromCharCode(10), { mode: 0o600 });
+    renameSync(temporary, this.globalStateFile);
+    this.projectlessThreadIds.add(threadId);
+    this.projectThreadIds.delete(threadId);
+    this.workspaceStateAvailable = true;
+    this.scheduleRefresh();
+    return true;
+  }
+
+  isSideChatThread(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    return Boolean(threadId) && this.sideChatThreadIds.has(threadId);
+  }
+
+  sideChatSourceThreadId(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    return this.sideChatSourceThreads.get(threadId) || '';
+  }
+
+  markSideChatThread(id, options = {}) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) return false;
+    let state = {};
+    try {
+      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      if (!state || typeof state !== 'object' || Array.isArray(state)) state = {};
+    } catch {
+      state = {};
+    }
+
+    const raw = state['side-chat-thread-ids'];
+    let ids;
+    let asObject = false;
+    if (Array.isArray(raw)) {
+      ids = raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else if (raw && typeof raw === 'object') {
+      asObject = true;
+      ids = Object.keys(raw).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else {
+      ids = [];
+    }
+    if (!ids.includes(threadId)) ids.push(threadId);
+    state['side-chat-thread-ids'] = asObject
+      ? Object.fromEntries(ids.map((value) => [value, true]))
+      : ids;
+
+    const sourceThreadId = String(options.sourceThreadId || '').trim().toLowerCase();
+    const sources = (state['side-chat-source-threads']
+      && typeof state['side-chat-source-threads'] === 'object'
+      && !Array.isArray(state['side-chat-source-threads']))
+      ? { ...state['side-chat-source-threads'] }
+      : {};
+    if (sourceThreadId && SESSION_ID_PATTERN.test(String(sourceThreadId) + '.jsonl')) {
+      sources[threadId] = sourceThreadId;
+    } else if (!sources[threadId]) {
+      sources[threadId] = '';
+    }
+    state['side-chat-source-threads'] = sources;
+
+    // Durable local registry first (Codex App frequently rewrites global state).
+    try {
+      const local = this.readLocalSideChatState();
+      const localIds = [...new Set([...(local.ids || []).map((value) => String(value || '').trim().toLowerCase()), threadId])];
+      const localSources = { ...(local.sources || {}) };
+      localSources[threadId] = sources[threadId] || '';
+      this.writeLocalSideChatState(localIds, localSources);
+    } catch {}
+
+    try {
+      const temporary = this.globalStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+      writeFileSync(temporary, JSON.stringify(state) + String.fromCharCode(10), { mode: 0o600 });
+      renameSync(temporary, this.globalStateFile);
+    } catch {}
+
+    this.sideChatThreadIds.add(threadId);
+    this.sideChatSourceThreads.set(threadId, sources[threadId] || '');
+    this.scheduleRefresh();
+    return true;
+  }
+
+  unmarkSideChatThread(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) return false;
+    let state = {};
+    try {
+      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      if (!state || typeof state !== 'object' || Array.isArray(state)) state = {};
+    } catch {
+      state = {};
+    }
+
+    const raw = state['side-chat-thread-ids'];
+    let ids;
+    let asObject = false;
+    if (Array.isArray(raw)) {
+      ids = raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else if (raw && typeof raw === 'object') {
+      asObject = true;
+      ids = Object.keys(raw).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else {
+      ids = [];
+    }
+    const nextIds = ids.filter((value) => value !== threadId);
+    if (nextIds.length === ids.length && !this.sideChatThreadIds.has(threadId)) return false;
+    state['side-chat-thread-ids'] = asObject
+      ? Object.fromEntries(nextIds.map((value) => [value, true]))
+      : nextIds;
+
+    const sources = (state['side-chat-source-threads']
+      && typeof state['side-chat-source-threads'] === 'object'
+      && !Array.isArray(state['side-chat-source-threads']))
+      ? { ...state['side-chat-source-threads'] }
+      : {};
+    if (sources[threadId] !== undefined) {
+      delete sources[threadId];
+      state['side-chat-source-threads'] = sources;
+    }
+
+    try {
+      const local = this.readLocalSideChatState();
+      const localIds = (local.ids || [])
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter((value) => value && value !== threadId);
+      const localSources = { ...(local.sources || {}) };
+      delete localSources[threadId];
+      this.writeLocalSideChatState(localIds, localSources);
+    } catch {}
+
+    try {
+      const temporary = this.globalStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+      writeFileSync(temporary, JSON.stringify(state) + String.fromCharCode(10), { mode: 0o600 });
+      renameSync(temporary, this.globalStateFile);
+    } catch {}
+
+    this.sideChatThreadIds.delete(threadId);
+    this.sideChatSourceThreads.delete(threadId);
+    this.scheduleRefresh();
+    return true;
   }
 
   refreshAppThreads() {
@@ -333,7 +633,12 @@ export class NativeSessionStore extends EventEmitter {
           : now - entry.mtimeMs <= this.runningWindowMs
             ? 'running'
             : 'done';
-        return sessionSummary(entry, status);
+        const summary = sessionSummary(entry, status);
+        if (this.isSideChatThread(entry.id)) {
+          summary.sideChat = true;
+          summary.sideChatSourceThreadId = this.sideChatSourceThreadId(entry.id) || '';
+        }
+        return summary;
       });
   }
 
@@ -712,10 +1017,12 @@ function createDetailCache(entry, options) {
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
     latestTurnId: '',
     currentTurnStartedAt: '',
+    currentTurnTokenUsage: null,
     turnStartScanComplete: startOffset === 0,
     displayUserMessagesInTurn: 0,
     lastTimestamp: '',
     subagentTurnIds: new Set(),
+    contentMutated: false,
   };
 
   const firstRecord = readFirstRecord(entry.filePath);
@@ -774,6 +1081,11 @@ function readSessionUpdates(cache, entry, maxMessages) {
     cache.offset = position;
     cache.size = entry.size;
     cache.mtimeMs = entry.mtimeMs;
+    if (cache.contentMutated) {
+      // One generation bump per read pass so merged content invalidates clients without thrashing.
+      cache.generation += 1;
+      cache.contentMutated = false;
+    }
   } catch {
     return;
   } finally {
@@ -1029,7 +1341,10 @@ function applyMetadataRecord(cache, record) {
 function applyEventRecord(cache, record, payload, maxMessages) {
   const turnId = String(payload.turn_id || payload.turnId || '');
   if (turnId) cache.latestTurnId = turnId;
-  if (payload.type === 'task_started') updateNativeTurnId(cache, turnId);
+  if (payload.type === 'task_started') {
+    updateNativeTurnId(cache, turnId);
+    cache.currentTurnTokenUsage = null;
+  }
   switch (payload.type) {
     case 'task_started':
       cache.status = 'running';
@@ -1039,9 +1354,19 @@ function applyEventRecord(cache, record, payload, maxMessages) {
       break;
     case 'task_complete': {
       cache.status = 'done';
+      // Promote the latest unphased assistant bubble of this turn to final_answer so Web history
+      // keeps intermediate progress separate from the permanent reply.
+      promoteLatestAssistantFinalAnswer(cache);
       const duration = Number(payload.duration_ms);
       const content = Number.isFinite(duration) ? `任务完成，耗时 ${(duration / 1000).toFixed(1)}s` : '任务完成';
-      appendNativeMessage(cache, 'process', content, record, maxMessages, payload.type);
+      appendNativeMessage(cache, 'process', content, record, maxMessages, payload.type, {
+        ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+      });
+      break;
+    }
+    case 'token_count': {
+      const usage = normalizeTurnTokenUsage(payload.info?.last_token_usage);
+      if (usage) cache.currentTurnTokenUsage = addTurnTokenUsage(cache.currentTurnTokenUsage, usage);
       break;
     }
     case 'task_error':
@@ -1061,23 +1386,39 @@ function applyEventRecord(cache, record, payload, maxMessages) {
 }
 
 function applyCompactedRecord(cache, record, maxMessages) {
-  const previous = cache.messages.at(-1);
-  const previousAt = Date.parse(previous?.at || '');
-  const compactedAt = Date.parse(record.timestamp || '');
-  const followsHandoffQuickly = Number.isFinite(previousAt)
-    && Number.isFinite(compactedAt)
-    && compactedAt >= previousAt
-    && compactedAt - previousAt <= 5000;
-  const embeddedHandoff = compactedRecordContainsHandoff(record, previous);
-  if (previous?.role === 'assistant' && previous.kind === 'final_answer' && (followsHandoffQuickly || embeddedHandoff)) {
-    cache.messages.pop();
-  }
+  dropRawHandoffBeforeCompaction(cache, record);
   if (cache.messages.at(-1)?.kind !== 'context_compacted') {
     appendNativeMessage(cache, 'process', '上下文已自动压缩', record, maxMessages, 'context_compacted');
   }
   // A browser may have read the internal handoff summary before the compacted
   // record landed. Changing the generation forces its next poll to reset.
   cache.generation += 1;
+}
+
+function dropRawHandoffBeforeCompaction(cache, record) {
+  const compactedAt = Date.parse(record.timestamp || '');
+  // Scan recent tail so interleaved tools after a handoff still get cleaned up.
+  for (let index = cache.messages.length - 1; index >= 0; index -= 1) {
+    const message = cache.messages[index];
+    const messageAt = Date.parse(message?.at || '');
+    const followsHandoffQuickly = Number.isFinite(messageAt)
+      && Number.isFinite(compactedAt)
+      && compactedAt >= messageAt
+      && compactedAt - messageAt <= 5000;
+    const embeddedHandoff = compactedRecordContainsHandoff(record, message);
+    if (!followsHandoffQuickly && !embeddedHandoff) {
+      if (message?.role === 'tool' || message?.role === 'process') continue;
+      break;
+    }
+    if (message?.role === 'assistant' && message.kind === 'final_answer' && isHandoffSummaryText(message.content)) {
+      // Keep the folded handoff summary context; only drop raw final_answer handoffs.
+      cache.messages.splice(index, 1);
+      return;
+    }
+    if (message?.role === 'context' && message.kind === 'handoff_summary') return;
+    if (message?.role === 'tool' || message?.role === 'process') continue;
+    break;
+  }
 }
 
 function compactedRecordContainsHandoff(record, message) {
@@ -1088,25 +1429,73 @@ function compactedRecordContainsHandoff(record, message) {
   return compactedMessage.includes(content.slice(0, Math.min(240, content.length)));
 }
 
+function isHandoffSummaryText(text) {
+  const normalized = String(text || '').replace(/\r\n/g,'\n').trim();
+  if (!normalized) return false;
+  const firstLine = normalized.split('\n', 1)[0].trim();
+  const plain = firstLine
+    .replace(/^#{1,6}\s+/, '')
+    .replace(/^\*{1,2}|\*{1,2}$/g, '')
+    .replace(/^_+|_+$/g, '')
+    .trim()
+    .toLowerCase();
+  if (
+    plain === 'handoff'
+    || plain === 'handoff summary'
+    || plain === 'current task'
+    || plain.startsWith('handoff:')
+    || plain.startsWith('handoff summary:')
+    || plain.startsWith('current task:')
+    || plain.startsWith('交接摘要')
+    || /^\*\*handoff(?:\s+summary)?\*\*/i.test(firstLine)
+    || /^\*\*current task\*\*/i.test(firstLine)
+  ) return true;
+  // Collab handoffs may omit a clean title but still ship the standard sections.
+  const head = normalized.slice(0, 1200).toLowerCase();
+  const hasGoal = head.includes('## goal') || head.includes('## 目标');
+  const hasOps = head.includes('service / ops')
+    || head.includes('immediate next steps')
+    || head.includes('already done')
+    || head.includes('key files')
+    || head.includes('constraints');
+  return hasGoal && hasOps;
+}
+
+function shouldHideHandoffMessage(message) {
+  if (!message) return false;
+  if (message.role === 'context' && message.kind === 'handoff_summary') return true;
+  if (message.role === 'assistant' && isHandoffSummaryText(message.content)) return true;
+  return false;
+}
 function applyMessageRecord(cache, record, payload, maxMessages) {
   if (!['user', 'assistant'].includes(payload.role)) return;
   const text = contentText(payload.content);
   const images = contentImages(payload.content);
-  if ((!text && !images.length) || (text && isInjectedWorkspaceInstructions(payload.role, text))) return;
+  if (!text && !images.length) return;
   const browserComments = payload.role === 'user' && isBrowserCommentsMessage(text);
   const browserCommentMeta = browserComments ? browserCommentsMetadata(text) : null;
-  const context = payload.role === 'user' ? normalizeInjectedContext(text) : null;
+  const contexts = payload.role === 'user' ? normalizeInjectedContexts(text) : [];
+  if (text && !contexts.length && isInjectedWorkspaceInstructions(payload.role, text)) return;
   const displayText = payload.role === 'user' ? normalizeUserDisplayText(text) : text;
   let messageKind = payload.phase || 'message';
-  if (payload.role === 'user' && !context && (displayText || images.length)) {
+  if (payload.role === 'assistant' && !payload.phase && displayText) {
+    // When the runtime omits phase, classify short intermediate chatter as commentary
+    // so completed history can keep it under process while leaving the final bubble intact.
+    messageKind = isProgressStyleText(displayText) ? 'commentary' : 'message';
+  }
+  if (payload.role === 'user' && !contexts.length && (displayText || images.length)) {
     const turnId = String(payload.internal_chat_message_metadata_passthrough?.turn_id || '');
     if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
       messageKind = browserComments ? 'steering_browser_comment' : 'steering_user';
     }
     cache.displayUserMessagesInTurn += 1;
   }
-  if (context) {
-    appendNativeMessage(cache, 'context', context.content, record, maxMessages, context.kind);
+  if (contexts.length) {
+    for (const context of contexts) {
+      appendNativeMessage(cache, 'context', context.content, record, maxMessages, context.kind);
+    }
+  } else if (displayText && payload.role === 'assistant' && isHandoffSummaryText(displayText)) {
+    // Internal agent handoff must not surface in the Web chat UI.
   } else if (displayText) {
     appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind, browserCommentMeta);
   }
@@ -1144,34 +1533,31 @@ function isInjectedWorkspaceInstructions(role, text) {
   return workspaceInstructions || skillInstructions;
 }
 
-function normalizeInjectedContext(text) {
+function normalizeInjectedContexts(text) {
   const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!normalized) return [];
+
+  const exact = normalizeExactInjectedContext(normalized);
+  if (exact) return [exact];
+
+  return peelCompositeInjectedContexts(normalized);
+}
+
+function normalizeInjectedContext(text) {
+  const contexts = normalizeInjectedContexts(text);
+  return contexts[0] || null;
+}
+
+function normalizeExactInjectedContext(normalized) {
   const environment = normalized.match(/^<environment_context>\s*([\s\S]*?)\s*<\/environment_context>$/);
-  if (environment) {
-    const source = environment[1];
-    const date = firstContextTag(source, 'current_date');
-    const timezone = firstContextTag(source, 'timezone');
-    const cwd = firstContextTag(source, 'cwd');
-    const roots = contextTagValues(source, 'root');
-    const permission = source.match(/<permission_profile\b[^>]*\btype="([^"]+)"/)?.[1] || '';
-    const lines = [];
-    if (date) lines.push(`日期 ${date}`);
-    if (timezone) lines.push(`时区 ${timezone}`);
-    if (cwd && !roots.includes(cwd)) lines.push(`目录 ${cwd}`);
-    if (roots.length) {
-      lines.push(`工作区 ${roots.length}`);
-      for (const root of roots) lines.push(`- ${root}`);
-    }
-    if (permission) lines.push(`权限 ${permission}`);
-    return { kind: 'environment_context', content: lines.join('\n') || '环境信息已同步' };
-  }
+  if (environment) return formatEnvironmentContext(environment[1]);
 
   const browser = normalized.match(/^<in-app-browser-context\b[^>]*>\s*([\s\S]*?)\s*<\/in-app-browser-context>$/);
   if (browser) {
     const url = browser[1].match(/Current URL:\s*(\S+)/)?.[1] || '';
     return {
       kind: 'browser_context',
-      content: url ? `当前页面 ${url}` : '浏览器状态已同步',
+      content: url ? ('当前页面 ' + url) : '浏览器状态已同步',
     };
   }
 
@@ -1180,7 +1566,7 @@ function normalizeInjectedContext(text) {
     const objective = firstContextTag(internal[1], 'objective');
     return {
       kind: 'goal_context',
-      content: objective ? `持续目标\n${objective}` : '内部任务状态已同步',
+      content: objective ? ('持续目标\n' + objective) : '内部任务状态已同步',
     };
   }
 
@@ -1192,6 +1578,132 @@ function normalizeInjectedContext(text) {
   }
 
   return null;
+}
+
+function formatEnvironmentContext(source) {
+  const date = firstContextTag(source, 'current_date');
+  const timezone = firstContextTag(source, 'timezone');
+  const cwd = firstContextTag(source, 'cwd');
+  const roots = contextTagValues(source, 'root');
+  const permission = source.match(/<permission_profile\b[^>]*\btype="([^"]+)"/)?.[1] || '';
+  const lines = [];
+  if (date) lines.push('日期 ' + date);
+  if (timezone) lines.push('时区 ' + timezone);
+  if (cwd && !roots.includes(cwd)) lines.push('目录 ' + cwd);
+  if (roots.length) {
+    lines.push('工作区 ' + roots.length);
+    for (const root of roots) lines.push('- ' + root);
+  }
+  if (permission) lines.push('权限 ' + permission);
+  return { kind: 'environment_context', content: lines.join('\n') || '环境信息已同步' };
+}
+
+function peelCompositeInjectedContexts(normalized) {
+  let remaining = normalized;
+  const contexts = [];
+
+  const workspace = takeWorkspaceInjectedPrefix(remaining);
+  if (workspace) {
+    contexts.push(workspace.context);
+    remaining = workspace.remaining.trim();
+  }
+
+  const environment = remaining.match(/^<environment_context>\s*([\s\S]*?)\s*<\/environment_context>\s*$/);
+  if (environment) {
+    contexts.push(formatEnvironmentContext(environment[1]));
+    remaining = '';
+  }
+
+  // Only fold when the entire user message is injected context.
+  if (remaining) return [];
+  return contexts;
+}
+
+function takeWorkspaceInjectedPrefix(normalized) {
+  const taggedPlugins = normalized.match(/^<recommended_plugins>\s*([\s\S]*?)\s*<\/recommended_plugins>/);
+  const plainPluginsPrefix = 'Here is a list of plugins that are available but not installed.';
+  const hasPlainPlugins = normalized.startsWith(plainPluginsPrefix);
+  if (!taggedPlugins && !hasPlainPlugins) return null;
+
+  let afterPlugins = '';
+  let pluginSource = '';
+  if (taggedPlugins) {
+    pluginSource = taggedPlugins[1];
+    afterPlugins = normalized.slice(taggedPlugins[0].length).replace(/^\n+/, '').trimStart();
+  } else {
+    const agentsAt = normalized.search(/\n# AGENTS\.md instructions for /);
+    const envAt = normalized.search(/\n<environment_context>/);
+    let cut = normalized.length;
+    if (agentsAt >= 0) cut = Math.min(cut, agentsAt);
+    if (envAt >= 0) cut = Math.min(cut, envAt);
+    pluginSource = normalized.slice(0, cut);
+    afterPlugins = normalized.slice(cut).replace(/^\n+/, '').trimStart();
+  }
+
+  const workspaceMatch = afterPlugins.match(
+    /^# AGENTS\.md instructions for ([^\n]+)\n\n<INSTRUCTIONS>\n[\s\S]*?\n<\/INSTRUCTIONS>/,
+  );
+  if (taggedPlugins && afterPlugins && !workspaceMatch && !afterPlugins.startsWith('<environment_context>')) {
+    return null;
+  }
+  if (hasPlainPlugins && afterPlugins && !workspaceMatch && !afterPlugins.startsWith('<environment_context>')) {
+    return null;
+  }
+
+  let remaining = afterPlugins;
+  if (workspaceMatch) {
+    remaining = afterPlugins.slice(workspaceMatch[0].length).replace(/^\n+/, '').trimStart();
+  }
+
+  if (remaining && !remaining.startsWith('<environment_context>')) return null;
+
+  const pluginCount = (pluginSource.match(/^\s*-\s+[^\n]+$/gm) || []).length;
+  const lines = [];
+  if (pluginCount) lines.push('推荐插件 ' + pluginCount);
+  else lines.push('推荐插件列表已同步');
+  const workspace = String(workspaceMatch?.[1] || '').trim();
+  if (workspace) lines.push('工作区规则 ' + workspace);
+  return {
+    context: {
+      kind: 'workspace_context',
+      content: lines.join('\n'),
+    },
+    remaining,
+  };
+}
+
+function normalizeWorkspaceInjectedContext(normalized) {
+  const taken = takeWorkspaceInjectedPrefix(normalized);
+  if (!taken || taken.remaining) return null;
+  return taken.context;
+}
+
+function normalizeTurnTokenUsage(value) {
+  if (!value || typeof value !== 'object') return null;
+  const fields = {
+    inputTokens: 'input_tokens',
+    cachedInputTokens: 'cached_input_tokens',
+    outputTokens: 'output_tokens',
+    reasoningOutputTokens: 'reasoning_output_tokens',
+    totalTokens: 'total_tokens',
+  };
+  const usage = {};
+  let found = false;
+  for (const [target, source] of Object.entries(fields)) {
+    const numeric = Number(value[source] ?? value[target]);
+    if (!Number.isFinite(numeric) || numeric < 0) continue;
+    usage[target] = Math.round(numeric);
+    found = true;
+  }
+  if (!found) return null;
+  for (const target of Object.keys(fields)) usage[target] ??= 0;
+  if (!usage.totalTokens) usage.totalTokens = usage.inputTokens + usage.outputTokens;
+  return usage;
+}
+
+function addTurnTokenUsage(current, addition) {
+  const fields = ['inputTokens', 'cachedInputTokens', 'outputTokens', 'reasoningOutputTokens', 'totalTokens'];
+  return Object.fromEntries(fields.map((field) => [field, Number(current?.[field] || 0) + Number(addition?.[field] || 0)]));
 }
 
 function firstContextTag(source, tag) {
@@ -1262,6 +1774,7 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind, me
       : DETAIL_TEXT_LIMIT;
   const clean = limitText(String(content || '').trim(), limit);
   if (!clean) return;
+  if (tryMergeAssistantMessage(cache, role, clean, record, kind, metadata)) return;
   cache.messages.push({
     seq: cache.nextSequence++,
     role,
@@ -1278,6 +1791,109 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind, me
   }
 }
 
+function tryMergeAssistantMessage(cache, role, clean, record, kind, metadata = null) {
+  if (role !== 'assistant') return false;
+  if (!canMergeAssistantKind(kind)) return false;
+  if (metadata && typeof metadata === 'object' && Object.keys(metadata).length) return false;
+  const previous = findMergeableAssistantMessage(cache, kind, clean);
+  if (!previous) return false;
+  if (previous.content === clean || previous.content.endsWith('\n\n' + clean) || previous.content.endsWith('\n' + clean)) {
+    return true;
+  }
+  const before = previous.content;
+  if (clean.startsWith(previous.content) && clean.length > previous.content.length) {
+    previous.content = limitText(clean, MESSAGE_TEXT_LIMIT);
+  } else {
+    previous.content = limitText(previous.content + '\n\n' + clean, MESSAGE_TEXT_LIMIT);
+  }
+  // Progress stays progress; final_answer only merges with adjacent final_answer.
+  if (kind === 'final_answer') previous.kind = 'final_answer';
+  else if (previous.kind === 'message' || !previous.kind) previous.kind = kind || previous.kind || 'message';
+  if (record?.timestamp) previous.at = record.timestamp;
+  // Keep chronological order: note → tools → note → tools (App-style).
+  // Do not relocate progress bubbles past interleaved tools/process items.
+  if (previous.content !== before) cache.contentMutated = true;
+  return true;
+}
+
+function findMergeableAssistantMessage(cache, kind = '', clean = '') {
+  const turnId = cache.currentTurnId || '';
+  const incomingFinal = kind === 'final_answer';
+  // final_answer only merges with an immediately previous final_answer (no tools between).
+  if (incomingFinal) {
+    const previous = cache.messages.at(-1);
+    if (!previous || previous.role !== 'assistant') return null;
+    if ((previous.turnId || '') !== turnId) return null;
+    if (previous.kind !== 'final_answer') return null;
+    return previous;
+  }
+  // Keep long unphased summaries as their own bubble instead of folding into progress chatter.
+  if (!isProgressStyleText(clean)) return null;
+  // Only merge immediately consecutive progress notes.
+  // Tools / process / user between notes start a new progress bubble so the
+  // timeline stays note → tools → note → tools (matches Codex App).
+  const previous = cache.messages.at(-1);
+  if (!previous) return null;
+  if ((previous.turnId || '') !== turnId) return null;
+  if (previous.role !== 'assistant') return null;
+  if (!canMergeProgressKind(previous.kind)) return null;
+  if (!isProgressStyleText(previous.content)) return null;
+  return previous;
+}
+
+function relocateNativeMessageToEnd(cache, message) {
+  const index = cache.messages.indexOf(message);
+  if (index < 0 || index === cache.messages.length - 1) return;
+  cache.messages.splice(index, 1);
+  cache.messages.push(message);
+}
+
+function promoteLatestAssistantFinalAnswer(cache) {
+  const turnId = cache.currentTurnId || "";
+  let lastAssistant = null;
+  let lastSummary = null;
+  for (let index = cache.messages.length - 1; index >= 0; index -= 1) {
+    const message = cache.messages[index];
+    if (!message) continue;
+    if (turnId && (message.turnId || "") && (message.turnId || "") !== turnId) {
+      if (message.role === "assistant" || message.role === "user" || (message.role === "process" && message.kind === "task_started")) break;
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    const kind = String(message.kind || "");
+    if (kind === "final_answer") return;
+    if (!lastAssistant) lastAssistant = message;
+    if (!lastSummary && ["", "message", "commentary"].includes(kind) && !isProgressStyleText(message.content)) {
+      lastSummary = message;
+      break;
+    }
+    if (!["", "message", "commentary"].includes(kind)) break;
+  }
+  const target = lastSummary || lastAssistant;
+  if (!target) return;
+  if (String(target.kind || "") !== "final_answer") target.kind = "final_answer";
+}
+
+function canMergeAssistantKind(kind) {
+  return ['', 'message', 'commentary', 'final_answer'].includes(String(kind || ''));
+}
+
+function canMergeProgressKind(kind) {
+  return ['', 'message', 'commentary'].includes(String(kind || ''));
+}
+
+function isProgressStyleText(text) {
+  const source = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!source) return false;
+  const lines = source.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (source.length >= 500 || lines.length >= 6) return false;
+  // Numbered/markdown section summaries are treated as final-style, not live progress.
+  if (/^\d+\.\s+\S/.test(source) && lines.length >= 3) return false;
+  if (/^#{1,6}\s+\S/.test(source)) return false;
+  if (/^\*\*[^*]+\*\*\s*$/.test(lines[0] || '') && lines.length >= 3) return false;
+  return true;
+}
+
 function updateNativeTurnId(cache, value) {
   const turnId = String(value || '').trim();
   if (!turnId) return;
@@ -1286,6 +1902,7 @@ function updateNativeTurnId(cache, value) {
   cache.previousTurnId = cache.currentTurnId || '';
   cache.currentTurnId = turnId;
   cache.currentTurnStartedAt = '';
+  cache.currentTurnTokenUsage = null;
   cache.turnStartScanComplete = false;
   cache.displayUserMessagesInTurn = 0;
 }
@@ -1557,7 +2174,8 @@ function buildConversation(entry, cache, options, runningWindowMs) {
   const availableMessages = hasAfter && !reset
     ? cache.messages.filter((message) => message.seq > after)
     : cache.messages;
-  const messages = limit && (!hasAfter || reset) ? availableMessages.slice(-limit) : availableMessages;
+  const visibleMessages = availableMessages.filter((message) => !shouldHideHandoffMessage(message));
+  const messages = limit && (!hasAfter || reset) ? visibleMessages.slice(-limit) : visibleMessages;
 
   return {
     id: entry.id,
@@ -1570,7 +2188,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     latestTurnStartedAt: cache.currentTurnStartedAt,
     readOnly: false,
     truncated: cache.messagesTruncated,
-    hasEarlierMessages: messages.length < availableMessages.length,
+    hasEarlierMessages: messages.length < visibleMessages.length,
     generation: cache.generation,
     cursor: Math.max(0, cache.nextSequence - 1),
     reset,

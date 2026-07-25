@@ -16,7 +16,7 @@ index 5fc1614..ddf9a01 100644
  import Header from './components/Header'
  import SearchBar from './components/SearchBar'
  import TaskGrid from './components/TaskGrid'
-@@ -96,6 +96,61 @@ export default function App() {
+@@ -96,6 +96,73 @@ export default function App() {
      initStore()
    }, [setSettings])
 
@@ -32,6 +32,7 @@ index 5fc1614..ddf9a01 100644
 +          agentApiConfigMode?: 'hybrid'
 +          agentTextProfileId?: string
 +          agentImageProfileId?: string
++          allowedOrigins?: string[]
 +        }>
 +      })
 +      .then((config) => {
@@ -45,14 +46,25 @@ index 5fc1614..ddf9a01 100644
 +
 +        const imageProfileId = config.agentImageProfileId || 'codex-web-default'
 +        const importedById = new Map(importedProfiles.map((profile) => [profile.id, profile]))
++        const allowedOrigins = new Set(config.allowedOrigins || [])
 +        const updatedProfiles = importedProfiles.map((profile) => {
 +          const existing = state.settings.profiles.find((item) => item.id === profile.id)
++          const existingBaseUrl = existing?.baseUrl?.trim() || ''
++          let existingOrigin = ''
++          try {
++            existingOrigin = new URL(existingBaseUrl).origin
++          } catch {
++            // Ignore stale or malformed browser-local API URLs.
++          }
++          const preserveExistingUpstream = allowedOrigins.has(existingOrigin)
 +          return {
 +            ...existing,
 +            ...profile,
-+            baseUrl: existing?.baseUrl?.trim() || profile.baseUrl,
-+            apiKey: existing?.apiKey?.trim() || profile.apiKey,
++            baseUrl: preserveExistingUpstream ? existingBaseUrl : profile.baseUrl,
++            apiKey: preserveExistingUpstream ? existing?.apiKey?.trim() || profile.apiKey : profile.apiKey,
 +            model: profile.id === imageProfileId ? existing?.model || profile.model : profile.model,
++            streamImages: typeof existing?.streamImages === 'boolean' ? existing.streamImages : profile.streamImages,
++            streamPartialImages: typeof existing?.streamPartialImages === 'number' ? existing.streamPartialImages : profile.streamPartialImages,
 +          }
 +        })
 +        const importedIds = new Set(importedProfiles.map((profile) => profile.id))
@@ -78,7 +90,7 @@ index 5fc1614..ddf9a01 100644
    useEffect(() => {
      const preventPageImageDrag = (e: DragEvent) => {
        if ((e.target as HTMLElement | null)?.closest('img')) {
-@@ -107,6 +162,64 @@ export default function App() {
+@@ -107,6 +174,64 @@ export default function App() {
      return () => document.removeEventListener('dragstart', preventPageImageDrag)
    }, [])
 

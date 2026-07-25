@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   ImagePromptLibrary,
+  normalizeImagePromptAssetPath,
 } from '../image-prompt-library.mjs';
 
 const BUILTIN_REVISION = 'a'.repeat(40);
@@ -40,7 +41,8 @@ test('downloads a pinned GitHub revision and reloads it from runtime cache', asy
     assert.equal(status.updatedAt, '2026-07-17T05:30:00.000Z');
     assert.equal(library.getLibrary().totalCases, 2);
     assert.equal(library.getLibrary().totalTemplates, 1);
-    assert.match(library.getLibrary().imageBaseUrl, new RegExp(UPDATED_REVISION));
+    assert.equal(library.getLibrary().imageBaseUrl, '/api/image-prompts/assets');
+    assert.match(library.getLibrary().imageUpstreamBaseUrl, new RegExp(UPDATED_REVISION));
     assert.ok(requested.some((url) => url.includes(`/${UPDATED_REVISION}/data/cases.json`)));
     assert.ok(requested.some((url) => url.includes(`/${UPDATED_REVISION}/data/style-library.json`)));
 
@@ -171,6 +173,57 @@ test('retries an automatic sync after a transient startup failure', async () => 
     assert.equal(library.getStatus().error, '');
   } finally {
     library.stop();
+    await rm(fixture.temporary, { recursive: true, force: true });
+  }
+});
+
+test('proxies same-origin image assets from the active GitHub revision', async () => {
+  const fixture = await createFixture();
+  const requested = [];
+  const library = new ImagePromptLibrary({
+    ...fixture,
+    builtInRevision: BUILTIN_REVISION,
+    fetchImpl: async (url) => {
+      requested.push(url);
+      if (String(url).endsWith('/data/images/case1.jpg')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: {
+            get(name) {
+              return String(name).toLowerCase() === 'content-type' ? 'image/jpeg' : null;
+            },
+          },
+          async arrayBuffer() {
+            return Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+          },
+        };
+      }
+      return {
+        ok: false,
+        status: 404,
+        headers: { get() { return null; } },
+        async arrayBuffer() {
+          return Buffer.alloc(0);
+        },
+      };
+    },
+    autoSync: false,
+  });
+
+  try {
+    assert.equal(normalizeImagePromptAssetPath('../secret.txt'), '');
+    assert.equal(normalizeImagePromptAssetPath('images/case1.jpg'), 'images/case1.jpg');
+    assert.throws(() => library.resolveAsset('../../etc/passwd'), /无效的提示词图片路径/);
+
+    const asset = await library.fetchAsset('/images/case1.jpg');
+    assert.equal(asset.path, 'images/case1.jpg');
+    assert.equal(asset.revision, BUILTIN_REVISION);
+    assert.equal(asset.contentType, 'image/jpeg');
+    assert.equal(asset.cacheControl, 'private, max-age=86400');
+    assert.deepEqual([...asset.body], [0xff, 0xd8, 0xff, 0xd9]);
+    assert.ok(requested.some((url) => url.includes(`/${BUILTIN_REVISION}/data/images/case1.jpg`)));
+  } finally {
     await rm(fixture.temporary, { recursive: true, force: true });
   }
 });

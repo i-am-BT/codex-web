@@ -8,6 +8,16 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const uiStyles = readFileSync(path.join(ROOT, 'ui.css'), 'utf8');
 const serverSource = readFileSync(path.join(ROOT, 'server.mjs'), 'utf8');
 
+test('new-task composer treats project selection as optional', () => {
+  assert.match(serverSource, /composerProjectPanel\.className='composerProjectPanel hidden'/);
+  assert.match(serverSource, /projectTitle\.textContent='项目路径（可选）'/);
+  assert.match(serverSource, /noProjectName\.textContent='无项目'/);
+  assert.match(serverSource, /noProjectDetail\.textContent='使用默认工作目录'/);
+  assert.match(serverSource, /projectName=projectPath\?historyProjectName\(projectPath\):'选择项目（可选）'/);
+  assert.match(serverSource, /function resetNewTaskComposerCwd\(\)\{\s*cwd\.value=''/);
+  assert.match(serverSource, /直接输入任务；项目路径可选。/);
+});
+
 test('composer project row and queued prompts share the native visual surface', () => {
   assert.match(
     uiStyles,
@@ -27,11 +37,11 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /\.promptQueue\s*\{[^}]*border-bottom-color:\s*transparent;[^}]*background:\s*transparent/s,
+    /\.promptQueue\s*\{[^}]*Above the input capsule/s,
   );
   assert.match(
     uiStyles,
-    /body\[data-theme="dark"\] \.promptQueue\s*\{[^}]*border-bottom-color:\s*transparent;[^}]*background:\s*transparent/s,
+    /body\[data-theme="dark"\] \.promptQueue\s*\{[^}]*background:/s,
   );
   assert.match(
     uiStyles,
@@ -47,7 +57,7 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*background:\s*transparent;[^}]*backdrop-filter:\s*none/s,
+    /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*border-color:/s,
   );
   assert.match(
     uiStyles,
@@ -55,15 +65,32 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /body\[data-theme="light"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s,
+    /body\[data-theme="light"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*background:\s*#ffffff;[^}]*box-shadow:\s*none/s,
   );
   assert.match(
     uiStyles,
-    /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s,
+    /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*background:\s*var\(--surface\);[^}]*box-shadow:\s*none/s,
   );
   assert.match(
     uiStyles,
-    /\.activityClusterText\s*\{[^}]*width:\s*fit-content;[^}]*max-width:\s*100%;[^}]*justify-self:\s*start/s,
+    /@media \(min-width: 821px\)[\s\S]*?body \.main\s*\{[^}]*position:\s*relative;[^}]*height:\s*100dvh/s,
+  );
+  assert.match(
+    uiStyles,
+    /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\)/s,
+  );
+  assert.match(
+    uiStyles,
+    /body \.main:has\(> \.composer > \.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*padding-bottom:\s*max\(202px, calc\(var\(--composer-overlay-height, 190px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(202px, calc\(var\(--composer-overlay-height, 190px\) \+ 12px\)\)/s,
+  );
+  assert.match(
+    uiStyles,
+    /@media \(min-width: 821px\)[\s\S]*?body \.composer\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*auto 0 0;[^}]*background:\s*transparent;[^}]*pointer-events:\s*none/s,
+  );
+  assert.match(uiStyles, /body \.composer > \*\s*\{[^}]*pointer-events:\s*auto/s);
+  assert.match(
+    uiStyles,
+    /\.activityClusterText\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%;[^}]*justify-self:\s*stretch;[^}]*text-overflow:\s*ellipsis/s,
   );
 });
 
@@ -75,7 +102,7 @@ test('running history dots stay before App without changing the row grid', () =>
   );
   assert.match(
     uiStyles,
-    /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-4px;[^}]*pointer-events:\s*none/s,
+    /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-12px;[^}]*pointer-events:\s*none/s,
   );
   assert.match(
     serverSource,
@@ -116,7 +143,7 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   );
   assert.match(
     uiStyles,
-    /\.composerReasoningRange::-webkit-slider-thumb\s*\{[^}]*width:\s*15px;[^}]*border:\s*2px solid var\(--text\)/s,
+    /\.composerReasoningRange::-webkit-slider-thumb\s*\{[^}]*width:\s*24px;[^}]*height:\s*24px;[^}]*border:\s*0;[^}]*background:\s*#ffffff/s,
   );
   assert.match(uiStyles, /\.composerReasoningRange:focus-visible\s*\{[^}]*box-shadow:\s*none/s);
   assert.match(
@@ -133,7 +160,7 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   );
   assert.match(
     uiStyles,
-    /\.composerReasoningInline \.composerReasoningSlider\s*\{[^}]*gap:\s*1px;[^}]*padding:\s*0 8px 7px/s,
+    /\.composerReasoningInline \.composerReasoningSlider\s*\{[^}]*gap:\s*0;[^}]*padding:\s*0/s,
   );
 });
 
