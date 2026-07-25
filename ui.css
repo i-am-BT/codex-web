@@ -562,6 +562,12 @@ body .subQuotaClose:hover {
   color: var(--danger);
 }
 
+.subQuotaError {
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 500;
+}
+
 .subQuotaContent {
   display: grid;
   min-width: 0;

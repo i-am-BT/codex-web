@@ -829,6 +829,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.sideActions \.miniPrimary \.buttonLabel\s*\{[^}]*flex:\s*0 0 auto;[^}]*word-break:\s*keep-all/s);
     assert.match(uiStyles, /\.subQuotaPopover\s*\{/);
     assert.match(uiStyles, /\.subQuotaSettingsDialog\s*\{/);
+    assert.match(uiStyles, /\.subQuotaError\s*\{[^}]*font-size:\s*11px;[^}]*line-height:\s*1\.4/s);
     assert.match(uiStyles, /@container sidebar \(max-width: 280px\)/);
     assert.match(uiStyles, /\.archiveView\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*auto/s);
     assert.match(uiStyles, /\.archiveTaskRestore,[^}]*\.archiveTaskDelete\s*\{/s);
