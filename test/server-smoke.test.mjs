@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('playground profile refresh preserves browser streaming preferences', async () => {
   const playgroundAssetScript = await readFile(
-    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-CXjHvR1L.js'),
+    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-BP90Uyg2.js'),
     'utf8',
   );
   const playgroundPatchSource = await readFile(
@@ -24,18 +24,18 @@ test('playground profile refresh preserves browser streaming preferences', async
 
   assert.match(playgroundPatchSource, /streamImages: typeof existing\?\.streamImages === 'boolean'/);
   assert.match(playgroundPatchSource, /streamPartialImages: typeof existing\?\.streamPartialImages === 'number'/);
-  assert.match(playgroundAssetScript, /streamImages:typeof\(S==null\?void 0:S\.streamImages\)=="boolean"\?S\.streamImages:I\.streamImages/);
-  assert.match(playgroundAssetScript, /streamPartialImages:typeof\(S==null\?void 0:S\.streamPartialImages\)=="number"\?S\.streamPartialImages:I\.streamPartialImages/);
+  assert.match(playgroundAssetScript, /streamImages:typeof\(w==null\?void 0:w\.streamImages\)=="boolean"\?w\.streamImages:I\.streamImages/);
+  assert.match(playgroundAssetScript, /streamPartialImages:typeof\(w==null\?void 0:w\.streamPartialImages\)=="number"\?w\.streamPartialImages:I\.streamPartialImages/);
   assert.match(
     playgroundAssetScript,
-    /M\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const S of a\.inputImageIds\)xr\.delete\(S\)\}/,
+    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const k of a\.inputImageIds\)OI\(k\)\}/,
   );
   assert.doesNotMatch(
     playgroundAssetScript,
-    /M\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for\(const S of a\.inputImageIds\)xr\.delete\(S\)\}/,
+    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for\(const k of a\.inputImageIds\)OI\(k\)\}/,
   );
   await new Promise((resolve, reject) => {
-    execFile('node', ['--check', path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-CXjHvR1L.js')], (error, stdout, stderr) => {
+    execFile('node', ['--check', path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-BP90Uyg2.js')], (error, stdout, stderr) => {
       if (error) {
         reject(new Error(stderr || stdout || error.message));
         return;
