@@ -760,7 +760,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.box\.runActive/);
     assert.match(uiStyles, /\.composerModelToggle\.running:not\(:disabled\)\s*\{[^}]*cursor:\s*pointer/s);
     assert.match(uiStyles, /\.composerModelToggle\.running \.composerModelState\s*\{[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/s);
-    assert.match(uiStyles, /\.composerModelPanel\s*\{[^}]*width:\s*min\(244px,[^}]*border-radius:\s*18px/s);
+    assert.match(uiStyles, /\.composerModelPanel\s*\{[^}]*width:\s*min\(260px,[^}]*border-radius:\s*18px/s);
     assert.match(uiStyles, /\.composerModelMenuRow\s*\{[^}]*min-height:\s*44px;[^}]*grid-template-columns:/s);
     assert.match(uiStyles, /\.composerModelMenuRow\.active\s*\{[^}]*background:\s*var\(--surface-hover\)/s);
     assert.match(uiStyles, /\.composerModelSubmenu\s*\{[^}]*position:\s*static;[^}]*width:\s*auto;[^}]*max-height:[^}]*border:\s*0;[^}]*box-shadow:\s*none/s);
@@ -768,7 +768,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer > \.box\s*\{[^}]*width:\s*min\(380px, calc\(100% - 20px\)\)/s);
     assert.match(uiStyles, /\.composerModelOption\[aria-selected="true"\]/);
     assert.match(uiStyles, /\.composerReasoningRange\s*\{[^}]*appearance:\s*none;[^}]*cursor:\s*pointer/s);
-    assert.match(uiStyles, /\.composerReasoningRange::-webkit-slider-thumb\s*\{[^}]*width:\s*15px;[^}]*border:\s*2px solid var\(--text\)/s);
+    assert.match(uiStyles, /\.composerReasoningRange::-webkit-slider-thumb\s*\{[^}]*width:\s*24px;[^}]*height:\s*24px;[^}]*border:\s*0;[^}]*background:\s*#ffffff/s);
     assert.match(uiStyles, /\.composerReasoningRange:focus-visible\s*\{[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /\.composerReasoningMarks\s*\{[^}]*grid-template-columns:\s*repeat\(var\(--reasoning-step-count\), 1fr\)/s);
     assert.match(uiStyles, /body \.box\.runActive > \.send:not\(\.cancelButton\):disabled\s*\{[^}]*display:\s*none/s);
@@ -820,8 +820,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body\[data-theme="dark"\] \.liveProcessElapsed\s*\{[^}]*border-bottom-color:\s*#303030;[^}]*color:\s*#acacac/s);
     assert.match(uiStyles, /\.liveProcessTimeline\s*\{[^}]*width:\s*100%;[^}]*gap:\s*14px/s);
     assert.doesNotMatch(uiStyles, /\.turnPlanPanel|\.turnPlanList|\.turnPlanStep/);
-    assert.match(uiStyles, /\.liveProcessTimeline > \.progressCommentary\.streaming \.markdownBody > :last-child,[^}]*\.activityCluster\.streaming > summary \.activityClusterText[^}]*var\(--primary\)[^}]*background-size:\s*260% 100%;[^}]*animation:\s*liveProcessFlow 2\.2s linear infinite/s);
-    assert.match(uiStyles, /\.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 2\.1s linear infinite/s);
+    assert.match(uiStyles, /body \.liveProcessTimeline > \.progressCommentary\.streaming[^,]*,\s*body \.liveProcessTimeline > \.activityCluster\.streaming > summary \.activityClusterText\s*\{[^}]*var\(--primary\)[^}]*background-size:\s*220% 100%;[^}]*animation:\s*liveProcessFlow 4\.8s linear infinite/s);
+    assert.match(uiStyles, /body\[data-theme\] \.liveProcessTimeline > \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*animation:\s*liveProcessFlow 4\.8s linear infinite/s);
     assert.match(uiStyles, /@keyframes liveProcessFlow/);
     assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser/);
     assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(112px, 1fr\) repeat\(4, 36px\);[^}]*gap:\s*6px/s);
@@ -882,13 +882,13 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body\[data-theme="light"\] \.box,\s*body\[data-theme="light"\] \.box:focus-within\s*\{[^}]*background:\s*#ffffff/s);
     assert.match(uiStyles, /body \.composer > \.box,\s*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*var\(--surface\);[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.main\s*\{[^}]*position:\s*relative;[^}]*height:\s*100dvh/s);
-    assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*156px;[^}]*scroll-padding-bottom:\s*156px/s);
+    assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\)/s);
     assert.match(uiStyles, /\.liveProcessPanel\s*\{[^}]*margin:\s*0 0 18px/s);
     assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.composer\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*auto 0 0;[^}]*background:\s*transparent;[^}]*pointer-events:\s*none/s);
     assert.match(uiStyles, /body \.composer > \*\s*\{[^}]*pointer-events:\s*auto/s);
     assert.match(uiStyles, /--composer-width:\s*var\(--conversation-width\)/);
     assert.match(uiStyles, /body \.msg\.user\s*\{[^}]*max-width:\s*min\(var\(--conversation-width\), 77%\);[^}]*border-radius:\s*16px;[^}]*background:\s*color-mix\(in oklab, var\(--text\) 5%, transparent\);[^}]*color:\s*var\(--text\);[^}]*padding:\s*8px 12px/s);
-    assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser\s*\{[^}]*max-width:\s*77%;[^}]*padding:\s*8px 12px/s);
+    assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser\s*\{[^}]*max-width:\s*77%;[^}]*padding:\s*10px 12px 8px/s);
     assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 60px\)\)/s);
     assert.match(uiStyles, /body \.box\s*\{[^}]*grid-template-rows:\s*minmax\(50px, auto\) 34px;[^}]*border-radius:\s*20px/s);
     assert.match(uiStyles, /\.composerPermissionToggle\s*\{[^}]*display:\s*inline-flex/);
@@ -957,6 +957,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedArchivedTasks.status, 401);
     const unauthorizedAutomations = await fetch(`${baseUrl}/api/automations`);
     assert.equal(unauthorizedAutomations.status, 401);
+    const unauthorizedSkills = await fetch(`${baseUrl}/api/skills`);
+    assert.equal(unauthorizedSkills.status, 401);
     const unauthorizedSubQuotas = await fetch(`${baseUrl}/api/sub-quotas`);
     assert.equal(unauthorizedSubQuotas.status, 401);
     const unauthorizedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`);
@@ -971,6 +973,16 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    const skills = await fetch(`${baseUrl}/api/skills`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(skills.status, 200);
+    const skillsPayload = await skills.json();
+    assert.ok(Array.isArray(skillsPayload.skills));
+    assert.equal(typeof skillsPayload.count, 'number');
+    assert.doesNotMatch(JSON.stringify(skillsPayload), /\/Users\//);
+    assert.doesNotMatch(JSON.stringify(skillsPayload), /CODEX_HOME/);
 
     const subQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
       headers: { Cookie: cookie },
@@ -991,14 +1003,19 @@ if (args[0] === 'app-server') {
     assert.equal(rejectedSubQuotaUrl.status, 400);
     assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /SUB2API_BASE_URL/);
 
-        const rejectedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
+    const uncheckedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ baseUrl: customProviderBaseUrl, apiKey: 'bad-sub-key' }),
     });
-    assert.equal(rejectedSubQuotaKey.status, 502);
-    assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), /bad-sub-key/);
-    assert.doesNotMatch(await readFile(webEnv, 'utf8').catch(() => ''), new RegExp(customProviderBaseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.equal(uncheckedSubQuotaKey.status, 200);
+    const uncheckedSubQuotaPayload = await uncheckedSubQuotaKey.json();
+    assert.equal(uncheckedSubQuotaPayload.saved, true);
+    assert.match(String(uncheckedSubQuotaPayload.detectDetail || ''), /上游检测结果不会阻止保存/);
+    assert.doesNotMatch(JSON.stringify(uncheckedSubQuotaPayload), /bad-sub-key/);
+    const uncheckedPersistedConfig = await readFile(webEnv, 'utf8');
+    assert.match(uncheckedPersistedConfig, /^SUB2API_API_KEY="bad-sub-key"$/m);
+    assert.match(uncheckedPersistedConfig, new RegExp(customProviderBaseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 
     const updatedSubQuotaKey = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
@@ -1010,18 +1027,13 @@ if (args[0] === 'app-server') {
     assert.equal(updatedSubQuotaPayload.baseUrl, customProviderBaseUrl);
     assert.equal(updatedSubQuotaPayload.provider, 'cpa-codex');
     assert.equal(updatedSubQuotaPayload.providerLabel, 'CPA Codex');
-    assert.match(String(updatedSubQuotaPayload.detectDetail || ''), /CPA|CLIProxyAPI/);
+    assert.match(String(updatedSubQuotaPayload.detectDetail || ''), /上游检测结果不会阻止保存/);
     assert.doesNotMatch(JSON.stringify(updatedSubQuotaPayload), /new-sub-key/);
     let persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
     assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(customProviderBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
     assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
     assert.match(persistedSubQuotaConfig, /^SUB_QUOTA_PROVIDER="?cpa-codex"?$/m);
     assert.equal((await stat(webEnv)).mode & 0o777, 0o600);
-    const managementRequests = providerRequests.filter((item) => String(item.url || '').startsWith('/v0/management/'));
-    assert.ok(managementRequests.some((item) => item.url === '/v0/management/auth-files'));
-    assert.ok(managementRequests.some((item) => item.url === '/v0/management/api-call'));
-    assert.equal(managementRequests.at(-1).managementKey, 'new-sub-key');
-    assert.equal(providerRequests.at(-1).host, new URL(customProviderBaseUrl).host);
 
     const updatedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
@@ -1033,8 +1045,6 @@ if (args[0] === 'app-server') {
     persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
     assert.match(persistedSubQuotaConfig, new RegExp(`^SUB2API_BASE_URL=${JSON.stringify(providerBaseUrl).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
     assert.match(persistedSubQuotaConfig, /^SUB2API_API_KEY="new-sub-key"$/m);
-
-    assert.equal(providerRequests.at(-1).host, new URL(providerBaseUrl).host);
 
     const refreshedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
       headers: { Cookie: cookie },
@@ -1061,6 +1071,11 @@ if (args[0] === 'app-server') {
     assert.equal(subQuotaPayload.quotas[0].rateLimits[1].window, '7d');
     assert.equal(subQuotaPayload.quotas[0].rateLimits[1].remaining, 82);
     assert.equal(subQuotaPayload.quotas[0].rateLimits[1].resetAt, '2026-08-03T07:19:33.000Z');
+    const managementRequests = providerRequests.filter((item) => String(item.url || '').startsWith('/v0/management/'));
+    assert.ok(managementRequests.some((item) => item.url === '/v0/management/auth-files'));
+    assert.ok(managementRequests.some((item) => item.url === '/v0/management/api-call'));
+    assert.equal(managementRequests.at(-1).managementKey, 'new-sub-key');
+    assert.equal(managementRequests.at(-1).host, new URL(providerBaseUrl).host);
     assert.doesNotMatch(JSON.stringify(subQuotaPayload), /test-sub-key/);
     const refreshedSubQuotas = await fetch(`${baseUrl}/api/sub-quotas?refresh=1`, {
       headers: { Cookie: cookie },
@@ -1446,7 +1461,7 @@ updated_at = 1784422800000
     assert.doesNotMatch(page, /function createTurnPlanElement|turnPlanPanel/);
     assert.match(page, /function upsertLiveTurnPlan/);
     assert.match(page, /presentation\.variant==='plan'/);
-    assert.match(page, /descriptor\.name==='exec'[^\n]+target:'工具'/);
+    assert.match(page, /if\(descriptor\.name==='exec'\)\{const command=toolDetailCommand\(descriptor\.detail\);if\(command\)return\[commandActivityPresentation\(command\)\];return\[\{verb:'Ran',target:shortActivityText\(descriptor\.detail,72\)\|\|'command'/);
     assert.doesNotMatch(page, /descriptor\.name\+\(descriptor\.detail/);
     assert.match(page, /activityBatch/);
     assert.match(page, /liveProcessPanel/);
@@ -1459,7 +1474,7 @@ updated_at = 1784422800000
     assert.match(page, /beginTurnProcessCollection\(activeStartedAt,true,activeNativeTurnId\)/);
     assert.match(page, /hydrating:true/);
     assert.match(page, /function turnProcessElapsedMatches\(turnId\)/);
-    assert.match(page, /if\(terminalProcess&&!turnProcessElapsedMatches\(options\.turnId\)\)return null/);
+    assert.match(page, /if\(terminalProcess&&!options\.hydrating&&turnProcessElapsedTurnId&&!turnProcessElapsedMatches\(options\.turnId\)\)return null/);
     assert.match(page, /if\(isCompletedNativeRuntimeTurn\(runtime\.turnId\)&&\['delta','item-completed','connection-error','turn'\]\.includes\(runtime\.type\)\)return/);
     assert.match(page, /\['delta','item-completed','connection-error','turn'\]\.includes\(runtime\.type\)\)return/);
     assert.match(page, /freezeTurnProcessElapsed\(options\.at,options\.turnId\)/);
@@ -1523,7 +1538,7 @@ updated_at = 1784422800000
     assert.match(page, /function renameHistoryProject/);
     assert.match(page, /'pencil','重命名项目'/);
     assert.match(page, /historyProjectName\(item\.cwd\)/);
-    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)\{historyRefreshPending=true;return\}/);
+    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\)\{historyRefreshPending=true;return\}/);
     assert.match(page, /\/api\/native-projects\/archive/);
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);
@@ -1555,15 +1570,17 @@ updated_at = 1784422800000
     assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
     assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
     assert.match(page, /title\.textContent='额度监控'/);
-    assert.match(page, /subQuotaUrlLabel\.textContent='上游 URL'/);
-    assert.match(page, /subQuotaBaseUrlInput\.type='url'/);
-    assert.match(page, /subQuotaBaseUrlInput\.required=true/);
-    assert.match(page, /subQuotaBaseUrlInput\.autocomplete='url'/);
-    assert.match(page, /subQuotaBaseUrlInput\.value=data\.baseUrl\|\|''/);
-    assert.match(page, /data\.keyConfigured\?'Key 已配置，留空保留':'CPA Management Key 或 Sub2API API Key'/);
-    assert.match(page, /已识别 '\+providerLabel/);
-    assert.match(page, /正在自动识别上游并检测额度/);
-    assert.match(page, /JSON\.stringify\(\{baseUrl:subQuotaBaseUrlInput\.value,apiKey:subQuotaApiKeyInput\.value\}\)/);
+    assert.match(page, /urlLabel\.textContent='上游 URL'/);
+    assert.match(page, /baseUrlInput\.type='url'/);
+    assert.doesNotMatch(page, /baseUrlInput\.required=true/);
+    assert.match(page, /baseUrlInput\.autocomplete='url'/);
+    assert.match(page, /subQuotaSettingsForm\.appendChild\(createSourceFields\('cpa-codex','CPA Codex'/);
+    assert.match(page, /subQuotaSettingsForm\.appendChild\(createSourceFields\('sub2api','Sub2API'/);
+    assert.match(page, /inputs\.baseUrlInput\.value=source\.baseUrl\|\|''/);
+    assert.match(page, /source\.keyConfigured\?'Key 已配置，留空保留'/);
+    assert.match(page, /正在保存 CPA 与 Sub2API 配置/);
+    assert.match(page, /JSON\.stringify\(\{sources\}\)/);
+    assert.match(page, /检测错误不影响保存/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);
     assert.match(page, /subQuotaSettingsClose\.addEventListener\('click',closeSubQuotaSettings\)/);
@@ -1642,7 +1659,7 @@ updated_at = 1784422800000
     assert.match(page, /option\.tabIndex=selected\?0:-1/);
     assert.match(page, /function composerPermissionPayload/);
     assert.match(page, /if\(mode==='custom'\)return\{permissionMode:'custom'\}/);
-    assert.match(page, /input\.placeholder=[^;]*'随心输入'/);
+    assert.match(page, /input\.placeholder=[^;]*'向 Codex 提问'/);
     assert.match(page, /function renderArchivedTasks/);
     assert.match(page, /永久删除全部已归档任务/);
     assert.match(page, /function createTurnResultArtifacts/);
@@ -1654,10 +1671,11 @@ updated_at = 1784422800000
     assert.match(page, /if\(item\._subagentTrace\?\.autoTrack\)loadSubagentTrace/);
     assert.doesNotMatch(page, /currentActivityCluster\.dataset\.activityGroup!==group/);
     assert.match(page, /turnProcessTimeline\.insertBefore\(element,matched\.nextSibling\)/);
-    assert.match(page, /function appendConversationElement\(element,role\)/);
-    assert.match(page, /appendConversationElement\(el,role\)/);
+    assert.match(page, /function appendConversationElement\(element,role,options=\{\}\)/);
+    assert.match(page, /appendConversationElement\(el,role,\{steering:steeringUser\}\)/);
     assert.doesNotMatch(page, /matched\.open=true/);
-    assert.match(page, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
+    assert.doesNotMatch(page, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
+    assert.match(page, /pinSteeringMessageToBottom\(el\)/);
     assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);
@@ -1708,7 +1726,7 @@ updated_at = 1784422800000
     assert.match(page, /async function boot\(selectRecent=false\)/);
     const inlineScript = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert.ok(inlineScript);
-    const completedRuntimeHelper = inlineScript.match(/(function isCompletedNativeRuntimeTurn[\s\S]*?)(?=function connectSessionEvents)/)?.[1];
+    const completedRuntimeHelper = inlineScript.match(/(function isCompletedNativeRuntimeTurn[\s\S]*?)(?=function refreshPromptQueueOnResume)/)?.[1];
     assert.ok(completedRuntimeHelper);
     const isCompletedNativeRuntimeTurn = new Function(
       completedRuntimeHelper + '; return isCompletedNativeRuntimeTurn;',
@@ -1717,6 +1735,7 @@ updated_at = 1784422800000
     assert.equal(isCompletedNativeRuntimeTurn('turn-old', '', 'turn-old'), true);
     assert.equal(isCompletedNativeRuntimeTurn('turn-new', 'turn-old', 'turn-old'), false);
     assert.equal(isCompletedNativeRuntimeTurn('', 'turn-old', 'turn-old'), false);
+    assert.doesNotMatch(inlineScript, /function\s+([A-Za-z_$][\w$]*)function\s+\1\b/);
     assert.doesNotThrow(() => new Function(inlineScript));
     const subQuotaProgressHelper = inlineScript.match(/(function subQuotaProgressPercent[\s\S]*?)(?=function appendSubQuotaWindow)/)?.[1];
     assert.ok(subQuotaProgressHelper);
@@ -2089,7 +2108,7 @@ updated_at = 1784422800000
       clusterBatch('commands', [commandItem(), commandItem()]),
     ])), {
       icon: 'wrench',
-      text: '已加载工具运行了多个命令',
+      text: '已加载工具并运行了多个命令',
     });
     assert.deepEqual(activityApi.activityClusterPresentation(activityCluster([
       clusterBatch('files_read', [clusterItem({
@@ -2129,17 +2148,22 @@ updated_at = 1784422800000
       expandable: false,
     }]);
     assert.deepEqual(parseToolActivity("exec_command\nsed -n '1,40p' server.mjs\nworkdir=/workspace"), [{
-      verb: '已读取',
-      target: 'server.mjs',
-      icon: 'book-open',
-      targetType: 'file',
+      verb: 'Ran',
+      target: "sed -n '1,40p' server.mjs",
+      icon: 'square-terminal',
+      targetType: '',
+      expandable: true,
+      shell: true,
+      command: "sed -n '1,40p' server.mjs",
     }]);
     assert.deepEqual(parseToolActivity('exec\nconst result = await tools.exec_command({cmd:"sed -n \'1,40p\' server.mjs", workdir:"/workspace"});'), [{
-      verb: '已读取',
-      target: 'server.mjs',
-      icon: 'book-open',
-      targetType: 'file',
-      expandable: false,
+      verb: 'Ran',
+      target: "sed -n '1,40p' server.mjs",
+      icon: 'square-terminal',
+      targetType: '',
+      expandable: true,
+      shell: true,
+      command: "sed -n '1,40p' server.mjs",
     }]);
     assert.deepEqual(parseToolActivity('exec_command\nrg -n "menuBtn|toggleMenu" server.mjs ui.css'), [{
       verb: '已在',
@@ -2147,6 +2171,7 @@ updated_at = 1784422800000
       suffix: '中搜索“menuBtn|toggleMenu”',
       icon: 'search',
       targetType: 'file',
+      expandable: false,
     }]);
     assert.deepEqual(parseToolActivity('spawn_agent\n{\n  "task_name": "ui_trace",\n  "fork_turns": "all"\n}'), [{
       variant: 'agent',
@@ -2201,7 +2226,7 @@ updated_at = 1784422800000
     }]);
     assert.deepEqual(parseToolActivity([
       'exec_command',
-      'nl -ba /tmp/example-codex-home/memories/rollout_summaries/example-rollout.md',
+      'nl -ba /tmp/example-codex-home/.codex/memories/rollout_summaries/2026-07-11T04-52-18-ZaKl-codex_web.md',
     ].join('\n')), [{
       verb: '已读取',
       target: '2026-07-11T04-52-18-ZaKl-codex_web',
@@ -2228,8 +2253,8 @@ updated_at = 1784422800000
     ].join('\n');
     assert.deepEqual(parseToolActivity(orchestratedCall), [
       { verb: '已查看', target: '1 张图像', icon: 'images' },
-      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
       { verb: '已在', target: 'ui.css', suffix: '中搜索“composer”', icon: 'search', targetType: 'file', expandable: false },
+      { verb: 'Ran', target: "sed -n '1,40p' server.mjs", icon: 'square-terminal', targetType: '', expandable: true, shell: true, command: "sed -n '1,40p' server.mjs" },
     ]);
     const archiveProtocolCall = [
       'exec',
@@ -2245,9 +2270,6 @@ updated_at = 1784422800000
     ].join('\n');
     const archiveProtocolActivity = parseToolActivity(archiveProtocolCall);
     assert.deepEqual(archiveProtocolActivity.slice(0, 4), [
-      { verb: '已读取', target: 'desktop-ipc-client.mjs', icon: 'book-open', targetType: 'file', expandable: false },
-      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
-      { verb: '已读取', target: 'server.mjs', icon: 'book-open', targetType: 'file', expandable: false },
       {
         verb: '已在',
         target: 'server.mjs',
@@ -2256,11 +2278,14 @@ updated_at = 1784422800000
         targetType: 'file',
         expandable: false,
       },
+      { verb: 'Ran', target: "sed -n '430,670p' desktop-ipc-client.mjs", icon: 'square-terminal', targetType: '', expandable: true, shell: true, command: "sed -n '430,670p' desktop-ipc-client.mjs" },
+      { verb: 'Ran', target: "sed -n '4300,4660p' server.mjs", icon: 'square-terminal', targetType: '', expandable: true, shell: true, command: "sed -n '4300,4660p' server.mjs" },
+      { verb: 'Ran', target: "sed -n '2500,2825p' server.mjs", icon: 'square-terminal', targetType: '', expandable: true, shell: true, command: "sed -n '2500,2825p' server.mjs" },
     ]);
-    assert.equal(archiveProtocolActivity[4].verb, '已运行');
+    assert.equal(archiveProtocolActivity[4].verb, 'Ran');
     assert.equal(archiveProtocolActivity[4].icon, 'square-terminal');
-    assert.equal(archiveProtocolActivity[4].expandable, false);
-    assert.match(archiveProtocolActivity[4].target, /^rg · -n -i/);
+    assert.equal(archiveProtocolActivity[4].expandable, true);
+    assert.match(archiveProtocolActivity[4].target, /^rg -n -i/);
     const patchCall = 'exec\nconst patch = "*** Begin Patch\\n*** Update File: /workspace/server.mjs\\n-old\\n---literal-minus\\n+new\\n+++literal-plus\\n*** Update File: /workspace/ui.css\\n+added\\n*** End Patch";\ntext(await tools.apply_patch(patch));';
     assert.deepEqual(parseToolActivity(patchCall), [
       {
@@ -2674,13 +2699,14 @@ updated_at = 1784422800000
     };
     const livePromptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
     const liveAttachmentTray = { kind: 'attachment-tray', parentNode: null, isConnected: true };
-    const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true };
+    const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [livePromptQueuePanel] };
     let liveComposerInsertCalls = 0;
     const liveComposer = {
-      children: [livePromptQueuePanel, liveAttachmentTray, liveDropZone],
+      // Match the real composer DOM: input capsule first, attachment tray after it.
+      children: [liveDropZone, liveAttachmentTray],
       insertBefore(node, reference) {
         liveComposerInsertCalls += 1;
-        assert.strictEqual(reference, livePromptQueuePanel);
+        assert.strictEqual(reference, liveDropZone);
         detachLiveNode(node);
         const index = this.children.indexOf(reference);
         assert.notEqual(index, -1);
@@ -2700,7 +2726,7 @@ updated_at = 1784422800000
         return previous;
       },
     };
-    livePromptQueuePanel.parentNode = liveComposer;
+    livePromptQueuePanel.parentNode = liveDropZone;
     liveAttachmentTray.parentNode = liveComposer;
     liveDropZone.parentNode = liveComposer;
     const toolArtifact = { kind: 'tool-artifact' };
@@ -2739,6 +2765,7 @@ updated_at = 1784422800000
       'composer',
       'dropZone',
       'promptQueuePanel',
+      'attachmentTray',
       `
         let liveEditedFilesResult = null;
         let liveTurnPlan = initialPlan;
@@ -2761,21 +2788,23 @@ updated_at = 1784422800000
       liveComposer,
       liveDropZone,
       livePromptQueuePanel,
+      liveAttachmentTray,
     );
     const firstLivePill = liveResultApi.refresh();
     const secondLivePill = liveResultApi.refresh();
     assert.notStrictEqual(firstLivePill, secondLivePill);
     assert.deepEqual(liveTimeline.children, []);
-    assert.deepEqual(liveComposer.children, [secondLivePill, livePromptQueuePanel, liveAttachmentTray, liveDropZone]);
+    assert.deepEqual(liveComposer.children, [secondLivePill, liveDropZone, liveAttachmentTray]);
     assert.strictEqual(secondLivePill.parentNode, liveComposer);
-    assert.strictEqual(secondLivePill.nextSibling, livePromptQueuePanel);
-    assert.strictEqual(liveComposer.children.at(-1), liveDropZone);
+    assert.strictEqual(secondLivePill.nextSibling, liveDropZone);
+    assert.ok(liveComposer.children.indexOf(secondLivePill) < liveComposer.children.indexOf(liveDropZone));
+    assert.strictEqual(livePromptQueuePanel.parentNode, liveDropZone);
     assert.equal(liveComposerInsertCalls, 1);
     assert.deepEqual(liveResultApi.state().turnProcessElements, [toolArtifact]);
     assert.equal(liveResultApi.state().turnProcessElements.includes(secondLivePill), false);
     assert.equal(createdLiveCards.length, 2);
     assert.deepEqual(createdLiveCards.at(-1).options, { live: true, plan: referencePlan });
-    assert.match(inlineScript, /const anchor=promptQueuePanel\?\.parentNode===composer\?promptQueuePanel:dropZone/);
+    assert.match(inlineScript, /composer\.insertBefore\(liveEditedFilesResult,dropZone\)/);
     assert.match(inlineScript, /if\(files\.length\)container\.appendChild\(createEditedFilesResultCard\(files,turnId\)\)/);
 
     const searchActivity = createToolActivityItem({
@@ -2818,7 +2847,7 @@ updated_at = 1784422800000
         codexCli: true,
         apiProxy: true,
         streamImages: true,
-        streamPartialImages: 2,
+        streamPartialImages: 3,
       },
       profiles: [
         {
@@ -2833,7 +2862,7 @@ updated_at = 1784422800000
           codexCli: true,
           apiProxy: true,
           streamImages: true,
-          streamPartialImages: 2,
+          streamPartialImages: 3,
         },
         {
           id: 'codex-web-agent',
@@ -2847,7 +2876,7 @@ updated_at = 1784422800000
           codexCli: false,
           apiProxy: true,
           streamImages: true,
-          streamPartialImages: 2,
+          streamPartialImages: 3,
         },
       ],
       allowedOrigins: [providerBaseUrl, customProviderBaseUrl],
@@ -4110,8 +4139,11 @@ function startServer({
     FAKE_APP_SERVER_TRACE: appServerTraceFile,
     FAKE_APP_SERVER_CONTROL: appServerControlFile,
   };
+  env.CPA_QUOTA_BASE_URL = '';
+  env.CPA_QUOTA_API_KEY = '';
   delete env.SUB2API_BASE_URL;
   delete env.SUB2API_API_KEY;
+  env.SUB_QUOTA_PROVIDER = 'cpa-codex';
   if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;
   if (sub2ApiKey !== undefined) env.SUB2API_API_KEY = sub2ApiKey;
   return spawn(process.execPath, [path.join(ROOT, 'server.mjs')], {

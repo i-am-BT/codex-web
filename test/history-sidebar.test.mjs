@@ -190,7 +190,7 @@ test('archived standalone tasks keep a separate task group and filter', () => {
 test('history refreshes deferred while a project menu or preview is open', () => {
   assert.match(inlineScript, /let historyRefreshPending=false/);
   assert.match(inlineScript, /function flushPendingHistoryRefresh/);
-  assert.match(inlineScript, /if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\)\{historyRefreshPending=true;return\}/);
+  assert.match(inlineScript, /if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\)\{historyRefreshPending=true;return\}/);
   assert.match(inlineScript, /flushPendingHistoryRefresh\(\)/);
 });
 

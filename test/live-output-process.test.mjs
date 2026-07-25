@@ -45,11 +45,27 @@ test('a user question stays before an already-mounted live response panel', () =
   )(chat, livePanel);
   const question = { kind: 'user-question' };
   const answer = { kind: 'assistant-answer' };
+  const steer = { kind: 'user-steer', classList: { contains: (name) => name === 'steeringUser' } };
 
   appendConversationElement(question, 'user');
   appendConversationElement(answer, 'assistant');
+  appendConversationElement(steer, 'user', { steering: true });
 
-  assert.deepEqual(chat.children, [question, livePanel, answer]);
+  assert.deepEqual(chat.children, [question, livePanel, answer, steer]);
+});
+
+test('steering and input image helpers avoid above-live and duplicate uploads', () => {
+  assert.match(inlineScript, /function normalizeInputImageSrc\(source\)/);
+  assert.match(inlineScript, /function inputImageIdentity\(source\)/);
+  assert.match(inlineScript, /function isOptimisticUploadImageSrc\(source\)/);
+  assert.match(inlineScript, /function isServerSessionImageSrc\(source\)/);
+  assert.match(inlineScript, /function pinSteeringMessageToBottom\(element\)/);
+  assert.match(inlineScript, /function pinOpenSteeringMessages\(\)/);
+  assert.match(inlineScript, /if\(role==='user'&&!steering&&turnProcessHeader/);
+  assert.match(inlineScript, /appendConversationElement\(el,role,\{steering:steeringUser\}\)/);
+  assert.match(inlineScript, /pinSteeringMessageToBottom\(el\)/);
+  assert.match(inlineScript, /Rebind either direction instead of creating a second copy/);
+  assert.doesNotMatch(inlineScript, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
 });
 
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
@@ -348,13 +364,14 @@ test('the live progress pill stays out of completion artifacts', () => {
   };
   const promptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
   const hiddenAttachmentTray = { kind: 'hidden-attachment-tray', parentNode: null, isConnected: true };
-  const dropZone = { kind: 'drop-zone', parentNode: null, isConnected: true };
+  const dropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [promptQueuePanel] };
   let composerInsertCalls = 0;
   const composer = {
-    children: [promptQueuePanel, hiddenAttachmentTray, dropZone],
+    // Match the real composer DOM: input capsule first, attachment tray after it.
+    children: [dropZone, hiddenAttachmentTray],
     insertBefore(node, reference) {
       composerInsertCalls += 1;
-      assert.strictEqual(reference, promptQueuePanel);
+      assert.strictEqual(reference, dropZone);
       detachNode(node);
       const index = this.children.indexOf(reference);
       assert.notEqual(index, -1);
@@ -374,7 +391,7 @@ test('the live progress pill stays out of completion artifacts', () => {
       return previous;
     },
   };
-  promptQueuePanel.parentNode = composer;
+  promptQueuePanel.parentNode = dropZone;
   hiddenAttachmentTray.parentNode = composer;
   dropZone.parentNode = composer;
   const toolArtifact = { kind: 'tool-artifact' };
@@ -405,6 +422,7 @@ test('the live progress pill stays out of completion artifacts', () => {
     'composer',
     'dropZone',
     'promptQueuePanel',
+    'attachmentTray',
     `
       let liveEditedFilesResult = null;
       let liveTurnPlan = initialPlan;
@@ -427,16 +445,18 @@ test('the live progress pill stays out of completion artifacts', () => {
     composer,
     dropZone,
     promptQueuePanel,
+    hiddenAttachmentTray,
   );
 
   const first = api.refresh();
   const second = api.refresh();
   assert.notStrictEqual(first, second);
   assert.deepEqual(timeline.children, []);
-  assert.deepEqual(composer.children, [second, promptQueuePanel, hiddenAttachmentTray, dropZone]);
+  assert.deepEqual(composer.children, [second, dropZone, hiddenAttachmentTray]);
   assert.strictEqual(second.parentNode, composer);
-  assert.strictEqual(second.nextSibling, promptQueuePanel);
-  assert.strictEqual(composer.children.at(-1), dropZone);
+  assert.strictEqual(second.nextSibling, dropZone);
+  assert.ok(composer.children.indexOf(second) < composer.children.indexOf(dropZone));
+  assert.ok(promptQueuePanel.parentNode === dropZone || promptQueuePanel.parentNode === composer);
   assert.equal(composerInsertCalls, 1);
   assert.deepEqual(api.state().turnProcessElements, [toolArtifact]);
   assert.equal(api.state().turnProcessElements.includes(second), false);
@@ -463,7 +483,7 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.match(uiStyles, /\.activityCluster \.activityBatch\.streaming \.activityItem:last-child \.activityItemIcon\s*\{[^}]*animation:\s*none/s);
   assert.match(
     uiStyles,
-    /\.activityCluster\.streaming > summary \.activityClusterText\s*\{[^}]*var\(--primary\)[^}]*background-size:\s*260% 100%;[^}]*animation:\s*liveProcessFlow 2\.2s linear infinite/s,
+    /body \.liveProcessTimeline > \.progressCommentary\.streaming[^,]*,\s*body \.liveProcessTimeline > \.activityCluster\.streaming > summary \.activityClusterText\s*\{[^}]*var\(--primary\)[^}]*background-size:\s*220% 100%;[^}]*animation:\s*liveProcessFlow 4\.8s linear infinite/s,
   );
   assert.match(uiStyles, /@media \(hover: none\)[\s\S]*?\.activityCluster \.activityItem:not\(\[data-current="true"\]\):not\(\[open\]\)[^}]*opacity:\s*0\.5/s);
   assert.match(uiStyles, /\.editedFilesResult\.withPlan > \.turnResultHead\s*\{[^}]*min-height:\s*36px/s);
@@ -490,41 +510,32 @@ test('the prompt queue shares one visual surface with the composer and stays ope
   };
 
   const queueRule = ruleBody('.promptQueue');
-  const queueWidth = queueRule.match(
-    /width:\s*min\(calc\(var\(--composer-width\)\s*-\s*(\d+(?:\.\d+)?)px\),\s*calc\(100%\s*-\s*(\d+(?:\.\d+)?)px\)\)/,
-  );
-  assert.ok(queueWidth, 'the queue width must stay inset from both the desktop and fluid composer widths');
-  assert.ok(Number(queueWidth[2]) >= Number(queueWidth[1]), 'the fluid queue inset must not be narrower than the desktop inset');
-  assert.ok(Number(queueWidth[1]) > 12, 'the queue must be narrower than the former six-pixels-per-side mobile inset');
-
-  const overlap = pixelValue(queueRule, 'margin-bottom', { negative: true });
-  const overlapPadding = pixelValue(queueRule, 'padding-bottom');
-  assert.ok(overlap > 0, 'the queue must overlap the composer');
-  assert.equal(overlapPadding, overlap, 'bottom padding must protect the final queue row from the overlap');
-
-  const queueLayer = Number(queueRule.match(/z-index:\s*(-?\d+)(?:;|$)/)?.[1]);
-  const composerRule = ruleBody('body .box');
-  const composerLayer = Number(composerRule.match(/z-index:\s*(-?\d+)(?:;|$)/)?.[1]);
-  assert.ok(Number.isFinite(queueLayer), 'the queue must declare its stacking layer');
-  assert.ok(Number.isFinite(composerLayer), 'the composer box must declare its stacking layer');
-  assert.ok(composerLayer > queueLayer, 'the rounded composer must paint over the queue boundary');
-  assert.match(queueRule, /border-bottom-color:\s*transparent(?:;|$)/);
-  assert.match(queueRule, /background:\s*transparent(?:;|$)/);
-  assert.match(uiStyles, /body\[data-theme="dark"\] \.promptQueue\s*\{[^}]*background:\s*transparent/s);
+  assert.match(queueRule, /Above the input capsule/);
+  assert.doesNotMatch(queueRule, /Nested inside \.box/);
+  assert.doesNotMatch(queueRule, /grid-column:\s*1 \/ -1/);
+  assert.match(queueRule, /width:\s*min\(calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
+  assert.match(queueRule, /max-width:\s*min\(calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
+  assert.match(queueRule, /margin:\s*0 auto 8px(?:;|$)/);
+  assert.match(queueRule, /border-radius:\s*16px(?:;|$)/);
+  assert.match(queueRule, /background:\s*color-mix\(in srgb, var\(--surface\)/);
+  assert.doesNotMatch(queueRule, /grid-row:\s*1(?:;|$)/);
+  assert.doesNotMatch(queueRule, /margin-bottom:\s*-\d/);
+  assert.match(inlineScript, /composer\.insertBefore\(promptQueuePanel,queueAnchor\)/);
+  assert.match(inlineScript, /Queue sits above the input capsule/);
+  assert.match(inlineScript, /const queueAnchor=\(attachmentTray&&attachmentTray\.parentNode===composer\)\?attachmentTray:dropZone/);
   assert.match(ruleBody('.promptQueueRow:hover'), /background:\s*transparent(?:;|$)/);
   assert.match(ruleBody('.promptQueueRow.sending'), /background:\s*transparent(?:;|$)/);
   assert.match(ruleBody('.promptQueueRow.failed'), /background:\s*transparent(?:;|$)/);
-  assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*background:\s*transparent;[^}]*backdrop-filter:\s*none/s);
+  assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*border-color:/s);
 
   assert.match(ruleBody('.promptQueueHead'), /display:\s*none(?:;|$)/);
-  assert.doesNotMatch(uiStyles, /\.promptQueue\s*\{[^}]*width:\s*calc\(100%\s*-\s*12px\)/s);
 
   const queueStart = inlineScript.indexOf('function renderPromptQueue(){');
   const queueEnd = inlineScript.indexOf('function enqueuePrompt', queueStart);
   assert.ok(queueStart >= 0 && queueEnd > queueStart, 'missing prompt queue renderer source');
   const queueRenderer = inlineScript.slice(queueStart, queueEnd);
   assert.doesNotMatch(queueRenderer, /queueActionButton\('pencil'/);
-  assert.match(queueRenderer, /queueActionButton\('ellipsis','编辑'/);
+  assert.match(queueRenderer, /queueActionButton\('ellipsis','队列操作'/);
   assert.match(queueRenderer, /body\.disabled=busy/);
   assert.match(queueRenderer, /guide\.disabled=busy\|\|\(!webRunActive&&!queueFailures\.has\(item\.id\)\)/);
   assert.match(queueRenderer, /remove\.disabled=busy/);
@@ -580,7 +591,19 @@ test('persisted active commentary renders progressively and deduplicates by sequ
     body.textContent = text;
     rendered.push(text);
   };
+  let chatScrollTop = 600;
+  let chatScrollWrites = 0;
+  let chatScrollListener = null;
   const chat = {
+    scrollHeight: 1000,
+    clientHeight: 400,
+    get scrollTop() { return chatScrollTop; },
+    set scrollTop(value) { chatScrollTop = value; chatScrollWrites += 1; },
+    setScrollTop(value) { chatScrollTop = value; },
+    emitScroll() { chatScrollListener?.(); },
+    addEventListener(type, listener) {
+      if (type === 'scroll') chatScrollListener = listener;
+    },
     querySelectorAll(selector) {
       if (selector !== '.msg.assistant') return [];
       return addCalls.map((call) => call.element);
@@ -599,6 +622,9 @@ test('persisted active commentary renders progressively and deduplicates by sequ
       let nativeLiveItems = new Map();
       let nativeRuntimeStreamTurnIds = new Set();
       let nativeRenderedMessageKeys = new Set();
+      let nativeLiveScrollTimer = null;
+      let nativeLiveFollowBottom = true;
+      let nativeLiveScrollTrackingBound = false;
       let activeNativeTurnId = 'turn-active';
       ${liveSource}
       return {
@@ -644,13 +670,15 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.equal(first.text, '');
   assert.equal(first.element.classList.contains('streaming'), true);
   assert.equal(timers.size, 1);
+  assert.equal([...timers.values()][0].delay, 120, 'live text should use a slower render cadence');
 
   runNextTimer();
   assert.ok(message.content.startsWith(first.text));
   assert.notEqual(first.text, message.content);
-  assert.ok(first.text.length <= 6, 'persisted snapshot should advance in visibly small steps');
+  assert.ok(first.text.length <= 2, 'persisted snapshot should advance in visibly small steps');
   assert.equal(first.element.dataset.messageText, first.text);
   assert.equal(first.element.classList.contains('streaming'), true);
+  assert.deepEqual([...timers.values()].map((timer) => timer.delay).sort((a, b) => a - b), [120, 120]);
 
   const extended = { ...message, content: `${message.content}继续补充新的尾部。` };
   assert.strictEqual(api.upsert(extended, conversation), first);
@@ -663,15 +691,22 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.equal(api.state().nativeLiveItems.size, 0);
   assert.equal(api.state().nativeRenderedMessageKeys.size, 1);
   assert.equal(rendered.at(-1), extended.content);
+  assert.ok(chatScrollWrites > 0, 'near-bottom live output should follow with a coalesced scroll');
 
   assert.equal(api.upsert(extended, conversation), null);
   assert.equal(addCalls.length, 1);
   assert.equal(timers.size, 0);
 
+  chat.setScrollTop(0);
+  chat.emitScroll();
+  const writesBeforeAwayRender = chatScrollWrites;
   const pending = api.upsert({ ...message, seq: 8, content: `${message.content}尚未逐字完成。` }, conversation);
   assert.equal(timers.size, 1);
+  runNextTimer();
+  assert.ok([...timers.values()].every((timer) => timer.delay === 120), 'away-from-bottom output must not queue a scroll');
   api.finishAll();
   assert.equal(timers.size, 0);
+  assert.equal(chatScrollWrites, writesBeforeAwayRender, 'manual scrolling must not be overridden');
   assert.equal(pending.text, pending.targetText);
   assert.equal(pending.element.dataset.messageText, pending.targetText);
   assert.equal(pending.element.classList.contains('streaming'), false);
@@ -687,26 +722,78 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.match(inlineScript, /loadConversation[\s\S]*hydrating:true/);
   assert.match(inlineScript, /nativeRuntimeStreamTurnIds\.has\(String\(msg\.turnId\|\|''\)\)/);
   assert.doesNotMatch(inlineScript, /nativeLiveItems\.size&&\['assistant','thinking'\]/);
+  assert.match(liveSource, /kind:'live_progress',autoScroll:false/);
+  assert.doesNotMatch(liveSource, /scrollChatToLatest\(/);
+  assert.match(inlineScript, /if\(nearBottom&&\(conversation\.messages\|\|\[\]\)\.length\)scheduleNativeLiveScroll\(\)/);
+});
+
+test('streaming output has no blinking text caret', () => {
+  assert.doesNotMatch(uiStyles, /streamCaret/);
+  assert.doesNotMatch(uiStyles, /streamRail/);
+  assert.doesNotMatch(uiStyles, /\.msg\.assistant\.streaming[^{}]*::before\s*\{/s);
+  assert.doesNotMatch(uiStyles, /\.msg\.assistant\.streaming[^{}]*::after\s*\{/s);
+});
+
+test('queue send and explicit guide are mutually exclusive', () => {
+  const sendStart = inlineScript.indexOf('async function send(){');
+  assert.ok(sendStart >= 0, 'missing send source');
+  const sendSource = inlineScript.slice(sendStart);
+  const steerSource = sourceBetween('async function steerQueuedPrompt', 'async function dispatchNextQueuedPrompt');
+  const dispatchSource = sourceBetween('async function dispatchNextQueuedPrompt', 'function closeComposerPopovers');
+  assert.match(sendSource, /if\(existingId&&webRunActive\)\{\s*enqueuePrompt\(text,attachments\);\s*return;/);
+  assert.doesNotMatch(sendSource, /promptQueueMode|steerQueuedPrompt\(existingId/);
+  assert.doesNotMatch(inlineScript, /PROMPT_QUEUE_MODE_KEY|setPromptQueueMode|readPromptQueueMode/);
+  assert.match(steerSource, /queueItemId:item\.id/);
+  assert.match(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:true\}\)/);
+  assert.ok(steerSource.indexOf("fetch('/api/native-sessions/") < steerSource.indexOf('removeQueuedPromptLocal(threadId,item,{persist:true})'));
+  assert.ok(steerSource.indexOf('removeQueuedPromptLocal(threadId,item,{persist:true})') < steerSource.indexOf('await flushPromptQueueToServer(threadId)'));
+  assert.ok(steerSource.indexOf('await flushPromptQueueToServer(threadId)') < steerSource.indexOf('showNativeSteerOptimistically(item)'));
+  assert.doesNotMatch(steerSource, /const previousItems=|const stillMissing=/);
+  assert.match(dispatchSource, /queueGuidingItems\.has\(item\.id\)\|\|steerSubmitting/);
+  assert.match(inlineScript, /Array\.isArray\(data\.items\)&&!promptQueueServerSyncPending\.has\(id\)/);
+  assert.match(inlineScript, /while\(promptQueueServerSyncInflight\.has\(id\)\)await promptQueueServerSyncInflight\.get\(id\)/);
+});
+
+test('pasted attachments stay in compact fixed-size chips', () => {
+  assert.match(uiStyles, /\.attachmentTray\s*\{[^}]*display:\s*inline-flex;[^}]*width:\s*fit-content;[^}]*max-width:\s*min\(360px[^}]*border:\s*0;[^}]*background:\s*transparent/s);
+  assert.match(uiStyles, /body\[data-theme\] \.attachmentChip\s*\{[^}]*width:\s*min\(168px,[^}]*height:\s*44px;[^}]*grid-template-columns:\s*36px minmax\(0, 1fr\) 24px[^}]*border:\s*1px solid var\(--border\)/s);
+  assert.match(uiStyles, /body \.attachmentChip img,[^}]*width:\s*36px;[^}]*height:\s*36px/s);
+  assert.match(inlineScript, /name\.title=name\.textContent/);
+});
+
+test('dynamic queue clearance keeps the latest message above the composer', () => {
+  const observerSource = sourceBetween('function enhanceComposerOverlayInset', 'function enhanceComposerKeyboardLift');
+  const insetSource = sourceBetween('function updateComposerOverlayInset', 'function scrollChatToLatest');
+  const scrollSource = sourceBetween('function scrollChatToLatest', 'async function loadConversation');
+  assert.match(observerSource, /updateComposerOverlayInset\(\{scroll:true\}\)/);
+  assert.match(insetSource, /const pinned=distance<=Math\.max\(72,prev\+48\)/);
+  assert.match(insetSource, /options\.scroll&&chat&&pinned/);
+  assert.match(scrollSource, /chat\.scrollTop=chat\.scrollHeight/);
+  assert.doesNotMatch(scrollSource, /scrollIntoView/);
+  assert.match(uiStyles, /body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
+  assert.match(uiStyles, /\.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*--composer-overlay-height/s);
+});
+
+test('live process timeline keeps note then tools order while streaming', () => {
+  assert.match(inlineScript, /const alreadyPlaced=turnProcessElements\.includes\(element\)\|\|element.parentNode===turnProcessTimeline/);
+  assert.match(inlineScript, /if\(inTimeline&&!beforeTools\)return element/);
+  assert.match(inlineScript, /appendTurnProcessTimelineElement\(element,\{beforeTools:false\}\)/);
+  assert.match(inlineScript, /const kept=\[\]/);
+  assert.match(inlineScript, /contains\('activityCluster'\)\|\|item\?.classList\?.contains\('agentActivityGroup'\)/);
 });
 
 test('task_complete keeps progress commentary in the completion timeline', () => {
   assert.match(inlineScript, /Keep assistant progress commentary in the completion timeline instead of dropping it\./);
-  assert.match(
-    inlineScript,
-    /for\(const item of artifacts\)\{[\s\S]*?if\(isProgressArtifact\(item\)\)\{[\s\S]*?processElements\.push\(item\)/,
-  );
-  assert.doesNotMatch(
-    inlineScript,
-    /for\(const item of artifacts\)\{if\(isProgressArtifact\(item\)&&item\.parentNode\)item\.remove\(\)\}/,
-  );
-  assert.match(
-    inlineScript,
-    /const completion=createCompletionMessage\(text,processElements,options\.turnId,elapsedSeconds,options\.tokenUsage\)/,
-  );
-  assert.match(
-    inlineScript,
-    /if\(processElements\.some\(\(item\)=>isProgressArtifact\(item\)\)\)completion\.open=true/,
-  );
+  assert.match(inlineScript, /Interleave note -> tools -> note -> tools in chronological artifact order/);
+  assert.match(inlineScript, /const flushPendingTools=\(\)=>\{/);
+  assert.match(inlineScript, /const kept=\[\]/);
+  assert.match(inlineScript, /processElements\.push\(\.\.\.kept, \.\.\.regroupTurnToolArtifacts\(loose\)\)/);
+  assert.doesNotMatch(inlineScript, /processElements\.push\(\.\.\.progressElements, \.\.\.regroupTurnToolArtifacts\(toolBucket\)\)/);
+  assert.match(inlineScript, /function appendTurnProcessTimelineElement/);
+  assert.match(inlineScript, /appendTurnProcessTimelineElement\(element,\{beforeTools:false\}\)/);
+  assert.doesNotMatch(inlineScript, /for\(const item of artifacts\)\{if\(isProgressArtifact\(item\)&&item\.parentNode\)item\.remove\(\)\}/);
+  assert.match(inlineScript, /const completion=createCompletionMessage\(text,processElements,options\.turnId,elapsedSeconds,options\.tokenUsage\)/);
+  assert.match(inlineScript, /if\(processElements\.some\(\(item\)=>isProgressArtifact\(item\)\)\)completion.open=true/);
 });
 
 test('composerCollapsed defaults to a capsule input', () => {
@@ -717,7 +804,7 @@ test('composerCollapsed defaults to a capsule input', () => {
   assert.match(inlineScript, /setComposerExpanded\(!prefersCollapsedComposer\(\)\|\|composerShouldStayExpanded\(\)\,\{force:true\}\)/);
   assert.match(inlineScript, /composerMicBtn/);
   assert.match(inlineScript, /function composerPopoverOpen\(\)\{/);
-  assert.match(inlineScript, /webRunActive&&native\?'跟进':'向 Codex 提问'/);
+  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':'向 Codex 提问'/);
   assert.match(inlineScript, /向 Codex 提问/);
   assert.match(uiStyles, /body \.box\.composerCollapsed/);
   assert.match(uiStyles, /border-radius:\s*999px !important/);
@@ -800,4 +887,3 @@ test('model toggle stays chromeless without a pill background', () => {
   assert.match(uiStyles, /composerModelToggle:hover,[\s\S]*background: transparent/);
   assert.doesNotMatch(uiStyles, /composerModelToggle:hover,\s*\.composerModelToggle\[aria-expanded="true"\] \{\s*background: var\(--surface-active\)/);
 });
-

@@ -64,7 +64,7 @@ index 5fc1614..ddf9a01 100644
 +            apiKey: preserveExistingUpstream ? existing?.apiKey?.trim() || profile.apiKey : profile.apiKey,
 +            model: profile.id === imageProfileId ? existing?.model || profile.model : profile.model,
 +            streamImages: typeof existing?.streamImages === 'boolean' ? existing.streamImages : profile.streamImages,
-+            streamPartialImages: typeof existing?.streamPartialImages === 'number' ? Math.max(existing.streamPartialImages || 0, profile.streamPartialImages || 0) : profile.streamPartialImages,
++            streamPartialImages: typeof existing?.streamPartialImages === 'number' ? existing.streamPartialImages : profile.streamPartialImages,
 +          }
 +        })
 +        const importedIds = new Set(importedProfiles.map((profile) => profile.id))

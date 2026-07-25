@@ -1418,28 +1418,34 @@ test('native session store merges consecutive same-turn assistant segments into 
     store = new NativeSessionStore(codexHome, { watchChanges: false });
     const conversation = store.get(id);
     const assistantMessages = conversation.messages.filter((message) => message.role === 'assistant');
-    assert.equal(assistantMessages.length, 3);
-    // Progress lines merge across tools/reasoning and land after interleaved process items.
+    // note A -> tools -> note B (+ consecutive note C merge) -> final -> tools -> final
+    assert.equal(assistantMessages.length, 4);
     assert.equal(assistantMessages[0].kind, 'commentary');
-    assert.match(assistantMessages[0].content, /先定位相关代码和会话渲染路径。/);
-    assert.match(assistantMessages[0].content, /相关代码主要在 native-sessions/);
-    assert.match(assistantMessages[0].content, /工作区里已经有折叠上下文/);
+    assert.equal(assistantMessages[0].content, '先定位相关代码和会话渲染路径。');
+    // Second progress note stays after tools (not folded into the first note).
+    assert.equal(assistantMessages[1].kind, 'commentary');
+    assert.match(assistantMessages[1].content, /相关代码主要在 native-sessions/);
+    assert.match(assistantMessages[1].content, /工作区里已经有折叠上下文/);
     assert.equal(
-      assistantMessages[0].content.includes('\n\n相关代码主要在 native-sessions'),
+      assistantMessages[1].content.includes('\n\n工作区里已经有折叠上下文'),
       true,
     );
     // final_answer does not absorb earlier progress across tools.
-    assert.equal(assistantMessages[1].kind, 'final_answer');
-    assert.equal(assistantMessages[1].content, '最终汇总：应合并为一条可复制回复。');
     assert.equal(assistantMessages[2].kind, 'final_answer');
-    assert.equal(assistantMessages[2].content, '工具之后的另一条最终回复。');
-    // Timeline: merged progress appears after the interleaved tool/process block, before finals.
+    assert.equal(assistantMessages[2].content, '最终汇总：应合并为一条可复制回复。');
+    assert.equal(assistantMessages[3].kind, 'final_answer');
+    assert.equal(assistantMessages[3].content, '工具之后的另一条最终回复。');
+    // Timeline: note -> tool -> note -> finals (App-style interleaving).
     const roles = conversation.messages.map((message) => message.role + ':' + (message.kind || ''));
-    const progressIndex = conversation.messages.findIndex((message) => (
+    const firstProgressIndex = conversation.messages.findIndex((message) => (
       message.role === 'assistant' && message.content.includes('先定位相关代码和会话渲染路径。')
     ));
     const firstToolIndex = conversation.messages.findIndex((message) => message.kind === 'function_call');
-    assert.ok(progressIndex > firstToolIndex, roles.join(' > '));
+    const secondProgressIndex = conversation.messages.findIndex((message) => (
+      message.role === 'assistant' && message.content.includes('相关代码主要在 native-sessions')
+    ));
+    assert.ok(firstProgressIndex < firstToolIndex, roles.join(' > '));
+    assert.ok(firstToolIndex < secondProgressIndex, roles.join(' > '));
 
     // Append a long unphased summary: should stay separate from short progress chatter.
     await appendFile(sessionFile, jsonl([{
@@ -1449,11 +1455,11 @@ test('native session store merges consecutive same-turn assistant segments into 
         type: 'message',
         role: 'assistant',
         content: [{ type: 'output_text', text: [
-          '1. **Handoff Summary → 折叠 context**',
+          '1. **Handoff Summary -> context folding**',
           '   - native-sessions keeps context folding',
-          '2. **保留已有逻辑**',
+          '2. **keep existing logic**',
           '   - tokenUsage remains on task_complete',
-          '3. **修复**',
+          '3. **fix**',
           '   - progress and final stay separate',
         ].join('\n') }],
       },
@@ -1461,9 +1467,9 @@ test('native session store merges consecutive same-turn assistant segments into 
     store.refresh();
     const afterSummary = store.get(id);
     const assistantsAfter = afterSummary.messages.filter((message) => message.role === 'assistant');
-    assert.equal(assistantsAfter.length, 4);
-    assert.match(assistantsAfter[3].content, /Handoff Summary/);
-    assert.equal(assistantsAfter[3].content.includes('先定位相关代码和会话渲染路径。'), false);
+    assert.equal(assistantsAfter.length, 5);
+    assert.match(assistantsAfter[4].content, /Handoff Summary/);
+    assert.equal(assistantsAfter[4].content.includes('先定位相关代码和会话渲染路径。'), false);
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });

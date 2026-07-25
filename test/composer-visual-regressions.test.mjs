@@ -37,11 +37,11 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /\.promptQueue\s*\{[^}]*border-bottom-color:\s*transparent;[^}]*background:\s*transparent/s,
+    /\.promptQueue\s*\{[^}]*Above the input capsule/s,
   );
   assert.match(
     uiStyles,
-    /body\[data-theme="dark"\] \.promptQueue\s*\{[^}]*border-bottom-color:\s*transparent;[^}]*background:\s*transparent/s,
+    /body\[data-theme="dark"\] \.promptQueue\s*\{[^}]*background:/s,
   );
   assert.match(
     uiStyles,
@@ -57,7 +57,7 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*background:\s*transparent;[^}]*backdrop-filter:\s*none/s,
+    /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*border-color:/s,
   );
   assert.match(
     uiStyles,
@@ -77,11 +77,11 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*156px;[^}]*scroll-padding-bottom:\s*156px/s,
+    /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\)/s,
   );
   assert.match(
     uiStyles,
-    /body \.main:has\(> \.composer > \.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*padding-bottom:\s*202px;[^}]*scroll-padding-bottom:\s*202px/s,
+    /body \.main:has\(> \.composer > \.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*padding-bottom:\s*max\(202px, calc\(var\(--composer-overlay-height, 190px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(202px, calc\(var\(--composer-overlay-height, 190px\) \+ 12px\)\)/s,
   );
   assert.match(
     uiStyles,
@@ -143,7 +143,7 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   );
   assert.match(
     uiStyles,
-    /\.composerReasoningRange::-webkit-slider-thumb\s*\{[^}]*width:\s*15px;[^}]*border:\s*2px solid var\(--text\)/s,
+    /\.composerReasoningRange::-webkit-slider-thumb\s*\{[^}]*width:\s*24px;[^}]*height:\s*24px;[^}]*border:\s*0;[^}]*background:\s*#ffffff/s,
   );
   assert.match(uiStyles, /\.composerReasoningRange:focus-visible\s*\{[^}]*box-shadow:\s*none/s);
   assert.match(
@@ -160,7 +160,7 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   );
   assert.match(
     uiStyles,
-    /\.composerReasoningInline \.composerReasoningSlider\s*\{[^}]*gap:\s*1px;[^}]*padding:\s*0 8px 7px/s,
+    /\.composerReasoningInline \.composerReasoningSlider\s*\{[^}]*gap:\s*0;[^}]*padding:\s*0/s,
   );
 });
 

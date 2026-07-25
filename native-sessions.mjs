@@ -38,6 +38,9 @@ export class NativeSessionStore extends EventEmitter {
     this.sessionsDir = path.join(this.codexHome, 'sessions');
     this.indexFile = path.join(this.codexHome, 'session_index.jsonl');
     this.globalStateFile = path.join(this.codexHome, '.codex-global-state.json');
+    this.sideChatStateFile = path.resolve(
+      options.sideChatStateFile || path.join(this.codexHome, 'codex-web-side-chat.json'),
+    );
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.maxReadBytes = positiveNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
     this.turnStartScanBytes = positiveNumber(
@@ -59,6 +62,8 @@ export class NativeSessionStore extends EventEmitter {
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
     this.projectThreadIds = new Set();
+    this.sideChatThreadIds = new Set();
+    this.sideChatSourceThreads = new Map();
     this.pinnedThreadIds = [];
     this.appThreads = null;
     this.stateDb = null;
@@ -181,6 +186,7 @@ export class NativeSessionStore extends EventEmitter {
       this.projectlessThreadIds = new Set();
       this.projectThreadIds = new Set();
       this.workspaceStateAvailable = false;
+      this.refreshSideChatState(state);
       return pinnedChangedIds;
     }
 
@@ -202,7 +208,109 @@ export class NativeSessionStore extends EventEmitter {
       .map((id) => String(id || '').trim().toLowerCase())
       .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
     this.workspaceStateAvailable = true;
+    this.refreshSideChatState(state);
     return pinnedChangedIds;
+  }
+
+  readLocalSideChatState() {
+    try {
+      const parsed = JSON.parse(readFileSync(this.sideChatStateFile, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ids: [], sources: {} };
+      const raw = parsed['side-chat-thread-ids'];
+      const ids = Array.isArray(raw)
+        ? raw
+        : raw && typeof raw === 'object'
+          ? Object.keys(raw)
+          : [];
+      const sources = (parsed['side-chat-source-threads']
+        && typeof parsed['side-chat-source-threads'] === 'object'
+        && !Array.isArray(parsed['side-chat-source-threads']))
+        ? parsed['side-chat-source-threads']
+        : {};
+      return { ids, sources };
+    } catch {
+      return { ids: [], sources: {} };
+    }
+  }
+
+  writeLocalSideChatState(ids, sources) {
+    const cleanIds = [...new Set((ids || [])
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter((id) => SESSION_ID_PATTERN.test(String(id) + '.jsonl')))];
+    const cleanSources = {};
+    for (const [id, source] of Object.entries(sources || {})) {
+      const threadId = String(id || '').trim().toLowerCase();
+      const sourceThreadId = String(source || '').trim().toLowerCase();
+      if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) continue;
+      if (!cleanIds.includes(threadId)) continue;
+      cleanSources[threadId] = SESSION_ID_PATTERN.test(String(sourceThreadId) + '.jsonl') ? sourceThreadId : '';
+    }
+    const payload = {
+      'side-chat-thread-ids': cleanIds,
+      'side-chat-source-threads': cleanSources,
+      updatedAt: Date.now(),
+    };
+    const temporary = this.sideChatStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    writeFileSync(temporary, JSON.stringify(payload) + String.fromCharCode(10), { mode: 0o600 });
+    renameSync(temporary, this.sideChatStateFile);
+    return payload;
+  }
+
+  refreshSideChatState(state = null) {
+    let snapshot = state;
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      try {
+        snapshot = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      } catch {
+        snapshot = {};
+      }
+    }
+
+    const globalRaw = snapshot?.['side-chat-thread-ids'];
+    const globalIds = Array.isArray(globalRaw)
+      ? globalRaw
+      : globalRaw && typeof globalRaw === 'object'
+        ? Object.keys(globalRaw)
+        : [];
+    const globalSources = (snapshot?.['side-chat-source-threads']
+      && typeof snapshot['side-chat-source-threads'] === 'object'
+      && !Array.isArray(snapshot['side-chat-source-threads']))
+      ? snapshot['side-chat-source-threads']
+      : {};
+
+    const local = this.readLocalSideChatState();
+    const mergedIds = new Set();
+    const mergedSources = new Map();
+
+    for (const list of [globalIds, local.ids]) {
+      for (const id of list || []) {
+        const threadId = String(id || '').trim().toLowerCase();
+        if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) continue;
+        mergedIds.add(threadId);
+      }
+    }
+    for (const sources of [globalSources, local.sources]) {
+      for (const [id, source] of Object.entries(sources || {})) {
+        const threadId = String(id || '').trim().toLowerCase();
+        const sourceThreadId = String(source || '').trim().toLowerCase();
+        if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) continue;
+        if (!mergedIds.has(threadId)) continue;
+        if (!mergedSources.has(threadId) || sourceThreadId) {
+          mergedSources.set(
+            threadId,
+            SESSION_ID_PATTERN.test(String(sourceThreadId) + '.jsonl') ? sourceThreadId : '',
+          );
+        }
+      }
+    }
+
+    this.sideChatThreadIds = mergedIds;
+    this.sideChatSourceThreads = mergedSources;
+
+    // Keep a durable local copy even if Codex App rewrites global state.
+    try {
+      this.writeLocalSideChatState([...mergedIds], Object.fromEntries(mergedSources));
+    } catch {}
   }
 
   listPinnedThreadIds() {
@@ -271,6 +379,137 @@ export class NativeSessionStore extends EventEmitter {
     this.projectlessThreadIds.add(threadId);
     this.projectThreadIds.delete(threadId);
     this.workspaceStateAvailable = true;
+    this.scheduleRefresh();
+    return true;
+  }
+
+  isSideChatThread(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    return Boolean(threadId) && this.sideChatThreadIds.has(threadId);
+  }
+
+  sideChatSourceThreadId(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    return this.sideChatSourceThreads.get(threadId) || '';
+  }
+
+  markSideChatThread(id, options = {}) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) return false;
+    let state = {};
+    try {
+      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      if (!state || typeof state !== 'object' || Array.isArray(state)) state = {};
+    } catch {
+      state = {};
+    }
+
+    const raw = state['side-chat-thread-ids'];
+    let ids;
+    let asObject = false;
+    if (Array.isArray(raw)) {
+      ids = raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else if (raw && typeof raw === 'object') {
+      asObject = true;
+      ids = Object.keys(raw).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else {
+      ids = [];
+    }
+    if (!ids.includes(threadId)) ids.push(threadId);
+    state['side-chat-thread-ids'] = asObject
+      ? Object.fromEntries(ids.map((value) => [value, true]))
+      : ids;
+
+    const sourceThreadId = String(options.sourceThreadId || '').trim().toLowerCase();
+    const sources = (state['side-chat-source-threads']
+      && typeof state['side-chat-source-threads'] === 'object'
+      && !Array.isArray(state['side-chat-source-threads']))
+      ? { ...state['side-chat-source-threads'] }
+      : {};
+    if (sourceThreadId && SESSION_ID_PATTERN.test(String(sourceThreadId) + '.jsonl')) {
+      sources[threadId] = sourceThreadId;
+    } else if (!sources[threadId]) {
+      sources[threadId] = '';
+    }
+    state['side-chat-source-threads'] = sources;
+
+    // Durable local registry first (Codex App frequently rewrites global state).
+    try {
+      const local = this.readLocalSideChatState();
+      const localIds = [...new Set([...(local.ids || []).map((value) => String(value || '').trim().toLowerCase()), threadId])];
+      const localSources = { ...(local.sources || {}) };
+      localSources[threadId] = sources[threadId] || '';
+      this.writeLocalSideChatState(localIds, localSources);
+    } catch {}
+
+    try {
+      const temporary = this.globalStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+      writeFileSync(temporary, JSON.stringify(state) + String.fromCharCode(10), { mode: 0o600 });
+      renameSync(temporary, this.globalStateFile);
+    } catch {}
+
+    this.sideChatThreadIds.add(threadId);
+    this.sideChatSourceThreads.set(threadId, sources[threadId] || '');
+    this.scheduleRefresh();
+    return true;
+  }
+
+  unmarkSideChatThread(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) return false;
+    let state = {};
+    try {
+      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      if (!state || typeof state !== 'object' || Array.isArray(state)) state = {};
+    } catch {
+      state = {};
+    }
+
+    const raw = state['side-chat-thread-ids'];
+    let ids;
+    let asObject = false;
+    if (Array.isArray(raw)) {
+      ids = raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else if (raw && typeof raw === 'object') {
+      asObject = true;
+      ids = Object.keys(raw).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+    } else {
+      ids = [];
+    }
+    const nextIds = ids.filter((value) => value !== threadId);
+    if (nextIds.length === ids.length && !this.sideChatThreadIds.has(threadId)) return false;
+    state['side-chat-thread-ids'] = asObject
+      ? Object.fromEntries(nextIds.map((value) => [value, true]))
+      : nextIds;
+
+    const sources = (state['side-chat-source-threads']
+      && typeof state['side-chat-source-threads'] === 'object'
+      && !Array.isArray(state['side-chat-source-threads']))
+      ? { ...state['side-chat-source-threads'] }
+      : {};
+    if (sources[threadId] !== undefined) {
+      delete sources[threadId];
+      state['side-chat-source-threads'] = sources;
+    }
+
+    try {
+      const local = this.readLocalSideChatState();
+      const localIds = (local.ids || [])
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter((value) => value && value !== threadId);
+      const localSources = { ...(local.sources || {}) };
+      delete localSources[threadId];
+      this.writeLocalSideChatState(localIds, localSources);
+    } catch {}
+
+    try {
+      const temporary = this.globalStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+      writeFileSync(temporary, JSON.stringify(state) + String.fromCharCode(10), { mode: 0o600 });
+      renameSync(temporary, this.globalStateFile);
+    } catch {}
+
+    this.sideChatThreadIds.delete(threadId);
+    this.sideChatSourceThreads.delete(threadId);
     this.scheduleRefresh();
     return true;
   }
@@ -394,7 +633,12 @@ export class NativeSessionStore extends EventEmitter {
           : now - entry.mtimeMs <= this.runningWindowMs
             ? 'running'
             : 'done';
-        return sessionSummary(entry, status);
+        const summary = sessionSummary(entry, status);
+        if (this.isSideChatThread(entry.id)) {
+          summary.sideChat = true;
+          summary.sideChatSourceThreadId = this.sideChatSourceThreadId(entry.id) || '';
+        }
+        return summary;
       });
   }
 
@@ -1546,8 +1790,8 @@ function tryMergeAssistantMessage(cache, role, clean, record, kind, metadata = n
   if (kind === 'final_answer') previous.kind = 'final_answer';
   else if (previous.kind === 'message' || !previous.kind) previous.kind = kind || previous.kind || 'message';
   if (record?.timestamp) previous.at = record.timestamp;
-  // Keep the merged bubble after any interleaved tools so timeline order stays readable.
-  relocateNativeMessageToEnd(cache, previous);
+  // Keep chronological order: note → tools → note → tools (App-style).
+  // Do not relocate progress bubbles past interleaved tools/process items.
   if (previous.content !== before) cache.contentMutated = true;
   return true;
 }
@@ -1565,17 +1809,16 @@ function findMergeableAssistantMessage(cache, kind = '', clean = '') {
   }
   // Keep long unphased summaries as their own bubble instead of folding into progress chatter.
   if (!isProgressStyleText(clean)) return null;
-  // Progress commentary may be interleaved with tool calls and reasoning summaries.
-  for (let index = cache.messages.length - 1; index >= 0; index -= 1) {
-    const message = cache.messages[index];
-    if ((message.turnId || '') !== turnId) return null;
-    if (message.role === 'assistant' && canMergeProgressKind(message.kind) && isProgressStyleText(message.content)) {
-      return message;
-    }
-    if (message.role === 'tool' || message.role === 'process') continue;
-    return null;
-  }
-  return null;
+  // Only merge immediately consecutive progress notes.
+  // Tools / process / user between notes start a new progress bubble so the
+  // timeline stays note → tools → note → tools (matches Codex App).
+  const previous = cache.messages.at(-1);
+  if (!previous) return null;
+  if ((previous.turnId || '') !== turnId) return null;
+  if (previous.role !== 'assistant') return null;
+  if (!canMergeProgressKind(previous.kind)) return null;
+  if (!isProgressStyleText(previous.content)) return null;
+  return previous;
 }
 
 function relocateNativeMessageToEnd(cache, message) {
@@ -1937,9 +2180,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
 
 function effectiveSessionStatus(status, mtimeMs, runningWindowMs, now = Date.now()) {
   if (status !== 'running') return status;
-  // Keep long-running turns marked as running so page reloads reconnect stop/live UI.
-  // Terminal events (task_complete/error) flip cache.status away from running.
-  return 'running';
+  return now - mtimeMs <= runningWindowMs ? 'running' : 'interrupted';
 }
 
 function cleanTitle(value) {

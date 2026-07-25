@@ -29,6 +29,7 @@
   --user-bg: #315fd6;
   --code-bg: #080a0d;
   --sidebar-width: 316px;
+  --side-chat-width: 420px;
   --header-height: 60px;
   --conversation-width: 760px;
   --composer-width: var(--conversation-width);
@@ -681,11 +682,27 @@ body .subQuotaClose:hover {
 
 .subQuotaSettingsForm {
   display: grid;
-  gap: 10px;
+  gap: 14px;
 }
 
 .subQuotaSettingsForm .field {
   margin: 0;
+}
+
+.subQuotaSettingsSource {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.subQuotaSettingsSourceTitle {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
 }
 
 .subQuotaCredentialHint {
@@ -711,8 +728,8 @@ body .subQuotaClose:hover {
 
 .subQuotaSettingsDialog {
   display: flex;
-  width: min(460px, calc(100vw - 32px));
-  max-height: min(82vh, 520px);
+  width: min(520px, calc(100vw - 32px));
+  max-height: min(86vh, 680px);
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -727,6 +744,7 @@ body .subQuotaClose:hover {
   min-width: 0;
   gap: 10px;
   padding: 18px;
+  overflow-y: auto;
 }
 
 .subQuotaSettingsBody .subQuotaSettingsDescription {
@@ -3528,6 +3546,8 @@ body #modeLabel {
 }
 
 body .chat {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   gap: 13px;
   background: var(--canvas);
@@ -4617,7 +4637,7 @@ body .msg.process.completionSummary {
 
 .completionTimeline {
   display: grid;
-  gap: 15px;
+  gap: 10px;
 }
 
 body[data-theme="dark"] .completionTimeline {
@@ -4680,6 +4700,92 @@ body[data-theme] .completionTimeline > .msg.progressCommentary > .msgBody {
   display: none;
 }
 
+/* Process progress notes: flush main-text column, same weight as final answer. */
+body[data-theme] .completionTimeline > .msg.progressCommentary,
+body[data-theme] .liveProcessTimeline > .msg.progressCommentary,
+body[data-theme] .processHistoryTimeline > .msg.progressCommentary,
+body[data-theme] .sideChatMessages > .msg.progressCommentary,
+body[data-theme] .completionTimeline > .msg.assistant.progressCommentary,
+body[data-theme] .liveProcessTimeline > .msg.assistant.progressCommentary,
+body[data-theme] .processHistoryTimeline > .msg.assistant.progressCommentary,
+body[data-theme] .sideChatMessages > .msg.assistant.progressCommentary {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 2px 0;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.65;
+}
+
+body[data-theme] .completionTimeline > .msg.progressCommentary > .msgBody,
+body[data-theme] .liveProcessTimeline > .msg.progressCommentary > .msgBody,
+body[data-theme] .processHistoryTimeline > .msg.progressCommentary > .msgBody,
+body[data-theme] .completionTimeline > .msg.assistant.progressCommentary > .msgBody,
+body[data-theme] .liveProcessTimeline > .msg.assistant.progressCommentary > .msgBody,
+body[data-theme] .processHistoryTimeline > .msg.assistant.progressCommentary > .msgBody,
+body[data-theme] .sideChatMessages > .msg.progressCommentary > .msgBody,
+body[data-theme] .sideChatMessages > .msg.assistant.progressCommentary > .msgBody {
+  color: var(--text);
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+  padding: 0;
+  margin: 0;
+}
+
+body[data-theme] .completionTimeline > .msg.progressCommentary .markdownBody,
+body[data-theme] .liveProcessTimeline > .msg.progressCommentary .markdownBody,
+body[data-theme] .processHistoryTimeline > .msg.progressCommentary .markdownBody,
+body[data-theme] .sideChatMessages > .msg.progressCommentary .markdownBody {
+  color: var(--text);
+}
+
+body[data-theme] .completionTimeline > .msg.progressCommentary .markdownBody > :first-child,
+body[data-theme] .liveProcessTimeline > .msg.progressCommentary .markdownBody > :first-child,
+body[data-theme] .processHistoryTimeline > .msg.progressCommentary .markdownBody > :first-child {
+  margin-top: 0;
+}
+
+body[data-theme] .completionTimeline > .msg.progressCommentary .markdownBody > :last-child,
+body[data-theme] .liveProcessTimeline > .msg.progressCommentary .markdownBody > :last-child,
+body[data-theme] .processHistoryTimeline > .msg.progressCommentary .markdownBody > :last-child {
+  margin-bottom: 0;
+}
+
+body[data-theme="dark"] .completionTimeline > .msg.progressCommentary,
+body[data-theme="dark"] .liveProcessTimeline > .msg.progressCommentary,
+body[data-theme="dark"] .processHistoryTimeline > .msg.progressCommentary {
+  color: #f3f4f6;
+}
+
+body[data-theme="dark"] .completionTimeline > .msg.progressCommentary .markdownBody,
+body[data-theme="dark"] .liveProcessTimeline > .msg.progressCommentary .markdownBody,
+body[data-theme="dark"] .processHistoryTimeline > .msg.progressCommentary .markdownBody {
+  color: #f3f4f6;
+}
+body[data-theme] .completionTimeline > .msg.progressCommentary + .activityCluster,
+body[data-theme] .liveProcessTimeline > .msg.progressCommentary + .activityCluster {
+  margin-top: 2px;
+}
+
+body[data-theme] .completionTimeline > .activityCluster + .msg.progressCommentary,
+body[data-theme] .liveProcessTimeline > .activityCluster + .msg.progressCommentary {
+  margin-top: 2px;
+}
+
+/* Keep cluster summary one-line and tool hierarchy primary when settled. */
+.activityCluster:not(.streaming) > summary .activityClusterText {
+  color: var(--text-muted);
+}
+
+
 body[data-theme] .activityBatch {
   width: 100%;
   max-width: 100%;
@@ -4690,7 +4796,7 @@ body[data-theme] .activityBatch {
   color: var(--text-muted);
   padding: 0;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 14px;
+  font-size: 12px;
 }
 
 .liveProcessPanel {
@@ -4734,12 +4840,12 @@ body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-
 body .liveProcessTimeline > .activityCluster.streaming > summary .activityClusterText {
   background: linear-gradient(105deg, var(--text-subtle) 0%, var(--text-muted) 28%, var(--text) 43%, var(--primary) 50%, var(--text) 57%, var(--text-muted) 72%, var(--text-subtle) 100%);
   background-position: 120% 50%;
-  background-size: 260% 100%;
+  background-size: 220% 100%;
   background-clip: text;
   color: transparent;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: liveProcessFlow 2.2s linear infinite;
+  animation: liveProcessFlow 4.8s linear infinite;
   will-change: background-position;
 }
 
@@ -4761,12 +4867,12 @@ body[data-theme] .msg.process.reasoningStatus {
 body[data-theme] .liveProcessTimeline > .msg.process.reasoningStatus.streaming {
   background: linear-gradient(90deg, var(--reasoning-flow-muted) 0%, var(--reasoning-flow-muted) 36%, var(--reasoning-flow-strong) 50%, var(--reasoning-flow-muted) 64%, var(--reasoning-flow-muted) 100%);
   background-position: 100% 50%;
-  background-size: 240% 100%;
+  background-size: 220% 100%;
   background-clip: text;
   color: transparent;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: liveProcessFlow 2.1s linear infinite;
+  animation: liveProcessFlow 4.8s linear infinite;
 }
 
 body .liveProcessTimeline > .progressCommentary.streaming .markdownBody > :last-child::after {
@@ -4782,38 +4888,109 @@ body[data-theme="dark"] .completionTimeline .markdownBody code {
 .completionTimeline > .msg.user.steeringUser {
   width: fit-content;
   max-width: 77%;
-  margin: 2px 0 10px auto;
-  padding: 8px 12px;
+  margin: 6px 0 12px auto;
+  padding: 10px 12px 8px;
   font-size: 13px;
 }
 
 /* Main-stream steering (follow-up/guide) should stay visible outside collapsed process panels */
+/* Flex order keeps mid-turn steers after completion / assistant siblings even if DOM momentarily races. */
+body .chat > .msg.user.steeringUser {
+  order: 9999;
+}
+
 body .msg.user.steeringUser {
   position: relative;
-  border: 1px solid color-mix(in srgb, var(--blue) 34%, var(--line));
-  background: color-mix(in srgb, var(--user, #6b4eff) 92%, white 8%);
-  box-shadow: 0 6px 18px rgba(74, 53, 190, 0.14);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
+  border-radius: 16px;
+  background:
+    linear-gradient(
+      165deg,
+      color-mix(in srgb, var(--primary) 12%, var(--surface)) 0%,
+      color-mix(in srgb, var(--primary) 5%, var(--surface)) 100%
+    );
+  color: var(--text);
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--primary) 12%, transparent),
+    0 10px 22px color-mix(in srgb, var(--primary) 8%, transparent);
+  padding: 10px 12px 8px;
+  box-sizing: border-box;
 }
 body .msg.user.steeringUser::before {
   content: '引导';
   display: inline-flex;
   align-items: center;
-  margin: 0 0 6px;
-  padding: 1px 7px;
+  align-self: flex-start;
+  margin: 0 0 7px;
+  padding: 2px 8px;
   border-radius: 999px;
-  background: rgba(255,255,255,0.18);
-  color: rgba(255,255,255,0.92);
-  font-size: 11px;
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary);
+  border: 1px solid color-mix(in srgb, var(--primary) 26%, transparent);
+  font-size: 10.5px;
   font-weight: 700;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.04em;
+  line-height: 1.25;
+}
+body[data-theme="light"] .msg.user.steeringUser {
+  background:
+    linear-gradient(
+      165deg,
+      color-mix(in srgb, var(--primary) 9%, #ffffff) 0%,
+      color-mix(in srgb, var(--primary) 3%, #ffffff) 100%
+    );
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--primary) 10%, transparent),
+    0 8px 18px rgba(47, 103, 216, 0.08);
+}
+body[data-theme="dark"] .msg.user.steeringUser {
+  background:
+    linear-gradient(
+      165deg,
+      color-mix(in srgb, var(--primary) 16%, var(--surface)) 0%,
+      color-mix(in srgb, var(--primary) 7%, var(--surface)) 100%
+    );
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--primary) 16%, transparent),
+    0 12px 26px rgba(0, 0, 0, 0.22);
+}
+body .msg.user.steeringUser > .msgBody,
+body .msg.user.steeringUser > .msgBody.markdownBody {
+  width: 100%;
+  color: var(--text);
+}
+body .msg.user.steeringUser .markdownBody,
+body .msg.user.steeringUser .markdownBody p,
+body .msg.user.steeringUser .markdownBody li,
+body .msg.user.steeringUser .markdownBody code {
+  color: inherit;
 }
 body .msg.user.steeringUser.optimistic {
   opacity: 0.9;
+  border-style: dashed;
 }
 body .msg.user.steeringUser .msgActions {
-  margin-top: 4px;
+  margin-top: 6px;
+  align-self: stretch;
+}
+body .msg.user.steeringUser .userAttachmentStack,
+body .msg.user.steeringUser.hasInputImage .userAttachmentStack {
+  width: min(220px, 100%);
+  grid-template-columns: minmax(0, 1fr);
+  margin: 0 0 8px 0;
+  align-self: stretch;
+}
+body .msg.user.steeringUser .userAttachmentStack .userAttachment:nth-child(n+2) {
+  display: none;
 }
 
+body .msg.user.steeringUser .messageTime {
+  color: var(--text-muted);
+}
 
 .completionTimeline > .msg.user.steeringUser.optimistic {
   opacity: 0.88;
@@ -5369,7 +5546,7 @@ body[data-theme] .activityCluster {
   color: var(--text-muted);
   padding: 0;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 @supports (color: color-mix(in srgb, black 50%, transparent)) {
@@ -5422,8 +5599,8 @@ body[data-theme] .activityCluster {
   overflow: hidden;
   justify-self: stretch;
   color: var(--text-muted);
-  font-size: 14px;
-  line-height: 1.4;
+  font-size: 12px;
+  line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -5469,8 +5646,8 @@ body[data-theme] .activityCluster {
 .activityClusterItems {
   position: relative;
   display: grid;
-  gap: 4px;
-  margin: 5px 0 7px 8px;
+  gap: 3px;
+  margin: 4px 0 6px 8px;
   padding: 0 0 0 17px;
 }
 
@@ -5497,7 +5674,7 @@ body[data-theme] .activityCluster {
 .activityItem {
   min-width: 0;
   color: var(--text-muted);
-  font-size: 14px;
+  font-size: 12px;
 }
 
 .activityCluster .activityItem {
@@ -6214,37 +6391,6 @@ body .toolDetails[open] summary {
   box-shadow: none;
 }
 
-body .msg.assistant.streaming {
-  position: relative;
-  border-left-color: var(--primary);
-}
-
-body .msg.assistant.streaming::before {
-  position: absolute;
-  top: 0;
-  left: -2px;
-  width: 2px;
-  height: 24px;
-  border-radius: 2px;
-  background: var(--primary);
-  content: "";
-  animation: streamRail 1.1s ease-in-out infinite;
-}
-
-body .msg.assistant.streaming .markdownBody > :last-child::after,
-body .msg.assistant.streaming .msgBody:not(.markdownBody)::after,
-body .msg.assistant.streaming .markdownBody:empty::after {
-  display: inline-block;
-  width: 7px;
-  height: 1em;
-  margin-left: 4px;
-  border-radius: 1px;
-  background: var(--primary);
-  content: "";
-  vertical-align: -0.14em;
-  animation: streamCaret 820ms steps(1, end) infinite;
-}
-
 body .msg.thinking.streaming .toolSummaryText::after {
   color: var(--thinking);
   content: " · 实时生成";
@@ -6277,6 +6423,12 @@ body .chat > :is(
 body .chat {
   padding-right: 30px;
   padding-left: 30px;
+}
+
+/* Dynamic bottom inset: JS sets --composer-overlay-height from live composer+queue height. */
+body .chat {
+  padding-bottom: max(156px, calc(var(--composer-overlay-height, 156px) + 12px));
+  scroll-padding-bottom: max(156px, calc(var(--composer-overlay-height, 156px) + 12px));
 }
 
 body .chat > :is(
@@ -6769,6 +6921,21 @@ body .box:not(.composerCollapsed) > .composerMicBtn .lucide {
   height: 18px;
 }
 
+/* Voice dictation active state */
+body .box > .composerMicBtn.listening,
+body .box.composerCollapsed > .composerMicBtn.listening,
+body .box.composerExpanded > .composerMicBtn.listening,
+body .box:not(.composerCollapsed) > .composerMicBtn.listening {
+  background: color-mix(in srgb, var(--danger, #ef4444) 18%, transparent) !important;
+  color: var(--danger, #ef4444) !important;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger, #ef4444) 28%, transparent);
+}
+body .box > .composerMicBtn.listening .lucide,
+body .box.composerCollapsed > .composerMicBtn.listening .lucide,
+body .box.composerExpanded > .composerMicBtn.listening .lucide {
+  color: inherit;
+}
+
 /* Shift send/stop right by one column to leave room for mic */
 body .box.composerExpanded,
 body .box:not(.composerCollapsed) {
@@ -7099,18 +7266,33 @@ body .cancelButton .lucide {
 }
 
 .promptQueue {
+  /* Above the input capsule, not inside it. */
   position: relative;
-  z-index: 1;
-  width: min(calc(var(--composer-width) - 108px), calc(100% - 156px));
-  max-height: min(30vh, 230px);
-  margin-bottom: -18px;
+  z-index: 2;
+  display: block;
+  /* Always shorter than the input capsule (.box uses composer-width - 60px). */
+  width: min(calc(var(--composer-width) - 48px), calc(100% - 108px));
+  max-width: min(calc(var(--composer-width) - 48px), calc(100% - 108px));
+  box-sizing: border-box;
+  max-height: min(28vh, 200px);
+  margin: 0 auto 8px;
   overflow: hidden auto;
-  border: 1px solid var(--border);
-  border-bottom-color: transparent;
-  border-radius: 18px 18px 0 0;
-  background: transparent;
-  padding-bottom: 18px;
-  box-shadow: none;
+  border: 1px solid color-mix(in srgb, var(--border) 48%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  padding: 4px 6px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.08);
+  pointer-events: auto;
+}
+
+.promptQueue.hidden {
+  display: none !important;
+}
+
+body .composer > .promptQueue {
+  width: min(calc(var(--composer-width) - 48px), calc(100% - 108px));
+  max-width: min(calc(var(--composer-width) - 48px), calc(100% - 108px));
+  margin: 0 auto 8px;
 }
 
 .promptQueueHead {
@@ -7136,14 +7318,15 @@ body .cancelButton .lucide {
 
 .promptQueueRow {
   display: grid;
-  min-height: 42px;
-  grid-template-columns: 18px minmax(0, 1fr) auto 30px 30px;
+  min-height: 40px;
+  grid-template-columns: 22px minmax(0, 1fr) auto 30px 30px;
   align-items: center;
   gap: 4px;
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 42%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 28%, transparent);
   background: transparent;
-  padding: 5px 7px 5px 10px;
-  transition: background 140ms var(--ease), opacity 140ms var(--ease);
+  padding: 4px 6px 4px 4px;
+  transition: background 140ms var(--ease), opacity 140ms var(--ease), box-shadow 140ms var(--ease);
+  will-change: auto;
 }
 
 .promptQueueRow:last-child {
@@ -7163,15 +7346,65 @@ body .cancelButton .lucide {
 }
 
 body[data-theme="dark"] .promptQueue {
-  border-color: #454545;
-  border-bottom-color: transparent;
-  background: transparent;
+  border-color: color-mix(in srgb, #454545 70%, transparent);
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.28);
 }
-
 .promptQueueLead {
+  display: grid;
+  width: 22px;
+  height: 28px;
+  place-items: center;
+  color: var(--text-subtle);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  flex: 0 0 auto;
+}
+.promptQueueLead svg {
   width: 14px;
   height: 14px;
-  color: var(--text-subtle);
+}
+
+.promptQueueRow.dragging {
+  opacity: 0.96;
+  cursor: grabbing;
+  z-index: 5;
+  background: color-mix(in srgb, var(--surface) 88%, var(--primary) 12%);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.16);
+  transform: scale(1.012);
+  transition: none;
+}
+
+.promptQueueList.dragging {
+  cursor: grabbing;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.promptQueueList.dragging .promptQueueRow:not(.dragging) {
+  transition: transform 120ms var(--ease), background 120ms var(--ease), box-shadow 120ms var(--ease);
+}
+
+.promptQueueRow.dragOver {
+  background: color-mix(in srgb, var(--primary) 7%, transparent);
+  box-shadow: inset 0 2px 0 var(--primary);
+}
+
+.promptQueueRow.dragOver.dragOverAfter {
+  box-shadow: inset 0 -2px 0 var(--primary);
+}
+
+.promptQueueRow:not(.sending) {
+  cursor: default;
+}
+.promptQueueRow:not(.sending) .promptQueueLead:active {
+  cursor: grabbing;
+}
+
+.promptQueueRow.sending {
+  cursor: default;
 }
 
 .promptQueueRow.sending .promptQueueLead {
@@ -7262,35 +7495,58 @@ body[data-theme="dark"] .promptQueue {
   white-space: nowrap;
 }
 
-.promptQueue:has(+ .attachmentTray:not(.hidden)) {
-  margin-bottom: 7px;
-  border-radius: 18px;
-  padding-bottom: 0;
-}
-
 .attachmentTray {
-  width: min(calc(var(--composer-width) - 72px), calc(100% - 120px));
+  display: inline-flex;
+  align-self: center;
+  width: fit-content;
+  max-width: min(360px, calc(var(--composer-width) - 72px), calc(100% - 120px));
   gap: 6px;
-  max-height: 132px;
-  margin-bottom: 6px;
+  max-height: 112px;
+  margin: 0 auto 6px;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--surface);
-  padding: 6px;
-  box-shadow: 0 7px 20px rgba(0, 0, 0, 0.07);
-}
-
-body[data-theme] .attachmentChip {
   border: 0;
   border-radius: 7px;
   background: transparent;
+  padding: 0;
+  box-shadow: none;
+}
+
+body[data-theme] .attachmentChip {
+  display: grid;
+  width: min(168px, calc(100vw - 72px));
+  max-width: 168px;
+  height: 44px;
+  grid-template-columns: 36px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
   color: var(--text-muted);
+  padding: 4px;
+  font-size: 11px;
+}
+
+body .attachmentChip img,
+body .attachmentChip .attachmentIcon {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  border-radius: 6px;
+}
+
+body .attachmentText {
+  min-width: 0;
+  gap: 1px;
+}
+
+body .attachmentMeta {
+  font-size: 9px;
 }
 
 body .attachmentChip button {
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   color: var(--danger);
 }
 
@@ -7899,6 +8155,266 @@ body[data-theme="dark"] .composerReasoningMark {
   font-weight: 650;
 }
 
+.composerSlashPanel {
+  left: 10px;
+  right: 10px;
+  width: auto;
+  max-width: min(460px, calc(100vw - 24px));
+  max-height: min(520px, calc(100dvh - 120px));
+  bottom: calc(100% + 10px);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow: hidden;
+  z-index: 40;
+}
+
+.composerSlashHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 1px 6px 2px;
+}
+
+.composerSlashHead .composerPopoverTitle {
+  margin: 0;
+  font-size: 11px;
+}
+
+.composerSlashStatus {
+  color: var(--text-muted, var(--muted));
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.composerSlashSection {
+  color: var(--text-muted, var(--muted));
+  font-size: 10px;
+  font-weight: 650;
+  padding: 8px 8px 3px;
+  letter-spacing: 0.02em;
+}
+
+.composerSlashList {
+  display: grid;
+  gap: 1px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  max-height: min(480px, calc(100dvh - 150px));
+  padding-right: 1px;
+}
+
+.composerSlashItem {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) max-content;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+.composerSlashItem.disabled,
+.composerSlashItem:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.composerSlashItem > .lucide,
+.composerSlashItem > i {
+  width: 13px;
+  height: 13px;
+  margin-top: 0;
+  color: var(--blue, #6aa8ff);
+  opacity: 0.9;
+  flex: 0 0 auto;
+}
+
+.composerSlashItem:hover,
+.composerSlashItem.active {
+  background: rgba(106, 168, 255, 0.12);
+}
+
+.composerSlashItemBody {
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.composerSlashItemName {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: visible;
+}
+
+.composerSlashItemDesc {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-muted, var(--muted));
+  font-size: 10px;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline;
+}
+
+.composerSlashItemMeta {
+  color: var(--text-muted, var(--muted));
+  font-size: 10px;
+  white-space: nowrap;
+  margin-left: 4px;
+  justify-self: end;
+  align-self: center;
+  text-align: right;
+  flex: 0 0 auto;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.composerSlashEmpty {
+  color: var(--text-muted, var(--muted));
+  font-size: 11px;
+  padding: 10px 8px;
+  text-align: center;
+}
+
+.composerAtPanel {
+  left: 10px;
+  right: 10px;
+  width: auto;
+  max-width: min(460px, calc(100vw - 24px));
+  max-height: min(520px, calc(100dvh - 120px));
+  bottom: calc(100% + 10px);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow: hidden;
+  z-index: 40;
+}
+
+.composerAtList {
+  display: grid;
+  gap: 1px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  max-height: min(480px, calc(100dvh - 150px));
+  padding-right: 1px;
+}
+
+.composerAtSection {
+  color: var(--text-muted, var(--muted));
+  font-size: 10px;
+  font-weight: 650;
+  padding: 8px 8px 3px;
+  letter-spacing: 0.02em;
+}
+
+.composerAtItem {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) max-content;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.composerAtItem > .lucide,
+.composerAtItem > i {
+  width: 14px;
+  height: 14px;
+  margin-top: 0;
+  color: var(--text-muted, var(--muted));
+  flex: 0 0 auto;
+}
+
+.composerAtPluginIcon.tone-pdf { color: #ef6b6b; }
+.composerAtPluginIcon.tone-docs { color: #5b8def; }
+.composerAtPluginIcon.tone-sheets { color: #3fad6f; }
+.composerAtPluginIcon.tone-slides { color: #e2a33a; }
+.composerAtPluginIcon.tone-media { color: #9b7bff; }
+.composerAtPluginIcon.tone-web { color: #5aa7ff; }
+.composerAtPluginIcon.tone-default { color: var(--text-muted, var(--muted)); }
+
+.composerAtItem:hover,
+.composerAtItem.active {
+  background: rgba(106, 168, 255, 0.12);
+}
+
+.composerAtItem.disabled,
+.composerAtItem:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.composerAtItemBody {
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.composerAtItemName {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: visible;
+}
+
+.composerAtItemDesc {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-muted, var(--muted));
+  font-size: 10px;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline;
+}
+
+.composerAtItemMeta {
+  color: var(--text-muted, var(--muted));
+  font-size: 10px;
+  white-space: nowrap;
+  margin-left: 4px;
+  justify-self: end;
+  align-self: center;
+  text-align: right;
+  flex: 0 0 auto;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+}
+
 .composerControls .field,
 .composerMenuField {
   display: grid;
@@ -8128,12 +8644,12 @@ body[data-theme="dark"][data-chat-bg="custom"] .box.composerCollapsed {
 }
 
 body[data-chat-bg="skin"] .promptQueue {
-  border-color: var(--primary-line);
-  border-bottom-color: transparent;
-  background: transparent;
-  backdrop-filter: none;
+  border-color: color-mix(in srgb, var(--primary-line) 55%, transparent);
+  background: color-mix(in srgb, var(--skin-surface, var(--surface)) 88%, transparent);
+  backdrop-filter: blur(14px) saturate(1.05);
+  -webkit-backdrop-filter: blur(14px) saturate(1.05);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
 }
-
 body[data-chat-bg="skin"] .msg.image,
 body[data-chat-bg="skin"] .nativeHistoryLoad,
 body[data-chat-bg="skin"] .providerBox {
@@ -8215,29 +8731,6 @@ body .composer > .box:focus-within {
   }
 }
 
-@keyframes streamCaret {
-  0%,
-  48% {
-    opacity: 1;
-  }
-  49%,
-  100% {
-    opacity: 0.18;
-  }
-}
-
-@keyframes streamRail {
-  0%,
-  100% {
-    transform: translateY(0);
-    opacity: 0.45;
-  }
-  50% {
-    transform: translateY(18px);
-    opacity: 1;
-  }
-}
-
 @keyframes streamDot {
   0%,
   100% {
@@ -8252,10 +8745,10 @@ body .composer > .box:focus-within {
 
 @keyframes liveProcessFlow {
   from {
-    background-position: 120% 50%;
+    background-position: 100% 50%;
   }
   to {
-    background-position: -120% 50%;
+    background-position: -100% 50%;
   }
 }
 
@@ -8344,13 +8837,13 @@ body .composer > .box:focus-within {
   }
 
   body .chat {
-    padding-bottom: 156px;
-    scroll-padding-bottom: 156px;
+    padding-bottom: max(156px, calc(var(--composer-overlay-height, 156px) + 12px));
+    scroll-padding-bottom: max(156px, calc(var(--composer-overlay-height, 156px) + 12px));
   }
 
   body .main:has(> .composer > .editedFilesResult.live.withPlan) > .chat {
-    padding-bottom: 202px;
-    scroll-padding-bottom: 202px;
+    padding-bottom: max(202px, calc(var(--composer-overlay-height, 190px) + 12px));
+    scroll-padding-bottom: max(202px, calc(var(--composer-overlay-height, 190px) + 12px));
   }
 
   /* Keep the desktop composer floating over the conversation canvas. */
@@ -8370,8 +8863,8 @@ body .composer > .box:focus-within {
   }
 
   body.keyboardOpen .chat {
-    padding-bottom: calc(156px + var(--keyboard-inset, 0px));
-    scroll-padding-bottom: calc(156px + var(--keyboard-inset, 0px));
+    padding-bottom: max(calc(156px + var(--keyboard-inset, 0px)), calc(var(--composer-overlay-height, 156px) + var(--keyboard-inset, 0px) + 12px));
+    scroll-padding-bottom: max(calc(156px + var(--keyboard-inset, 0px)), calc(var(--composer-overlay-height, 156px) + var(--keyboard-inset, 0px) + 12px));
   }
 
   body .composer > * {
@@ -8480,6 +8973,7 @@ body .composer > .box:focus-within {
 
   body .app,
   body .main {
+    position: relative;
     height: 100dvh;
   }
 
@@ -8686,20 +9180,109 @@ body .composer > .box:focus-within {
     max-width: 92%;
   }
 
+  /* Float composer over chat with transparent rail so session wallpaper/bg shows through. */
+  body .chat {
+    padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
+    scroll-padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
+  }
+
+  body .main:has(> .composer > .editedFilesResult.live.withPlan) > .chat {
+    padding-bottom: max(calc(178px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 166px) + env(safe-area-inset-bottom, 0px) + 12px));
+    scroll-padding-bottom: max(calc(178px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 166px) + env(safe-area-inset-bottom, 0px) + 12px));
+  }
+
   body .composer {
-    padding: 0 13px calc(env(safe-area-inset-bottom, 0px) + 24px);
+    position: absolute;
+    inset: auto 0 0;
+    bottom: var(--keyboard-inset, 0px);
+    z-index: 12;
+    width: auto;
+    margin: 0;
+    padding: 0 13px calc(env(safe-area-inset-bottom, 0px) + 16px);
+    border: 0;
+    background: transparent !important;
+    box-shadow: none;
+    pointer-events: none;
+    transition: bottom 120ms var(--ease);
   }
 
-  .composer > * {
+  body.keyboardOpen .composer {
+    padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+  }
+
+  body.keyboardOpen .chat {
+    padding-bottom: max(calc(132px + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px) + 12px));
+    scroll-padding-bottom: max(calc(132px + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px) + 12px));
+  }
+
+  body .composer > * {
     width: 100%;
+    pointer-events: auto;
   }
 
-  .promptQueue {
-    width: min(calc(var(--composer-width) - 72px), calc(100% - 88px));
+  body[data-theme="light"] .composer,
+  body[data-theme="dark"] .composer,
+  body[data-chat-bg] .composer,
+  body[data-chat-bg="skin"] .composer,
+  body[data-chat-bg="custom"] .composer,
+  body[data-chat-bg="default"] .composer,
+  body[data-chat-bg="plain"] .composer {
+    background: transparent !important;
+  }
+
+  /* Capsule uses same translucent fill as session chrome, not a solid slab. */
+  body[data-theme="light"] .composer > .box,
+  body[data-theme="light"] .composer > .box:focus-within,
+  body[data-theme="light"] .composer > .box.composerCollapsed,
+  body[data-theme="light"] .composer > .box.composerExpanded {
+    border-color: color-mix(in srgb, #e1e3e6 88%, transparent);
+    background: color-mix(in srgb, #ffffff 88%, transparent);
+    box-shadow: 0 10px 28px rgba(31, 35, 41, 0.10);
+    backdrop-filter: blur(16px) saturate(1.06);
+    -webkit-backdrop-filter: blur(16px) saturate(1.06);
+  }
+
+  body[data-theme="dark"] .composer > .box,
+  body[data-theme="dark"] .composer > .box:focus-within,
+  body[data-theme="dark"] .composer > .box.composerCollapsed,
+  body[data-theme="dark"] .composer > .box.composerExpanded {
+    border-color: color-mix(in srgb, #454545 88%, transparent);
+    background: color-mix(in srgb, var(--surface) 86%, transparent);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
+    backdrop-filter: blur(16px) saturate(1.06);
+    -webkit-backdrop-filter: blur(16px) saturate(1.06);
+  }
+
+  body[data-chat-bg="skin"] .composer > .box,
+  body[data-theme="light"][data-chat-bg="skin"] .composer > .box,
+  body[data-theme="dark"][data-chat-bg="skin"] .composer > .box {
+    border-color: var(--primary-line);
+    background: color-mix(in srgb, var(--skin-surface-strong) 78%, transparent);
+    box-shadow: 0 10px 28px var(--skin-accent-glow);
+    backdrop-filter: blur(18px) saturate(1.1);
+    -webkit-backdrop-filter: blur(18px) saturate(1.1);
+  }
+
+  body[data-chat-bg="custom"] .composer > .box,
+  body[data-theme="light"][data-chat-bg="custom"] .composer > .box,
+  body[data-theme="dark"][data-chat-bg="custom"] .composer > .box {
+    border-color: color-mix(in srgb, var(--border) 70%, transparent);
+    background: color-mix(in srgb, var(--surface) 72%, transparent);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
+    backdrop-filter: blur(18px) saturate(1.08);
+    -webkit-backdrop-filter: blur(18px) saturate(1.08);
+  }
+
+  .promptQueue,
+  body .composer > .promptQueue {
+    width: min(calc(var(--composer-width) - 40px), calc(100% - 84px));
+    max-width: min(calc(var(--composer-width) - 40px), calc(100% - 84px));
+    margin: 0 auto 10px;
   }
 
   .attachmentTray {
-    width: min(calc(var(--composer-width) - 36px), calc(100% - 40px));
+    width: fit-content;
+    max-width: min(360px, calc(var(--composer-width) - 36px), calc(100% - 40px));
   }
 
   body .nativeNotice {
@@ -9167,4 +9750,1000 @@ body .composer > .box:focus-within {
   .activityClusterSummary:focus-visible {
     outline-color: CanvasText;
   }
+}
+
+
+/* Side chat: desktop split + mobile/top tab switch (never insert into chat stream) */
+/* Visual contract: inherit main session background, message bubbles, and composer look. */
+.main {
+  position: relative;
+  min-width: 0;
+}
+
+.main.sideChatOpen {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, var(--side-chat-width, 420px));
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  transition: grid-template-columns 180ms var(--ease);
+}
+
+.main.sideChatOpen.sideChatResizing {
+  cursor: col-resize;
+  user-select: none;
+  transition: none;
+}
+
+.main.sideChatOpen > .top {
+  grid-column: 1 / -1;
+  grid-row: 1;
+}
+
+.main.sideChatOpen > .sideChatTabs {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+.main.sideChatOpen > .chat,
+.main.sideChatOpen > .automationView,
+.main.sideChatOpen > .archiveView {
+  grid-column: 1;
+  grid-row: 3;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.main.sideChatOpen > .composer {
+  position: relative;
+  inset: auto;
+  bottom: auto;
+  grid-column: 1;
+  grid-row: 4;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  z-index: 10;
+}
+
+/* Desktop floating composer must not stretch under the side pane. */
+@media (min-width: 821px) {
+  body .main.sideChatOpen > .composer {
+    position: relative !important;
+    inset: auto !important;
+    bottom: auto !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    margin: 0 !important;
+    padding: 0 12px calc(env(safe-area-inset-bottom, 0px) + 14px) !important;
+    box-sizing: border-box;
+    overflow: hidden;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    /* Keep the same 760px reading rail; do not stretch full left column. */
+    --composer-width: min(760px, 100%);
+    --conversation-width: min(760px, 100%);
+  }
+
+  body .main.sideChatOpen > .chat {
+    min-width: 0;
+    padding-bottom: 24px;
+    scroll-padding-bottom: 24px;
+    --composer-width: min(760px, 100%);
+    --conversation-width: min(760px, 100%);
+  }
+
+  body .main.sideChatOpen > .composer > *,
+  body .main.sideChatOpen > .composer > .box,
+  body .main.sideChatOpen > .composer > .box.composerCollapsed,
+  body .main.sideChatOpen > .composer > .box.composerExpanded,
+  body .main.sideChatOpen > .composer > .promptQueue,
+  body .main.sideChatOpen > .composer > .composerProjectPicker,
+  body .main.sideChatOpen > .composer > .editedFilesResult {
+    width: min(760px, calc(100% - 24px)) !important;
+    max-width: min(760px, calc(100% - 24px)) !important;
+    min-width: 0 !important;
+    margin-inline: auto !important;
+    align-self: center !important;
+    box-sizing: border-box;
+  }
+
+  body .main.sideChatOpen > .composer > .promptQueue {
+    width: min(calc(var(--composer-width) - 48px), calc(100% - 72px)) !important;
+    max-width: min(calc(var(--composer-width) - 48px), calc(100% - 72px)) !important;
+    margin: 0 auto 8px !important;
+  }
+
+  /* Main-only tab keeps the same centered rail after collapsing the side pane. */
+  body .main.sideChatOpen.sideChatViewMain > .composer,
+  body .main.sideChatOpen:has(> .sideChatPane.hidden) > .composer {
+    --composer-width: min(760px, 100%) !important;
+    --conversation-width: min(760px, 100%) !important;
+  }
+
+  body .main.sideChatOpen > .sideChatPane {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  body .main.sideChatOpen > .sideChatPane .sideChatComposer,
+  body .main.sideChatOpen > .sideChatPane .sideChatComposerBox {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+  }
+
+  body .main.sideChatOpen.sideChatViewMain > .chat,
+  body .main.sideChatOpen:has(> .sideChatPane.hidden) > .chat {
+    --composer-width: min(760px, 100%) !important;
+    --conversation-width: min(760px, 100%) !important;
+  }
+}
+
+.sideChatTabs {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  backdrop-filter: blur(12px) saturate(1.05);
+  -webkit-backdrop-filter: blur(12px) saturate(1.05);
+  padding: 8px 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+
+.sideChatTabs::-webkit-scrollbar {
+  height: 6px;
+}
+
+.main.sideChatOpen > .sideChatTabs {
+  display: flex;
+}
+
+.sideChatTabs.hidden {
+  display: none !important;
+}
+
+.sideChatTab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(42vw, 200px);
+  min-height: 32px;
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.sideChatTab > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sideChatTab:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.sideChatTab.active {
+  border-color: color-mix(in srgb, var(--primary) 34%, var(--border));
+  background: color-mix(in srgb, var(--primary) 12%, var(--surface));
+  color: var(--text);
+}
+
+.sideChatTabDot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.sideChatTabClose {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0;
+  margin-left: 2px;
+}
+
+.sideChatTabClose:hover {
+  background: var(--surface-active);
+  color: var(--text);
+}
+
+/* Pane is transparent so main session background (skin/custom/default) shows through. */
+.sideChatPane {
+  position: relative;
+  grid-column: 2;
+  grid-row: 3 / 5;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  border-left: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: transparent;
+  box-shadow: none;
+  z-index: 4;
+  overflow: hidden;
+  color: var(--text);
+}
+
+/* Desktop drag handle on the left edge of the side chat pane. */
+.sideChatResizeHandle {
+  display: none;
+}
+
+@media (min-width: 821px) {
+  .sideChatPane > .sideChatResizeHandle {
+    position: absolute;
+    z-index: 20;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    display: block;
+    width: 14px;
+    cursor: col-resize;
+    outline: none;
+    touch-action: none;
+    transform: translateX(-50%);
+  }
+
+  .sideChatPane > .sideChatResizeHandle::before {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 1px;
+    background: transparent;
+    content: "";
+    transform: translateX(-50%);
+    transition: background 140ms var(--ease), box-shadow 140ms var(--ease);
+  }
+
+  .sideChatPane > .sideChatResizeHandle:hover::before,
+  .sideChatPane > .sideChatResizeHandle:focus-visible::before,
+  .main.sideChatOpen.sideChatResizing .sideChatResizeHandle::before {
+    background: var(--primary);
+    box-shadow: 0 0 0 2px var(--primary-soft);
+  }
+}
+
+@media (max-width: 820px) {
+  .sideChatResizeHandle {
+    display: none !important;
+  }
+}
+
+/* Main tab / collapse: only main conversation; drop second grid track. */
+.main.sideChatOpen.sideChatViewMain {
+  grid-template-columns: minmax(0, 1fr) !important;
+}
+.main.sideChatOpen.sideChatViewMain > .sideChatPane,
+.main.sideChatOpen.sideChatViewMain > .sideChatResizeHandle {
+  display: none !important;
+}
+.main.sideChatOpen.sideChatViewMain > .chat,
+.main.sideChatOpen.sideChatViewMain > .automationView,
+.main.sideChatOpen.sideChatViewMain > .archiveView,
+.main.sideChatOpen.sideChatViewMain > .composer {
+  grid-column: 1 / -1;
+}
+.sideChatPane.hidden {
+  display: none !important;
+}
+/* When pane is hidden (collapsed), do not reserve the side column. */
+.main.sideChatOpen:has(> .sideChatPane.hidden) {
+  grid-template-columns: minmax(0, 1fr) !important;
+}
+.main.sideChatOpen:has(> .sideChatPane.hidden) > .chat,
+.main.sideChatOpen:has(> .sideChatPane.hidden) > .automationView,
+.main.sideChatOpen:has(> .sideChatPane.hidden) > .archiveView,
+.main.sideChatOpen:has(> .sideChatPane.hidden) > .composer {
+  grid-column: 1 / -1;
+}
+
+.sideChatHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  backdrop-filter: blur(16px) saturate(1.08);
+  -webkit-backdrop-filter: blur(16px) saturate(1.08);
+  padding: 12px 14px;
+}
+
+.sideChatHead[data-state="running"] {
+  background: color-mix(in srgb, var(--primary) 8%, color-mix(in srgb, var(--surface) 78%, transparent));
+}
+
+.sideChatHead[data-state="error"] {
+  background: color-mix(in srgb, var(--danger, #d14343) 8%, color-mix(in srgb, var(--surface) 78%, transparent));
+}
+
+.sideChatHeadCopy {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: grid;
+  gap: 4px;
+}
+
+.sideChatEyebrow {
+  color: var(--text-subtle);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sideChatTitle {
+  /* Session name is shown only on the top tab, not in the pane header. */
+  display: none !important;
+}
+
+.sideChatMeta {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-raised) 70%, transparent);
+  color: var(--text-muted);
+  padding: 3px 9px 3px 7px;
+}
+
+.sideChatMeta[data-state="running"] {
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+  background: color-mix(in srgb, var(--primary) 10%, var(--surface));
+  color: color-mix(in srgb, var(--primary) 70%, var(--text));
+}
+
+.sideChatMeta[data-state="error"] {
+  border-color: color-mix(in srgb, var(--danger, #d14343) 40%, var(--border));
+  background: color-mix(in srgb, var(--danger, #d14343) 10%, var(--surface));
+  color: var(--danger, #d14343);
+}
+
+.sideChatMeta[data-state="interrupted"] {
+  border-color: color-mix(in srgb, var(--border-strong) 70%, transparent);
+  color: var(--text-muted);
+}
+
+.sideChatStatusDot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--text-subtle) 80%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-subtle) 10%, transparent);
+}
+
+.sideChatMeta[data-state="running"] .sideChatStatusDot {
+  background: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 18%, transparent);
+  animation: sideChatPulse 1.4s ease-in-out infinite;
+}
+
+.sideChatMeta[data-state="error"] .sideChatStatusDot {
+  background: var(--danger, #d14343);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger, #d14343) 16%, transparent);
+  animation: none;
+}
+
+.sideChatMeta[data-state="interrupted"] .sideChatStatusDot {
+  background: var(--text-muted);
+  animation: none;
+}
+
+@keyframes sideChatPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.86); }
+}
+
+.sideChatStatus {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sideChatHeadActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.sideChatClose {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-raised) 86%, transparent);
+  color: var(--text-muted);
+  padding: 0;
+  transition: border-color 140ms var(--ease), color 140ms var(--ease), background 140ms var(--ease);
+}
+
+.sideChatClose:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+/* Match main chat stream spacing / transparent wash. */
+.sideChatMessages {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 22px 18px 12px;
+  background: transparent;
+  scroll-padding-block: 24px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.sideChatEmpty {
+  margin: auto;
+  color: var(--text-subtle);
+  font-size: 12px;
+}
+
+/*
+ * Message nodes use class "msg sideChatMsg user|assistant" so main bubble
+ * rules (body .msg.user / body .msg.assistant) own the look. Only reset the
+ * old card-like sideChat overrides and keep layout helpers.
+ */
+.sideChatMsg {
+  /* do not invent a separate card system */
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+  max-width: 100%;
+  align-self: stretch;
+  color: var(--text);
+  font-size: inherit;
+  line-height: inherit;
+  word-break: break-word;
+}
+
+/* User / assistant bubbles are controlled by main body .msg.* rules. */
+.sideChatMessages > .msg.user,
+.sideChatMessages > .sideChatMsg.user {
+  align-self: flex-end;
+  max-width: min(var(--conversation-width), 92%);
+}
+
+.sideChatMessages > .msg.assistant,
+.sideChatMessages > .sideChatMsg.assistant {
+  align-self: stretch;
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Layout only: typography comes from main body .msg.* rules. */
+.sideChatMsg .msgBody,
+.sideChatMsgBody {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.sideChatMsg .msgBody.markdownBody,
+.sideChatMsgBody.markdownBody {
+  white-space: normal !important;
+}
+
+.sideChatMsg .msgBody:not(.markdownBody),
+.sideChatMsgBody:not(.markdownBody) {
+  white-space: pre-wrap;
+}
+
+/* Composer shell mirrors main floating composer: transparent rail + capsule box. */
+.sideChatComposer {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  border-top: 0;
+  background: transparent;
+  padding: 0 12px calc(env(safe-area-inset-bottom, 0px) + 16px);
+}
+
+.sideChatComposerBox {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  align-items: end;
+  gap: 6px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  padding: 6px 8px 6px 14px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.10);
+  transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease), background 160ms var(--ease);
+}
+
+.sideChatComposerBox:focus-within {
+  border-color: var(--border-strong);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.13);
+}
+
+body[data-theme="light"] .sideChatComposerBox {
+  border-color: #e6e6e6;
+  background: #ffffff;
+  box-shadow: 0 8px 24px rgba(31, 35, 41, 0.08);
+}
+
+body[data-theme="dark"] .sideChatComposerBox {
+  border-color: #3a3a3a;
+  background: var(--surface);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+}
+
+/* Skin / custom wallpaper: same frosted capsule as main composer. */
+body[data-chat-bg="skin"] .sideChatComposerBox,
+body[data-theme="light"][data-chat-bg="skin"] .sideChatComposerBox,
+body[data-theme="dark"][data-chat-bg="skin"] .sideChatComposerBox {
+  border-color: var(--primary-line);
+  background: color-mix(in srgb, var(--skin-surface-strong) 78%, transparent);
+  box-shadow: 0 10px 28px var(--skin-accent-glow);
+  backdrop-filter: blur(18px) saturate(1.1);
+  -webkit-backdrop-filter: blur(18px) saturate(1.1);
+}
+
+body[data-chat-bg="custom"] .sideChatComposerBox,
+body[data-theme="light"][data-chat-bg="custom"] .sideChatComposerBox,
+body[data-theme="dark"][data-chat-bg="custom"] .sideChatComposerBox {
+  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
+  backdrop-filter: blur(18px) saturate(1.08);
+  -webkit-backdrop-filter: blur(18px) saturate(1.08);
+}
+
+.sideChatInput {
+  min-height: 36px;
+  max-height: 120px;
+  width: 100%;
+  resize: none;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 8px 4px;
+  outline: none;
+  font: inherit;
+  font-size: 15px;
+  line-height: 20px;
+}
+
+.sideChatInput::placeholder {
+  color: var(--text-subtle);
+}
+
+.sideChatInput:focus {
+  border: 0;
+  box-shadow: none;
+}
+
+.sideChatSend {
+  width: 36px;
+  height: 36px;
+  align-self: end;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: var(--primary);
+  color: var(--canvas);
+  padding: 0;
+  box-shadow: none;
+}
+
+body[data-chat-bg="skin"] .sideChatSend {
+  background: var(--primary);
+  color: var(--canvas);
+  box-shadow: 0 6px 18px var(--skin-accent-glow);
+}
+
+.sideChatSend:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.sideChatSend:disabled,
+.sideChatInput:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Side chat reuses main .msg / .activityBatch / .progressCommentary rules.
+   Only layout containment here — no separate typography. */
+.sideChatMessages > .msg.activityBatch,
+.sideChatMessages > .msg.process,
+.sideChatMessages > .msg.progressCommentary {
+  align-self: stretch;
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+}
+
+.sideChatLiveHint {
+  align-self: stretch;
+  margin-top: 4px;
+  border: 1px dashed color-mix(in srgb, var(--primary) 35%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 8px 12px;
+}
+
+
+.promptQueueMenu {
+  position: fixed;
+  z-index: 80;
+  min-width: 188px;
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-lg);
+  padding: 6px;
+}
+
+.promptQueueMenu.hidden {
+  display: none !important;
+}
+
+.promptQueueMenuItem {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  min-height: 34px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  padding: 0 10px;
+  text-align: left;
+  font-size: 12px;
+  font-weight: 560;
+}
+
+.promptQueueMenuItem:hover {
+  background: var(--surface-active);
+}
+
+.promptQueueMenuItem.danger {
+  color: var(--danger);
+}
+
+@media (max-width: 820px) {
+  /* Mobile: top tabs + full panel switch; never insert into message stream. */
+  .main.sideChatOpen {
+    display: flex !important;
+    flex-direction: column;
+    grid-template-columns: none;
+    grid-template-rows: none;
+    min-height: 0;
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  .main.sideChatOpen > .top,
+  .main.sideChatOpen > .sideChatTabs {
+    position: relative;
+    z-index: 40;
+    flex: 0 0 auto;
+  }
+
+  .main.sideChatOpen > .sideChatTabs {
+    position: sticky;
+    top: 0;
+    background: color-mix(in srgb, var(--surface) 72%, transparent);
+    backdrop-filter: blur(12px) saturate(1.05);
+    -webkit-backdrop-filter: blur(12px) saturate(1.05);
+  }
+
+  .main.sideChatOpen > .chat,
+  .main.sideChatOpen > .automationView,
+  .main.sideChatOpen > .archiveView,
+  .main.sideChatOpen > .composer {
+    grid-column: auto;
+    grid-row: auto;
+  }
+
+  body .main.sideChatOpen > .composer {
+    position: absolute !important;
+    inset: auto 0 0 !important;
+    bottom: var(--keyboard-inset, 0px) !important;
+    width: auto !important;
+  }
+
+  /* Full-screen side pane reuses main background; never paint solid canvas over skin/custom. */
+  .main.sideChatOpen > .sideChatPane {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: calc(var(--header-height, 56px) + env(safe-area-inset-top, 0px) + 48px);
+    z-index: 30;
+    display: none;
+    min-height: 0;
+    height: auto;
+    border-left: 0;
+    border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .main.sideChatOpen.sideChatViewMain > .sideChatPane {
+    display: none !important;
+  }
+
+  .main.sideChatOpen.sideChatViewSide > .chat,
+  .main.sideChatOpen.sideChatViewSide > .automationView,
+  .main.sideChatOpen.sideChatViewSide > .archiveView,
+  .main.sideChatOpen.sideChatViewSide > .composer {
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  .main.sideChatOpen.sideChatViewSide > .sideChatPane {
+    display: flex !important;
+  }
+
+  .main.sideChatOpen > .sideChatPane > .sideChatHead {
+    display: none;
+  }
+
+  .main.sideChatOpen > .sideChatPane > .sideChatMessages {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 16px 16px 10px;
+    background: transparent;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .main.sideChatOpen > .sideChatPane > .sideChatComposer {
+    flex: 0 0 auto;
+    padding: 0 12px calc(env(safe-area-inset-bottom, 0px) + 14px);
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  body.keyboardOpen .main.sideChatOpen > .sideChatPane > .sideChatComposer {
+    padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+  }
+
+  /* composer-fit mobile sidechat: keep capsule inside column */
+  .main.sideChatOpen > .composer {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box;
+    overflow: hidden;
+    --composer-width: 100%;
+    --conversation-width: 100%;
+  }
+  .main.sideChatOpen > .composer > *,
+  .main.sideChatOpen > .composer > .box,
+  .main.sideChatOpen > .composer > .promptQueue {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box;
+  }
+  .main.sideChatOpen > .composer > .promptQueue {
+    width: calc(100% - 40px) !important;
+    max-width: calc(100% - 40px) !important;
+    margin: 0 auto 8px !important;
+  }
+
+  .main.sideChatOpen > .sideChatPane > .sideChatComposer .sideChatInput {
+    min-height: 40px;
+    font-size: 16px;
+  }
+
+  .main.sideChatOpen > .sideChatPane > .sideChatComposer .sideChatSend {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+  }
+
+  .sideChatTab {
+    max-width: min(58vw, 240px);
+    min-height: 34px;
+    font-size: 12px;
+  }
+}
+
+
+/* App-like Shell expand panel + dual image activity gallery */
+.activityItemContent.shell {
+  position: relative;
+  margin: 6px 0 8px 25px;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 88%, transparent);
+  border-radius: 10px;
+  background: #0b1220;
+  overflow: hidden;
+}
+.activityShellHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-strong) 80%, transparent);
+  background: color-mix(in srgb, #111827 92%, #1d4ed8 8%);
+  color: #cbd5e1;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.activityShellLabel { opacity: 0.92; }
+.activityItemContent.shell .activityShellBody {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #e2e8f0;
+  padding: 10px 12px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.activityItemContent.shell .activityCopy {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+}
+.activityImageGallery {
+  width: min(640px, calc(100% - 25px));
+}
+.activityImageGallery:not(.single) {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-width: min(560px, calc(100% - 25px));
+}
+.activityImagePreview {
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border-strong) 70%, transparent);
+}
+.activityImagePreview.loaded {
+  aspect-ratio: auto;
+  background: transparent;
+}
+.activityImagePreview img {
+  object-fit: contain;
+  background: transparent;
+}
+
+/* Inline local/path images inside assistant/user markdown bodies:
+   fixed thumbnails only; click opens full preview. */
+.markdownBody .markdownImage,
+.msgBody.markdownBody .markdownImage {
+  display: inline-block;
+  width: 120px;
+  max-width: min(120px, 42vw);
+  margin: 8px 8px 8px 0;
+  vertical-align: top;
+}
+.markdownBody .markdownImage img,
+.msgBody.markdownBody .markdownImage img,
+.markdownBody img.markdownInlineImage {
+  display: block;
+  width: 120px;
+  max-width: min(120px, 42vw);
+  height: 150px;
+  max-height: 150px;
+  object-fit: cover;
+  object-position: center top;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
+  cursor: zoom-in;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
+  transition: transform 140ms var(--ease), box-shadow 140ms var(--ease);
+}
+.markdownBody .markdownImage img:hover,
+.msgBody.markdownBody .markdownImage img:hover,
+.markdownBody img.markdownInlineImage:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.12);
+}
+.markdownBody .markdownImage.unavailable img {
+  display: none;
+}
+.markdownBody .markdownImageFallback {
+  display: inline-block;
+  max-width: 100%;
+  padding: 6px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  word-break: break-all;
+}
+.markdownBody .markdownImageRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 8px 0;
+  max-width: min(560px, 100%);
+}
+.markdownBody .markdownImageRow .markdownImage {
+  margin: 0;
+  width: 120px;
+  max-width: min(120px, 42vw);
+}
+.markdownBody .markdownImageRow .markdownImage img {
+  width: 120px;
+  max-width: min(120px, 42vw);
+  height: 150px;
+  max-height: 150px;
+  aspect-ratio: auto;
+  object-fit: cover;
+  object-position: center top;
+}
+
+/* Standalone image messages also use compact thumbs; click still opens preview */
+body[data-theme] .msg.image:not(.inputImage) {
+  width: fit-content;
+  max-width: min(148px, 46%);
+  padding: 6px;
+}
+body[data-theme] .msg.image:not(.inputImage) img {
+  display: block;
+  width: 120px;
+  max-width: 120px;
+  height: 150px;
+  max-height: 150px;
+  object-fit: cover;
+  object-position: center top;
+  border-radius: 12px;
+  cursor: zoom-in;
 }
