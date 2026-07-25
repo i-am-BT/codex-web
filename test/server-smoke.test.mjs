@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer, request as createHttpRequest } from 'node:http';
 import net from 'node:net';
@@ -25,6 +26,23 @@ test('playground profile refresh preserves browser streaming preferences', async
   assert.match(playgroundPatchSource, /streamPartialImages: typeof existing\?\.streamPartialImages === 'number'/);
   assert.match(playgroundAssetScript, /streamImages:typeof\(S==null\?void 0:S\.streamImages\)=="boolean"\?S\.streamImages:I\.streamImages/);
   assert.match(playgroundAssetScript, /streamPartialImages:typeof\(S==null\?void 0:S\.streamPartialImages\)=="number"\?S\.streamPartialImages:I\.streamPartialImages/);
+  assert.match(
+    playgroundAssetScript,
+    /M\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const S of a\.inputImageIds\)xr\.delete\(S\)\}/,
+  );
+  assert.doesNotMatch(
+    playgroundAssetScript,
+    /M\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for\(const S of a\.inputImageIds\)xr\.delete\(S\)\}/,
+  );
+  await new Promise((resolve, reject) => {
+    execFile('node', ['--check', path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-CXjHvR1L.js')], (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(stderr || stdout || error.message));
+        return;
+      }
+      resolve();
+    });
+  });
 });
 
 test('playground proxy maps an external host alias only to a matching loopback provider port', async () => {
@@ -933,7 +951,7 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptScript, /new CustomEvent\('codex-web:workspace-view'/);
     assert.match(imagePromptScript, /options\.focus === true/);
     assert.match(imagePromptScript, /function checkLibraryStatus/);
-    assert.match(imagePromptScript, /data-src="\/playground\/"/);
+    assert.match(imagePromptScript, /data-src="\/playground\/(?:\?v=[^"]*)?"/);
 
     const unauthorized = await fetch(`${baseUrl}/api/config`);
     assert.equal(unauthorized.status, 401);
@@ -1214,7 +1232,7 @@ updated_at = 1784422800000
     assert.match(playgroundResponse.headers.get('cache-control'), /private, no-store/);
     const playgroundPage = await playgroundResponse.text();
     assert.match(playgroundPage, /<title>GPT Image Playground<\/title>/);
-    const playgroundAssetPath = playgroundPage.match(/src="\.\/(assets\/[^\"?]+\.js)"/)?.[1];
+    const playgroundAssetPath = playgroundPage.match(/src="\.\/(assets\/[^"\?]+\.js)/)?.[1];
     assert.ok(playgroundAssetPath);
     const playgroundAsset = await fetch(`${baseUrl}/playground/${playgroundAssetPath}`, {
       headers: { Cookie: cookie },
