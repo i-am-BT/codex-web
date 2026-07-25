@@ -14402,11 +14402,11 @@ function scheduleNativeLiveRender(live){
   live.renderTimer=setTimeout(()=>{
     live.renderTimer=null;
     pumpNativeLiveRender(live);
-  },120);
+  },60);
 }
 function nativeLiveRenderStep(live,remaining){
-  if(live.source==='snapshot')return remaining>1200?36:remaining>480?14:remaining>160?6:remaining>60?3:1;
-  return remaining>1500?64:remaining>600?24:remaining>180?9:remaining>60?4:2;
+  if(live.source==='snapshot')return remaining>1200?56:remaining>480?22:remaining>160?10:remaining>60?5:2;
+  return remaining>1500?112:remaining>600?48:remaining>180?18:remaining>60?8:4;
 }
 function pumpNativeLiveRender(live){
   const remaining=live.targetText.length-live.text.length;

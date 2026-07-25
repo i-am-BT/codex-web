@@ -670,15 +670,15 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.equal(first.text, '');
   assert.equal(first.element.classList.contains('streaming'), true);
   assert.equal(timers.size, 1);
-  assert.equal([...timers.values()][0].delay, 120, 'live text should use a slower render cadence');
+  assert.equal([...timers.values()][0].delay, 60, 'live text should use the faster balanced render cadence');
 
   runNextTimer();
   assert.ok(message.content.startsWith(first.text));
   assert.notEqual(first.text, message.content);
-  assert.ok(first.text.length <= 2, 'persisted snapshot should advance in visibly small steps');
+  assert.ok(first.text.length <= 56, 'persisted snapshot should advance in bounded steps');
   assert.equal(first.element.dataset.messageText, first.text);
   assert.equal(first.element.classList.contains('streaming'), true);
-  assert.deepEqual([...timers.values()].map((timer) => timer.delay).sort((a, b) => a - b), [120, 120]);
+  assert.deepEqual([...timers.values()].map((timer) => timer.delay).sort((a, b) => a - b), [60, 120]);
 
   const extended = { ...message, content: `${message.content}继续补充新的尾部。` };
   assert.strictEqual(api.upsert(extended, conversation), first);
@@ -703,7 +703,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   const pending = api.upsert({ ...message, seq: 8, content: `${message.content}尚未逐字完成。` }, conversation);
   assert.equal(timers.size, 1);
   runNextTimer();
-  assert.ok([...timers.values()].every((timer) => timer.delay === 120), 'away-from-bottom output must not queue a scroll');
+  assert.ok([...timers.values()].every((timer) => timer.delay === 60), 'away-from-bottom output must not queue a scroll');
   api.finishAll();
   assert.equal(timers.size, 0);
   assert.equal(chatScrollWrites, writesBeforeAwayRender, 'manual scrolling must not be overridden');
@@ -732,6 +732,11 @@ test('streaming output has no blinking text caret', () => {
   assert.doesNotMatch(uiStyles, /streamRail/);
   assert.doesNotMatch(uiStyles, /\.msg\.assistant\.streaming[^{}]*::before\s*\{/s);
   assert.doesNotMatch(uiStyles, /\.msg\.assistant\.streaming[^{}]*::after\s*\{/s);
+});
+
+test('streaming output uses the faster balanced render pace', () => {
+  assert.match(inlineScript, /function scheduleNativeLiveRender\(live\)[\s\S]*?\},60\);/);
+  assert.match(inlineScript, /function nativeLiveRenderStep\(live,remaining\)\{\s*if\(live\.source==='snapshot'\)return remaining>1200\?56:remaining>480\?22:remaining>160\?10:remaining>60\?5:2;\s*return remaining>1500\?112:remaining>600\?48:remaining>180\?18:remaining>60\?8:4;/);
 });
 
 test('queue send and explicit guide are mutually exclusive', () => {
