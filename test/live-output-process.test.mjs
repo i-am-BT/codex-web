@@ -727,6 +727,115 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.match(inlineScript, /if\(nearBottom&&\(conversation\.messages\|\|\[\]\)\.length\)scheduleNativeLiveScroll\(\)/);
 });
 
+test('runtime stream and snapshot message adopt into one assistant bubble', () => {
+  const liveSource = sourceBetween('function isNativeSnapshotStreamingMessage', 'async function copyText');
+  const rendered = [];
+  const addCalls = [];
+  const createElement = () => {
+    const classes = new Set(['msg', 'assistant', 'streaming']);
+    return {
+      dataset: { messageKind: 'live_progress' },
+      _messageBody: { textContent: '' },
+      classList: {
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        contains: (name) => classes.has(name),
+      },
+    };
+  };
+  const addMsg = (role, text, options) => {
+    const element = createElement();
+    element.dataset.messageText = text;
+    if (options?.kind) element.dataset.messageKind = String(options.kind);
+    if (options?.turnId) element.dataset.turnId = String(options.turnId);
+    if (Number.isInteger(options?.nativeMessageSeq)) element.dataset.nativeMessageSeq = String(options.nativeMessageSeq);
+    addCalls.push({ role, text, options, element });
+    return element;
+  };
+  const renderAssistantMarkdown = (body, text) => {
+    body.textContent = text;
+    rendered.push(text);
+  };
+  const chat = {
+    scrollHeight: 1000,
+    clientHeight: 400,
+    scrollTop: 600,
+    addEventListener() {},
+    querySelectorAll(selector) {
+      if (selector !== '.msg.assistant') return [];
+      return addCalls.map((call) => call.element);
+    },
+  };
+  const api = new Function(
+    'setTimeout',
+    'clearTimeout',
+    'addMsg',
+    'renderAssistantMarkdown',
+    'scrollChatToLatest',
+    'chat',
+    `
+      let nativeGeneration = 4;
+      let nativeCompletionSync = null;
+      let nativeLiveItems = new Map();
+      let nativeRuntimeStreamTurnIds = new Set();
+      let nativeRenderedMessageKeys = new Set();
+      let nativeLiveScrollTimer = null;
+      let nativeLiveFollowBottom = true;
+      let nativeLiveScrollTrackingBound = false;
+      let activeNativeTurnId = 'turn-active';
+      let latestAssistantElement = null;
+      let latestFinalAssistantElement = null;
+      let collectingTurnProcess = false;
+      let turnProcessElapsedTurnId = '';
+      let turnProcessStartedAt = 0;
+      let turnProcessElapsedLabel = null;
+      const statusEl = { textContent: '', classList: { add() {}, remove() {} } };
+      function beginTurnProcessCollection() {}
+      function ensureTurnProcessElapsedRunning() {}
+      function turnProcessElapsedMatches() { return true; }
+      function activateTurnProcessElement() {}
+      function removeNativeRunningElement() {}
+      ${liveSource}
+      return {
+        updateDelta: updateNativeLiveDelta,
+        finishItem: finishNativeLiveItem,
+        finishAll: finishAllNativeLiveItems,
+        adopt: adoptRuntimeLiveForSnapshotMessage,
+        upsert: upsertNativeSnapshotLiveMessage,
+        addMsg,
+        state: () => ({ nativeLiveItems, nativeRuntimeStreamTurnIds, nativeRenderedMessageKeys, latestAssistantElement }),
+      };
+    `,
+  )(() => 1, () => {}, addMsg, renderAssistantMarkdown, () => {}, chat);
+
+  const content = '明白了：不是日程禁止嘟嘴，而是别让参考像把每张图都带成嘟嘴。';
+  api.updateDelta({ itemId: 'item-1', turnId: 'turn-active', delta: content, updatedAt: '2026-07-26T12:00:00.000Z' });
+  assert.equal(addCalls.length, 1);
+  api.finishItem('item-1', 'turn-active');
+  api.finishAll();
+  assert.equal(addCalls.length, 1);
+
+  const message = {
+    seq: 12,
+    role: 'assistant',
+    kind: 'message',
+    turnId: 'turn-active',
+    content,
+    at: '2026-07-26T12:00:01.000Z',
+  };
+  assert.ok(api.adopt(message));
+  assert.equal(addCalls.length, 1, 'snapshot must adopt runtime bubble instead of creating a twin');
+  assert.equal(addCalls[0].element.dataset.nativeMessageSeq, '12');
+  assert.equal(addCalls[0].element.dataset.messageText, content);
+  assert.equal(api.upsert(message, { status: 'running', activeTurnId: 'turn-active', generation: 4 }), null);
+  assert.equal(addCalls.length, 1);
+
+  // Residual same-text insert after adoption should not create another bubble when using real addMsg path.
+  // (Here we only assert the runtime→snapshot adoption path used by live sync.)
+  assert.equal(addCalls[0].element.dataset.messageKind, 'message');
+  assert.equal(api.state().nativeRenderedMessageKeys.size >= 1, true);
+});
+
 test('streaming output has no blinking text caret', () => {
   assert.doesNotMatch(uiStyles, /streamCaret/);
   assert.doesNotMatch(uiStyles, /streamRail/);

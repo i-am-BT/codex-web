@@ -11147,6 +11147,9 @@ async function syncCurrentNativeConversationOnce(){
       upsertNativeSnapshotLiveMessage(msg,conversation);
       continue;
     }
+    if(role==='assistant'&&adoptRuntimeLiveForSnapshotMessage(msg)){
+      continue;
+    }
     addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage})
   }
   nativeCursor=Number(conversation.cursor||nativeCursor);
@@ -14125,6 +14128,27 @@ function addMsg(role,text,options={}){
     }
     latestUserElement=null;
   }
+  if(role==='assistant'&&!options.streaming){
+    const duplicate=findDuplicateAssistantBubble(text,options);
+    if(duplicate){
+      const targetText=String(text||'');
+      if(targetText&&normalizeAssistantDedupeText(duplicate.dataset.messageText||'')!==normalizeAssistantDedupeText(targetText)){
+        duplicate.dataset.messageText=targetText;
+        if(duplicate._messageBody)renderAssistantMarkdown(duplicate._messageBody,targetText);
+      }
+      if(options.kind)duplicate.dataset.messageKind=String(options.kind);
+      if(options.turnId)duplicate.dataset.turnId=String(options.turnId);
+      if(Number.isInteger(options.nativeMessageSeq))duplicate.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+      if(options.at)duplicate.dataset.messageAt=String(options.at);
+      if(options.kind==='final_answer'){
+        duplicate.classList.remove('progressCommentary');
+        latestFinalAssistantElement=duplicate;
+      }
+      latestAssistantElement=duplicate;
+      if(options.autoScroll!==false)scrollChatToLatest();
+      return duplicate;
+    }
+  }
   const collapsible=role==='tool'||role==='thinking'||role==='context';
   const el=document.createElement(collapsible?'details':'div');
   el.className='msg '+role+(collapsible?' toolDetails':'')+(options.streaming?' streaming':'');
@@ -14336,6 +14360,95 @@ function clearNativeLiveScroll(){
   if(nativeLiveScrollTimer)clearTimeout(nativeLiveScrollTimer);
   nativeLiveScrollTimer=null;
 }
+function normalizeAssistantDedupeText(text){
+  return String(text||'').replace(/\r\n/g,'\n').replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+}
+function assistantTextsMatch(a,b){
+  const left=normalizeAssistantDedupeText(a);
+  const right=normalizeAssistantDedupeText(b);
+  if(!left||!right)return false;
+  if(left===right)return true;
+  if(left.startsWith(right)||right.startsWith(left))return true;
+  const compact=(value)=>value.replace(/\s+/g,'');
+  return compact(left)===compact(right);
+}
+function findRuntimeLiveForSnapshotMessage(message){
+  const turnId=String(message?.turnId||'');
+  const target=normalizeAssistantDedupeText(message?.content||'');
+  if(!turnId||!target)return null;
+  let best=null;
+  for(const live of nativeLiveItems.values()){
+    if(live?.source!=='runtime'||!live.element)continue;
+    if(String(live.turnId||'')!==turnId)continue;
+    const liveText=normalizeAssistantDedupeText(live.targetText||live.text||live.element.dataset?.messageText||'');
+    if(!assistantTextsMatch(liveText,target))continue;
+    if(!best)best=live;
+    else{
+      const bestLen=String(best.targetText|| best.text || '').length;
+      const liveLen=String(live.targetText || live.text || '').length;
+      if(liveLen>=bestLen)best=live;
+    }
+  }
+  if(best)return best;
+  for(const item of [...chat.querySelectorAll('.msg.assistant')].reverse()){
+    if(!item)continue;
+    if(item.dataset.turnId&&item.dataset.turnId!==turnId)continue;
+    if(item.dataset.nativeMessageSeq)continue;
+    const kind=item.dataset.messageKind||'';
+    if(kind&&!['','message','commentary','live_progress','final_answer'].includes(kind))continue;
+    const liveText=normalizeAssistantDedupeText(item.dataset.messageText||item.textContent||'');
+    if(!assistantTextsMatch(liveText,target))continue;
+    return {key:'dom-runtime:'+turnId,source:'runtime',turnId,element:item,text:liveText,targetText:liveText,complete:true,renderTimer:null};
+  }
+  return null;
+}
+function adoptRuntimeLiveForSnapshotMessage(message){
+  const live=findRuntimeLiveForSnapshotMessage(message);
+  if(!live?.element)return null;
+  const targetText=String(message.content||'');
+  if(live.renderTimer){clearTimeout(live.renderTimer);live.renderTimer=null}
+  live.complete=true;
+  live.targetText=targetText;
+  live.text=targetText;
+  live.messageSeq=message.seq;
+  live.element.classList.remove('streaming');
+  live.element.dataset.messageText=targetText;
+  live.element.dataset.messageKind=String(message.kind||live.element.dataset.messageKind||'message');
+  live.element.dataset.turnId=String(message.turnId||live.turnId||'');
+  if(Number.isInteger(message.seq))live.element.dataset.nativeMessageSeq=String(message.seq);
+  if(message.at)live.element.dataset.messageAt=String(message.at);
+  if(live.element._messageBody)renderAssistantMarkdown(live.element._messageBody,targetText);
+  if(live.key&&nativeLiveItems.has(live.key))nativeLiveItems.delete(live.key);
+  if(Number.isInteger(message.seq)){
+    const snapshotKey=nativeSnapshotLiveKey(message,{generation:nativeGeneration});
+    nativeRenderedMessageKeys.add(snapshotKey);
+  }
+  const turnId=String(message.turnId||live.turnId||'');
+  if(turnId&&![...nativeLiveItems.values()].some((item)=>item.source==='runtime'&&String(item.turnId||'')===turnId&&!item.complete)){
+    nativeRuntimeStreamTurnIds.delete(turnId);
+  }
+  if(message.kind==='final_answer'){
+    live.element.classList.remove('progressCommentary');
+    latestFinalAssistantElement=live.element;
+  }
+  latestAssistantElement=live.element;
+  return live.element;
+}
+function findDuplicateAssistantBubble(text,options={}){
+  const target=normalizeAssistantDedupeText(text);
+  if(!target)return null;
+  const turnId=String(options.turnId||'');
+  const seq=Number.isInteger(options.nativeMessageSeq)?Number(options.nativeMessageSeq):null;
+  const candidates=[...chat.querySelectorAll('.msg.assistant')].reverse();
+  for(const item of candidates){
+    if(!item)continue;
+    if(turnId&&item.dataset.turnId&&item.dataset.turnId!==turnId)continue;
+    if(seq!=null&&Number(item.dataset.nativeMessageSeq)===seq)return item;
+    const existing=normalizeAssistantDedupeText(item.dataset.messageText||item.textContent||'');
+    if(assistantTextsMatch(existing,target))return item;
+  }
+  return null;
+}
 function nativeSnapshotLiveKey(message,conversation){
   return 'snapshot:'+String(conversation?.generation||nativeGeneration||0)+':'+String(message?.seq||'');
 }
@@ -14343,6 +14456,12 @@ function upsertNativeSnapshotLiveMessage(message,conversation){
   const key=nativeSnapshotLiveKey(message,conversation);
   if(!message?.seq||!String(message.content||''))return null;
   const targetText=String(message.content||'');
+  // Prefer adopting the runtime stream bubble so live deltas and history never create twins.
+  const adopted=adoptRuntimeLiveForSnapshotMessage(message);
+  if(adopted){
+    nativeRenderedMessageKeys.add(key);
+    return null;
+  }
   let live=nativeLiveItems.get(key);
   // Same generation+seq may grow after a content merge; only reopen when content actually expanded.
   if(!live&&nativeRenderedMessageKeys.has(key)){
@@ -14441,12 +14560,13 @@ function finishNativeLiveItem(itemId,turnId=''){
   if(live.text.length<live.targetText.length)scheduleNativeLiveRender(live);else settleNativeLiveItem(live);
 }
 function finishAllNativeLiveItems(){
-  for(const live of nativeLiveItems.values()){
+  for(const live of [...nativeLiveItems.values()]){
     if(live.renderTimer)clearTimeout(live.renderTimer);
     live.renderTimer=null;
     live.complete=true;
     if(live.text!==live.targetText){live.text=live.targetText;renderNativeLiveItem(live)}
     settleNativeLiveItem(live);
+    if(live.source==='runtime')nativeLiveItems.delete(live.key);
   }
   nativeRuntimeStreamTurnIds.clear();
 }
