@@ -1452,6 +1452,7 @@ updated_at = 1784422800000
     const pageResponse = await fetch(baseUrl, { headers: { Cookie: cookie } });
     assert.equal(pageResponse.status, 200);
     const page = await pageResponse.text();
+    assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260723g"/);

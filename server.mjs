@@ -6463,7 +6463,7 @@ function commitPromptQueueDomOrder(threadId,{render=false}={}){
   if(next.length!==byId.size)return false;
   const prev=promptQueueFor(threadId).map((item)=>String(item.id||''));
   const curr=next.map((item)=>String(item.id||''));
-  if(prev.join('\0')===curr.join('\0'))return false;
+  if(prev.length===curr.length&&prev.every((id,index)=>id===curr[index]))return false;
   applyPromptQueueLocal(threadId,next,{persist:true,render:!!render});
   schedulePromptQueueServerSync(threadId);
   statusEl.textContent='队列顺序已更新';
@@ -14361,7 +14361,7 @@ function clearNativeLiveScroll(){
   nativeLiveScrollTimer=null;
 }
 function normalizeAssistantDedupeText(text){
-  return String(text||'').replace(/\r\n/g,'\n').replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+  return String(text||'').replace(/\\r\\n/g,'\\n').replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n').trim();
 }
 function assistantTextsMatch(a,b){
   const left=normalizeAssistantDedupeText(a);
@@ -14369,7 +14369,7 @@ function assistantTextsMatch(a,b){
   if(!left||!right)return false;
   if(left===right)return true;
   if(left.startsWith(right)||right.startsWith(left))return true;
-  const compact=(value)=>value.replace(/\s+/g,'');
+  const compact=(value)=>value.replace(/\\s+/g,'');
   return compact(left)===compact(right);
 }
 function findRuntimeLiveForSnapshotMessage(message){
