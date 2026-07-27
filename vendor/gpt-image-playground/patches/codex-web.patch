@@ -19,7 +19,7 @@ index 5fc1614..2ec9586 100644
 @@ -96,6 +96,73 @@ export default function App() {
      initStore()
    }, [setSettings])
- 
+
 +  useEffect(() => {
 +    if (window.parent === window) return
 +
@@ -93,7 +93,7 @@ index 5fc1614..2ec9586 100644
 @@ -107,6 +174,64 @@ export default function App() {
      return () => document.removeEventListener('dragstart', preventPageImageDrag)
    }, [])
- 
+
 +  useEffect(() => {
 +    if (window.parent === window) return
 +
@@ -164,12 +164,12 @@ index 37375ba..203fc6e 100644
    | { type: 'input'; key: string; label: string; imageId: string; dataUrl: string; imageIndex: number }
    | { type: 'agent-output'; key: string; label: string; imageId: string; insertText: string }
 +  | { type: 'upload'; key: string; label: string }
- 
+
  function agentImageMentionMatches(query: string, label: string) {
    const normalized = query.trim().toLowerCase()
 @@ -57,13 +58,23 @@ function agentImageMentionMatches(query: string, label: string) {
  }
- 
+
  function AtImageOptionThumb({ option }: { option: AtImageOption }) {
 -  const [src, setSrc] = useState(option.type === 'input' ? option.dataUrl : getCachedImage(option.imageId) || '')
 +  const [src, setSrc] = useState(
@@ -179,7 +179,7 @@ index 37375ba..203fc6e 100644
 +        ? getCachedImage(option.imageId) || ''
 +        : '',
 +  )
- 
+
    useEffect(() => {
      if (option.type === 'input') {
        setSrc(option.dataUrl)
@@ -189,12 +189,12 @@ index 37375ba..203fc6e 100644
 +      setSrc('')
 +      return
 +    }
- 
+
      let cancelled = false
      setSrc(getCachedImage(option.imageId) || '')
 @@ -76,8 +87,14 @@ function AtImageOptionThumb({ option }: { option: AtImageOption }) {
    }, [option])
- 
+
    return (
 -    <span className="h-9 w-9 shrink-0 overflow-hidden rounded-lg border border-gray-200/70 bg-gray-100 dark:border-white/[0.08] dark:bg-white/[0.04]">
 -      {src && <img src={src} className="h-full w-full object-cover" alt="" />}
@@ -241,8 +241,8 @@ index 37375ba..203fc6e 100644
      : []
    const showAtImageMenu = !atImageMenuDismissed && atImageOptions.length > 0
 @@ -553,6 +576,13 @@ export default function InputBar() {
- 
- 
+
+
    const selectAtImageOption = useCallback((option: AtImageOption) => {
 +    if (option.type === 'upload') {
 +      setAtImageMenuDismissed(true)
@@ -256,7 +256,7 @@ index 37375ba..203fc6e 100644
      const query = getAtImageQuery(stripImageMentionMarkers(prompt), cursor, { length: atImageSourceCount })
 @@ -832,8 +862,20 @@ export default function InputBar() {
    handleFilesRef.current = handleFiles
- 
+
    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
 +    const imageCountBeforeUpload = useStore.getState().inputImages.length
 +    const reopenMentionMenu = Boolean(
@@ -273,7 +273,7 @@ index 37375ba..203fc6e 100644
 +      })
 +    }
    }
- 
+
    const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
 diff --git a/src/components/SettingsModal.tsx b/src/components/SettingsModal.tsx
 index bbd5f59..cec9b9c 100644
@@ -311,7 +311,7 @@ index 67d35ff..8d9ed1a 100644
 @@ -222,6 +222,35 @@ describe('callAgentResponsesApi', () => {
      expect(textDeltas).toEqual(['Hel'])
    })
- 
+
 +  it('surfaces nested Responses API stream failure details', async () => {
 +    const streamBody = [
 +      'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"sensitive_words_detected","message":"sensitive_words_detected (request id: test-request)"}}}',
@@ -350,7 +350,7 @@ index f04b9d1..08925d6 100644
 +++ b/src/lib/agentApi.ts
 @@ -289,15 +289,19 @@ function applyUrlCitations(text: string, annotations: ResponseTextAnnotation[] |
  }
- 
+
  function getStreamEventErrorMessage(event: Record<string, unknown>): string | null {
 -  const error = event.error
 -  if (isRecordValue(error)) {
@@ -364,7 +364,7 @@ index f04b9d1..08925d6 100644
 +  const response = isRecordValue(event.response) ? event.response : null
 +  const responseError = getErrorMessageFromValue(response?.error)
 +  if (responseError) return responseError
- 
+
    const type = getStringValue(event, 'type')
 -  if (type?.endsWith('.failed')) return getStringValue(event, 'message') ?? 'Agent 流式请求失败'
 +  if (type?.endsWith('.failed')) {
@@ -374,14 +374,14 @@ index f04b9d1..08925d6 100644
 +  }
    return null
  }
- 
+
 diff --git a/src/lib/api.test.ts b/src/lib/api.test.ts
 index c91b829..a896996 100644
 --- a/src/lib/api.test.ts
 +++ b/src/lib/api.test.ts
 @@ -599,7 +599,7 @@ describe('callImageApi', () => {
      })
- 
+
      expect(fetchMock).toHaveBeenCalledWith(
 -      '/api-proxy/images/generations',
 +      '/api-proxy/images/generations?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1',
@@ -390,7 +390,7 @@ index c91b829..a896996 100644
    })
 @@ -626,7 +626,7 @@ describe('callImageApi', () => {
      })
- 
+
      expect(fetchMock).toHaveBeenCalledWith(
 -      '/api-proxy/images/generations',
 +      '/api-proxy/images/generations?codex_upstream=',
@@ -399,7 +399,7 @@ index c91b829..a896996 100644
    })
 @@ -675,7 +675,7 @@ describe('callImageApi', () => {
      })
- 
+
      expect(fetchMock).toHaveBeenCalledWith(
 -      '/api-proxy/custom/images',
 +      '/api-proxy/custom/images?codex_upstream=',
@@ -408,7 +408,7 @@ index c91b829..a896996 100644
    })
 @@ -753,7 +753,7 @@ describe('callImageApi', () => {
      })
- 
+
      expect(fetchMock).toHaveBeenCalledWith(
 -      '/api-proxy/images/generations',
 +      '/api-proxy/images/generations?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1',
@@ -427,14 +427,14 @@ index adc16bb..fd5327a 100644
 +      '/api-proxy/images/edits?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1',
      )
    })
- 
+
    it('leaves API versioning to the proxy target when proxying', () => {
      expect(buildApiUrl('http://api.example.com', 'images/generations', null, true)).toBe(
 -      '/api-proxy/images/generations',
 +      '/api-proxy/images/generations?codex_upstream=http%3A%2F%2Fapi.example.com',
      )
    })
- 
+
 @@ -28,7 +28,7 @@ describe('buildApiUrl', () => {
          },
          true,
@@ -442,7 +442,7 @@ index adc16bb..fd5327a 100644
 -    ).toBe('/openai-proxy/responses')
 +    ).toBe('/openai-proxy/responses?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1')
    })
- 
+
    it('uses the configured API URL directly when API proxy is disabled', () => {
 diff --git a/src/lib/devProxy.ts b/src/lib/devProxy.ts
 index ede2298..b9bc384 100644
@@ -450,14 +450,14 @@ index ede2298..b9bc384 100644
 +++ b/src/lib/devProxy.ts
 @@ -64,7 +64,9 @@ export function buildApiUrl(
    const endpointPath = path.replace(/^\/+/, '')
- 
+
    if (useApiProxy) {
 -    return `${proxyConfig?.prefix ?? DEFAULT_PROXY_PREFIX}/${endpointPath}`
 +    const proxyUrl = `${proxyConfig?.prefix ?? DEFAULT_PROXY_PREFIX}/${endpointPath}`
 +    const separator = proxyUrl.includes('?') ? '&' : '?'
 +    return `${proxyUrl}${separator}codex_upstream=${encodeURIComponent(normalizedBaseUrl)}`
    }
- 
+
    const apiPath = normalizedBaseUrl.endsWith('/v1')
 diff --git a/src/store.test.ts b/src/store.test.ts
 index 98afeac..730a724 100644
@@ -469,13 +469,13 @@ index 98afeac..730a724 100644
  import { removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
 -import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
 +import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, isDirectAgentImageFallbackPrompt, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
- 
+
  const commitTaskDeletionImplementation = vi.mocked(commitTaskDeletion).getMockImplementation()!
  const deleteDbImageImplementation = vi.mocked(deleteDbImage).getMockImplementation()!
 @@ -154,6 +154,108 @@ describe('error toast messages', () => {
    })
  })
- 
+
 +describe('Agent direct image fallback', () => {
 +  const textProfile = createDefaultOpenAIProfile({
 +    id: 'agent-text-profile',
@@ -588,7 +588,7 @@ index f9cb8cd..db3d9c9 100644
 @@ -2365,6 +2365,16 @@ export async function submitAgentMessage() {
    void executeAgentRound(conversation.id, roundId, normalizedParams, requestSettings, activeProfile, imageProfile)
  }
- 
+
 +export function isDirectAgentImageFallbackPrompt(prompt: string, hasInputImages = false): boolean {
 +  const text = prompt.trim()
 +  if (!text) return false
@@ -684,7 +684,7 @@ index f9cb8cd..db3d9c9 100644
 +        }
 +      }
        if (controller.signal.aborted) throw createAgentAbortError()
- 
+
        lastResponseId = result.responseId ?? lastResponseId
 @@ -4450,4 +4526,3 @@ export async function addImageFromUrl(src: string): Promise<void> {
    cacheImage(id, dataUrl)
