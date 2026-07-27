@@ -1753,8 +1753,8 @@ updated_at = 1784422800000
     assert.match(page, /function appendConversationElement\(element,role,options=\{\}\)/);
     assert.match(page, /appendConversationElement\(el,role,\{steering:steeringUser\}\)/);
     assert.doesNotMatch(page, /matched\.open=true/);
-    assert.doesNotMatch(page, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
-    assert.match(page, /pinSteeringMessageToBottom\(el\)/);
+    assert.match(page, /if\(completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\);\s*else activateTurnProcessElement\(el\)/);
+    assert.doesNotMatch(page, /pinSteeringMessageToBottom|pinOpenSteeringMessages|ensureSteeringPinObserver/);
     assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);

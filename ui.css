@@ -4942,12 +4942,6 @@ body[data-theme="dark"] .completionTimeline .markdownBody code {
   font-size: 13px;
 }
 
-/* Main-stream steering (follow-up/guide) should stay visible outside collapsed process panels */
-/* Flex order keeps mid-turn steers after completion / assistant siblings even if DOM momentarily races. */
-body .chat > .msg.user.steeringUser {
-  order: 9999;
-}
-
 body .msg.user.steeringUser {
   position: relative;
   display: flex;

@@ -7016,7 +7016,6 @@ function showNativeSteerOptimistically(item){
     for(const attachment of item.attachments||[]){
       if(attachment.kind==='image')appendInputImageToUser(existing,attachment.url,existing.dataset.messageAt);
     }
-    pinSteeringMessageToBottom(existing);
     latestUserElement=existing;
     scrollChatToLatest({force:true});
     return existing;
@@ -7032,7 +7031,6 @@ function showNativeSteerOptimistically(item){
   for(const attachment of item.attachments||[]){
     if(attachment.kind==='image')appendInputImageToUser(element,attachment.url,element.dataset.messageAt);
   }
-  pinSteeringMessageToBottom(element);
   scrollChatToLatest({force:true});
   return element;
 }
@@ -11297,11 +11295,8 @@ async function loadConversation(id,source='web',options={}){
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
   closeMenu();
   persistActiveConversation(currentConversationId,currentConversationSource);
-  // Hydrated history can leave mid-turn steers above the completion card — re-pin after full render.
-  ensureSteeringPinObserver();
-  pinOpenSteeringMessages();
   scrollChatToLatest({force:true});
-  [120,320,800].forEach((ms)=>setTimeout(()=>{pinOpenSteeringMessages();scrollChatToLatest({force:false});},ms));
+  [120,320,800].forEach((ms)=>setTimeout(()=>scrollChatToLatest({force:false}),ms));
   return true;
 }
 function updateConversationStatus(conversation){
@@ -11542,7 +11537,6 @@ async function syncCurrentNativeConversationOnce(){
   updateConversationStatus(conversation);
   applyConversationMode();
   if(!webRunActive)schedulePromptQueueDispatch(id,180);
-  pinOpenSteeringMessages();
   if(nearBottom&&(conversation.messages||[]).length)scheduleNativeLiveScroll();
 }
 function nativeTerminalPersisted(conversation,turnId){
@@ -13543,7 +13537,7 @@ function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
         if(orphanFinal.parentNode!==chat)chat.appendChild(orphanFinal);
         latestFinalAssistantElement=orphanFinal;
       }
-      const processKeep=orphaned.filter((item)=>item!==orphanFinal&&item.classList?.contains('progressCommentary'));
+      const processKeep=orphaned.filter((item)=>item!==orphanFinal&&(item.classList?.contains('progressCommentary')||item.classList?.contains('steeringUser')));
       const completion=createCompletionMessage('任务完成',processKeep,turnProcessElapsedTurnId||'',NaN,null);
       if(processKeep.length)completion.open=true;
       if(orphanFinal?.parentNode===chat)chat.insertBefore(completion,orphanFinal);
@@ -13673,7 +13667,7 @@ function isHandoffSummaryText(text){
   if(!normalized)return false;
   const firstLine=normalized.split('\\n',1)[0].trim();
   const plain=firstLine.replace(/^#{1,6}\\s+/,'').replace(/^\\*{1,2}|\\*{1,2}$/g,'').replace(/^_+|_+$/g,'').trim().toLowerCase();
-  if(plain==='handoff'||plain==='handoff summary'||plain==='current task'||plain.startsWith('handoff:')||plain.startsWith('handoff summary:')||plain.startsWith('current task:')||plain.startsWith('交接摘要')||/^\\*\\*handoff(?:\\s+summary)?\\*\\*/i.test(firstLine)||/^\\*\\*current task\\*\\*/i.test(firstLine))return true;
+  if(plain==='handoff'||plain==='handoff summary'||plain==='current task'||plain==='current progress'||plain.startsWith('handoff:')||plain.startsWith('handoff summary:')||plain.startsWith('current task:')||plain.startsWith('current progress:')||plain.startsWith('交接摘要')||/^\\*\\*handoff(?:\\s+summary)?\\*\\*/i.test(firstLine)||/^\\*\\*current task\\*\\*/i.test(firstLine)||/^\\*\\*current progress\\*\\*/i.test(firstLine))return true;
   const head=normalized.slice(0,1200).toLowerCase();
   const hasGoal=head.includes('## goal')||head.includes('## 目标');
   const hasOps=head.includes('service / ops')||head.includes('immediate next steps')||head.includes('already done')||head.includes('key files')||head.includes('constraints');
@@ -13784,8 +13778,8 @@ function regroupTurnToolArtifacts(elements=[]){
   return [...grouped,...standalone];
 }
 function createCompletionMessage(text,processElements=[],turnId='',elapsedSeconds=NaN,tokenUsage=null){
-  // Never fold user / steering bubbles into the collapsed process timeline.
-  const items=settleTurnProcessHistory(processElements).filter((item)=>Boolean(item)&&!item.classList?.contains('user')&&!item.classList?.contains('steeringUser'));
+  // Preserve mid-turn steering at its chronological point between response/tool items.
+  const items=settleTurnProcessHistory(processElements).filter((item)=>Boolean(item)&&(!item.classList?.contains('user')||item.classList?.contains('steeringUser')));
   const collapsible=items.length>0;
   const el=document.createElement(collapsible?'details':'div');
   el.className='msg process completionSummary'+(collapsible?' collapsible':'');
@@ -14249,18 +14243,13 @@ function consumeNativeOptimisticSteering(text,at,turnId){
     delete element.dataset.optimisticQueueId;
     element.dataset.messageAt=String(at||element.dataset.messageAt||'');
     if(expectedTurnId)element.dataset.turnId=expectedTurnId;
-    pinSteeringMessageToBottom(element);
     latestUserElement=element;
     return element;
   }
   return null;
 }
-function pinSteeringMessageToBottom(element){
+function cleanSteeringMessageDuplicates(element){
   if(!element||!chat)return element;
-  // Detach from completion timelines / live process panels / nested wrappers first.
-  if(element.isConnected&&element.parentNode!==chat)chat.appendChild(element);
-  else if(element.isConnected&&chat.lastElementChild!==element)chat.appendChild(element);
-  else if(!element.isConnected)chat.appendChild(element);
   // Collapse multi-thumb attachment stacks on steers (same upload rebinding).
   const stack=element.querySelector('.userAttachmentStack');
   if(stack){
@@ -14290,70 +14279,14 @@ function pinSteeringMessageToBottom(element){
       if(wrap)wrap.remove(); else image.remove();
     }
   }
-  // Absolute bottom: after completion cards, result artifacts, assistants, process panels.
-  if(chat.lastElementChild!==element)chat.appendChild(element);
   return element;
-}
-function pinOpenSteeringMessages(){
-  if(!chat)return;
-  // Include steers trapped inside completion/live wrappers, not only direct chat children.
-  const steers=[...chat.querySelectorAll('.msg.user.steeringUser')].filter((node)=>node?.isConnected);
-  // Stable chronological order among steers, then append each so the newest ends last.
-  steers.sort((a,b)=>{
-    const sa=Number(a.dataset.nativeMessageSeq||0);
-    const sb=Number(b.dataset.nativeMessageSeq||0);
-    if(sa&&sb&&sa!==sb)return sa-sb;
-    const ta=Date.parse(a.dataset.messageAt||'')||0;
-    const tb=Date.parse(b.dataset.messageAt||'')||0;
-    if(ta&&tb&&ta!==tb)return ta-tb;
-    // Fall back to current document order.
-    return (a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING)?-1:1;
-  });
-  for(const steer of steers)pinSteeringMessageToBottom(steer);
-  // Second pass: if anything else was appended during rebind, force steers last again.
-  for(const steer of steers){
-    if(steer.isConnected&&chat.lastElementChild!==steer&&steers[steers.length-1]===steer)chat.appendChild(steer);
-    else if(steer.isConnected&&steer.parentNode!==chat)chat.appendChild(steer);
-  }
-  // Ensure the whole steer block is contiguous at the end (oldest→newest).
-  for(const steer of steers){
-    if(steer.isConnected)chat.appendChild(steer);
-  }
-}
-function ensureSteeringPinObserver(){
-  if(!chat||window.__steeringPinObserver)return;
-  window.__steeringPinObserver=new MutationObserver((mutations)=>{
-    let needsPin=false;
-    for(const mutation of mutations){
-      if(mutation.type!=='childList')continue;
-      for(const node of mutation.addedNodes){
-        if(!(node instanceof Element))continue;
-        if(node.classList?.contains('completionSummary')||node.classList?.contains('liveProcessPanel')||node.classList?.contains('turnResultArtifacts')||node.classList?.contains('steeringUser')||node.querySelector?.('.completionSummary,.steeringUser')){
-          needsPin=true;break;
-        }
-      }
-      if(needsPin)break;
-      if(mutation.removedNodes.length&&chat.querySelector('.msg.user.steeringUser'))needsPin=true;
-    }
-    if(!needsPin)return;
-    if(window.__steeringPinRaf)cancelAnimationFrame(window.__steeringPinRaf);
-    window.__steeringPinRaf=requestAnimationFrame(()=>{
-      window.__steeringPinRaf=0;
-      pinOpenSteeringMessages();
-    });
-  });
-  window.__steeringPinObserver.observe(chat,{childList:true,subtree:true});
 }
 function appendConversationElement(element,role,options={}){
   const steering=Boolean(options.steering)||element?.classList?.contains('steeringUser');
-  // Normal user questions stay above the live process panel; mid-turn steers go to the bottom.
+  // Normal user questions stay above the live process panel. A mid-turn steer is
+  // adopted into the live timeline by activateTurnProcessElement at its send point.
   if(role==='user'&&!steering&&turnProcessHeader?.parentNode===chat)chat.insertBefore(element,turnProcessHeader);
   else chat.appendChild(element);
-  // Any non-steer append can push past a previously-pinned steer; re-seat open steers at the end.
-  if(!steering&&role!=='user'){
-    const openSteers=chat.querySelectorAll?.('.msg.user.steeringUser');
-    if(openSteers?.length)pinOpenSteeringMessages();
-  }
   return element;
 }
 function clearMessageActionsOpen(except=null){
@@ -14556,6 +14489,11 @@ function addMsg(role,text,options={}){
     };
     for(const item of artifacts){
       if(item===anchor)continue;
+      if(item.classList?.contains('steeringUser')){
+        flushPendingTools();
+        processElements.push(item);
+        continue;
+      }
       if(isProgressArtifact(item)){
         const progressText=String(item.dataset?.messageText||item.textContent||'').trim();
         if(!progressText){
@@ -14574,7 +14512,7 @@ function addMsg(role,text,options={}){
     for(const item of visibleActivities)settleTurnTool(item);
     const completion=createCompletionMessage(text,processElements,options.turnId,elapsedSeconds,options.tokenUsage);
     // Expand when progress commentary is present so intermediate steps stay visible after completion.
-    if(processElements.some((item)=>isProgressArtifact(item)))completion.open=true;
+    if(processElements.some((item)=>isProgressArtifact(item)||item.classList?.contains('steeringUser')))completion.open=true;
     if(anchor){
       chat.insertBefore(completion,anchor);
       for(const item of visibleActivities)chat.insertBefore(item,anchor);
@@ -14586,8 +14524,7 @@ function addMsg(role,text,options={}){
     }
     latestToolElement=null;
     refreshIcons(chat);
-    pinOpenSteeringMessages();
-    requestAnimationFrame(()=>{pinOpenSteeringMessages();if(options.autoScroll!==false)scrollChatToLatest({force:false});});
+    requestAnimationFrame(()=>{if(options.autoScroll!==false)scrollChatToLatest({force:false});});
     if(options.autoScroll!==false)scrollChatToLatest();
     return completion;
   }
@@ -14796,10 +14733,11 @@ function addMsg(role,text,options={}){
     el._messageBody=body;
   }
   if(role==='tool'&&latestToolElement?.parentNode)latestToolElement.remove();
-  // Steering always ends up at the absolute bottom of the main stream.
   appendConversationElement(el,role,{steering:steeringUser});
   if(steeringUser){
-    pinSteeringMessageToBottom(el);
+    cleanSteeringMessageDuplicates(el);
+    if(completedSteeringTimeline)completedSteeringTimeline.appendChild(el);
+    else activateTurnProcessElement(el);
   }else if(isTurnProcessMessage(role,kind,text)){
     activateTurnProcessElement(el);
   }
@@ -14812,7 +14750,6 @@ function addMsg(role,text,options={}){
   if(role==='user')latestUserElement=el;
   if(['user','assistant'].includes(role)&&!options.streaming)bindMessageActionToggle(el);
   else if(role==='assistant'&&options.streaming)bindMessageActionToggle(el);
-  if(terminalProcess||steeringUser)pinOpenSteeringMessages();
   if(options.autoScroll!==false)scrollChatToLatest();
   return el;
 }

@@ -1391,12 +1391,15 @@ function isHandoffSummaryText(text) {
     plain === 'handoff'
     || plain === 'handoff summary'
     || plain === 'current task'
+    || plain === 'current progress'
     || plain.startsWith('handoff:')
     || plain.startsWith('handoff summary:')
     || plain.startsWith('current task:')
+    || plain.startsWith('current progress:')
     || plain.startsWith('交接摘要')
     || /^\*\*handoff(?:\s+summary)?\*\*/i.test(firstLine)
     || /^\*\*current task\*\*/i.test(firstLine)
+    || /^\*\*current progress\*\*/i.test(firstLine)
   ) return true;
   // Collab handoffs may omit a clean title but still ship the standard sections.
   const head = normalized.slice(0, 1200).toLowerCase();
