@@ -13539,7 +13539,6 @@ function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
       }
       const processKeep=orphaned.filter((item)=>item!==orphanFinal&&(item.classList?.contains('progressCommentary')||item.classList?.contains('steeringUser')));
       const completion=createCompletionMessage('任务完成',processKeep,turnProcessElapsedTurnId||'',NaN,null);
-      if(processKeep.length)completion.open=true;
       if(orphanFinal?.parentNode===chat)chat.insertBefore(completion,orphanFinal);
       else chat.appendChild(completion);
     }
@@ -14216,7 +14215,6 @@ function completionTimelineForTurn(turnId){
   if(!id)return null;
   const completion=[...chat.querySelectorAll('.completionSummary')].reverse().find((item)=>item.dataset.turnId===id);
   if(!completion)return null;
-  if(completion.tagName==='DETAILS')completion.open=true;
   let content=completion.querySelector(':scope > .completionContent');
   if(!content){
     content=document.createElement('div');
@@ -14511,8 +14509,6 @@ function addMsg(role,text,options={}){
     const resultArtifacts=createTurnResultArtifacts(artifacts.filter((item)=>!isProgressArtifact(item)),options.turnId);
     for(const item of visibleActivities)settleTurnTool(item);
     const completion=createCompletionMessage(text,processElements,options.turnId,elapsedSeconds,options.tokenUsage);
-    // Expand when progress commentary is present so intermediate steps stay visible after completion.
-    if(processElements.some((item)=>isProgressArtifact(item)||item.classList?.contains('steeringUser')))completion.open=true;
     if(anchor){
       chat.insertBefore(completion,anchor);
       for(const item of visibleActivities)chat.insertBefore(item,anchor);

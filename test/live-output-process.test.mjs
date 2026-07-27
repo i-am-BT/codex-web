@@ -68,7 +68,6 @@ test('steering stays chronological and input image helpers avoid duplicate uploa
   assert.doesNotMatch(inlineScript, /pinSteeringMessageToBottom|pinOpenSteeringMessages|ensureSteeringPinObserver/);
   assert.match(inlineScript, /Rebind either direction instead of creating a second copy/);
   assert.match(inlineScript, /item\.classList\?\.contains\('steeringUser'\)[\s\S]*?processElements\.push\(item\)/);
-  assert.match(inlineScript, /isProgressArtifact\(item\)\|\|item\.classList\?\.contains\('steeringUser'\)/);
 });
 
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
@@ -948,7 +947,11 @@ test('task_complete keeps progress commentary and steering in chronological orde
   assert.match(inlineScript, /appendTurnProcessTimelineElement\(element,\{beforeTools:false\}\)/);
   assert.doesNotMatch(inlineScript, /for\(const item of artifacts\)\{if\(isProgressArtifact\(item\)&&item\.parentNode\)item\.remove\(\)\}/);
   assert.match(inlineScript, /const completion=createCompletionMessage\(text,processElements,options\.turnId,elapsedSeconds,options\.tokenUsage\)/);
-  assert.match(inlineScript, /if\(processElements\.some\(\(item\)=>isProgressArtifact\(item\)\|\|item\.classList\?\.contains\('steeringUser'\)\)\)completion.open=true/);
+  assert.match(inlineScript, /if\(collapsible\)el\.open=false/);
+  assert.doesNotMatch(inlineScript, /if\(processElements\.some\([\s\S]*?\)\)completion\.open=true/);
+  assert.doesNotMatch(inlineScript, /if\(processKeep\.length\)completion\.open=true/);
+  const completedSteeringSource=sourceBetween('function completionTimelineForTurn', 'function consumeNativeOptimisticSteering');
+  assert.doesNotMatch(completedSteeringSource, /completion\.open=true/);
 });
 
 test('composerCollapsed defaults to a capsule input', () => {
