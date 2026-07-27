@@ -934,6 +934,9 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\.single\s*\{[^}]*width:\s*144px/s);
+    assert.match(uiStyles, /\.userAttachment\s*\{[^}]*width:\s*100%;[^}]*aspect-ratio:\s*1 \/ 1/s);
+    assert.match(uiStyles, /\.userAttachment img\s*\{[^}]*width:\s*100%;[^}]*height:\s*100%;[^}]*max-height:\s*none;[^}]*object-fit:\s*cover/s);
+    assert.match(uiStyles, /\.steeringUser \.userAttachmentStack\.single,[^}]*\.steeringUser\.hasInputImage \.userAttachmentStack\.single\s*\{[^}]*width:\s*144px;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.user\.hasInputImage \.msgBody:empty/);
     assert.match(uiStyles, /\.settingsDialog/);
 
