@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('playground profile refresh preserves browser streaming preferences', async () => {
   const playgroundAssetScript = await readFile(
-    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-CXjHvR1L.js'),
+    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-BP90Uyg2.js'),
     'utf8',
   );
   const playgroundPatchSource = await readFile(
@@ -24,18 +24,18 @@ test('playground profile refresh preserves browser streaming preferences', async
 
   assert.match(playgroundPatchSource, /streamImages: typeof existing\?\.streamImages === 'boolean'/);
   assert.match(playgroundPatchSource, /streamPartialImages: typeof existing\?\.streamPartialImages === 'number'/);
-  assert.match(playgroundAssetScript, /streamImages:typeof\(S==null\?void 0:S\.streamImages\)=="boolean"\?S\.streamImages:I\.streamImages/);
-  assert.match(playgroundAssetScript, /streamPartialImages:typeof\(S==null\?void 0:S\.streamPartialImages\)=="number"\?S\.streamPartialImages:I\.streamPartialImages/);
+  assert.match(playgroundAssetScript, /streamImages:typeof\(w==null\?void 0:w\.streamImages\)=="boolean"\?w\.streamImages:I\.streamImages/);
+  assert.match(playgroundAssetScript, /streamPartialImages:typeof\(w==null\?void 0:w\.streamPartialImages\)=="number"\?w\.streamPartialImages:I\.streamPartialImages/);
   assert.match(
     playgroundAssetScript,
-    /M\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const S of a\.inputImageIds\)xr\.delete\(S\)\}/,
+    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const k of a\.inputImageIds\)OI\(k\)\}/,
   );
   assert.doesNotMatch(
     playgroundAssetScript,
-    /M\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for\(const S of a\.inputImageIds\)xr\.delete\(S\)\}/,
+    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for\(const k of a\.inputImageIds\)OI\(k\)\}/,
   );
   await new Promise((resolve, reject) => {
-    execFile('node', ['--check', path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-CXjHvR1L.js')], (error, stdout, stderr) => {
+    execFile('node', ['--check', path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-BP90Uyg2.js')], (error, stdout, stderr) => {
       if (error) {
         reject(new Error(stderr || stdout || error.message));
         return;
@@ -634,43 +634,62 @@ if (args[0] === 'app-server') {
           : [];
         send({ id: message.id, result: { data, nextCursor: null, backwardsCursor: null } });
       }
-      else if (message.method === 'thread/start') send({ id: message.id, result: { thread: thread(createdThreadId) } });
+      else if (message.method === 'thread/start') {
+        const control = archiveControl();
+        const threadId = String(control.threadStartId || createdThreadId);
+        send({ id: message.id, result: { thread: thread(threadId) } });
+      }
       else if (message.method === 'thread/fork') send({ id: message.id, result: { thread: thread(forkedThreadId) } });
       else if (message.method === 'thread/resume') send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
       else if (message.method === 'turn/start') {
         const turnId = '019f4f84-ea9f-73c2-b997-deba7b4aa798';
-        send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [] } } });
-        send({ method: 'turn/started', params: { threadId: message.params.threadId, turn: { id: turnId, status: 'inProgress', items: [] } } });
-        send({
-          method: 'error',
-          params: {
-            error: { message: 'Reconnecting... 1/5' },
-            willRetry: true,
-            threadId: message.params.threadId,
-            turnId
-          }
-        });
         const text = (message.params.input || []).find((item) => item.type === 'text')?.text || '';
-        if (text.includes('needs approval')) {
+        const control = archiveControl();
+        if (String(control.failTurnStartText || '') && text.includes(String(control.failTurnStartText))) {
+          send({ id: message.id, error: { code: -32000, message: 'controlled turn/start failure' } });
+          continue;
+        }
+        const respond = () => {
+          send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [] } } });
+          send({ method: 'turn/started', params: { threadId: message.params.threadId, turn: { id: turnId, status: 'inProgress', items: [] } } });
           send({
-            id: 'approval-1',
-            method: 'item/commandExecution/requestApproval',
+            method: 'error',
             params: {
+              error: { message: 'Reconnecting... 1/5' },
+              willRetry: true,
               threadId: message.params.threadId,
-              turnId,
-              itemId: 'item-1',
-              startedAtMs: Date.now(),
-              command: 'printf test',
-              cwd: process.env.HOME,
-              reason: 'test approval'
+              turnId
             }
           });
-        }
+          if (text.includes('needs approval')) {
+            send({
+              id: 'approval-1',
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: message.params.threadId,
+                turnId,
+                itemId: 'item-1',
+                startedAtMs: Date.now(),
+                command: 'printf test',
+                cwd: process.env.HOME,
+                reason: 'test approval'
+              }
+            });
+          }
+        };
+        const delayMs = Number(control.turnStartDelayMs || 0);
+        if (delayMs > 0) setTimeout(respond, delayMs);
+        else respond();
       }
       else if (message.method === 'turn/steer') {
         send({ id: message.id, result: { turnId: message.params.expectedTurnId } });
       }
       else if (message.method === 'thread/archive') {
+        const control = archiveControl();
+        if (String(control.failArchiveThreadId || '') === String(message.params.threadId || '')) {
+          send({ id: message.id, error: { code: -32000, message: 'controlled thread/archive failure' } });
+          continue;
+        }
         archivedThreadIds.add(message.params.threadId);
         send({ id: message.id, result: {} });
       }
@@ -869,7 +888,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.box\s*\{[^}]*grid-template-rows:\s*minmax\(50px, auto\) 34px;[^}]*gap:\s*2px;[^}]*border-radius:\s*20px/s);
     assert.match(uiStyles, /body\[data-theme\] \.box textarea\s*\{[^}]*min-height:\s*50px;[^}]*max-height:\s*180px;[^}]*font-size:\s*14px/s);
     assert.match(uiStyles, /@media \(max-width: 820px\)\s*\{[\s\S]*?body\[data-theme\] \.box textarea\s*\{[^}]*font-size:\s*16px/s);
-    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) - 22px\), calc\(100% - 60px\)\);[^}]*border-radius:\s*24px;[^}]*padding:\s*6px 7px 5px/s);
+    assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*width:\s*min\(calc\(var\(--composer-width\) - 22px\), calc\(100% - 60px\)\);[^}]*border-radius:\s*15px;[^}]*padding:\s*6px 7px 5px/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\.runActive\s*\{[^}]*grid-template-columns:\s*32px max-content minmax\(0, 1fr\) max-content 30px/s);
     assert.match(uiStyles, /body\[data-theme="light"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#e1e3e6;[^}]*background:\s*#ffffff;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /body\[data-theme="dark"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box\s*\{[^}]*border-color:\s*#454545;[^}]*background:\s*var\(--surface\);[^}]*box-shadow:\s*none/s);
@@ -985,6 +1004,18 @@ if (args[0] === 'app-server') {
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
+    const initialLoginErrors = [];
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const rejectedLogin = await fetch(`${baseUrl}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: `wrong-password-${attempt}` }),
+      });
+      assert.equal(rejectedLogin.status, 401);
+      initialLoginErrors.push((await rejectedLogin.json()).error);
+    }
+    assert.deepEqual([...new Set(initialLoginErrors)], ['密码错误']);
+
     const login = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -992,6 +1023,26 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const rejectedLogin = await fetch(`${baseUrl}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: `still-wrong-${attempt}` }),
+      });
+      assert.equal(rejectedLogin.status, 401, 'successful login must clear prior failures');
+    }
+    const rateLimitedLogin = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'still-wrong-final' }),
+    });
+    assert.equal(rateLimitedLogin.status, 429);
+    assert.equal(rateLimitedLogin.headers.get('retry-after'), '1');
+    assert.match((await rateLimitedLogin.json()).error, /登录尝试过于频繁/);
+    const healthWhileLoginLimited = await fetch(`${baseUrl}/api/health`);
+    assert.equal(healthWhileLoginLimited.status, 200);
+    assert.equal((await healthWhileLoginLimited.json()).ok, true);
 
     const skills = await fetch(`${baseUrl}/api/skills`, {
       headers: { Cookie: cookie },
@@ -1452,6 +1503,7 @@ updated_at = 1784422800000
     const pageResponse = await fetch(baseUrl, { headers: { Cookie: cookie } });
     assert.equal(pageResponse.status, 200);
     const page = await pageResponse.text();
+    assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260723g"/);
@@ -1529,8 +1581,10 @@ updated_at = 1784422800000
     assert.match(page, /function runningActivityVerb/);
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
     assert.match(page, /NATIVE_INITIAL_MESSAGE_LIMIT=60/);
-    assert.match(page, /images=external&limit=/);
-    assert.match(page, /function addNativeHistoryLoadButton/);
+    assert.match(page, /const requestUrl=endpoint\+encodeURIComponent\(id\)\+\(currentConversationSource==='codex'\?'\?images=external':''\)/);
+    assert.doesNotMatch(page, /fastNativeLoad/);
+    assert.doesNotMatch(page, /function addNativeHistoryLoadButton/);
+    assert.doesNotMatch(page, /加载完整近期记录/);
     assert.match(page, /function scheduleNativeCompletionSync/);
     assert.match(page, /function reconcileNativeCompletion/);
     assert.match(page, /runtime\.type==='connection-error'/);
@@ -1585,6 +1639,9 @@ updated_at = 1784422800000
     assert.match(page, /function handleSubQuotaToggleClick\(event\)/);
     assert.match(page, /const coarse=isCoarsePointer\(\)\|\|event\.pointerType==='touch'/);
     assert.match(page, /手机端点一下显示额度，再点一下打开配置/);
+    assert.match(page, /sourceName\.textContent=quota\.provider==='cpa-codex'\s*\? providerName/s);
+    assert.doesNotMatch(page, /providerName\+\(quota\.name&&quota\.name!==providerName/);
+    assert.match(page, /finiteSubQuotaNumber\(quota\.subscription\.monthly\?\.limit\)>0/);
     assert.match(page, /重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
     assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
     assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
@@ -1683,6 +1740,9 @@ updated_at = 1784422800000
     assert.match(page, /永久删除全部已归档任务/);
     assert.match(page, /function createTurnResultArtifacts/);
     assert.match(page, /function createEditedFilesResultCard/);
+    assert.match(page, /function revealExpandedEditedFilesCard/);
+    assert.match(page, /const delta=cardRect\.top-visibleTop;\s*if\(delta<=1\)return;\s*setNativeLiveFollowBottom\(false\)/);
+    assert.match(page, /if\(!live\)card\.addEventListener\('toggle'/);
     assert.match(page, /status\.className='turnResultStatus';\s*status\.textContent='已完成'/);
     assert.match(page, /function createWebPreviewResultCard/);
     assert.match(page, /function refreshLiveEditedFilesResult/);
@@ -1811,11 +1871,70 @@ updated_at = 1784422800000
     assert.equal(elapsedTitleApi.turnTokenUsageLabel({ totalTokens: 12345 }), '12,345 tokens');
     assert.equal(elapsedTitleApi.turnTokenUsageLabel(null), '');
     assert.match(inlineScript, /const collapsible=role==='tool'\|\|role==='thinking'\|\|role==='context'/);
-    assert.doesNotMatch(inlineScript, /role==='user'&&shouldCollapseUserMessage/);
-    assert.doesNotMatch(inlineScript, /longUser/);
+    assert.match(inlineScript, /function shouldCollapseUserMessage\(text\)/);
+    assert.match(inlineScript, /const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage\(text\)/);
+    assert.match(inlineScript, /if\(longUser\)bindLongUserMessage\(el,body\)/);
+    assert.match(inlineScript, /function automationHeartbeatDisplayText\(text\)/);
+    assert.match(inlineScript, /renderMessageMarkdown\(body,automationHeartbeatDisplayText\(text\),\{assistantArtifacts:true\}\)/);
+    const heartbeatDisplayHelper = inlineScript.match(/(function automationHeartbeatDisplayText[\s\S]*?)(?=function automationInstructionDisplayText)/)?.[1];
+    assert.ok(heartbeatDisplayHelper);
+    class TestHeartbeatDOMParser {
+      parseFromString(source) {
+        const tags = ['automation_id', 'current_time_iso', 'instructions', 'decision', 'message'];
+        const children = tags.flatMap((tag) => {
+          const open = `<${tag}>`;
+          const close = `</${tag}>`;
+          const start = source.indexOf(open);
+          const end = source.indexOf(close, start + open.length);
+          return start >= 0 && end >= 0
+            ? [{ tagName: tag, textContent: source.slice(start + open.length, end) }]
+            : [];
+        });
+        return {
+          querySelector: () => null,
+          documentElement: { tagName: 'heartbeat', children },
+        };
+      }
+    }
+    const automationHeartbeatDisplayText = new Function(
+      'DOMParser',
+      heartbeatDisplayHelper + '; return automationHeartbeatDisplayText;',
+    )(TestHeartbeatDOMParser);
+    const notifyHeartbeat = '<heartbeat>\n  <automation_id>09-30-linux-do</automation_id>\n  <decision>NOTIFY</decision>\n  <message>今日阅读已完成。</message>\n</heartbeat>';
+    const quietHeartbeat = notifyHeartbeat.replace('NOTIFY', 'DONT_NOTIFY').replace('今日阅读已完成。', '自动阅读仍在运行。');
+    assert.equal(automationHeartbeatDisplayText('普通消息 09-30-linux-do'), '普通消息 09-30-linux-do');
+    assert.equal(automationHeartbeatDisplayText(notifyHeartbeat), '今日阅读已完成。');
+    assert.equal(automationHeartbeatDisplayText(quietHeartbeat), '自动阅读仍在运行。');
+    assert.equal(automationHeartbeatDisplayText(`任务完成。\n\n${notifyHeartbeat}`), '任务完成。\n\n今日阅读已完成。');
+    assert.equal(automationHeartbeatDisplayText(`任务完成。\n\n\`\`\`xml\n${notifyHeartbeat}\n\`\`\``), '任务完成。\n今日阅读已完成。');
+    const duplicateHeartbeat = notifyHeartbeat.replace('今日阅读已完成。', '今日阅读已完成 100/100（当前 107）。');
+    assert.equal(
+      automationHeartbeatDisplayText(`今日阅读已完成 **100/100**（当前 **107**）。\n\n\`\`\`xml\n${duplicateHeartbeat}\n\`\`\``),
+      '今日阅读已完成 100/100（当前 107）。',
+    );
+    const instructionDisplayHelper = inlineScript.match(/(function automationInstructionDisplayText[\s\S]*?)(?=function renderAssistantMarkdown)/)?.[1];
+    assert.ok(instructionDisplayHelper);
+    const automationInstructionDisplayText = new Function(
+      'DOMParser',
+      instructionDisplayHelper + '; return automationInstructionDisplayText;',
+    )(TestHeartbeatDOMParser);
+    const automationInstruction = '<heartbeat>\n  <automation_id>09-30-linux-do</automation_id>\n  <current_time_iso>2026-07-27T01:30:27.548Z</current_time_iso>\n  <instructions>每天执行完整任务。</instructions>\n</heartbeat>';
+    assert.equal(automationInstructionDisplayText(automationInstruction), '每天执行完整任务。');
+    assert.equal(automationInstructionDisplayText('普通用户消息 2026-07-27T01:30:27.548Z'), '普通用户消息 2026-07-27T01:30:27.548Z');
+    assert.match(inlineScript, /renderMessageMarkdown\(body,automationInstructionDisplayText\(text\)\)/);
+    const longUserHelpers = inlineScript.match(/(function shouldCollapseUserMessage[\s\S]*?)(?=function addMsg)/)?.[1];
+    assert.ok(longUserHelpers);
+    const shouldCollapseUserMessage = new Function(
+      longUserHelpers + '; return shouldCollapseUserMessage;',
+    )();
+    assert.equal(shouldCollapseUserMessage('简短消息'), false);
+    assert.equal(shouldCollapseUserMessage('x'.repeat(560)), true);
+    assert.equal(shouldCollapseUserMessage(Array.from({ length: 10 }, (_, index) => `第 ${index + 1} 行 ${'内容'.repeat(14)}`).join('\n')), true);
     assert.match(uiStyles, /body \.msg\.user\s*\{[^}]*max-width:\s*min\(var\(--conversation-width\), 77%\);[^}]*overflow-wrap:\s*anywhere;[^}]*word-break:\s*break-word/s);
     assert.match(uiStyles, /body \.msg\.user \> \.msgBody\s*\{[^}]*white-space:\s*pre-wrap/s);
     assert.match(uiStyles, /body \.msg\.user \.markdownBody p[^}]*overflow-wrap:\s*anywhere/s);
+    assert.match(uiStyles, /body \.msg\.user\.longUserMessage:not\(\.expanded\) > \.msgBody\s*\{[^}]*max-height:\s*210px;[^}]*overflow:\s*hidden;[^}]*mask-image:\s*linear-gradient/s);
+    assert.match(uiStyles, /\.longUserMessageToggle\s*\{[^}]*width:\s*100%;[^}]*border-top:\s*1px solid[^}]*font-size:\s*11\.5px/s);
     assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 100_000), '已处理 0s');
     assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 133_999), '已处理 33s');
     assert.equal(elapsedTitleApi.liveProcessElapsedTitle(100_000, 160_000), '已处理 1m');
@@ -2853,13 +2972,14 @@ updated_at = 1784422800000
     });
     assert.equal(playgroundConfigResponse.status, 200);
     assert.match(playgroundConfigResponse.headers.get('cache-control'), /private, no-store/);
-    assert.deepEqual(await playgroundConfigResponse.json(), {
+    const playgroundConfig = await playgroundConfigResponse.json();
+    assert.doesNotMatch(JSON.stringify(playgroundConfig), /test-token/);
+    assert.deepEqual(playgroundConfig, {
       profile: {
         id: 'codex-web-default',
         name: 'Codex Image · Fake',
         provider: 'openai',
         baseUrl: `${providerBaseUrl}/v1`,
-        apiKey: 'test-token',
         model: 'gpt-image-2',
         timeout: 660,
         apiMode: 'images',
@@ -2874,7 +2994,6 @@ updated_at = 1784422800000
           name: 'Codex Image · Fake',
           provider: 'openai',
           baseUrl: `${providerBaseUrl}/v1`,
-          apiKey: 'test-token',
           model: 'gpt-image-2',
           timeout: 660,
           apiMode: 'images',
@@ -2888,7 +3007,6 @@ updated_at = 1784422800000
           name: 'Codex Agent · Fake',
           provider: 'openai',
           baseUrl: `${providerBaseUrl}/v1`,
-          apiKey: 'test-token',
           model: 'test-model',
           timeout: 660,
           apiMode: 'responses',
@@ -2903,6 +3021,86 @@ updated_at = 1784422800000
       agentTextProfileId: 'codex-web-agent',
       agentImageProfileId: 'codex-web-default',
     });
+    const uploadedHtmlResponse = await fetch(`${baseUrl}/api/uploads/file`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'active-content.html',
+        type: 'text/html',
+        data: `data:text/html;base64,${Buffer.from('<script>document.body.dataset.executed="true"</script>').toString('base64')}`,
+      }),
+    });
+    assert.equal(uploadedHtmlResponse.status, 200);
+    const uploadedHtml = (await uploadedHtmlResponse.json()).attachment;
+    const downloadedHtmlResponse = await fetch(`${baseUrl}${uploadedHtml.url}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(downloadedHtmlResponse.status, 200);
+    assert.match(downloadedHtmlResponse.headers.get('content-disposition') || '', /^attachment;/);
+    assert.equal(downloadedHtmlResponse.headers.get('x-content-type-options'), 'nosniff');
+    assert.match(downloadedHtmlResponse.headers.get('cache-control') || '', /private, no-store/);
+    assert.match(await downloadedHtmlResponse.text(), /document\.body\.dataset\.executed/);
+
+    // Regression: a declared image/png upload with an HTML filename must not be stored
+    // with a .html extension in IMAGE_DIR, which is served without a forced-download
+    // header and would let the script execute same-origin on load.
+    const spoofedImageUpload = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'evil.html',
+        type: 'image/png',
+        data: `data:image/png;base64,${Buffer.from('<script>document.body.dataset.executed="true"</script>').toString('base64')}`,
+      }),
+    });
+    const spoofedImageUploadPayload = await spoofedImageUpload.json();
+    assert.equal(spoofedImageUpload.status, 200, JSON.stringify(spoofedImageUploadPayload));
+    assert.match(spoofedImageUploadPayload.image.url, /\.png$/);
+    const spoofedImageDownload = await fetch(`${baseUrl}${spoofedImageUploadPayload.image.url}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(spoofedImageDownload.status, 200);
+    assert.equal(spoofedImageDownload.headers.get('x-content-type-options'), 'nosniff');
+    assert.doesNotMatch(spoofedImageDownload.headers.get('content-type') || '', /html/);
+
+    const malformedUpload = await fetch(`${baseUrl}/api/uploads/file`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'invalid.txt',
+        type: 'text/plain',
+        data: 'data:text/plain;base64,AAAA=AAA',
+      }),
+    });
+    assert.equal(malformedUpload.status, 400);
+    assert.match((await malformedUpload.json()).error, /上传内容格式无效/);
+
+    const oversizedImageUpload = await fetch(`${baseUrl}/api/uploads/image`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'too-large.png',
+        type: 'image/png',
+        data: `data:image/png;base64,${Buffer.alloc(10 * 1024 * 1024 + 1).toString('base64')}`,
+      }),
+    });
+    const oversizedImageUploadPayload = await oversizedImageUpload.json();
+    assert.equal(oversizedImageUpload.status, 413, JSON.stringify(oversizedImageUploadPayload));
+    assert.match(oversizedImageUploadPayload.error, /图片不能超过 10MB/);
+
+    const oversizedUploadRequest = await fetch(`${baseUrl}/api/uploads/file`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'request-too-large.txt',
+        type: 'text/plain',
+        data: 'A'.repeat(36 * 1024 * 1024),
+      }),
+    });
+    assert.equal(oversizedUploadRequest.status, 413);
+    assert.match(oversizedUploadRequest.headers.get('cache-control') || '', /no-store/);
+    assert.match((await oversizedUploadRequest.json()).error, /请求内容过大/);
+
     const blockedPlaygroundOrigin = await fetch(
       `${baseUrl}/api-proxy/images/generations?codex_upstream=${encodeURIComponent('http://127.0.0.1:1')}`,
       {
@@ -2975,7 +3173,7 @@ updated_at = 1784422800000
     assert.equal(playgroundProxyResponse.status, 200);
     assert.equal((await playgroundProxyResponse.json()).data.length, 1);
     assert.equal(providerRequests.at(-1).url, '/v1/images/generations');
-    assert.equal(providerRequests.at(-1).authorization, 'Bearer browser-playground-token');
+    assert.equal(providerRequests.at(-1).authorization, 'Bearer test-token');
     assert.equal(providerRequests.at(-1).contentType, 'application/json');
     assert.deepEqual(JSON.parse(providerRequests.at(-1).body), playgroundProxyPayload);
     const heartbeatStatuses = [];
@@ -3030,7 +3228,7 @@ updated_at = 1784422800000
       },
     );
     assert.equal(allowedCustomOrigin.status, 200);
-    assert.equal(providerRequests.at(-1).authorization, 'Bearer custom-site-token');
+    assert.equal(providerRequests.at(-1).authorization, '');
     const bufferedProxyFailure = await fetch(
       `${baseUrl}/api-proxy/responses?codex_upstream=${encodeURIComponent(customProviderBaseUrl)}`,
       {
@@ -3198,6 +3396,32 @@ updated_at = 1784422800000
     assert.equal(toolImage.status, 200);
     assert.equal(toolImage.headers.get('content-type'), 'image/png');
     assert.deepEqual(Buffer.from(await toolImage.arrayBuffer()), await readFile(toolImagePath));
+
+    // /api/local-image accepts a client-supplied path directly. It must still serve
+    // images that live inside the session cwd...
+    const inCwdLocalImage = await fetch(
+      `${baseUrl}/api/local-image?${new URLSearchParams({ path: toolImagePath, cwd: temporary })}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(inCwdLocalImage.status, 200);
+    assert.equal(inCwdLocalImage.headers.get('content-type'), 'image/png');
+    // ...but must reject an absolute path outside both the session cwd and the OS temp
+    // dir, or any authenticated user could read arbitrary image files on the host that
+    // have nothing to do with the current Codex session.
+    const outOfScopeImagePath = path.join(ROOT, `.local-image-security-probe-${process.pid}.png`);
+    await writeFile(
+      outOfScopeImagePath,
+      Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
+    );
+    try {
+      const outOfScopeLocalImage = await fetch(
+        `${baseUrl}/api/local-image?${new URLSearchParams({ path: outOfScopeImagePath, cwd: temporary })}`,
+        { headers: { Cookie: cookie } },
+      );
+      assert.equal(outOfScopeLocalImage.status, 404);
+    } finally {
+      await rm(outOfScopeImagePath, { force: true });
+    }
 
     const falseToolImageMessage = nativeConversation.messages.find((message) => (
       message.role === 'tool' && message.content.includes('not-a-real-image.png')
@@ -3529,6 +3753,100 @@ updated_at = 1784422800000
     });
     await waitForPendingRequestGone(baseUrl, cookie, removedDesktopApproval.id);
 
+    desktopIpc.broadcast({
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'patches',
+          baseRevision: 4,
+          revision: 5,
+          patches: [{
+            op: 'add',
+            path: ['requests', 0],
+            value: {
+              id: 'desktop-approval-reconnect',
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: nativeSessionId,
+                turnId: echoedContinuationPayload.turnId,
+                command: 'printf reconnect',
+                cwd: temporary,
+                reason: 'desktop reconnect test',
+              },
+            },
+          }],
+        },
+      },
+    });
+    const reconnectApproval = await waitForPendingRequestState(
+      baseUrl,
+      cookie,
+      (request) => request.id.includes('desktop-approval-reconnect'),
+      'desktop reconnect approval did not arrive',
+    );
+    const reconnectSnapshot = {
+      type: 'broadcast',
+      method: 'thread-stream-state-changed',
+      version: 11,
+      sourceClientId: 'desktop-owner',
+      params: {
+        conversationId: nativeSessionId,
+        change: {
+          type: 'snapshot',
+          revision: 6,
+          conversationState: {
+            requests: [{
+              id: 'desktop-approval-reconnect',
+              method: 'item/commandExecution/requestApproval',
+              params: {
+                threadId: nativeSessionId,
+                turnId: echoedContinuationPayload.turnId,
+                command: 'printf reconnect',
+                cwd: temporary,
+                reason: 'desktop reconnect test',
+              },
+            }],
+          },
+        },
+      },
+    };
+    desktopIpc.historySnapshots.set(nativeSessionId, reconnectSnapshot);
+    const initializeCountBeforeReconnect = desktopIpc.initializeCount;
+    desktopIpc.disconnectClients();
+    const disconnectedApproval = await waitForPendingRequestState(
+      baseUrl,
+      cookie,
+      (request) => request.id === reconnectApproval.id && Boolean(request.connectionError),
+      'desktop pending approval was cleared during disconnect',
+    );
+    assert.match(disconnectedApproval.connectionError, /关闭|断开|reset/i);
+    await waitForDesktopInitializeCount(desktopIpc, initializeCountBeforeReconnect + 1);
+    const reconciledApproval = await waitForPendingRequestState(
+      baseUrl,
+      cookie,
+      (request) => request.id === reconnectApproval.id && !request.connectionError,
+      'desktop pending approval was not reconciled after reconnect',
+    );
+    assert.equal(reconciledApproval.threadId, nativeSessionId);
+    assert.ok(desktopIpc.messages.some((message) => (
+      message.method === 'thread-follower-load-complete-history'
+      && message.params?.conversationId === nativeSessionId
+    )));
+    const resolvedReconnectApproval = await fetch(
+      `${baseUrl}/api/native-requests/${encodeURIComponent(reconnectApproval.id)}/respond`,
+      {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: 'decline' }),
+      },
+    );
+    assert.equal(resolvedReconnectApproval.status, 200);
+    await waitForPendingRequestGone(baseUrl, cookie, reconnectApproval.id);
+
     desktopIpc.startTurnMode = 'respond';
     desktopIpc.onStartTurn = null;
     const echoedInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
@@ -3567,6 +3885,314 @@ updated_at = 1784422800000
     assert.deepEqual(desktopSteer.params.attachments, []);
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
     desktopIpc.ownerAvailable = false;
+
+    await writeFile(appServerControlFile, JSON.stringify({ turnStartDelayMs: 120 }));
+    const concurrentTurnPayload = {
+      message: 'concurrent reservation test',
+      provider: 'fake',
+      model: 'test-model',
+      cwd: temporary,
+      sandbox: 'read-only',
+      approval: 'on-request',
+    };
+    const firstConcurrentTurn = fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify(concurrentTurnPayload),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const secondConcurrentTurn = fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify(concurrentTurnPayload),
+    });
+    const concurrentTurnResponses = await Promise.all([firstConcurrentTurn, secondConcurrentTurn]);
+    assert.deepEqual(concurrentTurnResponses.map((response) => response.status).sort(), [202, 409]);
+    const acceptedConcurrentResponse = concurrentTurnResponses.find((response) => response.status === 202);
+    const acceptedConcurrentPayload = await acceptedConcurrentResponse.json();
+    const rejectedConcurrentResponse = concurrentTurnResponses.find((response) => response.status === 409);
+    assert.match((await rejectedConcurrentResponse.json()).error, /已有任务|正在运行/);
+    const interruptedConcurrentTurn = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: acceptedConcurrentPayload.turnId }),
+    });
+    assert.equal(interruptedConcurrentTurn.status, 200);
+    await writeFile(appServerControlFile, '{}');
+
+    const queueItemA = {
+      id: 'queue-client-a',
+      message: 'same queue prompt',
+      createdAt: '2026-07-26T10:00:00.000Z',
+      source: 'web',
+    };
+    const queueItemB = {
+      id: 'queue-client-b',
+      message: 'same queue prompt',
+      createdAt: '2026-07-26T10:00:01.000Z',
+      source: 'web',
+    };
+    const queueClientA = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ revision: 0, items: [queueItemA] }),
+    });
+    assert.equal(queueClientA.status, 200);
+    const queueClientAPayload = await queueClientA.json();
+    assert.equal(queueClientAPayload.revision, 1);
+    const staleQueueClientB = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ revision: 0, items: [queueItemB] }),
+    });
+    assert.equal(staleQueueClientB.status, 409);
+    const staleQueuePayload = await staleQueueClientB.json();
+    assert.deepEqual(staleQueuePayload.items.map((item) => item.id), [queueItemA.id]);
+    const mergedQueueClientB = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        revision: staleQueuePayload.revision,
+        items: [queueItemB, ...staleQueuePayload.items],
+      }),
+    });
+    assert.equal(mergedQueueClientB.status, 200);
+    const mergedQueuePayload = await mergedQueueClientB.json();
+    assert.deepEqual(mergedQueuePayload.items.map((item) => item.id), [queueItemB.id, queueItemA.id]);
+
+    const queueTurn = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: queueItemA.message,
+        queueItemId: queueItemA.id,
+      }),
+    });
+    assert.equal(queueTurn.status, 202);
+    const queueTurnPayload = await queueTurn.json();
+    assert.deepEqual(queueTurnPayload.queue.items.map((item) => item.id), [queueItemB.id]);
+    const queueAfterTurn = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    const queueAfterTurnPayload = await queueAfterTurn.json();
+    assert.deepEqual(queueAfterTurnPayload.items.map((item) => item.id), [queueItemB.id]);
+    const staleQueueAfterConsume = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ revision: mergedQueuePayload.revision, items: [queueItemA, queueItemB] }),
+    });
+    assert.equal(staleQueueAfterConsume.status, 409);
+    const staleAfterConsumePayload = await staleQueueAfterConsume.json();
+    assert.deepEqual(staleAfterConsumePayload.items.map((item) => item.id), [queueItemB.id]);
+    const retriedQueueAfterConsume = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ revision: staleAfterConsumePayload.revision, items: [queueItemA, queueItemB] }),
+    });
+    assert.equal(retriedQueueAfterConsume.status, 200);
+    const retriedQueueAfterConsumePayload = await retriedQueueAfterConsume.json();
+    assert.deepEqual(retriedQueueAfterConsumePayload.items.map((item) => item.id), [queueItemB.id]);
+    const steerQueueItem = {
+      id: 'queue-steer',
+      message: 'steer queue prompt',
+      createdAt: '2026-07-26T10:00:01.500Z',
+      source: 'web',
+    };
+    const queuedSteerItem = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        revision: retriedQueueAfterConsumePayload.revision,
+        items: [queueItemB, steerQueueItem],
+      }),
+    });
+    assert.equal(queuedSteerItem.status, 200);
+    const queueSteer = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: steerQueueItem.message,
+        turnId: queueTurnPayload.turnId,
+        queueItemId: steerQueueItem.id,
+      }),
+    });
+    assert.equal(queueSteer.status, 202);
+    const queueSteerPayload = await queueSteer.json();
+    assert.deepEqual(queueSteerPayload.queue.items.map((item) => item.id), [queueItemB.id]);
+    const steersBeforeDuplicateQueue = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'turn/steer').length;
+    const duplicateQueueSteer = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: steerQueueItem.message,
+        turnId: queueTurnPayload.turnId,
+        queueItemId: steerQueueItem.id,
+      }),
+    });
+    assert.equal(duplicateQueueSteer.status, 409);
+    assert.match((await duplicateQueueSteer.json()).error, /不存在|已消费/);
+    const steersAfterDuplicateQueue = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'turn/steer').length;
+    assert.equal(steersAfterDuplicateQueue, steersBeforeDuplicateQueue);
+    const interruptedQueueTurn = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: queueTurnPayload.turnId }),
+    });
+    assert.equal(interruptedQueueTurn.status, 200);
+    const turnStartsBeforeDuplicateQueue = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'turn/start').length;
+    const duplicateQueueTurn = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: queueItemA.message,
+        queueItemId: queueItemA.id,
+      }),
+    });
+    assert.equal(duplicateQueueTurn.status, 409);
+    assert.match((await duplicateQueueTurn.json()).error, /不存在|已消费/);
+    const turnStartsAfterDuplicateQueue = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'turn/start').length;
+    assert.equal(turnStartsAfterDuplicateQueue, turnStartsBeforeDuplicateQueue);
+
+    const runningSideChatId = '019f4f84-ea9f-73c2-b997-deba7b4aa740';
+    await writeFile(appServerControlFile, JSON.stringify({ threadStartId: runningSideChatId }));
+    const runningSideChat = await fetch(`${baseUrl}/api/native-sessions`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: queueItemB.message,
+        sideChat: true,
+        sourceThreadId: nativeSessionId,
+        queueItemId: queueItemB.id,
+      }),
+    });
+    assert.equal(runningSideChat.status, 202);
+    const runningSideChatPayload = await runningSideChat.json();
+    assert.equal(runningSideChatPayload.threadId, runningSideChatId);
+    assert.deepEqual(runningSideChatPayload.queue.items, []);
+    const closeRunningSideChat = await fetch(`${baseUrl}/api/native-sessions/${runningSideChatId}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(closeRunningSideChat.status, 409);
+    assert.match((await closeRunningSideChat.json()).error, /正在运行/);
+    const sideChatStateFile = path.join(runtime, 'side-chat-threads.json');
+    const runningSideChatState = JSON.parse(await readFile(sideChatStateFile, 'utf8'));
+    assert.ok(runningSideChatState['side-chat-thread-ids'].includes(runningSideChatId));
+    const runningArchiveAttempts = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'thread/archive' && message.params?.threadId === runningSideChatId);
+    assert.equal(runningArchiveAttempts.length, 0);
+    const interruptedSideChat = await fetch(`${baseUrl}/api/native-sessions/${runningSideChatId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: runningSideChatPayload.turnId }),
+    });
+    assert.equal(interruptedSideChat.status, 200);
+    await writeFile(appServerControlFile, JSON.stringify({
+      threadStartId: runningSideChatId,
+      failArchiveThreadId: runningSideChatId,
+    }));
+    const failedCloseSideChat = await fetch(`${baseUrl}/api/native-sessions/${runningSideChatId}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(failedCloseSideChat.status, 502);
+    assert.match((await failedCloseSideChat.json()).error, /controlled thread\/archive failure/);
+    const failedCloseSideChatState = JSON.parse(await readFile(sideChatStateFile, 'utf8'));
+    assert.ok(failedCloseSideChatState['side-chat-thread-ids'].includes(runningSideChatId));
+    await writeFile(appServerControlFile, JSON.stringify({ threadStartId: runningSideChatId }));
+    const closedSideChat = await fetch(`${baseUrl}/api/native-sessions/${runningSideChatId}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(closedSideChat.status, 200);
+    const closedSideChatState = JSON.parse(await readFile(sideChatStateFile, 'utf8'));
+    assert.equal(closedSideChatState['side-chat-thread-ids'].includes(runningSideChatId), false);
+    const restoredRunningSideChat = await fetch(
+      `${baseUrl}/api/native-archived-sessions/${runningSideChatId}/unarchive`,
+      { method: 'POST', headers: { Cookie: cookie } },
+    );
+    assert.equal(restoredRunningSideChat.status, 200);
+
+    const failedSideChatId = '019f4f84-ea9f-73c2-b997-deba7b4aa741';
+    const queueBeforeFailedSideChat = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    const queueBeforeFailedSideChatPayload = await queueBeforeFailedSideChat.json();
+    const failedSideChatQueueItem = {
+      id: 'queue-sidechat-failure',
+      message: 'fail side chat second stage',
+      createdAt: '2026-07-26T10:00:02.000Z',
+      source: 'web',
+    };
+    const queuedFailedSideChat = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        revision: queueBeforeFailedSideChatPayload.revision,
+        items: [failedSideChatQueueItem],
+      }),
+    });
+    assert.equal(queuedFailedSideChat.status, 200);
+    await writeFile(appServerControlFile, JSON.stringify({
+      threadStartId: failedSideChatId,
+      failTurnStartText: failedSideChatQueueItem.message,
+      failArchiveThreadId: failedSideChatId,
+    }));
+    const failedSideChat = await fetch(`${baseUrl}/api/native-sessions`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: failedSideChatQueueItem.message,
+        sideChat: true,
+        sourceThreadId: nativeSessionId,
+        queueItemId: failedSideChatQueueItem.id,
+      }),
+    });
+    assert.equal(failedSideChat.status, 502);
+    const failedSideChatPayload = await failedSideChat.json();
+    assert.match(failedSideChatPayload.error, /controlled turn\/start failure/);
+    assert.equal(failedSideChatPayload.recoverableThreadId, failedSideChatId);
+    const failedSideChatState = JSON.parse(await readFile(sideChatStateFile, 'utf8'));
+    assert.equal(failedSideChatState['side-chat-thread-ids'].includes(failedSideChatId), false);
+    const queueAfterFailedSideChat = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.deepEqual((await queueAfterFailedSideChat.json()).items.map((item) => item.id), [failedSideChatQueueItem.id]);
+    const failedSideChatArchive = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'thread/archive' && message.params?.threadId === failedSideChatId);
+    assert.equal(failedSideChatArchive.length, 1);
+    await writeFile(appServerControlFile, '{}');
+    const clearFailedSideChatQueue = await fetch(
+      `${baseUrl}/api/prompt-queues/${nativeSessionId}/items/${failedSideChatQueueItem.id}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(clearFailedSideChatQueue.status, 200);
 
     const blockedWrite = await fetch(`${baseUrl}/api/defaults`, {
       method: 'POST',
@@ -3881,8 +4507,8 @@ updated_at = 1784422800000
         .length,
       createdDeleteCountBeforeBulkRace,
     );
-    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 2);
-    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 3);
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 4);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 7);
     const switchedProviderResume = protocolMessages.find((message) => (
       message.method === 'thread/resume'
       && message.params.modelProvider === 'custom'
@@ -3903,12 +4529,21 @@ updated_at = 1784422800000
     assert.equal(forkMessage.params.sandbox, 'workspace-write');
     assert.equal(forkMessage.params.approvalPolicy, 'on-request');
     const turnStartMessages = protocolMessages.filter((message) => message.method === 'turn/start');
-    assert.equal(turnStartMessages[0].params.sandboxPolicy.type, 'workspaceWrite');
-    assert.deepEqual(turnStartMessages[0].params.sandboxPolicy.writableRoots, [temporary]);
-    assert.equal(turnStartMessages[1].params.sandboxPolicy.type, 'readOnly');
-    assert.equal(turnStartMessages[2].params.model, 'custom-model');
-    assert.equal(turnStartMessages[2].params.effort, 'max');
-    const steerMessage = protocolMessages.find((message) => message.method === 'turn/steer');
+    const turnStartText = (message) => (
+      message.params.input.find((item) => item.type === 'text')?.text || ''
+    );
+    const createdTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'create native thread');
+    assert.equal(createdTurnStart.params.sandboxPolicy.type, 'workspaceWrite');
+    assert.deepEqual(createdTurnStart.params.sandboxPolicy.writableRoots, [temporary]);
+    const approvalTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'needs approval');
+    assert.equal(approvalTurnStart.params.sandboxPolicy.type, 'readOnly');
+    const switchedProviderTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'switch native provider');
+    assert.equal(switchedProviderTurnStart.params.model, 'custom-model');
+    assert.equal(switchedProviderTurnStart.params.effort, 'max');
+    const steerMessage = protocolMessages.find((message) => (
+      message.method === 'turn/steer'
+      && message.params.input?.some((item) => item.text === 'change direction while running')
+    ));
     assert.equal(steerMessage.params.expectedTurnId, continuedPayload.turnId);
     assert.deepEqual(steerMessage.params.input, [{ type: 'text', text: 'change direction while running' }]);
     assert.ok(protocolMessages.some((message) => message.method === 'turn/interrupt'));
@@ -4131,6 +4766,8 @@ function startServer({
 }) {
   const env = {
     ...process.env,
+    OPENAI_API_KEY: '',
+    OPENAI_BASE_URL: '',
     APP_NAME: 'Codex Web Test',
     CODEX_WEB_PASSWORD: 'test-password',
     SESSION_SECRET: 'test-session-secret-with-enough-entropy',
@@ -4183,8 +4820,13 @@ async function createDesktopIpcFixture(temporary) {
     startTurnMode: 'respond',
     onStartTurn: null,
     lastError: null,
+    initializeCount: 0,
+    historySnapshots: new Map(),
     broadcast(message) {
       for (const socket of sockets) writeDesktopFrame(socket, message);
+    },
+    disconnectClients() {
+      for (const socket of sockets) socket.destroy();
     },
     async close() {
       for (const socket of sockets) socket.destroy();
@@ -4198,6 +4840,7 @@ async function createDesktopIpcFixture(temporary) {
     attachDesktopFrameReader(socket, (message) => {
       fixture.messages.push(message);
       if (message.method === 'initialize') {
+        fixture.initializeCount += 1;
         writeDesktopFrame(socket, {
           type: 'response',
           requestId: message.requestId,
@@ -4221,6 +4864,21 @@ async function createDesktopIpcFixture(temporary) {
         Promise.resolve(fixture.onStartTurn?.(message)).catch((error) => {
           fixture.lastError = error;
         });
+        return;
+      }
+      if (message.method === 'thread-follower-load-complete-history') {
+        writeDesktopFrame(socket, {
+          type: 'response',
+          requestId: message.requestId,
+          resultType: 'success',
+          method: message.method,
+          handledByClientId: 'desktop-owner',
+          result: { result: { ok: true } },
+        });
+        const snapshot = fixture.historySnapshots.get(message.params?.conversationId);
+        if (snapshot) {
+          setImmediate(() => fixture.broadcast(snapshot));
+        }
         return;
       }
       const result = message.method === 'thread-follower-start-turn'
@@ -4295,6 +4953,29 @@ async function waitForPendingRequestGone(baseUrl, cookie, requestId) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error('native approval request did not clear');
+}
+
+async function waitForPendingRequestState(baseUrl, cookie, predicate, errorMessage) {
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const response = await fetch(`${baseUrl}/api/native-requests`, {
+      headers: { Cookie: cookie },
+    });
+    if (response.ok) {
+      const requests = (await response.json()).requests || [];
+      const request = requests.find(predicate);
+      if (request) return request;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(errorMessage);
+}
+
+async function waitForDesktopInitializeCount(fixture, expected) {
+  for (let attempt = 0; attempt < 120; attempt++) {
+    if (fixture.initializeCount >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Desktop IPC initialize count did not reach ${expected}`);
 }
 
 async function waitForServer(child, runtime) {

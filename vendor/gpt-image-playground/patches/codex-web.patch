@@ -1,5 +1,5 @@
 diff --git a/src/App.tsx b/src/App.tsx
-index 5fc1614..ddf9a01 100644
+index 5fc1614..2ec9586 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
 @@ -1,11 +1,11 @@
@@ -156,10 +156,10 @@ index 5fc1614..ddf9a01 100644
      <>
        <Header />
 diff --git a/src/components/InputBar.tsx b/src/components/InputBar.tsx
-index 5f8239d..fdf1e32 100644
+index 37375ba..203fc6e 100644
 --- a/src/components/InputBar.tsx
 +++ b/src/components/InputBar.tsx
-@@ -350,6 +350,7 @@ function useIsMobile() {
+@@ -48,6 +48,7 @@ function useIsMobile() {
  type AtImageOption =
    | { type: 'input'; key: string; label: string; imageId: string; dataUrl: string; imageIndex: number }
    | { type: 'agent-output'; key: string; label: string; imageId: string; insertText: string }
@@ -167,7 +167,7 @@ index 5f8239d..fdf1e32 100644
 
  function agentImageMentionMatches(query: string, label: string) {
    const normalized = query.trim().toLowerCase()
-@@ -359,13 +360,23 @@ function agentImageMentionMatches(query: string, label: string) {
+@@ -57,13 +58,23 @@ function agentImageMentionMatches(query: string, label: string) {
  }
 
  function AtImageOptionThumb({ option }: { option: AtImageOption }) {
@@ -192,7 +192,7 @@ index 5f8239d..fdf1e32 100644
 
      let cancelled = false
      setSrc(getCachedImage(option.imageId) || '')
-@@ -378,8 +389,14 @@ function AtImageOptionThumb({ option }: { option: AtImageOption }) {
+@@ -76,8 +87,14 @@ function AtImageOptionThumb({ option }: { option: AtImageOption }) {
    }, [option])
 
    return (
@@ -209,7 +209,7 @@ index 5f8239d..fdf1e32 100644
      </span>
    )
  }
-@@ -744,7 +761,7 @@ export default function InputBar() {
+@@ -437,7 +454,7 @@ export default function InputBar() {
      ? maskDraft ? '遮罩编辑' : '生成图像'
      : '请先配置 API'
    const submitTooltipText = activeAgentIsRunning ? '停止生成' : '尚未完成 API 配置，请在右上角设置中进行'
@@ -218,7 +218,7 @@ index 5f8239d..fdf1e32 100644
    const submitCurrentMode = useCallback(() => {
      if (appMode === 'agent') {
        void submitAgentMessage()
-@@ -837,7 +854,10 @@ export default function InputBar() {
+@@ -530,7 +547,10 @@ export default function InputBar() {
    const atImageSourceCount = inputImages.length + agentOutputImageOptions.length
    const atImageQuery = isCursorInSelectedImageMention(prompt, cursorPosition)
      ? null
@@ -230,7 +230,7 @@ index 5f8239d..fdf1e32 100644
    const atImageOptions = atImageQuery
      ? [
          ...inputImages
-@@ -851,6 +871,9 @@ export default function InputBar() {
+@@ -544,6 +564,9 @@ export default function InputBar() {
            } satisfies AtImageOption))
            .filter((option) => imageMentionMatches(atImageQuery.query, option.imageIndex)),
          ...agentOutputImageOptions.filter((option) => agentImageMentionMatches(atImageQuery.query, option.label)),
@@ -240,7 +240,7 @@ index 5f8239d..fdf1e32 100644
        ]
      : []
    const showAtImageMenu = !atImageMenuDismissed && atImageOptions.length > 0
-@@ -860,6 +883,13 @@ export default function InputBar() {
+@@ -553,6 +576,13 @@ export default function InputBar() {
 
 
    const selectAtImageOption = useCallback((option: AtImageOption) => {
@@ -254,8 +254,8 @@ index 5f8239d..fdf1e32 100644
      const el = textareaRef.current
      const cursor = el ? getContentEditableCursor(el) : prompt.length
      const query = getAtImageQuery(stripImageMentionMarkers(prompt), cursor, { length: atImageSourceCount })
-@@ -1189,8 +1219,20 @@ export default function InputBar() {
-   }, [commitReferenceEditChoice, openReplaceReferenceFilePicker, setConfirmDialog, setMaskEditorImageId, settings.referenceImageEditAction])
+@@ -832,8 +862,20 @@ export default function InputBar() {
+   handleFilesRef.current = handleFiles
 
    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
 +    const imageCountBeforeUpload = useStore.getState().inputImages.length
@@ -274,12 +274,12 @@ index 5f8239d..fdf1e32 100644
 +    }
    }
 
-   const handleReplaceFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
 diff --git a/src/components/SettingsModal.tsx b/src/components/SettingsModal.tsx
-index 53f717c..0ac4cbf 100644
+index bbd5f59..cec9b9c 100644
 --- a/src/components/SettingsModal.tsx
 +++ b/src/components/SettingsModal.tsx
-@@ -1552,13 +1552,12 @@ export default function SettingsModal() {
+@@ -1390,13 +1390,12 @@ export default function SettingsModal() {
                      onChange={(e) => updateActiveProfile({ baseUrl: e.target.value })}
                      onBlur={(e) => commitActiveProfilePatch({ baseUrl: e.target.value })}
                      type="text"
@@ -295,7 +295,7 @@ index 53f717c..0ac4cbf 100644
                      ) : activeProfile.provider === 'fal' ? (
                        <span>默认使用 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">{DEFAULT_FAL_BASE_URL}</code>；填写自定义地址时将作为 fal.ai 代理 URL。</span>
                      ) : (
-@@ -1588,7 +1587,7 @@ export default function SettingsModal() {
+@@ -1426,7 +1425,7 @@ export default function SettingsModal() {
                      </button>
                    </div>
                    <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
@@ -305,10 +305,10 @@ index 53f717c..0ac4cbf 100644
                  </div>
                )}
 diff --git a/src/lib/agentApi.test.ts b/src/lib/agentApi.test.ts
-index 9e5e172..2934511 100644
+index 67d35ff..8d9ed1a 100644
 --- a/src/lib/agentApi.test.ts
 +++ b/src/lib/agentApi.test.ts
-@@ -190,6 +190,35 @@ describe('callAgentResponsesApi', () => {
+@@ -222,6 +222,35 @@ describe('callAgentResponsesApi', () => {
      expect(textDeltas).toEqual(['Hel'])
    })
 
@@ -345,10 +345,10 @@ index 9e5e172..2934511 100644
      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
        output: [{
 diff --git a/src/lib/agentApi.ts b/src/lib/agentApi.ts
-index 56e654e..e064e92 100644
+index f04b9d1..08925d6 100644
 --- a/src/lib/agentApi.ts
 +++ b/src/lib/agentApi.ts
-@@ -291,15 +291,19 @@ function applyUrlCitations(text: string, annotations: ResponseTextAnnotation[] |
+@@ -289,15 +289,19 @@ function applyUrlCitations(text: string, annotations: ResponseTextAnnotation[] |
  }
 
  function getStreamEventErrorMessage(event: Record<string, unknown>): string | null {
@@ -460,19 +460,19 @@ index ede2298..b9bc384 100644
 
    const apiPath = normalizedBaseUrl.endsWith('/v1')
 diff --git a/src/store.test.ts b/src/store.test.ts
-index 3e750ee..b4b9f36 100644
+index 98afeac..730a724 100644
 --- a/src/store.test.ts
 +++ b/src/store.test.ts
-@@ -132,7 +132,7 @@ import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversati
+@@ -134,7 +134,7 @@ import { callImageApi } from './lib/api'
  import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
  import { getFalQueuedImageResult } from './lib/falAiImageApi'
  import { removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
--import { cleanStaleAgentInputDrafts, clearFailedTasks, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getAgentConversationTaskIds, getAgentRoundTaskIds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
-+import { cleanStaleAgentInputDrafts, clearFailedTasks, deleteAgentRoundFromConversation, deleteFavoriteCollection, editOutputs, getActiveAgentRounds, getAgentConversationTaskIds, getAgentRoundTaskIds, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, isDirectAgentImageFallbackPrompt, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, remapAgentRoundMentionsForPathChange, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
+-import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
++import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, isDirectAgentImageFallbackPrompt, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
 
- const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
- const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
-@@ -147,6 +147,108 @@ describe('error toast messages', () => {
+ const commitTaskDeletionImplementation = vi.mocked(commitTaskDeletion).getMockImplementation()!
+ const deleteDbImageImplementation = vi.mocked(deleteDbImage).getMockImplementation()!
+@@ -154,6 +154,108 @@ describe('error toast messages', () => {
    })
  })
 
@@ -582,10 +582,10 @@ index 3e750ee..b4b9f36 100644
    return {
      id: 'conversation-a',
 diff --git a/src/store.ts b/src/store.ts
-index 45545b2..04989ec 100644
+index f9cb8cd..db3d9c9 100644
 --- a/src/store.ts
 +++ b/src/store.ts
-@@ -3664,6 +3664,16 @@ export async function submitAgentMessage() {
+@@ -2365,6 +2365,16 @@ export async function submitAgentMessage() {
    void executeAgentRound(conversation.id, roundId, normalizedParams, requestSettings, activeProfile, imageProfile)
  }
 
@@ -602,110 +602,22 @@ index 45545b2..04989ec 100644
  export async function regenerateAgentAssistantMessage(conversationId: string, roundId: string) {
    const state = useStore.getState()
    const { settings, params, showToast } = state
-@@ -4296,67 +4306,133 @@ async function executeAgentRound(
+@@ -3025,7 +3035,9 @@ async function executeAgentRound(
        if (reachedToolLimit) break
        const textBeforeResponse = accumulatedText
        let currentResponseOutputItems: ResponsesOutputItem[] = []
 -      const result = await callAgentResponsesApi({
--        settings: requestSettings,
--        profile: activeProfile,
--        params,
--        input: apiInputForTurn,
--        maskDataUrl,
--        signal: controller.signal,
--        onTextDelta: shouldStreamAssistantMessage
--          ? (delta) => {
--              if (controller.signal.aborted) return
--              if (pendingToolTextSeparator && delta && accumulatedText.trim()) {
--                accumulatedText += '\n\n'
--                appendAgentAssistantMessageContent(conversationId, assistantMessageId, '\n\n')
 +      let result: Awaited<ReturnType<typeof callAgentResponsesApi>>
 +      try {
 +        result = await callAgentResponsesApi({
-+          settings: requestSettings,
-+          profile: activeProfile,
-+          params,
-+          input: apiInputForTurn,
-+          maskDataUrl,
-+          signal: controller.signal,
-+          onTextDelta: shouldStreamAssistantMessage
-+            ? (delta) => {
-+                if (controller.signal.aborted) return
-+                if (pendingToolTextSeparator && delta && accumulatedText.trim()) {
-+                  accumulatedText += '\n\n'
-+                  appendAgentAssistantMessageContent(conversationId, assistantMessageId, '\n\n')
-+                }
-+                pendingToolTextSeparator = false
-+                accumulatedText += delta
-+                appendAgentAssistantMessageContent(conversationId, assistantMessageId, delta)
-               }
--              pendingToolTextSeparator = false
--              accumulatedText += delta
--              appendAgentAssistantMessageContent(conversationId, assistantMessageId, delta)
--            }
--          : undefined,
--        onOutputItems: shouldStreamAssistantMessage
--          ? (outputItems) => {
--              if (controller.signal.aborted) return
--              currentResponseOutputItems = outputItems
--              updateAgentConversation(conversationId, (current) => ({
--                ...current,
--                rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, outputItems) } : item),
--              }))
--            }
--          : undefined,
--        onImageToolStarted: shouldStreamAssistantMessage
--          ? async ({ toolCallId }) => {
--              if (controller.signal.aborted) return
--              await ensureStreamingAgentTask(toolCallId)
--            }
--          : undefined,
--        onImagePartialImage: shouldStreamAssistantMessage
--          ? async ({ toolCallId, image, partialImageIndex }) => {
--              if (controller.signal.aborted) return
--              const taskId = await ensureStreamingAgentTask(toolCallId)
-+            : undefined,
-+          onOutputItems: shouldStreamAssistantMessage
-+            ? (outputItems) => {
-+                if (controller.signal.aborted) return
-+                currentResponseOutputItems = outputItems
-+                updateAgentConversation(conversationId, (current) => ({
-+                  ...current,
-+                  rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, outputItems) } : item),
-+                }))
-+              }
-+            : undefined,
-+          onImageToolStarted: shouldStreamAssistantMessage
-+            ? async ({ toolCallId }) => {
-+                if (controller.signal.aborted) return
-+                await ensureStreamingAgentTask(toolCallId)
-+              }
-+            : undefined,
-+          onImagePartialImage: shouldStreamAssistantMessage
-+            ? async ({ toolCallId, image, partialImageIndex }) => {
-+                if (controller.signal.aborted) return
-+                const taskId = await ensureStreamingAgentTask(toolCallId)
-+                if (controller.signal.aborted) return
-+                useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
-+                if (partialImageIndex === 0 || partialImageIndex == null) {
-+                  void persistTaskStreamPartialImage(taskId, image)
-+                }
-+              }
-+            : undefined,
-+          onImageToolCompleted: shouldStreamAssistantMessage
-+            ? async (image) => {
-+                if (controller.signal.aborted) return
-+                await completeAgentImageTask(image)
-+              }
-+            : undefined,
-+          onImageToolFailed: shouldStreamAssistantMessage
-+            ? async ({ toolCallId, error }) => {
-+                if (controller.signal.aborted) return
-+                await ensureStreamingAgentTask(toolCallId)
-+                if (controller.signal.aborted) return
-+                failAgentImageTask(toolCallId, error)
-+              }
-+            : undefined,
+         settings: requestSettings,
+         profile: activeProfile,
+         params,
+@@ -3085,7 +3097,71 @@ async function executeAgentRound(
+               failAgentImageTask(toolCallId, error)
+             }
+           : undefined,
+-      })
 +        })
 +      } catch (agentError) {
 +        const canUseDirectImageFallback =
@@ -746,28 +658,11 @@ index 45545b2..04989ec 100644
 +            taskParams: fallbackParams,
 +            signal: controller.signal,
 +            onPartialImage: async ({ image, partialImageIndex }) => {
-               if (controller.signal.aborted) return
-               useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
-               if (partialImageIndex === 0 || partialImageIndex == null) {
-                 void persistTaskStreamPartialImage(taskId, image)
-               }
--            }
--          : undefined,
--        onImageToolCompleted: shouldStreamAssistantMessage
--          ? async (image) => {
--              if (controller.signal.aborted) return
--              await completeAgentImageTask(image)
--            }
--          : undefined,
--        onImageToolFailed: shouldStreamAssistantMessage
--          ? async ({ toolCallId, error }) => {
--              if (controller.signal.aborted) return
--              await ensureStreamingAgentTask(toolCallId)
--              if (controller.signal.aborted) return
--              failAgentImageTask(toolCallId, error)
--            }
--          : undefined,
--      })
++              if (controller.signal.aborted) return
++              useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
++              if (partialImageIndex === 0 || partialImageIndex == null) {
++                void persistTaskStreamPartialImage(taskId, image)
++              }
 +            },
 +          })
 +          if (!fallbackResult.image) {
@@ -791,7 +686,7 @@ index 45545b2..04989ec 100644
        if (controller.signal.aborted) throw createAgentAbortError()
 
        lastResponseId = result.responseId ?? lastResponseId
-@@ -5655,4 +5731,3 @@ export async function addImageFromUrl(src: string): Promise<void> {
+@@ -4450,4 +4526,3 @@ export async function addImageFromUrl(src: string): Promise<void> {
    cacheImage(id, dataUrl)
    useStore.getState().addInputImage({ id, dataUrl })
  }

@@ -4,8 +4,8 @@ The production files in `app/` were built from:
 
 - Project: `CookSleep/gpt_image_playground`
 - Source: https://github.com/CookSleep/gpt_image_playground
-- Commit: `a10477581b3d43ac98d39777e4445625a9db113d`
-- Version: `0.7.0`
+- Commit: `eb91e4fb335ffee61f6b9db46d62ac8244c13d53`
+- Version: `0.7.1`
 - License: MIT, reproduced in `LICENSE`
 
 Rebuild from a clean checkout of the pinned commit:
@@ -21,7 +21,7 @@ rsync -a --delete --exclude sw.js dist/ <codex-web-checkout>/vendor/gpt-image-pl
 
 The included `package-lock.json` is the upstream lock refreshed with
 `npm audit fix` before building. It pins DOMPurify 3.4.12 and produced a clean
-production dependency audit on 2026-07-17.
+production dependency audit on 2026-07-25.
 
 This embedded build adds a small same-origin bridge in upstream `src/App.tsx`.
 It accepts prompt text, image parameters, and reference images from the Codex

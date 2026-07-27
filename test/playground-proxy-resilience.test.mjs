@@ -85,6 +85,8 @@ test('playground proxy returns clean 502 for truncated JSON and streams SSE', as
     cwd: ROOT,
     env: {
       ...process.env,
+      OPENAI_API_KEY: '',
+      OPENAI_BASE_URL: '',
       APP_NAME: 'Codex Web Proxy Test',
       CODEX_WEB_PASSWORD: 'test-password',
       SESSION_SECRET: 'test-session-secret-with-enough-entropy',

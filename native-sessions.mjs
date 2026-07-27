@@ -163,17 +163,15 @@ export class NativeSessionStore extends EventEmitter {
   }
 
   refreshWorkspaceState() {
-    let state;
+    let state = null;
     try {
       state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
-    } catch {
-      // Codex Desktop replaces this file atomically. Keep the last valid
-      // snapshot while it is temporarily missing or incomplete.
-      return [];
-    }
+    } catch {}
 
     const previousPinnedThreadIds = this.pinnedThreadIds;
-    this.pinnedThreadIds = normalizePinnedThreadIds(state?.['pinned-thread-ids']);
+    if (state && typeof state === 'object' && !Array.isArray(state)) {
+      this.pinnedThreadIds = normalizePinnedThreadIds(state['pinned-thread-ids']);
+    }
     const pinnedChangedIds = equalStringArrays(previousPinnedThreadIds, this.pinnedThreadIds)
       ? []
       : [...new Set([...previousPinnedThreadIds, ...this.pinnedThreadIds])];
@@ -182,40 +180,54 @@ export class NativeSessionStore extends EventEmitter {
       && typeof state === 'object'
       && !Array.isArray(state)
       && Object.prototype.hasOwnProperty.call(state, 'projectless-thread-ids');
-    if (!hasProjectlessIds) {
-      this.projectlessThreadIds = new Set();
-      this.projectThreadIds = new Set();
-      this.workspaceStateAvailable = false;
-      this.refreshSideChatState(state);
-      return pinnedChangedIds;
-    }
-
-    const value = state?.['projectless-thread-ids'];
-    const ids = Array.isArray(value)
+    const value = hasProjectlessIds ? state['projectless-thread-ids'] : null;
+    const globalIds = Array.isArray(value)
       ? value
       : value && typeof value === 'object'
         ? Object.keys(value)
-        : null;
-    if (!ids) return pinnedChangedIds;
+        : [];
+    const local = this.readLocalSideChatState();
 
-    this.projectlessThreadIds = new Set(ids
+    if (state) {
+      const assignments = state['thread-project-assignments'];
+      this.projectThreadIds = new Set((assignments && typeof assignments === 'object' && !Array.isArray(assignments)
+        ? Object.keys(assignments)
+        : [])
+        .map((id) => String(id || '').trim().toLowerCase())
+        .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
+    }
+    const globalProjectlessIds = [...globalIds, ...local.legacyProjectlessIds]
       .map((id) => String(id || '').trim().toLowerCase())
-      .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
-    const assignments = state?.['thread-project-assignments'];
-    this.projectThreadIds = new Set((assignments && typeof assignments === 'object' && !Array.isArray(assignments)
-      ? Object.keys(assignments)
-      : [])
+      .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`) && !this.projectThreadIds.has(id));
+    const localProjectlessIds = local.projectlessIds
       .map((id) => String(id || '').trim().toLowerCase())
-      .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
-    this.workspaceStateAvailable = true;
+      .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`));
+    this.projectlessThreadIds = new Set([...globalProjectlessIds, ...localProjectlessIds]);
+    this.workspaceStateAvailable = state
+      ? Boolean(hasProjectlessIds || local.projectlessIds.length || globalProjectlessIds.length)
+      : Boolean(local.projectlessIds.length || globalProjectlessIds.length || this.workspaceStateAvailable);
     this.refreshSideChatState(state);
+    try {
+      this.writeLocalSideChatState([...this.sideChatThreadIds], Object.fromEntries(this.sideChatSourceThreads), {
+        projectlessIds: local.projectlessIds,
+        legacyProjectlessIds: globalProjectlessIds,
+        workspaceHints: {
+          ...(state?.['thread-workspace-root-hints'] && typeof state['thread-workspace-root-hints'] === 'object'
+            ? state['thread-workspace-root-hints']
+            : {}),
+          ...local.workspaceHints,
+        },
+      });
+    } catch {}
     return pinnedChangedIds;
   }
 
   readLocalSideChatState() {
     try {
       const parsed = JSON.parse(readFileSync(this.sideChatStateFile, 'utf8'));
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ids: [], sources: {} };
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { ids: [], sources: {}, ignoredIds: [], projectlessIds: [], legacyProjectlessIds: [], workspaceHints: {} };
+      }
       const raw = parsed['side-chat-thread-ids'];
       const ids = Array.isArray(raw)
         ? raw
@@ -227,13 +239,34 @@ export class NativeSessionStore extends EventEmitter {
         && !Array.isArray(parsed['side-chat-source-threads']))
         ? parsed['side-chat-source-threads']
         : {};
-      return { ids, sources };
+      const ignoredIds = Array.isArray(parsed['ignored-side-chat-thread-ids'])
+        ? parsed['ignored-side-chat-thread-ids']
+        : [];
+      const projectlessRaw = parsed['projectless-thread-ids'];
+      const projectlessIds = Array.isArray(projectlessRaw)
+        ? projectlessRaw
+        : projectlessRaw && typeof projectlessRaw === 'object'
+          ? Object.keys(projectlessRaw)
+          : [];
+      const legacyProjectlessRaw = parsed['legacy-projectless-thread-ids'];
+      const legacyProjectlessIds = Array.isArray(legacyProjectlessRaw)
+        ? legacyProjectlessRaw
+        : legacyProjectlessRaw && typeof legacyProjectlessRaw === 'object'
+          ? Object.keys(legacyProjectlessRaw)
+          : [];
+      const workspaceHints = (parsed['thread-workspace-root-hints']
+        && typeof parsed['thread-workspace-root-hints'] === 'object'
+        && !Array.isArray(parsed['thread-workspace-root-hints']))
+        ? parsed['thread-workspace-root-hints']
+        : {};
+      return { ids, sources, ignoredIds, projectlessIds, legacyProjectlessIds, workspaceHints };
     } catch {
-      return { ids: [], sources: {} };
+      return { ids: [], sources: {}, ignoredIds: [], projectlessIds: [], legacyProjectlessIds: [], workspaceHints: {} };
     }
   }
 
-  writeLocalSideChatState(ids, sources) {
+  writeLocalSideChatState(ids, sources, options = {}) {
+    const current = this.readLocalSideChatState();
     const cleanIds = [...new Set((ids || [])
       .map((id) => String(id || '').trim().toLowerCase())
       .filter((id) => SESSION_ID_PATTERN.test(String(id) + '.jsonl')))];
@@ -245,9 +278,29 @@ export class NativeSessionStore extends EventEmitter {
       if (!cleanIds.includes(threadId)) continue;
       cleanSources[threadId] = SESSION_ID_PATTERN.test(String(sourceThreadId) + '.jsonl') ? sourceThreadId : '';
     }
+    const projectlessIds = [...new Set((options.projectlessIds || current.projectlessIds || [])
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter((id) => SESSION_ID_PATTERN.test(String(id) + '.jsonl')))];
+    const legacyProjectlessIds = [...new Set((options.legacyProjectlessIds || current.legacyProjectlessIds || [])
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter((id) => SESSION_ID_PATTERN.test(String(id) + '.jsonl') && !projectlessIds.includes(id)))];
+    const workspaceHints = {};
+    for (const [id, cwd] of Object.entries(options.workspaceHints || current.workspaceHints || {})) {
+      const threadId = String(id || '').trim().toLowerCase();
+      const value = String(cwd || '').trim();
+      if ((projectlessIds.includes(threadId) || legacyProjectlessIds.includes(threadId)) && value) {
+        workspaceHints[threadId] = value;
+      }
+    }
     const payload = {
       'side-chat-thread-ids': cleanIds,
       'side-chat-source-threads': cleanSources,
+      'ignored-side-chat-thread-ids': [...new Set((options.ignoredIds || current.ignoredIds || [])
+        .map((id) => String(id || '').trim().toLowerCase())
+        .filter((id) => SESSION_ID_PATTERN.test(String(id) + '.jsonl') && !cleanIds.includes(id)))],
+      'projectless-thread-ids': projectlessIds,
+      'legacy-projectless-thread-ids': legacyProjectlessIds,
+      'thread-workspace-root-hints': workspaceHints,
       updatedAt: Date.now(),
     };
     const temporary = this.sideChatStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
@@ -279,6 +332,9 @@ export class NativeSessionStore extends EventEmitter {
       : {};
 
     const local = this.readLocalSideChatState();
+    const ignoredIds = new Set(local.ignoredIds
+      .map((id) => String(id || '').trim().toLowerCase())
+      .filter(Boolean));
     const mergedIds = new Set();
     const mergedSources = new Map();
 
@@ -286,6 +342,7 @@ export class NativeSessionStore extends EventEmitter {
       for (const id of list || []) {
         const threadId = String(id || '').trim().toLowerCase();
         if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) continue;
+        if (ignoredIds.has(threadId)) continue;
         mergedIds.add(threadId);
       }
     }
@@ -320,62 +377,26 @@ export class NativeSessionStore extends EventEmitter {
   workspaceKindForThread(id) {
     const threadId = String(id || '').trim().toLowerCase();
     if (!this.workspaceStateAvailable || !SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return '';
-    if (this.projectThreadIds.has(threadId)) return 'project';
-    return this.projectlessThreadIds.has(threadId) ? 'projectless' : 'project';
+    if (this.projectlessThreadIds.has(threadId)) return 'projectless';
+    return 'project';
   }
 
   markProjectlessThread(id, options = {}) {
     const threadId = String(id || '').trim().toLowerCase();
     if (!SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return false;
-    let state = {};
-    try {
-      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
-      if (!state || typeof state !== 'object' || Array.isArray(state)) state = {};
-    } catch {
-      state = {};
-    }
-
-    const raw = state['projectless-thread-ids'];
-    let ids;
-    let asObject = false;
-    if (Array.isArray(raw)) {
-      ids = raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
-    } else if (raw && typeof raw === 'object') {
-      asObject = true;
-      ids = Object.keys(raw).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
-    } else {
-      ids = [];
-    }
+    const local = this.readLocalSideChatState();
+    const ids = local.projectlessIds.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
     if (!ids.includes(threadId)) ids.push(threadId);
-    state['projectless-thread-ids'] = asObject
-      ? Object.fromEntries(ids.map((value) => [value, true]))
-      : ids;
-
     const cwd = String(options.cwd || '').trim();
-    if (cwd) {
-      const hints = (state['thread-workspace-root-hints'] && typeof state['thread-workspace-root-hints'] === 'object' && !Array.isArray(state['thread-workspace-root-hints']))
-        ? { ...state['thread-workspace-root-hints'] }
-        : {};
-      hints[threadId] = cwd;
-      state['thread-workspace-root-hints'] = hints;
-      const outputs = (state['thread-projectless-output-directories'] && typeof state['thread-projectless-output-directories'] === 'object' && !Array.isArray(state['thread-projectless-output-directories']))
-        ? { ...state['thread-projectless-output-directories'] }
-        : {};
-      outputs[threadId] = path.join(cwd, 'outputs');
-      state['thread-projectless-output-directories'] = outputs;
-    }
-
-    const assignments = (state['thread-project-assignments'] && typeof state['thread-project-assignments'] === 'object' && !Array.isArray(state['thread-project-assignments']))
-      ? { ...state['thread-project-assignments'] }
-      : {};
-    if (assignments[threadId]) {
-      delete assignments[threadId];
-      state['thread-project-assignments'] = assignments;
-    }
-
-    const temporary = this.globalStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
-    writeFileSync(temporary, JSON.stringify(state) + String.fromCharCode(10), { mode: 0o600 });
-    renameSync(temporary, this.globalStateFile);
+    const workspaceHints = { ...local.workspaceHints };
+    if (cwd) workspaceHints[threadId] = cwd;
+    this.writeLocalSideChatState(local.ids, local.sources, {
+      projectlessIds: ids,
+      legacyProjectlessIds: local.legacyProjectlessIds.filter((value) => (
+        String(value || '').trim().toLowerCase() !== threadId
+      )),
+      workspaceHints,
+    });
     this.projectlessThreadIds.add(threadId);
     this.projectThreadIds.delete(threadId);
     this.workspaceStateAvailable = true;
@@ -396,57 +417,20 @@ export class NativeSessionStore extends EventEmitter {
   markSideChatThread(id, options = {}) {
     const threadId = String(id || '').trim().toLowerCase();
     if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) return false;
-    let state = {};
-    try {
-      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
-      if (!state || typeof state !== 'object' || Array.isArray(state)) state = {};
-    } catch {
-      state = {};
-    }
-
-    const raw = state['side-chat-thread-ids'];
-    let ids;
-    let asObject = false;
-    if (Array.isArray(raw)) {
-      ids = raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
-    } else if (raw && typeof raw === 'object') {
-      asObject = true;
-      ids = Object.keys(raw).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
-    } else {
-      ids = [];
-    }
+    const local = this.readLocalSideChatState();
+    const ids = local.ids.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
     if (!ids.includes(threadId)) ids.push(threadId);
-    state['side-chat-thread-ids'] = asObject
-      ? Object.fromEntries(ids.map((value) => [value, true]))
-      : ids;
 
     const sourceThreadId = String(options.sourceThreadId || '').trim().toLowerCase();
-    const sources = (state['side-chat-source-threads']
-      && typeof state['side-chat-source-threads'] === 'object'
-      && !Array.isArray(state['side-chat-source-threads']))
-      ? { ...state['side-chat-source-threads'] }
-      : {};
+    const sources = { ...local.sources };
     if (sourceThreadId && SESSION_ID_PATTERN.test(String(sourceThreadId) + '.jsonl')) {
       sources[threadId] = sourceThreadId;
     } else if (!sources[threadId]) {
       sources[threadId] = '';
     }
-    state['side-chat-source-threads'] = sources;
-
-    // Durable local registry first (Codex App frequently rewrites global state).
-    try {
-      const local = this.readLocalSideChatState();
-      const localIds = [...new Set([...(local.ids || []).map((value) => String(value || '').trim().toLowerCase()), threadId])];
-      const localSources = { ...(local.sources || {}) };
-      localSources[threadId] = sources[threadId] || '';
-      this.writeLocalSideChatState(localIds, localSources);
-    } catch {}
-
-    try {
-      const temporary = this.globalStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
-      writeFileSync(temporary, JSON.stringify(state) + String.fromCharCode(10), { mode: 0o600 });
-      renameSync(temporary, this.globalStateFile);
-    } catch {}
+    this.writeLocalSideChatState(ids, sources, {
+      ignoredIds: local.ignoredIds.filter((value) => String(value || '').trim().toLowerCase() !== threadId),
+    });
 
     this.sideChatThreadIds.add(threadId);
     this.sideChatSourceThreads.set(threadId, sources[threadId] || '');
@@ -457,56 +441,17 @@ export class NativeSessionStore extends EventEmitter {
   unmarkSideChatThread(id) {
     const threadId = String(id || '').trim().toLowerCase();
     if (!SESSION_ID_PATTERN.test(String(threadId) + '.jsonl')) return false;
-    let state = {};
-    try {
-      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
-      if (!state || typeof state !== 'object' || Array.isArray(state)) state = {};
-    } catch {
-      state = {};
-    }
-
-    const raw = state['side-chat-thread-ids'];
-    let ids;
-    let asObject = false;
-    if (Array.isArray(raw)) {
-      ids = raw.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
-    } else if (raw && typeof raw === 'object') {
-      asObject = true;
-      ids = Object.keys(raw).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
-    } else {
-      ids = [];
-    }
+    const local = this.readLocalSideChatState();
+    const ids = local.ids.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
     const nextIds = ids.filter((value) => value !== threadId);
     if (nextIds.length === ids.length && !this.sideChatThreadIds.has(threadId)) return false;
-    state['side-chat-thread-ids'] = asObject
-      ? Object.fromEntries(nextIds.map((value) => [value, true]))
-      : nextIds;
-
-    const sources = (state['side-chat-source-threads']
-      && typeof state['side-chat-source-threads'] === 'object'
-      && !Array.isArray(state['side-chat-source-threads']))
-      ? { ...state['side-chat-source-threads'] }
-      : {};
+    const sources = { ...local.sources };
     if (sources[threadId] !== undefined) {
       delete sources[threadId];
-      state['side-chat-source-threads'] = sources;
     }
-
-    try {
-      const local = this.readLocalSideChatState();
-      const localIds = (local.ids || [])
-        .map((value) => String(value || '').trim().toLowerCase())
-        .filter((value) => value && value !== threadId);
-      const localSources = { ...(local.sources || {}) };
-      delete localSources[threadId];
-      this.writeLocalSideChatState(localIds, localSources);
-    } catch {}
-
-    try {
-      const temporary = this.globalStateFile + '.tmp-' + Date.now() + '-' + Math.random().toString(16).slice(2);
-      writeFileSync(temporary, JSON.stringify(state) + String.fromCharCode(10), { mode: 0o600 });
-      renameSync(temporary, this.globalStateFile);
-    } catch {}
+    this.writeLocalSideChatState(nextIds, sources, {
+      ignoredIds: [...new Set([...local.ignoredIds, threadId])],
+    });
 
     this.sideChatThreadIds.delete(threadId);
     this.sideChatSourceThreads.delete(threadId);
@@ -540,6 +485,7 @@ export class NativeSessionStore extends EventEmitter {
         const source = String(row.source || '');
         const rolloutPath = String(row.rollout_path || '').trim();
         if (!SESSION_ID_PATTERN.test(`${id}.jsonl`) || !APP_THREAD_SOURCES.has(source)) continue;
+        if (Number(row.is_automation) === 1 && !this.pinnedThreadIds.includes(id)) continue;
         if (!rolloutPath) continue;
         next.set(id, {
           rolloutPath: path.resolve(rolloutPath),
@@ -758,20 +704,22 @@ function prepareAppThreadQuery(db) {
 
   const recencyColumn = columns.has('recency_at_ms') ? 'recency_at_ms' : 'updated_at_ms';
   const threadSource = columns.has('thread_source') ? "COALESCE(thread_source, '')" : "''";
+  const automationThread = `(
+    ${threadSource} = 'automation'
+    OR (
+      preview LIKE 'Automation:%'
+      AND preview LIKE '%Automation ID:%'
+      AND preview LIKE '%Automation memory:%'
+    )
+  )`;
   return db.prepare(`
-    SELECT id, rollout_path, source, cwd, title, created_at_ms, updated_at_ms, ${recencyColumn} AS recency_at_ms
+    SELECT id, rollout_path, source, cwd, title, created_at_ms, updated_at_ms,
+      ${recencyColumn} AS recency_at_ms,
+      CASE WHEN ${automationThread} THEN 1 ELSE 0 END AS is_automation
     FROM threads
     WHERE archived = 0
       AND preview <> ''
       AND cli_version <> ''
-      AND NOT (
-        ${threadSource} = 'automation'
-        OR (
-          preview LIKE 'Automation:%'
-          AND preview LIKE '%Automation ID:%'
-          AND preview LIKE '%Automation memory:%'
-        )
-      )
   `);
 }
 

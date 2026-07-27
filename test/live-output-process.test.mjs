@@ -727,6 +727,115 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.match(inlineScript, /if\(nearBottom&&\(conversation\.messages\|\|\[\]\)\.length\)scheduleNativeLiveScroll\(\)/);
 });
 
+test('runtime stream and snapshot message adopt into one assistant bubble', () => {
+  const liveSource = sourceBetween('function isNativeSnapshotStreamingMessage', 'async function copyText');
+  const rendered = [];
+  const addCalls = [];
+  const createElement = () => {
+    const classes = new Set(['msg', 'assistant', 'streaming']);
+    return {
+      dataset: { messageKind: 'live_progress' },
+      _messageBody: { textContent: '' },
+      classList: {
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        contains: (name) => classes.has(name),
+      },
+    };
+  };
+  const addMsg = (role, text, options) => {
+    const element = createElement();
+    element.dataset.messageText = text;
+    if (options?.kind) element.dataset.messageKind = String(options.kind);
+    if (options?.turnId) element.dataset.turnId = String(options.turnId);
+    if (Number.isInteger(options?.nativeMessageSeq)) element.dataset.nativeMessageSeq = String(options.nativeMessageSeq);
+    addCalls.push({ role, text, options, element });
+    return element;
+  };
+  const renderAssistantMarkdown = (body, text) => {
+    body.textContent = text;
+    rendered.push(text);
+  };
+  const chat = {
+    scrollHeight: 1000,
+    clientHeight: 400,
+    scrollTop: 600,
+    addEventListener() {},
+    querySelectorAll(selector) {
+      if (selector !== '.msg.assistant') return [];
+      return addCalls.map((call) => call.element);
+    },
+  };
+  const api = new Function(
+    'setTimeout',
+    'clearTimeout',
+    'addMsg',
+    'renderAssistantMarkdown',
+    'scrollChatToLatest',
+    'chat',
+    `
+      let nativeGeneration = 4;
+      let nativeCompletionSync = null;
+      let nativeLiveItems = new Map();
+      let nativeRuntimeStreamTurnIds = new Set();
+      let nativeRenderedMessageKeys = new Set();
+      let nativeLiveScrollTimer = null;
+      let nativeLiveFollowBottom = true;
+      let nativeLiveScrollTrackingBound = false;
+      let activeNativeTurnId = 'turn-active';
+      let latestAssistantElement = null;
+      let latestFinalAssistantElement = null;
+      let collectingTurnProcess = false;
+      let turnProcessElapsedTurnId = '';
+      let turnProcessStartedAt = 0;
+      let turnProcessElapsedLabel = null;
+      const statusEl = { textContent: '', classList: { add() {}, remove() {} } };
+      function beginTurnProcessCollection() {}
+      function ensureTurnProcessElapsedRunning() {}
+      function turnProcessElapsedMatches() { return true; }
+      function activateTurnProcessElement() {}
+      function removeNativeRunningElement() {}
+      ${liveSource}
+      return {
+        updateDelta: updateNativeLiveDelta,
+        finishItem: finishNativeLiveItem,
+        finishAll: finishAllNativeLiveItems,
+        adopt: adoptRuntimeLiveForSnapshotMessage,
+        upsert: upsertNativeSnapshotLiveMessage,
+        addMsg,
+        state: () => ({ nativeLiveItems, nativeRuntimeStreamTurnIds, nativeRenderedMessageKeys, latestAssistantElement }),
+      };
+    `,
+  )(() => 1, () => {}, addMsg, renderAssistantMarkdown, () => {}, chat);
+
+  const content = '明白了：不是日程禁止嘟嘴，而是别让参考像把每张图都带成嘟嘴。';
+  api.updateDelta({ itemId: 'item-1', turnId: 'turn-active', delta: content, updatedAt: '2026-07-26T12:00:00.000Z' });
+  assert.equal(addCalls.length, 1);
+  api.finishItem('item-1', 'turn-active');
+  api.finishAll();
+  assert.equal(addCalls.length, 1);
+
+  const message = {
+    seq: 12,
+    role: 'assistant',
+    kind: 'message',
+    turnId: 'turn-active',
+    content,
+    at: '2026-07-26T12:00:01.000Z',
+  };
+  assert.ok(api.adopt(message));
+  assert.equal(addCalls.length, 1, 'snapshot must adopt runtime bubble instead of creating a twin');
+  assert.equal(addCalls[0].element.dataset.nativeMessageSeq, '12');
+  assert.equal(addCalls[0].element.dataset.messageText, content);
+  assert.equal(api.upsert(message, { status: 'running', activeTurnId: 'turn-active', generation: 4 }), null);
+  assert.equal(addCalls.length, 1);
+
+  // Residual same-text insert after adoption should not create another bubble when using real addMsg path.
+  // (Here we only assert the runtime→snapshot adoption path used by live sync.)
+  assert.equal(addCalls[0].element.dataset.messageKind, 'message');
+  assert.equal(api.state().nativeRenderedMessageKeys.size >= 1, true);
+});
+
 test('streaming output has no blinking text caret', () => {
   assert.doesNotMatch(uiStyles, /streamCaret/);
   assert.doesNotMatch(uiStyles, /streamRail/);
@@ -749,20 +858,58 @@ test('queue send and explicit guide are mutually exclusive', () => {
   assert.doesNotMatch(sendSource, /promptQueueMode|steerQueuedPrompt\(existingId/);
   assert.doesNotMatch(inlineScript, /PROMPT_QUEUE_MODE_KEY|setPromptQueueMode|readPromptQueueMode/);
   assert.match(steerSource, /queueItemId:item\.id/);
-  assert.match(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:true\}\)/);
-  assert.ok(steerSource.indexOf("fetch('/api/native-sessions/") < steerSource.indexOf('removeQueuedPromptLocal(threadId,item,{persist:true})'));
-  assert.ok(steerSource.indexOf('removeQueuedPromptLocal(threadId,item,{persist:true})') < steerSource.indexOf('await flushPromptQueueToServer(threadId)'));
-  assert.ok(steerSource.indexOf('await flushPromptQueueToServer(threadId)') < steerSource.indexOf('showNativeSteerOptimistically(item)'));
+  assert.match(steerSource, /applyServerPromptQueue\(threadId,data\.queue\)/);
+  assert.match(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:false\}\)/);
+  assert.doesNotMatch(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:true\}\)/);
+  assert.ok(steerSource.indexOf('await flushPromptQueueToServer(threadId)') < steerSource.indexOf("fetch('/api/native-sessions/"));
+  assert.ok(steerSource.indexOf("fetch('/api/native-sessions/") < steerSource.indexOf('applyServerPromptQueue(threadId,data.queue)'));
+  assert.ok(steerSource.indexOf('applyServerPromptQueue(threadId,data.queue)') < steerSource.indexOf('showNativeSteerOptimistically(item)'));
   assert.doesNotMatch(steerSource, /const previousItems=|const stillMissing=/);
   assert.match(dispatchSource, /queueGuidingItems\.has\(item\.id\)\|\|steerSubmitting/);
   assert.match(inlineScript, /Array\.isArray\(data\.items\)&&!promptQueueServerSyncPending\.has\(id\)/);
   assert.match(inlineScript, /while\(promptQueueServerSyncInflight\.has\(id\)\)await promptQueueServerSyncInflight\.get\(id\)/);
 });
 
+test('queue fallback removes only the matching id when messages are identical', () => {
+  const dismissalSource = sourceBetween('function promptQueueFor', 'function promptQueueFingerprint');
+  const removeSource = sourceBetween('function removeQueuedPromptLocal', 'async function steerQueuedPrompt');
+  const api = new Function(
+    'initialItems',
+    `
+      let currentConversationId='thread-1';
+      let promptQueues={'thread-1':initialItems};
+      let queueDismissedKeys=new Map();
+      ${dismissalSource}
+      function setPromptQueue(threadId,items){promptQueues[threadId]=items;}
+      function applyPromptQueueLocal(threadId,items){promptQueues[threadId]=items;}
+      ${removeSource}
+      return {
+        removeQueuedPromptLocal,
+        items:()=>promptQueues['thread-1'],
+        dismissed:()=>[...queueDismissKeySet('thread-1')],
+      };
+    `,
+  )([
+    { id: 'queue-a', message: 'same prompt', createdAt: '2026-07-26T10:00:00.000Z' },
+    { id: 'queue-b', message: 'same prompt', createdAt: '2026-07-26T10:00:01.000Z' },
+  ]);
+
+  api.removeQueuedPromptLocal(
+    'thread-1',
+    { id: 'queue-a', message: 'same prompt', createdAt: '2026-07-26T10:00:00.000Z' },
+    { persist: false },
+  );
+
+  assert.deepEqual(api.items().map((item) => item.id), ['queue-b']);
+  assert.deepEqual(api.dismissed(), ['id:queue-a']);
+});
+
 test('pasted attachments stay in compact fixed-size chips', () => {
   assert.match(uiStyles, /\.attachmentTray\s*\{[^}]*display:\s*inline-flex;[^}]*width:\s*fit-content;[^}]*max-width:\s*min\(360px[^}]*border:\s*0;[^}]*background:\s*transparent/s);
   assert.match(uiStyles, /body\[data-theme\] \.attachmentChip\s*\{[^}]*width:\s*min\(168px,[^}]*height:\s*44px;[^}]*grid-template-columns:\s*36px minmax\(0, 1fr\) 24px[^}]*border:\s*1px solid var\(--border\)/s);
   assert.match(uiStyles, /body \.attachmentChip img,[^}]*width:\s*36px;[^}]*height:\s*36px/s);
+  assert.match(uiStyles, /body \.composer > \.attachmentTray\s*\{[^}]*display:\s*flex;[^}]*width:\s*min\(360px, calc\(100% - 20px\)\);[^}]*max-width:\s*min\(360px, calc\(100% - 20px\)\);[^}]*margin-inline:\s*auto;[^}]*box-sizing:\s*border-box;/s);
+  assert.match(uiStyles, /body \.main\.sideChatOpen > \.composer > \.attachmentTray\s*\{[^}]*width:\s*min\(360px, calc\(100% - 20px\)\) !important;[^}]*max-width:\s*min\(360px, calc\(100% - 20px\)\) !important;[^}]*margin-inline:\s*auto !important;/s);
   assert.match(inlineScript, /name\.title=name\.textContent/);
 });
 

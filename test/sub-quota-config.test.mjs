@@ -91,6 +91,8 @@ if (process.argv[2] === 'app-server') {
       cwd: ROOT,
       env: {
         ...process.env,
+        OPENAI_API_KEY: '',
+        OPENAI_BASE_URL: '',
         APP_NAME: 'Dual quota test',
         CODEX_WEB_PASSWORD: 'test-password',
         SESSION_SECRET: 'dual-quota-test-session-secret',

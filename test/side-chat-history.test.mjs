@@ -43,10 +43,14 @@ test('native store persists side-chat-thread-ids and annotates list summaries', 
         }) + '\n',
       );
     }
-    fs.writeFileSync(
-      path.join(temporary, '.codex-global-state.json'),
-      JSON.stringify({ 'projectless-thread-ids': [], 'pinned-thread-ids': [] }) + '\n',
-    );
+    const globalStateFile = path.join(temporary, '.codex-global-state.json');
+    const desktopState = {
+      'projectless-thread-ids': [],
+      'pinned-thread-ids': [mainId],
+      'thread-project-assignments': { [mainId]: { projectId: 'desktop-project' } },
+      'desktop-owned-field': { revision: 7 },
+    };
+    fs.writeFileSync(globalStateFile, JSON.stringify(desktopState) + '\n');
 
     const store = new NativeSessionStore(temporary, { watchChanges: false, pollIntervalMs: 60000, sideChatStateFile: path.join(temporary, 'side-chat-threads.json') });
     assert.equal(store.isSideChatThread(sideId), false);
@@ -54,11 +58,10 @@ test('native store persists side-chat-thread-ids and annotates list summaries', 
     assert.equal(store.isSideChatThread(sideId), true);
     assert.equal(store.sideChatSourceThreadId(sideId), mainId);
 
-    const persisted = JSON.parse(fs.readFileSync(path.join(temporary, '.codex-global-state.json'), 'utf8'));
-    const ids = Array.isArray(persisted['side-chat-thread-ids'])
-      ? persisted['side-chat-thread-ids']
-      : Object.keys(persisted['side-chat-thread-ids'] || {});
-    assert.ok(ids.map((id) => String(id).toLowerCase()).includes(sideId));
+    assert.deepEqual(JSON.parse(fs.readFileSync(globalStateFile, 'utf8')), desktopState);
+    assert.equal(store.markProjectlessThread(mainId, { cwd: '/tmp/projectless' }), true);
+    assert.equal(store.workspaceKindForThread(mainId), 'projectless');
+    assert.deepEqual(JSON.parse(fs.readFileSync(globalStateFile, 'utf8')), desktopState);
 
     // Local durable registry should survive Codex App rewriting global state.
     const localFile = path.join(temporary, 'side-chat-threads.json');
@@ -68,12 +71,15 @@ test('native store persists side-chat-thread-ids and annotates list summaries', 
       ? localState['side-chat-thread-ids']
       : Object.keys(localState['side-chat-thread-ids'] || {});
     assert.ok(localIds.map((id) => String(id).toLowerCase()).includes(sideId));
+    assert.ok(localState['projectless-thread-ids'].includes(mainId));
+    assert.equal(localState['thread-workspace-root-hints'][mainId], '/tmp/projectless');
     fs.writeFileSync(
-      path.join(temporary, '.codex-global-state.json'),
-      JSON.stringify({ 'projectless-thread-ids': [], 'pinned-thread-ids': [] }) + '\n',
+      globalStateFile,
+      JSON.stringify(desktopState) + '\n',
     );
     store.refresh();
     assert.equal(store.isSideChatThread(sideId), true);
+    assert.equal(store.workspaceKindForThread(mainId), 'projectless');
 
     store.refresh();
     const list = store.list(100);
@@ -87,6 +93,14 @@ test('native store persists side-chat-thread-ids and annotates list summaries', 
 
     assert.equal(store.unmarkSideChatThread(sideId), true);
     assert.equal(store.isSideChatThread(sideId), false);
+    fs.writeFileSync(globalStateFile, JSON.stringify({
+      ...desktopState,
+      'side-chat-thread-ids': [sideId],
+      'side-chat-source-threads': { [sideId]: mainId },
+    }) + '\n');
+    store.refresh();
+    assert.equal(store.isSideChatThread(sideId), false);
+    assert.ok(JSON.parse(fs.readFileSync(localFile, 'utf8'))['ignored-side-chat-thread-ids'].includes(sideId));
     store.stop();
   } finally {
     await rm(temporary, { recursive: true, force: true });

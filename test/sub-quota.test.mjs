@@ -114,7 +114,7 @@ test('normalizes Sub2API subscription and quota-limited responses', () => {
     balance: null,
     quota: null,
     subscription: {
-      daily: { used: 3, limit: 0, remaining: 0 },
+      daily: { used: 3, limit: 0, remaining: null },
       weekly: { used: 30, limit: 100, remaining: 70 },
       monthly: { used: 50, limit: 400, remaining: 350 },
       expiresAt: '2026-08-01T00:00:00Z',
@@ -258,7 +258,7 @@ test('normalizes wallet balances and rejects invalid negative quota values', () 
   assert.equal(invalid.daysUntilExpiry, null);
   assert.deepEqual(invalid.quota, { used: null, limit: 0, remaining: 0, unit: '' });
   assert.deepEqual(invalid.subscription, {
-    daily: { used: null, limit: 0, remaining: 0 },
+    daily: { used: null, limit: 0, remaining: null },
     weekly: { used: 0, limit: null, remaining: null },
     monthly: null,
     expiresAt: '',

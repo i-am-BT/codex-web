@@ -249,9 +249,9 @@ export function normalizeSubQuota(data) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('额度响应格式无效');
   const subscription = isRecord(data.subscription)
     ? {
-      daily: quotaWindow(data.subscription.daily_usage_usd, data.subscription.daily_limit_usd),
-      weekly: quotaWindow(data.subscription.weekly_usage_usd, data.subscription.weekly_limit_usd),
-      monthly: quotaWindow(data.subscription.monthly_usage_usd, data.subscription.monthly_limit_usd),
+      daily: quotaWindow(data.subscription.daily_usage_usd, data.subscription.daily_limit_usd, undefined, { zeroLimitUnlimited: true }),
+      weekly: quotaWindow(data.subscription.weekly_usage_usd, data.subscription.weekly_limit_usd, undefined, { zeroLimitUnlimited: true }),
+      monthly: quotaWindow(data.subscription.monthly_usage_usd, data.subscription.monthly_limit_usd, undefined, { zeroLimitUnlimited: true }),
       expiresAt: cleanDate(data.subscription.expires_at),
       weeklyWindowStart: cleanDate(data.subscription.weekly_window_start),
     }
@@ -555,12 +555,15 @@ function formatFetchError(error) {
   return message.slice(0, 160);
 }
 
-function quotaWindow(usedValue, limitValue, remainingValue) {
+function quotaWindow(usedValue, limitValue, remainingValue, { zeroLimitUnlimited = false } = {}) {
   const used = nonNegativeNumber(usedValue);
   const limit = nonNegativeNumber(limitValue);
   const explicitRemaining = nonNegativeNumber(remainingValue);
   if (used === null && limit === null && explicitRemaining === null) return null;
 
+  if (zeroLimitUnlimited && limit === 0) {
+    return { used, limit, remaining: null };
+  }
   let remaining = explicitRemaining;
   if (remaining === null && limit === 0) remaining = 0;
   if (remaining === null && limit !== null && used !== null) remaining = Math.max(0, limit - used);

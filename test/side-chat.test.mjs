@@ -30,7 +30,7 @@ test('side chat queue menu and pane helpers are present', () => {
     'markSideChatThread',
     'isSideChatThread',
     'async function steerQueuedPrompt',
-    'Keep steering and queue dispatch mutually exclusive across synchronized pages.',
+    'applyServerPromptQueue(threadId,data.queue)',
     'renderAssistantMarkdown(body,text)',
     'toolActivityPresentations',
     'createActivityBatch',
