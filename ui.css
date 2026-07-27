@@ -3714,6 +3714,7 @@ body .msg.user.hasInputImage {
   display: block;
   min-width: 0;
   width: 100%;
+  aspect-ratio: 1 / 1;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -3729,8 +3730,9 @@ body .msg.user.hasInputImage {
 .userAttachment img {
   display: block;
   width: 100%;
-  max-height: 180px;
-  object-fit: contain;
+  height: 100%;
+  max-height: none;
+  object-fit: cover;
 }
 
 body .msg.user.hasInputImage .msgBody {
@@ -4942,12 +4944,6 @@ body[data-theme="dark"] .completionTimeline .markdownBody code {
   font-size: 13px;
 }
 
-/* Main-stream steering (follow-up/guide) should stay visible outside collapsed process panels */
-/* Flex order keeps mid-turn steers after completion / assistant siblings even if DOM momentarily races. */
-body .chat > .msg.user.steeringUser {
-  order: 9999;
-}
-
 body .msg.user.steeringUser {
   position: relative;
   display: flex;
@@ -5032,6 +5028,13 @@ body .msg.user.steeringUser.hasInputImage .userAttachmentStack {
   grid-template-columns: minmax(0, 1fr);
   margin: 0 0 8px 0;
   align-self: stretch;
+}
+
+body .msg.user.steeringUser .userAttachmentStack.single,
+body .msg.user.steeringUser.hasInputImage .userAttachmentStack.single {
+  width: 144px;
+  max-width: 100%;
+  align-self: flex-end;
 }
 body .msg.user.steeringUser .userAttachmentStack .userAttachment:nth-child(n+2) {
   display: none;

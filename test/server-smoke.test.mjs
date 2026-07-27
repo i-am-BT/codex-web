@@ -934,6 +934,9 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\.single\s*\{[^}]*width:\s*144px/s);
+    assert.match(uiStyles, /\.userAttachment\s*\{[^}]*width:\s*100%;[^}]*aspect-ratio:\s*1 \/ 1/s);
+    assert.match(uiStyles, /\.userAttachment img\s*\{[^}]*width:\s*100%;[^}]*height:\s*100%;[^}]*max-height:\s*none;[^}]*object-fit:\s*cover/s);
+    assert.match(uiStyles, /\.steeringUser \.userAttachmentStack\.single,[^}]*\.steeringUser\.hasInputImage \.userAttachmentStack\.single\s*\{[^}]*width:\s*144px;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.user\.hasInputImage \.msgBody:empty/);
     assert.match(uiStyles, /\.settingsDialog/);
 
@@ -1753,8 +1756,8 @@ updated_at = 1784422800000
     assert.match(page, /function appendConversationElement\(element,role,options=\{\}\)/);
     assert.match(page, /appendConversationElement\(el,role,\{steering:steeringUser\}\)/);
     assert.doesNotMatch(page, /matched\.open=true/);
-    assert.doesNotMatch(page, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
-    assert.match(page, /pinSteeringMessageToBottom\(el\)/);
+    assert.match(page, /if\(completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\);\s*else activateTurnProcessElement\(el\)/);
+    assert.doesNotMatch(page, /pinSteeringMessageToBottom|pinOpenSteeringMessages|ensureSteeringPinObserver/);
     assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
     assert.match(page, /createTrailingSingleFlight\(syncCurrentNativeConversationOnce\)/);

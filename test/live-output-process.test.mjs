@@ -21,7 +21,7 @@ const referencePlan = [
   { step: '运行回归测试', status: 'pending' },
 ];
 
-test('a user question stays before an already-mounted live response panel', () => {
+test('a user question stays before a live panel while steering keeps its send position', () => {
   const appendSource = sourceBetween('function appendConversationElement', 'function addMsg');
   const chat = {
     children: [],
@@ -46,26 +46,28 @@ test('a user question stays before an already-mounted live response panel', () =
   const question = { kind: 'user-question' };
   const answer = { kind: 'assistant-answer' };
   const steer = { kind: 'user-steer', classList: { contains: (name) => name === 'steeringUser' } };
+  const afterSteer = { kind: 'assistant-after-steer' };
 
   appendConversationElement(question, 'user');
   appendConversationElement(answer, 'assistant');
   appendConversationElement(steer, 'user', { steering: true });
+  appendConversationElement(afterSteer, 'assistant');
 
-  assert.deepEqual(chat.children, [question, livePanel, answer, steer]);
+  assert.deepEqual(chat.children, [question, livePanel, answer, steer, afterSteer]);
 });
 
-test('steering and input image helpers avoid above-live and duplicate uploads', () => {
+test('steering stays chronological and input image helpers avoid duplicate uploads', () => {
   assert.match(inlineScript, /function normalizeInputImageSrc\(source\)/);
   assert.match(inlineScript, /function inputImageIdentity\(source\)/);
   assert.match(inlineScript, /function isOptimisticUploadImageSrc\(source\)/);
   assert.match(inlineScript, /function isServerSessionImageSrc\(source\)/);
-  assert.match(inlineScript, /function pinSteeringMessageToBottom\(element\)/);
-  assert.match(inlineScript, /function pinOpenSteeringMessages\(\)/);
+  assert.match(inlineScript, /function cleanSteeringMessageDuplicates\(element\)/);
   assert.match(inlineScript, /if\(role==='user'&&!steering&&turnProcessHeader/);
   assert.match(inlineScript, /appendConversationElement\(el,role,\{steering:steeringUser\}\)/);
-  assert.match(inlineScript, /pinSteeringMessageToBottom\(el\)/);
+  assert.match(inlineScript, /if\(completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\);\s*else activateTurnProcessElement\(el\)/);
+  assert.doesNotMatch(inlineScript, /pinSteeringMessageToBottom|pinOpenSteeringMessages|ensureSteeringPinObserver/);
   assert.match(inlineScript, /Rebind either direction instead of creating a second copy/);
-  assert.doesNotMatch(inlineScript, /if\(steeringUser&&completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\)/);
+  assert.match(inlineScript, /item\.classList\?\.contains\('steeringUser'\)[\s\S]*?processElements\.push\(item\)/);
 });
 
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
@@ -934,7 +936,7 @@ test('live process timeline keeps note then tools order while streaming', () => 
   assert.match(inlineScript, /contains\('activityCluster'\)\|\|item\?.classList\?.contains\('agentActivityGroup'\)/);
 });
 
-test('task_complete keeps progress commentary in the completion timeline', () => {
+test('task_complete keeps progress commentary and steering in chronological order', () => {
   assert.match(inlineScript, /Keep assistant progress commentary in the completion timeline instead of dropping it\./);
   assert.match(inlineScript, /Interleave note -> tools -> note -> tools in chronological artifact order/);
   assert.match(inlineScript, /const flushPendingTools=\(\)=>\{/);
@@ -945,7 +947,11 @@ test('task_complete keeps progress commentary in the completion timeline', () =>
   assert.match(inlineScript, /appendTurnProcessTimelineElement\(element,\{beforeTools:false\}\)/);
   assert.doesNotMatch(inlineScript, /for\(const item of artifacts\)\{if\(isProgressArtifact\(item\)&&item\.parentNode\)item\.remove\(\)\}/);
   assert.match(inlineScript, /const completion=createCompletionMessage\(text,processElements,options\.turnId,elapsedSeconds,options\.tokenUsage\)/);
-  assert.match(inlineScript, /if\(processElements\.some\(\(item\)=>isProgressArtifact\(item\)\)\)completion.open=true/);
+  assert.match(inlineScript, /if\(collapsible\)el\.open=false/);
+  assert.doesNotMatch(inlineScript, /if\(processElements\.some\([\s\S]*?\)\)completion\.open=true/);
+  assert.doesNotMatch(inlineScript, /if\(processKeep\.length\)completion\.open=true/);
+  const completedSteeringSource=sourceBetween('function completionTimelineForTurn', 'function consumeNativeOptimisticSteering');
+  assert.doesNotMatch(completedSteeringSource, /completion\.open=true/);
 });
 
 test('composerCollapsed defaults to a capsule input', () => {

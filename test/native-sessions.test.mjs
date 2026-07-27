@@ -1557,6 +1557,26 @@ test('hides hash-title handoff agent summaries from web history', async () => {
         },
       },
       {
+        timestamp: '2026-07-23T10:00:02.500Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            '**Current Progress**',
+            '',
+            '- Created the pull request.',
+            '',
+            '**Verification**',
+            '- All tests passed.',
+            '',
+            '**Remaining**',
+            '- Send the final response.',
+          ].join('\n') }],
+        },
+      },
+      {
         timestamp: '2026-07-23T10:00:03.000Z',
         type: 'response_item',
         payload: {
@@ -1572,6 +1592,8 @@ test('hides hash-title handoff agent summaries from web history', async () => {
     const conversation = store.get(id);
     assert.ok(conversation);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Handoff: Codex Web UI')), false);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Current Progress')), false);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Send the final response')), false);
     assert.equal(conversation.messages.some((message) => message.kind === 'handoff_summary'), false);
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content.includes('已隐藏交接摘要')));
   } finally {
