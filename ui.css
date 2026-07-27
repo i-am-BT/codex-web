@@ -3634,6 +3634,49 @@ body .msg.user .markdownBody code {
   word-break: break-word;
 }
 
+body .msg.user.longUserMessage:not(.expanded) > .msgBody {
+  max-height: 210px;
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 34px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 34px), transparent 100%);
+}
+
+body .msg.user.longUserMessage.expanded > .msgBody {
+  max-height: none;
+  overflow: visible;
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+
+.longUserMessageToggle {
+  display: flex;
+  width: 100%;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin-top: 4px;
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 6px 4px 0;
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.longUserMessageToggle:hover,
+.longUserMessageToggle:focus-visible {
+  background: transparent;
+  color: var(--text);
+}
+
+.longUserMessageToggle .lucide {
+  width: 14px;
+  height: 14px;
+}
+
 body .msg.user::after {
   position: absolute;
   top: 100%;
@@ -8890,7 +8933,7 @@ body .composer > .box:focus-within {
   body .composer:has(> .composerProjectPicker.hidden) > .box {
     width: min(calc(var(--composer-width) - 22px), calc(100% - 60px));
     grid-template-columns: 32px max-content minmax(0, 1fr) max-content 34px;
-    border-radius: 24px;
+    border-radius: 15px;
     padding: 6px 7px 5px;
   }
 
@@ -9286,9 +9329,12 @@ body .composer > .box:focus-within {
     margin: 0 auto 10px;
   }
 
-  .attachmentTray {
-    width: fit-content;
-    max-width: min(360px, calc(var(--composer-width) - 36px), calc(100% - 40px));
+  body .composer > .attachmentTray {
+    display: flex;
+    width: min(360px, calc(100% - 20px));
+    max-width: min(360px, calc(100% - 20px));
+    margin-inline: auto;
+    box-sizing: border-box;
   }
 
   body .nativeNotice {
@@ -10586,6 +10632,12 @@ body[data-chat-bg="skin"] .sideChatSend {
     width: calc(100% - 40px) !important;
     max-width: calc(100% - 40px) !important;
     margin: 0 auto 8px !important;
+  }
+
+  body .main.sideChatOpen > .composer > .attachmentTray {
+    width: min(360px, calc(100% - 20px)) !important;
+    max-width: min(360px, calc(100% - 20px)) !important;
+    margin-inline: auto !important;
   }
 
   .main.sideChatOpen > .sideChatPane > .sideChatComposer .sideChatInput {

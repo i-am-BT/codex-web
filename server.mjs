@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { createServer } from 'http';
-import { homedir, networkInterfaces } from 'os';
+import { homedir, networkInterfaces, tmpdir } from 'os';
 import path from 'path';
 import net from 'net';
 import { Readable } from 'stream';
@@ -136,6 +136,14 @@ const PLAYGROUND_PROXY_ALLOWED_ORIGINS = new Set(
     .filter(Boolean),
 );
 const NATIVE_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const JSON_BODY_MAX_BYTES = 36 * 1024 * 1024;
+const UPLOAD_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const UPLOAD_FILE_MAX_BYTES = 25 * 1024 * 1024;
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_BACKOFF_THRESHOLD = 5;
+const LOGIN_BACKOFF_BASE_MS = 1000;
+const LOGIN_BACKOFF_MAX_MS = 60 * 1000;
+const LOGIN_ATTEMPT_MAX_SOURCES = 10_000;
 const TOOL_IMAGE_MAX_BYTES = 25 * 1024 * 1024;
 const TOOL_IMAGE_TYPES = new Map([
   ['.png', 'image/png'],
@@ -209,11 +217,14 @@ const desktopIpcClient = new CodexDesktopIpcClient({
 });
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
+const nativeTurnReservations = new Set();
+const promptQueueItemReservations = new Map();
 const pendingNativeRequests = new Map();
 const desktopThreadStates = new Map();
 const desktopResolvedRequestKeys = new Map();
 const desktopSnapshotRequestTimes = new Map();
 const desktopSnapshotRequests = new Map();
+const loginAttempts = new Map();
 let activeProcess = null;
 let activeConversationId = '';
 let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
@@ -235,10 +246,11 @@ appServerClient.on('exit', (error) => {
   nativeSessions.scheduleRefresh();
 });
 desktopIpcClient.on('disconnect', (error) => {
-  clearDesktopThreadStates(error?.message || 'Codex Desktop IPC 已断开');
+  markDesktopThreadStatesDisconnected(error?.message || 'Codex Desktop IPC 已断开');
   const text = String(error?.message || '').trim();
   if (text) console.warn(`Codex Desktop IPC: ${text}`);
 });
+desktopIpcClient.on('connected', reconcileDesktopThreadStates);
 desktopIpcClient.on('broadcast', handleDesktopIpcBroadcast);
 
 app.disable('x-powered-by');
@@ -249,7 +261,14 @@ app.use(compression({
     return compression.filter(req, res);
   },
 }));
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: JSON_BODY_MAX_BYTES }));
+app.use((error, _req, res, next) => {
+  if (error?.type === 'entity.too.large') {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(413).json({ error: '请求内容过大' });
+  }
+  return next(error);
+});
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, port: server.address()?.port || null });
@@ -314,10 +333,16 @@ app.get('/image-prompt.js', (_req, res) => {
 });
 
 app.post('/api/login', (req, res) => {
+  const source = loginSourceKey(req);
+  const retryAfterMs = loginRetryAfterMs(source);
+  if (retryAfterMs > 0) return sendLoginRateLimited(res, retryAfterMs);
   const password = String(req.body?.password || '');
-  if (!safeEqual(password, webPassword)) {
+  if (password.length > 1024 || !safeEqual(password, webPassword)) {
+    const delayMs = recordLoginFailure(source);
+    if (delayMs > 0) return sendLoginRateLimited(res, delayMs);
     return res.status(401).json({ error: '密码错误' });
   }
+  loginAttempts.delete(source);
   const token = randomBytes(32).toString('hex');
   sessions.set(hashToken(token), Date.now() + SESSION_TTL_MS);
   saveSessions();
@@ -366,8 +391,21 @@ app.get('/api/session', (req, res) => {
   res.json({ authenticated: Boolean(validateSession(req)) });
 });
 
-app.use('/assets/images', requireAuth, express.static(IMAGE_DIR, { fallthrough: false }));
-app.use('/assets/files', requireAuth, express.static(FILE_DIR, { fallthrough: false }));
+app.use('/assets/images', requireAuth, express.static(IMAGE_DIR, {
+  fallthrough: false,
+  setHeaders: (res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  },
+}));
+app.use('/assets/files', requireAuth, express.static(FILE_DIR, {
+  fallthrough: false,
+  setHeaders: (res, filePath) => {
+    const filename = path.basename(filePath).replace(/[\r\n"]/g, '_');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, no-store');
+  },
+}));
 app.use('/assets/backgrounds', requireAuth, express.static(BACKGROUND_DIR, { fallthrough: false }));
 app.use('/assets/dream-skin', requireAuth, express.static(DREAM_SKIN_DIR, { fallthrough: false }));
 app.use('/playground', requireAuth, express.static(GPT_IMAGE_PLAYGROUND_DIR, {
@@ -389,7 +427,7 @@ app.post('/api/uploads/image', requireAuth, (req, res) => {
     const upload = saveUploadedAttachment(req.body || {}, { imagesOnly: true });
     res.json({ ok: true, image: upload });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(uploadErrorStatus(err)).json({ error: err.message });
   }
 });
 
@@ -398,7 +436,7 @@ app.post('/api/uploads/file', requireAuth, (req, res) => {
     const upload = saveUploadedAttachment(req.body || {});
     res.json({ ok: true, attachment: upload });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(uploadErrorStatus(err)).json({ error: err.message });
   }
 });
 
@@ -419,7 +457,7 @@ app.post('/api/appearance/background', requireAuth, (req, res) => {
     const appearance = saveAppearance({ chatBackground: background.value, customBackgrounds });
     res.json({ ok: true, appearance, background });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(uploadErrorStatus(err)).json({ error: err.message });
   }
 });
 
@@ -475,7 +513,6 @@ app.get('/api/playground-config', requireAuth, (_req, res) => {
     name: `Codex Image · ${provider.displayName}`,
     provider: 'openai',
     baseUrl: provider.baseUrl,
-    apiKey: providerCredential(provider),
     model: 'gpt-image-2',
     timeout: 660,
     apiMode: 'images',
@@ -490,7 +527,6 @@ app.get('/api/playground-config', requireAuth, (_req, res) => {
       name: `Codex Agent · ${provider.displayName}`,
       provider: 'openai',
       baseUrl: provider.baseUrl,
-      apiKey: providerCredential(provider),
       model: defaults.model || DEFAULT_MODEL,
       timeout: 660,
       apiMode: 'responses',
@@ -915,6 +951,9 @@ app.get('/api/local-image', requireAuth, (req, res) => {
       return res.status(400).json({ error: '不支持的图片路径' });
     }
     const cwd = normalizeCwd(req.query.cwd || DEFAULT_CWD);
+    if (!isLocalImagePathAllowed(rawPath, cwd)) {
+      return res.status(404).json({ error: '图片不存在或不受支持' });
+    }
     const image = readNativeToolImage(rawPath, cwd);
     if (!image) return res.status(404).json({ error: '图片不存在或不受支持' });
     res.setHeader('Cache-Control', 'private, max-age=300');
@@ -994,8 +1033,19 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
 });
 
 app.post('/api/native-sessions', requireAuth, async (req, res) => {
+  let createdThreadId = '';
+  let createdSideChat = false;
+  let queueReservation = null;
   try {
     const turn = parseNativeTurnPayload(req.body || {}, { allowProjectless: true });
+    const sideChat = req.body?.sideChat === true || req.body?.sideChat === 'true' || req.body?.workspaceKind === 'sidechat';
+    const sourceThreadId = cleanNativeThreadId(req.body?.sourceThreadId || req.body?.sourceThread || '');
+    const queueItemId = String(req.body?.queueItemId || '').trim();
+    createdSideChat = sideChat;
+    if (queueItemId) {
+      if (!sourceThreadId) throw promptQueueConflict('队列来源会话无效', getPromptQueueState(sourceThreadId));
+      queueReservation = reservePromptQueueItem(sourceThreadId, queueItemId);
+    }
     const started = await appServerClient.request('thread/start', compactObject({
       cwd: turn.cwd,
       model: turn.model,
@@ -1007,74 +1057,98 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
     }));
     const threadId = cleanNativeThreadId(started?.thread?.id);
     if (!threadId) throw new Error('Codex app-server 未返回有效 thread id');
+    createdThreadId = threadId;
     if (turn.projectless) {
       try { nativeSessions.markProjectlessThread?.(threadId, { cwd: turn.cwd }); }
       catch (error) { console.warn('登记无项目任务失败: ' + error.message); }
     }
-    const sideChat = req.body?.sideChat === true || req.body?.sideChat === 'true' || req.body?.workspaceKind === 'sidechat';
-    const sourceThreadId = cleanNativeThreadId(req.body?.sourceThreadId || req.body?.sourceThread || '');
     if (sideChat) {
-      try { nativeSessions.markSideChatThread?.(threadId, { sourceThreadId }); }
-      catch (error) { console.warn('登记 side chat 任务失败: ' + error.message); }
+      nativeSessions.markSideChatThread?.(threadId, { sourceThreadId });
     }
     const turnStarted = await startNativeTurn(threadId, turn);
+    const queue = queueReservation ? consumePromptQueueReservation(queueReservation) : null;
     nativeSessions.scheduleRefresh();
     res.status(202).json({
       ok: true,
       threadId,
       turnId: turnStarted.turnId,
       conversation: nativeConversationFromThread(started.thread, turnStarted.turnId),
+      ...(queue ? { queue } : {}),
     });
   } catch (err) {
-    res.status(nativeAppErrorStatus(err)).json({ error: `创建 Codex App 会话失败: ${err.message}` });
+    let recoverableThreadId = '';
+    if (createdSideChat && createdThreadId) {
+      try { nativeSessions.unmarkSideChatThread?.(createdThreadId); } catch {}
+      try {
+        await appServerClient.request('thread/archive', { threadId: createdThreadId });
+      } catch {
+        recoverableThreadId = createdThreadId;
+      }
+      nativeSessions.scheduleRefresh();
+    }
+    res.status(nativeAppErrorStatus(err)).json({
+      error: `创建 Codex App 会话失败: ${err.message}`,
+      ...(recoverableThreadId ? { recoverableThreadId } : {}),
+    });
+  } finally {
+    releasePromptQueueReservation(queueReservation);
   }
 });
 
 app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
-  if (activeNativeTurns.get(threadId)?.status === 'running') {
+  if (nativeTurnReservations.has(threadId) || activeNativeTurns.get(threadId)?.status === 'running') {
     return res.status(409).json({ error: '该 Codex App 会话已有任务正在运行' });
   }
+  nativeTurnReservations.add(threadId);
+  let queueReservation = null;
 
   try {
     const turn = parseNativeTurnPayload(req.body || {});
+    const queueItemId = String(req.body?.queueItemId || '').trim();
+    if (queueItemId) queueReservation = reservePromptQueueItem(threadId, queueItemId);
     const turnStarted = await continueNativeTurn(threadId, turn);
+    const queue = queueReservation ? consumePromptQueueReservation(queueReservation) : null;
     nativeSessions.scheduleRefresh();
-    res.status(202).json({ ok: true, threadId, turnId: turnStarted.turnId });
+    res.status(202).json({ ok: true, threadId, turnId: turnStarted.turnId, ...(queue ? { queue } : {}) });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `继续 Codex App 会话失败: ${err.message}` });
+  } finally {
+    releasePromptQueueReservation(queueReservation);
+    nativeTurnReservations.delete(threadId);
   }
 });
 
 app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+  let queueReservation = null;
 
   try {
     const steer = parseNativeSteerPayload(req.body || {});
+    const queueItemId = String(req.body?.queueItemId || '').trim();
+    if (queueItemId) queueReservation = reservePromptQueueItem(threadId, queueItemId);
     const expectedTurnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
     const result = await steerNativeTurn(threadId, steer, expectedTurnId);
     const turnId = String(result?.turnId || expectedTurnId);
     if (!turnId) return res.status(409).json({ error: '该会话没有可引导的运行中任务' });
     setNativeTurnState(threadId, { turnId, status: 'running', transport: result.transport });
-    const queueItemId = String(req.body?.queueItemId || '').trim();
-    if (queueItemId || steer.message) {
-      try {
-        dismissPromptQueueItem(threadId, {
-          id: queueItemId,
-          message: steer.message,
-          createdAt: req.body?.queueItemCreatedAt,
-        });
-      } catch (error) {
-        console.warn('引导成功后清理队列失败: ' + (error?.message || error));
-      }
-    }
+    const queue = queueReservation ? consumePromptQueueReservation(queueReservation) : null;
     nativeSessions.scheduleRefresh();
-    res.status(202).json({ ok: true, threadId, turnId });
+    res.status(202).json({ ok: true, threadId, turnId, ...(queue ? { queue } : {}) });
   } catch (err) {
-    const status=isNativeThreadNotFoundError(err)?409:nativeAppErrorStatus(err);
-    res.status(status).json({ error: status===409?'当前任务已结束，消息将按新一轮发送':`引导 Codex App 任务失败: ${err.message}` });
+    const status = Number(err?.statusCode) || (isNativeThreadNotFoundError(err) ? 409 : nativeAppErrorStatus(err));
+    res.status(status).json({
+      error: err?.statusCode
+        ? err.message
+        : status === 409
+          ? '当前任务已结束，消息将按新一轮发送'
+          : `引导 Codex App 任务失败: ${err.message}`,
+      ...(err.current ? err.current : {}),
+    });
+  } finally {
+    releasePromptQueueReservation(queueReservation);
   }
 });
 
@@ -1151,8 +1225,8 @@ app.delete('/api/native-sessions/:id', requireAuth, async (req, res) => {
   const threadCwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
 
   try {
-    try { nativeSessions.unmarkSideChatThread?.(threadId); } catch {}
     await appServerClient.request('thread/archive', { threadId });
+    try { nativeSessions.unmarkSideChatThread?.(threadId); } catch {}
     await notifyDesktopThreadArchived(threadId, threadCwd);
     nativeSessions.scheduleRefresh();
     res.json({ ok: true, id: threadId });
@@ -1258,7 +1332,8 @@ app.get('/api/prompt-queues/:threadId', requireAuth, (req, res) => {
   const threadId = cleanNativeThreadId(req.params.threadId);
   if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ ok: true, threadId, items: getPromptQueueItems(threadId), updatedAt: getPromptQueueUpdatedAt(threadId) });
+  const queue = getPromptQueueState(threadId);
+  res.json({ ok: true, threadId, ...queue });
 });
 
 app.put('/api/prompt-queues/:threadId', requireAuth, (req, res) => {
@@ -1267,10 +1342,35 @@ app.put('/api/prompt-queues/:threadId', requireAuth, (req, res) => {
     if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
     const items = Array.isArray(req.body?.items) ? req.body.items : null;
     if (!items) return res.status(400).json({ error: 'items 必须是数组' });
-    const saved = setPromptQueueItems(threadId, items);
-    res.json({ ok: true, threadId, items: saved.items, updatedAt: saved.updatedAt });
+    const saved = setPromptQueueItems(threadId, items, req.body?.revision);
+    res.json({ ok: true, threadId, ...saved });
   } catch (err) {
-    res.status(400).json({ error: err.message || '保存队列失败' });
+    const status = Number(err?.statusCode) || 400;
+    res.status(status).json({
+      error: err.message || '保存队列失败',
+      ...(err.current ? err.current : {}),
+    });
+  }
+});
+
+app.delete('/api/prompt-queues/:threadId/items/:itemId', requireAuth, (req, res) => {
+  try {
+    const threadId = cleanNativeThreadId(req.params.threadId);
+    const itemId = String(req.params.itemId || '').trim();
+    if (!threadId || !itemId) return res.status(400).json({ error: '队列条目无效' });
+    assertPromptQueueItemNotReserved(threadId, itemId);
+    // Look up the full normalized item (not just the bare id) so dismissal can fall
+    // back to its message-based key when the id was server-generated — otherwise a
+    // Codex App item with no source id would reappear once its id regenerates on the
+    // next sync (see queueItemDismissKeys / normalizeServerQueuedPrompt).
+    const target = getPromptQueueItems(threadId).find((entry) => String(entry?.id || '') === itemId) || { id: itemId };
+    const queue = consumePromptQueueItem(threadId, target);
+    res.json({ ok: true, threadId, ...queue });
+  } catch (err) {
+    res.status(Number(err?.statusCode) || 400).json({
+      error: err.message || '移除队列条目失败',
+      ...(err.current ? err.current : {}),
+    });
   }
 });
 
@@ -1740,18 +1840,16 @@ function appendMessage(convo, role, content, type = role) {
 function saveUploadedAttachment(body, options = {}) {
   const rawName = String(body.name || 'attachment').slice(0, 160);
   const safeName = rawName.replace(/[^\w.\-\u4e00-\u9fa5 ]/g, '').trim() || 'attachment';
-  const data = String(body.data || '');
-  const match = data.match(/^data:([^;,]*);base64,([A-Za-z0-9+/=\r\n]+)$/);
-  if (!match) throw new Error('上传内容格式无效');
-  const type = String(body.type || match[1] || 'application/octet-stream').toLowerCase();
-  const buffer = Buffer.from(match[2].replace(/\s/g, ''), 'base64');
-  if (!buffer.length) throw new Error('文件内容为空');
-
+  const parsed = parseUploadDataUrl(body.data);
+  const type = String(body.type || parsed.type || 'application/octet-stream').toLowerCase();
   const isImage = /^image\/(?:png|jpeg|webp|gif)$/.test(type);
   if (options.imagesOnly && !isImage) throw new Error('只支持 PNG、JPG、WEBP 或 GIF 图片');
-  const ext = uploadExtension(safeName, type);
+  const ext = uploadExtension(safeName, type, { imageOnly: isImage });
   if (!ext) throw new Error('不支持此文件类型');
-  if (buffer.length > (isImage ? 10 : 25) * 1024 * 1024) throw new Error(isImage ? '图片不能超过 10MB' : '文件不能超过 25MB');
+  const buffer = decodeUploadedBase64(parsed, isImage ? UPLOAD_IMAGE_MAX_BYTES : UPLOAD_FILE_MAX_BYTES, {
+    emptyMessage: '文件内容为空',
+    tooLargeMessage: isImage ? '图片不能超过 10MB' : '文件不能超过 25MB',
+  });
 
   const filename = `upload-${Date.now()}-${randomBytes(6).toString('hex')}.${ext}`;
   const dir = isImage ? IMAGE_DIR : FILE_DIR;
@@ -1806,16 +1904,15 @@ function saveAppearance(next) {
 }
 
 function saveUploadedBackground(body) {
-  const data = String(body.data || '');
-  const match = data.match(/^data:([^;,]*);base64,([A-Za-z0-9+/=\r\n]+)$/);
-  if (!match) throw new Error('上传内容格式无效');
-  const type = String(body.type || match[1] || '').toLowerCase();
+  const parsed = parseUploadDataUrl(body.data);
+  const type = String(body.type || parsed.type || '').toLowerCase();
   if (!/^image\/(?:png|jpeg|webp|gif)$/.test(type)) throw new Error('只支持 PNG、JPG、WEBP 或 GIF 图片');
-  const buffer = Buffer.from(match[2].replace(/\s/g, ''), 'base64');
-  if (!buffer.length) throw new Error('图片内容为空');
-  if (buffer.length > 10 * 1024 * 1024) throw new Error('背景图片不能超过 10MB');
-  const ext = uploadExtension(String(body.name || 'background'), type);
+  const ext = uploadExtension(String(body.name || 'background'), type, { imageOnly: true });
   if (!['png', 'jpg', 'webp', 'gif'].includes(ext)) throw new Error('不支持此图片类型');
+  const buffer = decodeUploadedBase64(parsed, UPLOAD_IMAGE_MAX_BYTES, {
+    emptyMessage: '图片内容为空',
+    tooLargeMessage: '背景图片不能超过 10MB',
+  });
   const filename = `background-${Date.now()}-${randomBytes(6).toString('hex')}.${ext}`;
   const filePath = path.join(BACKGROUND_DIR, filename);
   writeFileSync(filePath, buffer, { mode: 0o600 });
@@ -1828,6 +1925,73 @@ function saveUploadedBackground(body) {
     url: `/assets/backgrounds/${filename}`,
     ...(themeId ? { themeId } : {}),
   };
+}
+
+function parseUploadDataUrl(value) {
+  const data = String(value || '');
+  const comma = data.indexOf(',');
+  if (comma < 0 || comma > 255) throw new Error('上传内容格式无效');
+  const match = data.slice(0, comma).match(/^data:([^;,]*);base64$/);
+  if (!match) throw new Error('上传内容格式无效');
+  return { data, offset: comma + 1, type: match[1] };
+}
+
+function decodeUploadedBase64(parsed, maxBytes, messages) {
+  const maxEncodedLength = Math.ceil(maxBytes / 3) * 4;
+  const maxLineBreakLength = Math.ceil(maxEncodedLength / 64) * 2;
+  const rawLength = parsed.data.length - parsed.offset;
+  if (rawLength > maxEncodedLength + maxLineBreakLength) throw uploadTooLargeError(messages.tooLargeMessage);
+
+  const encoded = parsed.data.slice(parsed.offset).replace(/[\r\n]/g, '');
+  if (!encoded.length) throw new Error(messages.emptyMessage);
+  if (encoded.length > maxEncodedLength) throw uploadTooLargeError(messages.tooLargeMessage);
+  if (!isStrictBase64(encoded)) throw new Error('上传内容格式无效');
+
+  const padding = encoded.endsWith('==') ? 2 : encoded.endsWith('=') ? 1 : 0;
+  const decodedLength = (encoded.length / 4) * 3 - padding;
+  if (decodedLength > maxBytes) throw uploadTooLargeError(messages.tooLargeMessage);
+  const buffer = Buffer.from(encoded, 'base64');
+  if (buffer.length !== decodedLength) throw new Error('上传内容格式无效');
+  return buffer;
+}
+
+function isStrictBase64(value) {
+  if (!value.length || value.length % 4 !== 0) return false;
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  const contentLength = value.length - padding;
+  for (let index = 0; index < contentLength; index += 1) {
+    const code = value.charCodeAt(index);
+    const valid = (code >= 48 && code <= 57)
+      || (code >= 65 && code <= 90)
+      || (code >= 97 && code <= 122)
+      || code === 43
+      || code === 47;
+    if (!valid) return false;
+  }
+  for (let index = contentLength; index < value.length; index += 1) {
+    if (value.charCodeAt(index) !== 61) return false;
+  }
+  const tail = base64Sextet(value.charCodeAt(contentLength - 1));
+  if (padding === 2 && (tail & 15) !== 0) return false;
+  if (padding === 1 && (tail & 3) !== 0) return false;
+  return true;
+}
+
+function base64Sextet(code) {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 71;
+  if (code >= 48 && code <= 57) return code + 4;
+  return code === 43 ? 62 : 63;
+}
+
+function uploadTooLargeError(message) {
+  const error = new Error(message);
+  error.statusCode = 413;
+  return error;
+}
+
+function uploadErrorStatus(error) {
+  return error?.statusCode === 413 ? 413 : 400;
 }
 
 function deleteCustomBackground(value) {
@@ -2012,8 +2176,7 @@ function cleanBackgroundName(name) {
   return text ? text.slice(0, 80) : '自定义背景';
 }
 
-function uploadExtension(name, type) {
-  const fromName = path.extname(name).replace(/^\./, '').toLowerCase();
+function uploadExtension(name, type, { imageOnly = false } = {}) {
   const mimeExt = {
     'image/png': 'png',
     'image/jpeg': 'jpg',
@@ -2033,6 +2196,16 @@ function uploadExtension(name, type) {
     'application/x-yaml': 'yaml',
     'text/yaml': 'yaml',
   };
+  // Images are served without a forced download header, so the extension must be
+  // derived strictly from the validated MIME type — never trust the client-supplied
+  // filename here, or an `image/png`-declared upload named "evil.html" could land in
+  // IMAGE_DIR with a `.html` extension and execute as same-origin script on load.
+  if (imageOnly) {
+    const ext = mimeExt[type];
+    if (!ext || !['png', 'jpg', 'webp', 'gif'].includes(ext)) return '';
+    return ext;
+  }
+  const fromName = path.extname(name).replace(/^\./, '').toLowerCase();
   const allowed = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'pdf', 'txt', 'md', 'json', 'jsonl', 'csv', 'log', 'xml', 'yaml', 'yml', 'toml', 'ini', 'html', 'css', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'py', 'sh', 'bash', 'zsh', 'go', 'rs', 'java', 'c', 'h', 'cpp', 'hpp', 'cs', 'php', 'rb', 'sql']);
   const ext = allowed.has(fromName) ? fromName : mimeExt[type];
   if (!ext || !allowed.has(ext)) return '';
@@ -2357,9 +2530,12 @@ function syncDesktopPendingRequests(threadId, state) {
       createdAt: existing?.createdAt || new Date().toISOString(),
       transport: 'desktop-ipc',
       ownerClientId: state.ownerClientId,
+      connectionError: '',
     };
     pendingNativeRequests.set(key, pending);
-    if (!existing) broadcastNativeRequest({ type: 'pending', request: publicNativeRequest(pending) });
+    if (!existing || existing.connectionError) {
+      broadcastNativeRequest({ type: 'pending', request: publicNativeRequest(pending) });
+    }
   }
 
   for (const [key, pending] of pendingNativeRequests) {
@@ -2375,16 +2551,26 @@ function removeDesktopRequestFromState(threadId, requestId) {
   state.requests = state.requests.filter((request) => String(request.id ?? '') !== String(requestId));
 }
 
-function clearDesktopThreadStates(reason = '') {
+function markDesktopThreadStatesDisconnected(reason = '') {
   desktopThreadStates.clear();
-  desktopResolvedRequestKeys.clear();
   desktopSnapshotRequestTimes.clear();
   desktopSnapshotRequests.clear();
-  for (const [key, pending] of pendingNativeRequests) {
+  for (const pending of pendingNativeRequests.values()) {
     if (pending.transport !== 'desktop-ipc') continue;
-    pendingNativeRequests.delete(key);
-    broadcastNativeRequest({ type: 'resolved', id: key, threadId: pending.threadId, error: reason });
+    pending.connectionError = reason;
+    broadcastNativeRequest({ type: 'pending', request: publicNativeRequest(pending) });
   }
+}
+
+function reconcileDesktopThreadStates() {
+  const threadIds = new Set();
+  for (const [threadId, active] of activeNativeTurns) {
+    if (active.transport === 'desktop-ipc') threadIds.add(threadId);
+  }
+  for (const pending of pendingNativeRequests.values()) {
+    if (pending.transport === 'desktop-ipc' && pending.threadId) threadIds.add(pending.threadId);
+  }
+  for (const threadId of threadIds) requestDesktopThreadSnapshot(threadId, { force: true });
 }
 
 function requestDesktopThreadSnapshot(threadId, { force = false } = {}) {
@@ -2621,6 +2807,7 @@ function publicNativeRequest(request) {
     turnId: request.turnId,
     createdAt: request.createdAt,
     params: limitJsonValue(request.params),
+    ...(request.connectionError ? { connectionError: request.connectionError } : {}),
   };
 }
 
@@ -2945,6 +3132,34 @@ function readNativeToolImage(filePath, cwd) {
     return { type, data: readFileSync(resolved) };
   } catch {
     return null;
+  }
+}
+
+function isPathWithinRoot(targetPath, rootPath) {
+  if (!rootPath) return false;
+  const relative = path.relative(rootPath, targetPath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+// `/api/local-image` accepts a client-supplied absolute path (used to preview images
+// referenced in markdown/tool output). Without this check any authenticated user could
+// pass an unrelated absolute path and read arbitrary image files reachable by this
+// process, not just images tied to the current Codex session. Absolute paths are only
+// allowed inside the resolved session cwd or the OS temp dir (common for automation
+// screenshots); relative paths are unaffected since readNativeToolImage always resolves
+// them against cwd.
+function isLocalImagePathAllowed(filePath, cwd) {
+  if (!path.isAbsolute(filePath)) return true;
+  try {
+    const resolved = realpathSync(filePath);
+    if (cwd) {
+      try {
+        if (isPathWithinRoot(resolved, realpathSync(cwd))) return true;
+      } catch {}
+    }
+    return isPathWithinRoot(resolved, realpathSync(tmpdir()));
+  } catch {
+    return false;
   }
 }
 
@@ -3419,6 +3634,8 @@ function compactObject(value) {
 }
 
 function nativeAppErrorStatus(error) {
+  const statusCode = Number(error?.statusCode);
+  if (Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599) return statusCode;
   const message = String(error?.message || '').toLowerCase();
   if (message.includes('not found') || message.includes('不存在')) return 404;
   if (message.includes('active') || message.includes('running') || message.includes('in progress')) return 409;
@@ -3445,6 +3662,56 @@ function safeEqual(a, b) {
   const left = Buffer.from(a);
   const right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function loginSourceKey(req) {
+  return String(req?.socket?.remoteAddress || req?.ip || 'unknown').slice(0, 128);
+}
+
+function loginRetryAfterMs(source, now = Date.now()) {
+  const state = loginAttempts.get(source);
+  if (!state) return 0;
+  if (now - state.lastFailureAt > LOGIN_FAILURE_WINDOW_MS) {
+    loginAttempts.delete(source);
+    return 0;
+  }
+  return Math.max(0, state.blockedUntil - now);
+}
+
+function recordLoginFailure(source, now = Date.now()) {
+  const previous = loginAttempts.get(source);
+  const failures = previous && now - previous.lastFailureAt <= LOGIN_FAILURE_WINDOW_MS
+    ? previous.failures + 1
+    : 1;
+  const exponent = Math.max(0, failures - LOGIN_BACKOFF_THRESHOLD);
+  const delayMs = failures >= LOGIN_BACKOFF_THRESHOLD
+    ? Math.min(LOGIN_BACKOFF_MAX_MS, LOGIN_BACKOFF_BASE_MS * (2 ** exponent))
+    : 0;
+  loginAttempts.delete(source);
+  loginAttempts.set(source, {
+    failures,
+    lastFailureAt: now,
+    blockedUntil: now + delayMs,
+  });
+  pruneLoginAttempts(now);
+  return delayMs;
+}
+
+function pruneLoginAttempts(now = Date.now()) {
+  for (const [source, state] of loginAttempts) {
+    if (now - state.lastFailureAt > LOGIN_FAILURE_WINDOW_MS) loginAttempts.delete(source);
+  }
+  while (loginAttempts.size > LOGIN_ATTEMPT_MAX_SOURCES) {
+    const oldest = loginAttempts.keys().next().value;
+    if (oldest === undefined) break;
+    loginAttempts.delete(oldest);
+  }
+}
+
+function sendLoginRateLimited(res, delayMs) {
+  const seconds = Math.max(1, Math.ceil(delayMs / 1000));
+  res.setHeader('Retry-After', String(seconds));
+  return res.status(429).json({ error: '登录尝试过于频繁，请稍后重试' });
 }
 
 function hashToken(token) {
@@ -3871,11 +4138,11 @@ function normalizeHttpOrigin(value) {
 
 function playgroundProxyRequestHeaders(req, provider) {
   const headers = new Headers();
-  for (const name of ['accept', 'authorization', 'content-type', 'openai-organization', 'openai-project', 'x-api-key']) {
+  for (const name of ['accept', 'content-type', 'openai-organization', 'openai-project']) {
     const value = req.get(name);
     if (value) headers.set(name, value);
   }
-  if (!headers.has('authorization') && provider) {
+  if (provider) {
     const apiKey = providerCredential(provider);
     if (apiKey) headers.set('authorization', `Bearer ${apiKey}`);
   }
@@ -4341,8 +4608,14 @@ function normalizeServerQueuedPrompt(item) {
     : 'legacy';
   const source = item.source === 'codex-app' ? 'codex-app' : (item.source === 'web' ? 'web' : '');
   const inferredSource = source || ((!String(item.provider || '').trim() && !String(item.model || '').trim() && !attachments.length) ? 'codex-app' : 'web');
+  const rawId = String(item.id || '').trim();
   return {
-    id: String(item.id || `q-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`),
+    id: rawId || `q-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`,
+    // Marks that `id` above was invented on this read rather than provided by the
+    // source. Codex App queue entries without an id get a fresh random id every
+    // sync cycle, so queueItemDismissKeys() must fall back to a stable message-based
+    // key for these or a web-dismissed item would reappear once its id regenerates.
+    generatedId: !rawId,
     message,
     attachments,
     provider: String(item.provider || ''),
@@ -4522,10 +4795,10 @@ function syncAppQueuedFollowUpsIntoWeb({ force = false } = {}) {
     );
     if (fingerprintPromptQueueItems(existing) === fingerprintPromptQueueItems(merged)) continue;
     const updatedAt = new Date().toISOString();
-    if (merged.length) webQueues[threadId] = { updatedAt, items: merged };
-    else delete webQueues[threadId];
+    const revision = Number(webQueues[threadId]?.revision || 0) + 1;
+    webQueues[threadId] = { updatedAt, revision, items: merged };
     changedThreads.push(threadId);
-    broadcastPromptQueueChange({ threadId, items: merged, updatedAt, source: 'codex-app' });
+    broadcastPromptQueueChange({ threadId, items: merged, updatedAt, revision, source: 'codex-app' });
   }
   if (changedThreads.length) savePromptQueuesWithDismissed(webQueues, dismissed);
   return { changed: changedThreads.length > 0, threads: changedThreads };
@@ -4561,9 +4834,11 @@ function loadPromptQueuesRaw() {
       if (!threadId) continue;
       const itemsRaw = Array.isArray(entry) ? entry : Array.isArray(entry?.items) ? entry.items : [];
       const items = itemsRaw.slice(0, 50).map(normalizeServerQueuedPrompt).filter(Boolean);
-      if (!items.length) continue;
+      const revision = Number(entry?.revision || 0);
+      if (!items.length && revision <= 0) continue;
       queues[threadId] = {
         updatedAt: String(entry?.updatedAt || new Date().toISOString()),
+        revision,
         items,
       };
     }
@@ -4597,6 +4872,7 @@ function loadPromptQueues() {
     }
     merged[threadId] = {
       updatedAt: merged[threadId]?.updatedAt || new Date().toISOString(),
+      revision: Number(merged[threadId]?.revision || 0),
       items,
     };
   }
@@ -4618,26 +4894,34 @@ function getPromptQueueUpdatedAt(threadId) {
   return loadPromptQueues()[id]?.updatedAt || '';
 }
 
-function queueItemDismissKey(item) {
-  if (!item || typeof item !== 'object') return '';
-  const id = String(item.id || '').trim();
-  if (id) return 'id:' + id;
-  const message = String(item.message || item.text || '').replace(/\\s+/g, ' ').trim();
-  const createdAt = String(item.createdAt || '').trim();
-  if (!message && !createdAt) return '';
-  return 'msg:' + message + '||' + createdAt;
+function getPromptQueueState(threadId) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return { items: [], updatedAt: '', revision: 0 };
+  const raw = loadPromptQueuesRaw()[id];
+  const entry = loadPromptQueues()[id];
+  return {
+    items: entry?.items || [],
+    updatedAt: raw?.updatedAt || entry?.updatedAt || '',
+    revision: Number(raw?.revision || entry?.revision || 0),
+  };
 }
 
 function queueItemDismissKeys(item) {
   if (!item || typeof item !== 'object') return [];
-  const keys = [];
   const id = String(item.id || '').trim();
+  const keys = [];
   if (id) keys.push('id:' + id);
-  const message = String(item.message || item.text || '').replace(/\\s+/g, ' ').trim();
-  if (message) {
-    keys.push('msg:' + message);
-    const createdAt = String(item.createdAt || '').trim();
-    if (createdAt) keys.push('msg:' + message + '||' + createdAt);
+  // A generated id is re-randomized on every read (see normalizeServerQueuedPrompt),
+  // so an id-only key would never match again after the next sync and a dismissed
+  // item would silently reappear. Add a stable message+createdAt key as well so
+  // dismissal survives id regeneration for these entries.
+  if (!id || item.generatedId) {
+    const message = String(item.message || item.text || '').replace(/\s+/g, ' ').trim();
+    if (message) {
+      keys.push('msg:' + message);
+      const createdAt = String(item.createdAt || '').trim();
+      if (createdAt) keys.push('msg:' + message + '||' + createdAt);
+    }
   }
   return [...new Set(keys.filter(Boolean))];
 }
@@ -4667,9 +4951,10 @@ function savePromptQueuesWithDismissed(queues, dismissed) {
   const cleanQueues = {};
   for (const [threadId, entry] of Object.entries(queues || {})) {
     const id = cleanNativeThreadId(threadId);
-    if (!id || !entry?.items?.length) continue;
+    if (!id || (!entry?.items?.length && Number(entry?.revision || 0) <= 0)) continue;
     cleanQueues[id] = {
       updatedAt: String(entry.updatedAt || new Date().toISOString()),
+      revision: Number(entry.revision || 0),
       items: entry.items.slice(0, 50),
     };
   }
@@ -4704,34 +4989,48 @@ function filterDismissedPromptQueueItems(threadId, items, dismissedMap = loadPro
     return !keys.some((key) => blocked.has(key));
   });
 }
-function setPromptQueueItems(threadId, items) {
+function setPromptQueueItems(threadId, items, expectedRevision) {
   const id = cleanNativeThreadId(threadId);
   if (!id) throw new Error('会话 ID 无效');
   const queues = loadPromptQueuesRaw();
   const dismissed = loadPromptQueueDismissedRaw();
-  const previous = queues[id]?.items || [];
+  const current = getPromptQueueState(id);
+  if (hasPromptQueueReservationForThread(id)) {
+    const error = promptQueueConflict('队列正在发送，请稍后重试', current);
+    throw error;
+  }
+  const requestedRevision = Number(expectedRevision);
+  if (
+    (!Number.isInteger(requestedRevision) || requestedRevision < 0)
+    && (current.revision > 0 || current.items.length)
+  ) {
+    const error = new Error('队列状态已变化，请合并后重试');
+    error.statusCode = 409;
+    error.current = current;
+    throw error;
+  }
+  if (Number.isInteger(requestedRevision) && requestedRevision >= 0 && requestedRevision !== current.revision) {
+    const error = new Error('队列状态已变化，请合并后重试');
+    error.statusCode = 409;
+    error.current = current;
+    throw error;
+  }
   const incoming = (Array.isArray(items) ? items : []).slice(0, 50).map(normalizeServerQueuedPrompt).filter(Boolean);
-  const remainingKeys = new Set(incoming.flatMap(queueItemDismissKeys).filter(Boolean));
-  const removed = previous.filter((item) => {
-    const keys = queueItemDismissKeys(item);
-    if (!keys.length) return true;
-    return !keys.some((key) => remainingKeys.has(key));
-  });
-  markPromptQueueDismissed(id, removed, dismissed);
   const cleanItems = filterDismissedPromptQueueItems(id, incoming, dismissed).slice(0, 50);
+  if (JSON.stringify(current.items) === JSON.stringify(cleanItems)) return current;
   const updatedAt = new Date().toISOString();
-  if (cleanItems.length) queues[id] = { updatedAt, items: cleanItems };
-  else delete queues[id];
+  const revision = current.revision + 1;
+  queues[id] = { updatedAt, revision, items: cleanItems };
   savePromptQueuesWithDismissed(queues, dismissed);
-  broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt });
-  return { items: cleanItems, updatedAt };
+  broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision });
+  return { items: cleanItems, updatedAt, revision };
 }
 
 function dismissPromptQueueItem(threadId, item) {
   const id = cleanNativeThreadId(threadId);
   if (!id) throw new Error('会话 ID 无效');
   const targetKeys = new Set(queueItemDismissKeys(item));
-  if (!targetKeys.size) return { items: getPromptQueueItems(id), updatedAt: getPromptQueueUpdatedAt(id) };
+  if (!targetKeys.size) return getPromptQueueState(id);
 
   const current = getPromptQueueItems(id);
   const matches = (entry) => queueItemDismissKeys(entry).some((key) => targetKeys.has(key));
@@ -4739,14 +5038,76 @@ function dismissPromptQueueItem(threadId, item) {
   const remaining = current.filter((entry) => !matches(entry));
   const queues = loadPromptQueuesRaw();
   const dismissed = loadPromptQueueDismissedRaw();
+  const alreadyDismissed = targetKeys.size > 0 && [...targetKeys].every((key) => (
+    Array.isArray(dismissed[id]) && dismissed[id].includes(key)
+  ));
+  if (!removed.length && alreadyDismissed) return getPromptQueueState(id);
   markPromptQueueDismissed(id, [item, ...removed], dismissed);
   const cleanItems = filterDismissedPromptQueueItems(id, remaining, dismissed).slice(0, 50);
   const updatedAt = new Date().toISOString();
-  if (cleanItems.length) queues[id] = { updatedAt, items: cleanItems };
-  else delete queues[id];
+  const revision = Number(queues[id]?.revision || 0) + 1;
+  queues[id] = { updatedAt, revision, items: cleanItems };
   savePromptQueuesWithDismissed(queues, dismissed);
-  broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt });
-  return { items: cleanItems, updatedAt };
+  broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision });
+  return { items: cleanItems, updatedAt, revision };
+}
+
+function consumePromptQueueItem(threadId, item) {
+  return dismissPromptQueueItem(threadId, item);
+}
+
+function promptQueueConflict(message, current = null) {
+  const error = new Error(message);
+  error.statusCode = 409;
+  if (current) error.current = current;
+  return error;
+}
+
+function promptQueueReservationKey(threadId, itemId) {
+  return `${cleanNativeThreadId(threadId)}:${String(itemId || '').trim()}`;
+}
+
+function hasPromptQueueReservationForThread(threadId) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return false;
+  for (const reservation of promptQueueItemReservations.values()) {
+    if (reservation.threadId === id) return true;
+  }
+  return false;
+}
+
+function assertPromptQueueItemNotReserved(threadId, itemId) {
+  const key = promptQueueReservationKey(threadId, itemId);
+  if (promptQueueItemReservations.has(key)) {
+    throw promptQueueConflict('队列条目正在发送，请稍后重试', getPromptQueueState(threadId));
+  }
+}
+
+function reservePromptQueueItem(threadId, itemId) {
+  const id = cleanNativeThreadId(threadId);
+  const cleanItemId = String(itemId || '').trim();
+  if (!id || !cleanItemId) throw promptQueueConflict('队列条目无效', getPromptQueueState(id));
+  const key = promptQueueReservationKey(id, cleanItemId);
+  if (promptQueueItemReservations.has(key)) {
+    throw promptQueueConflict('队列条目正在发送，请稍后重试', getPromptQueueState(id));
+  }
+  const item = getPromptQueueItems(id).find((entry) => String(entry?.id || '').trim() === cleanItemId);
+  if (!item) throw promptQueueConflict('队列条目不存在或已消费', getPromptQueueState(id));
+  const reservation = { key, threadId: id, itemId: cleanItemId, item };
+  promptQueueItemReservations.set(key, reservation);
+  return reservation;
+}
+
+function consumePromptQueueReservation(reservation) {
+  if (!reservation) return null;
+  return consumePromptQueueItem(reservation.threadId, { id: reservation.itemId });
+}
+
+function releasePromptQueueReservation(reservation) {
+  if (!reservation) return;
+  if (promptQueueItemReservations.get(reservation.key) === reservation) {
+    promptQueueItemReservations.delete(reservation.key);
+  }
 }
 
 function broadcastPromptQueueChange(event) {
@@ -5337,7 +5698,7 @@ function rememberQueueDismissed(threadId,itemOrItems){
   for(const item of list){
     if(!item)continue;
     const itemId=String(item.id||'').trim();
-    if(itemId)set.add('id:'+itemId);
+    if(itemId){set.add('id:'+itemId);continue}
     const message=String(item.message||item.text||'').replace(/\s+/g,' ').trim();
     if(message){
       set.add('msg:'+message);
@@ -5350,7 +5711,7 @@ function isQueueItemLocallyDismissed(threadId,item){
   const set=queueDismissKeySet(threadId);
   if(!set.size||!item)return false;
   const itemId=String(item.id||'').trim();
-  if(itemId&&set.has('id:'+itemId))return true;
+  if(itemId)return set.has('id:'+itemId);
   const message=String(item.message||item.text||'').replace(/\s+/g,' ').trim();
   if(message&&set.has('msg:'+message))return true;
   const createdAt=String(item.createdAt||'').trim();
@@ -5400,6 +5761,7 @@ const promptQueueServerSyncTimers=new Map();
 const promptQueueServerSyncInflight=new Map();
 const promptQueueServerSyncPending=new Map();
 let promptQueueRemoteSyncing=false;
+const promptQueueServerRevisions=new Map();
 function schedulePromptQueueServerSync(threadId){
   const id=String(threadId||'').trim();
   if(!id)return;
@@ -5411,7 +5773,7 @@ async function pushPromptQueueToServer(threadId){
   const id=String(threadId||'').trim();
   if(!id)return;
   const items=promptQueueFor(id);
-  const body=JSON.stringify({items});
+  const body=JSON.stringify({items,revision:promptQueueServerRevisions.get(id)||0});
   if(promptQueueServerSyncInflight.has(id)){
     promptQueueServerSyncPending.set(id,body);
     return;
@@ -5423,11 +5785,19 @@ async function pushPromptQueueToServer(threadId){
         headers:{'Content-Type':'application/json'},
         body,
       });
-      if(!res.ok){
-        const data=await res.json().catch(()=>({}));
-        throw new Error(data.error||res.statusText||'队列同步失败');
-      }
       const data=await res.json().catch(()=>({}));
+      if(res.status===409){
+        const remote=Array.isArray(data.items)?data.items:[];
+        const local=promptQueueFor(id);
+        const seen=new Set(local.map((item)=>String(item.id||'')));
+        const merged=[...local,...remote.filter((item)=>!seen.has(String(item?.id||'')))];
+        if(Number.isInteger(data.revision))promptQueueServerRevisions.set(id,data.revision);
+        applyPromptQueueLocal(id,merged,{persist:true,render:true});
+        promptQueueServerSyncPending.set(id,JSON.stringify({items:merged}));
+        return;
+      }
+      if(!res.ok)throw new Error(data.error||res.statusText||'队列同步失败');
+      if(Number.isInteger(data.revision))promptQueueServerRevisions.set(id,data.revision);
       // A newer local queue snapshot wins over an older request finishing late.
       if(Array.isArray(data.items)&&!promptQueueServerSyncPending.has(id))applyPromptQueueLocal(id,data.items,{persist:true,render:true});
     }catch(e){
@@ -5465,6 +5835,7 @@ async function pullPromptQueueFromServer(threadId,{render=true,preferServer=true
     const res=await fetch('/api/prompt-queues/'+encodeURIComponent(id),{headers:{Accept:'application/json'}});
     if(!res.ok)return null;
     const data=await res.json();
+    if(Number.isInteger(data.revision))promptQueueServerRevisions.set(id,data.revision);
     const items=Array.isArray(data.items)?data.items.slice(0,50).map(normalizeQueuedPrompt).filter(Boolean):[];
     if(preferServer||!promptQueueFor(id).length){
       promptQueueRemoteSyncing=true;
@@ -5488,6 +5859,7 @@ async function hydratePromptQueuesFromServer(){
     try{
       for(const [threadId,entry] of Object.entries(remote)){
         const items=Array.isArray(entry)?entry:Array.isArray(entry?.items)?entry.items:[];
+        if(Number.isInteger(entry?.revision))promptQueueServerRevisions.set(threadId,entry.revision);
         applyPromptQueueLocal(threadId,items,{persist:true,render:false});
       }
       for(const threadId of Object.keys(local||{})){
@@ -5503,6 +5875,7 @@ function applyRemotePromptQueueEvent(event){
   if(!threadId)return;
   if(promptQueueServerSyncInflight.has(threadId)||promptQueueServerSyncTimers.has(threadId))return;
   const items=Array.isArray(event?.items)?event.items:[];
+  if(Number.isInteger(event?.revision))promptQueueServerRevisions.set(threadId,event.revision);
   promptQueueRemoteSyncing=true;
   try{applyPromptQueueLocal(threadId,items,{persist:true,render:true});}
   finally{promptQueueRemoteSyncing=false;}
@@ -5515,7 +5888,23 @@ function createQueuedPrompt(message,attachments){return normalizeQueuedPrompt({
 function queuedPromptPayload(item){return{
   message:item.message,attachments:item.attachments,provider:item.provider,model:item.model,
   reasoningEffort:item.reasoningEffort,cwd:item.cwd,...composerPermissionPayload(item.permissionMode,item.sandbox,item.approval),
+  queueItemId:item.id,
 }}
+
+function applyServerPromptQueue(threadId,queue){
+  if(!queue||!Array.isArray(queue.items))return false;
+  if(Number.isInteger(queue.revision))promptQueueServerRevisions.set(threadId,queue.revision);
+  applyPromptQueueLocal(threadId,queue.items,{persist:true,render:true});
+  return true;
+}
+
+async function consumeQueuedPromptOnServer(threadId,itemId){
+  const res=await fetch('/api/prompt-queues/'+encodeURIComponent(threadId)+'/items/'+encodeURIComponent(itemId),{method:'DELETE'});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok)throw new Error(data.error||'移除队列条目失败');
+  applyServerPromptQueue(threadId,data);
+  return data;
+}
 function queuedPromptLabel(item){
   const text=String(item.message||'').replace(/\\s+/g,' ').trim();
   if(text)return text;
@@ -5916,12 +6305,19 @@ function resetActiveSideChatUi(){
 async function closeSideChatTab(threadId,{archive=true}={}){
   const id=String(threadId||sideChatThreadId||'').trim();
   if(!id)return;
+  if(archive){
+    try{
+      const res=await fetch('/api/native-sessions/'+encodeURIComponent(id),{method:'DELETE'});
+      const data=await res.json().catch(()=>({}));
+      if(!res.ok)throw new Error(data.error||'关闭 side chat 失败');
+    }catch(error){
+      if(sideChatStatus)sideChatStatus.textContent=error.message||'关闭 side chat 失败';
+      persistSideChatState();
+      return false;
+    }
+  }
   if(sideChatSyncTimer&&sideChatThreadId===id){clearTimeout(sideChatSyncTimer);sideChatSyncTimer=null}
   removeSideChatTab(id);
-  if(archive){
-    // Best-effort: archive temporary side chats so history stays clean.
-    fetch('/api/native-sessions/'+encodeURIComponent(id),{method:'DELETE'}).catch(()=>{});
-  }
   if(!sideChatOpenTabs.length){
     sideChatThreadId='';
     sideChatSourceThreadId='';
@@ -5929,24 +6325,16 @@ async function closeSideChatTab(threadId,{archive=true}={}){
     resetActiveSideChatUi();
     setSideChatOpen(false);
     persistSideChatState();
-    return;
+    return true;
   }
   const next=sideChatOpenTabs.find((tab)=>tab.threadId===sideChatThreadId)||sideChatOpenTabs[sideChatOpenTabs.length-1];
   await activateSideChatTab(next.threadId,{force:true});
   persistSideChatState();
+  return true;
 }
-function closeSideChat(){
-  // Close all open side chats.
+async function closeSideChat(){
   const ids=sideChatOpenTabs.map((tab)=>tab.threadId);
-  sideChatOpenTabs=[];
-  if(sideChatSyncTimer){clearTimeout(sideChatSyncTimer);sideChatSyncTimer=null}
-  sideChatThreadId='';
-  sideChatSourceThreadId='';
-  sideChatView='side';
-  resetActiveSideChatUi();
-  setSideChatOpen(false);
-  persistSideChatState();
-  for(const id of ids)fetch('/api/native-sessions/'+encodeURIComponent(id),{method:'DELETE'}).catch(()=>{});
+  for(const id of ids)await closeSideChatTab(id,{archive:true});
 }
 function sideChatMessageNode(message){
   const role=String(message.role||'assistant');
@@ -6164,23 +6552,25 @@ async function openQueuedPromptInSideChat(threadId,itemId){
   const item=promptQueueFor(threadId).find((entry)=>entry.id===itemId);
   if(!item)return;
   queueFailures.delete(itemId);
-  // Opening in side chat consumes this queue row permanently.
-  removeQueuedPromptLocal(threadId,item,{persist:true});
   statusEl.textContent='正在打开 side chat…';
   try{
     ensureSideChatPane();
     if(sideChatStatus)sideChatStatus.textContent='创建中…';
     setSideChatOpen(true);
+    await flushPromptQueueToServer(threadId);
     const res=await fetch('/api/native-sessions',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({...queuedPromptPayload(item),sideChat:true,sourceThreadId:threadId}),
     });
     const data=await res.json().catch(()=>({}));
-    if(!res.ok)throw new Error(data.error||'创建 side chat 失败');
+    if(!res.ok){
+      if(data.recoverableThreadId)refreshHistory();
+      throw new Error((data.error||'创建 side chat 失败')+(data.recoverableThreadId?'；未归档任务已保留在历史记录':''));
+    }
     const newThreadId=String(data.threadId||'').trim();
     if(!newThreadId)throw new Error('未返回 side chat thread id');
-    removeQueuedPromptLocal(threadId,item,{persist:true});
+    if(!applyServerPromptQueue(threadId,data.queue))removeQueuedPromptLocal(threadId,item,{persist:false});
     await openSideChat(newThreadId,{
       sourceThreadId:threadId,
       title:queuedPromptLabel(item).slice(0,48)||'临时侧聊',
@@ -6188,27 +6578,6 @@ async function openQueuedPromptInSideChat(threadId,itemId){
     statusEl.textContent='已在 side chat 打开 · 当前 '+sideChatOpenTabs.length+' 个标签';
     refreshHistory();
   }catch(error){
-    const items=[...promptQueueFor(threadId)];
-    const stillMissing=!items.some((entry)=>{
-      const sameId=entry.id&&item.id&&entry.id===item.id;
-      const sameMsg=String(entry.message||'').replace(/\s+/g,' ').trim()===String(item.message||'').replace(/\s+/g,' ').trim();
-      return sameId||sameMsg;
-    });
-    if(stillMissing){
-      try{
-        const set=queueDismissKeySet(threadId);
-        const itemIdKey='id:'+String(item.id||'').trim();
-        const message=String(item.message||'').replace(/\s+/g,' ').trim();
-        if(itemIdKey!=='id:')set.delete(itemIdKey);
-        if(message){
-          set.delete('msg:'+message);
-          const createdAt=String(item.createdAt||'').trim();
-          if(createdAt)set.delete('msg:'+message+'||'+createdAt);
-        }
-      }catch{}
-      items.push(item);
-      setPromptQueue(threadId,items);
-    }
     statusEl.textContent=error.message||'打开 side chat 失败';
     if(!sideChatOpenTabs.length)setSideChatOpen(false);
   }
@@ -6399,14 +6768,16 @@ function enqueuePrompt(message,attachments){
   input.focus();
   return true;
 }
-function deleteQueuedPrompt(threadId,itemId){
+async function deleteQueuedPrompt(threadId,itemId){
   const firstId=promptQueueFor(threadId)[0]?.id;
   const victim=promptQueueFor(threadId).find((item)=>item.id===itemId)||{id:itemId};
-  rememberQueueDismissed(threadId,victim);
   queueFailures.delete(itemId);
-  setPromptQueue(threadId,promptQueueFor(threadId).filter((item)=>item.id!==itemId&&!isQueueItemLocallyDismissed(threadId,item)));
-  statusEl.textContent='已从队列移除';
-  if(firstId===itemId&&!webRunActive)schedulePromptQueueDispatch(threadId,100);
+  try{
+    await consumeQueuedPromptOnServer(threadId,itemId);
+    rememberQueueDismissed(threadId,victim);
+    statusEl.textContent='已从队列移除';
+    if(firstId===itemId&&!webRunActive)schedulePromptQueueDispatch(threadId,100);
+  }catch(error){statusEl.textContent=error.message||'移除队列条目失败'}
 }
 function moveQueuedPrompt(threadId,itemId,toIndex){
   const items=[...promptQueueFor(threadId)];
@@ -6598,7 +6969,7 @@ async function restoreQueuedPrompt(threadId,itemId){
   if(!item)return;
   if((input.value.trim()||pendingAttachments.length)&&!confirm('用队列消息替换当前输入内容？'))return;
   queueFailures.delete(itemId);
-  setPromptQueue(threadId,promptQueueFor(threadId).filter((entry)=>entry.id!==itemId));
+  try{await consumeQueuedPromptOnServer(threadId,itemId)}catch(error){statusEl.textContent=error.message||'恢复队列消息失败';return}
   input.value=item.message;
   input.style.height='auto';
   input.style.height=Math.min(input.scrollHeight,180)+'px';
@@ -6670,11 +7041,16 @@ function removeQueuedPromptLocal(threadId,item,{persist=true}={}){
   rememberQueueDismissed(threadId,item);
   const targetId=String(item.id||'').trim();
   const targetMessage=String(item.message||'').replace(/\s+/g,' ').trim();
+  const targetCreatedAt=String(item.createdAt||'').trim();
   const next=promptQueueFor(threadId).filter((entry)=>{
     const entryId=String(entry.id||'').trim();
-    if(targetId&&entryId&&entryId===targetId)return false;
-    const entryMessage=String(entry.message||'').replace(/\s+/g,' ').trim();
-    if(targetMessage&&entryMessage===targetMessage)return false;
+    if(targetId){
+      if(entryId===targetId)return false;
+    }else{
+      const entryMessage=String(entry.message||'').replace(/\s+/g,' ').trim();
+      const entryCreatedAt=String(entry.createdAt||'').trim();
+      if(targetMessage&&entryMessage===targetMessage&&(!targetCreatedAt||entryCreatedAt===targetCreatedAt))return false;
+    }
     if(isQueueItemLocallyDismissed(threadId,entry))return false;
     return true;
   });
@@ -6701,13 +7077,12 @@ async function steerQueuedPrompt(threadId,itemId,preloadedItem=null){
   applyConversationMode();
   statusEl.textContent='正在发送引导...';
   try{
+    await flushPromptQueueToServer(threadId);
     const res=await fetch('/api/native-sessions/'+encodeURIComponent(threadId)+'/steer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:item.message,attachments:item.attachments,turnId:activeNativeTurnId,queueItemId:item.id,queueItemCreatedAt:item.createdAt})});
     const data=await res.json();
     if(!res.ok)throw Object.assign(new Error(data.error||res.statusText),{status:res.status});
     activeNativeTurnId=data.turnId||activeNativeTurnId;
-    removeQueuedPromptLocal(threadId,item,{persist:true});
-    // Keep steering and queue dispatch mutually exclusive across synchronized pages.
-    await flushPromptQueueToServer(threadId);
+    if(!applyServerPromptQueue(threadId,data.queue))removeQueuedPromptLocal(threadId,item,{persist:false});
     showNativeSteerOptimistically(item);
     statusEl.textContent='Codex App · 已发送引导';
     setTimeout(syncCurrentNativeConversation,180);
@@ -6742,6 +7117,7 @@ async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
     renderPromptQueue();
   }
   try{
+    await flushPromptQueueToServer(threadId);
     const res=await fetch('/api/native-sessions/'+encodeURIComponent(threadId)+'/turns',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(queuedPromptPayload(item))});
     const data=await res.json();
     if(!res.ok){
@@ -6756,7 +7132,7 @@ async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
       }
       throw new Error(data.error||res.statusText);
     }
-    removeQueuedPromptLocal(threadId,item,{persist:true});
+    if(!applyServerPromptQueue(threadId,data.queue))removeQueuedPromptLocal(threadId,item,{persist:false});
     if(currentConversationSource==='codex'&&currentConversationId===threadId){
       setNativeComposerOverride(threadId,item.provider,item.model,item.reasoningEffort,item.permissionMode,item.sandbox,item.approval);
       showNativePromptOptimistically(item);
@@ -8897,7 +9273,10 @@ function renderSubQuota(data){
     const planName=document.createElement('span');
     planName.textContent=quota.planName||(quota.mode==='cpa_codex'?'Codex':quota.mode==='quota_limited'?'API Key 限额':'额度');
     const sourceName=document.createElement('span');
-    sourceName.textContent=quota.name||quota.sourceName||(quota.provider==='sub2api'?'Sub2API':'CPA Codex');
+    const providerName=quota.provider==='sub2api'?'Sub2API':'CPA Codex';
+    sourceName.textContent=quota.provider==='cpa-codex'
+      ? providerName
+      : (quota.name||quota.sourceName||providerName);
     plan.appendChild(planName);
     plan.appendChild(sourceName);
     source.appendChild(plan);
@@ -8906,7 +9285,9 @@ function renderSubQuota(data){
     if(quota.subscription){
       detailCount+=appendSubQuotaWindow(source,'每日',quota.subscription.daily,unit)?1:0;
       detailCount+=appendSubQuotaWindow(source,'每周',quota.subscription.weekly,unit)?1:0;
-      detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit)?1:0;
+      if(finiteSubQuotaNumber(quota.subscription.monthly?.limit)>0){
+        detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit)?1:0;
+      }
     }
     if(quota.quota)detailCount+=appendSubQuotaWindow(source,'总额度',quota.quota,unit)?1:0;
     for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
@@ -10880,8 +11261,7 @@ async function loadConversation(id,source='web',options={}){
   updateActiveHistory();
   statusEl.textContent='Loading...';
   const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
-  const fastNativeLoad=currentConversationSource==='codex'&&!options.full;
-  const requestUrl=endpoint+encodeURIComponent(id)+(currentConversationSource==='codex'?'?images=external'+(fastNativeLoad?'&limit='+NATIVE_INITIAL_MESSAGE_LIMIT:''):'');
+  const requestUrl=endpoint+encodeURIComponent(id)+(currentConversationSource==='codex'?'?images=external':'');
   const res=await fetch(requestUrl);
   if(seq!==conversationLoadSeq)return false;
   if(!res.ok){statusEl.textContent='加载失败';return false}
@@ -10911,7 +11291,6 @@ async function loadConversation(id,source='web',options={}){
   });
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(!messages.length&&!webRunActive)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
-  if(currentConversationSource==='codex'&&conversation.hasEarlierMessages&&!options.full)addNativeHistoryLoadButton(conversation.id);
   updateConversationStatus(conversation);
   if(currentConversationSource==='codex')await pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
   else renderPromptQueue();
@@ -10925,21 +11304,13 @@ async function loadConversation(id,source='web',options={}){
   [120,320,800].forEach((ms)=>setTimeout(()=>{pinOpenSteeringMessages();scrollChatToLatest({force:false});},ms));
   return true;
 }
-function addNativeHistoryLoadButton(id){
-  const button=document.createElement('button');
-  button.type='button';
-  button.className='nativeHistoryLoad';
-  button.textContent='加载完整近期记录';
-  button.addEventListener('click',()=>loadConversation(id,'codex',{full:true}));
-  chat.prepend(button);
-}
 function updateConversationStatus(conversation){
   const time=new Date(conversation.updatedAt||conversation.createdAt);
   const stamp=Number.isNaN(time.getTime())?'':time.toLocaleString();
   statusEl.classList.toggle('running',conversation.status==='running');
   if(conversation.source==='codex'){
     statusEl.textContent='Codex App · '+(conversation.status==='running'?'运行中':'已同步')+(stamp?' · '+stamp:'');
-    nativeNotice.textContent='Codex App 会话 · 双向同步'+(conversation.hasEarlierMessages?' · 已快速加载最近消息':conversation.truncated?' · 仅显示最近记录':'');
+    nativeNotice.textContent='Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':'');
   }else{
     statusEl.textContent='Loaded '+stamp;
   }
@@ -11507,7 +11878,83 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
   if(parsed.comments.length)renderReviewComments(body,parsed.comments);
   if(memoryParsed.citations.length)renderMemoryCitations(body,memoryParsed.citations);
 }
-function renderAssistantMarkdown(body,text){renderMessageMarkdown(body,text,{assistantArtifacts:true})}
+function automationHeartbeatDisplayText(text){
+  const original=String(text||'');
+  const openTag='<heartbeat>';
+  const closeTag='</heartbeat>';
+  const start=original.indexOf(openTag);
+  if(start<0||original.indexOf(openTag,start+openTag.length)>=0)return original;
+  const closeStart=original.indexOf(closeTag,start+openTag.length);
+  if(closeStart<0||original.indexOf(closeTag,closeStart+closeTag.length)>=0)return original;
+  const end=closeStart+closeTag.length;
+  const source=original.slice(start,end);
+  try{
+    const parsed=new DOMParser().parseFromString(source,'application/xml');
+    if(parsed.querySelector('parsererror'))return original;
+    const root=parsed.documentElement;
+    if(!root||root.tagName!=='heartbeat')return original;
+    const children=[...root.children];
+    const allowed=new Set(['automation_id','decision','message']);
+    if(children.some((child)=>!allowed.has(child.tagName)))return original;
+    const nodes=(tag)=>children.filter((child)=>child.tagName===tag);
+    const automationId=nodes('automation_id');
+    const decision=nodes('decision');
+    const message=nodes('message');
+    if(automationId.length!==1||decision.length!==1||message.length!==1)return original;
+    const decisionText=decision[0].textContent.trim();
+    const messageText=message[0].textContent.trim();
+    if(!automationId[0].textContent.trim()||!['NOTIFY','DONT_NOTIFY'].includes(decisionText)||!messageText)return original;
+    const newline=String.fromCharCode(10);
+    let before=original.slice(0,start);
+    let after=original.slice(end);
+    const beforeLines=before.split(newline);
+    const afterLines=after.split(newline);
+    while(beforeLines.length&&!String(beforeLines.at(-1)||'').trim())beforeLines.pop();
+    while(afterLines.length&&!String(afterLines[0]||'').trim())afterLines.shift();
+    const fenceStart=String(beforeLines.at(-1)||'').trim();
+    const fenceEnd=String(afterLines[0]||'').trim();
+    const fence=String.fromCharCode(96).repeat(3);
+    if([fence,fence+'xml'].includes(fenceStart)&&fenceEnd===fence){
+      beforeLines.pop();
+      afterLines.shift();
+      before=beforeLines.join(newline);
+      after=afterLines.join(newline);
+    }
+    if(!after.trim()&&normalizeAutomationDuplicateText(before)===normalizeAutomationDuplicateText(messageText))return messageText;
+    return (before+messageText+after).trim()||original;
+  }catch(e){return original}
+}
+function normalizeAutomationDuplicateText(value){
+  let normalized=String(value||'').trim();
+  for(const marker of ['*','_',String.fromCharCode(96)])normalized=normalized.split(marker).join('');
+  for(const code of [9,10,13])normalized=normalized.split(String.fromCharCode(code)).join(' ');
+  while(normalized.includes('  '))normalized=normalized.split('  ').join(' ');
+  return normalized.trim();
+}
+function automationInstructionDisplayText(text){
+  const original=String(text||'');
+  const source=original.trim();
+  if(!source.startsWith('<heartbeat>')||!source.endsWith('</heartbeat>'))return original;
+  try{
+    const parsed=new DOMParser().parseFromString(source,'application/xml');
+    if(parsed.querySelector('parsererror'))return original;
+    const root=parsed.documentElement;
+    if(!root||root.tagName!=='heartbeat')return original;
+    const children=[...root.children];
+    const allowed=new Set(['automation_id','current_time_iso','instructions']);
+    if(children.some((child)=>!allowed.has(child.tagName)))return original;
+    const nodes=(tag)=>children.filter((child)=>child.tagName===tag);
+    const automationId=nodes('automation_id');
+    const currentTime=nodes('current_time_iso');
+    const instructions=nodes('instructions');
+    if(automationId.length!==1||currentTime.length!==1||instructions.length!==1)return original;
+    const timeText=currentTime[0].textContent.trim();
+    const instructionText=instructions[0].textContent.trim();
+    if(!automationId[0].textContent.trim()||!Number.isFinite(Date.parse(timeText))||!instructionText)return original;
+    return instructionText;
+  }catch(e){return original}
+}
+function renderAssistantMarkdown(body,text){renderMessageMarkdown(body,automationHeartbeatDisplayText(text),{assistantArtifacts:true})}
 function looksLikeHttpUrl(value){
   const clean=String(value||'').trim().replace(/[),.;:!?]+$/,'');
   if(!clean)return false;
@@ -13459,6 +13906,18 @@ function prepareUndoEditedFiles(files){
   statusEl.textContent='撤销请求已准备，请检查后发送';
   input.focus();
 }
+function revealExpandedEditedFilesCard(card){
+  if(!card?.open||!card.isConnected||!chat)return;
+  const cardRect=card.getBoundingClientRect();
+  const chatRect=chat.getBoundingClientRect();
+  const visibleTop=chatRect.top+12;
+  const delta=cardRect.top-visibleTop;
+  if(delta<=1)return;
+  setNativeLiveFollowBottom(false);
+  const nextTop=Math.max(0,chat.scrollTop+delta);
+  if(typeof chat.scrollTo==='function')chat.scrollTo({top:nextTop,behavior:'smooth'});
+  else chat.scrollTop=nextTop;
+}
 function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
   const progress=turnPlanProgress(plan);
   const hasPlan=progress.total>0;
@@ -13540,6 +13999,10 @@ function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
   }
   card.appendChild(head);
   if(!hasFiles)return card;
+  if(!live)card.addEventListener('toggle',()=>{
+    if(!card.open)return;
+    requestAnimationFrame(()=>revealExpandedEditedFilesCard(card));
+  });
   const content=document.createElement('div');
   content.className='editedFilesContent';
   const actions=document.createElement('div');
@@ -13913,12 +14376,51 @@ function bindMessageActionToggle(el){
     if(!open)el.classList.add('actionsOpen');
   });
 }
+function shouldCollapseUserMessage(text){
+  const value=String(text||'').trim();
+  if(value.length>=560)return true;
+  const lines=value.split(String.fromCharCode(10)).map((line)=>line.trim()).filter(Boolean);
+  return value.length>=280&&lines.length>=10;
+}
+let longUserMessageSerial=0;
+function bindLongUserMessage(el,body){
+  if(!el||!body||el.querySelector(':scope > .longUserMessageToggle'))return;
+  longUserMessageSerial+=1;
+  body.id='long-user-message-body-'+longUserMessageSerial;
+  el.classList.add('longUserMessage');
+  const toggle=document.createElement('button');
+  toggle.type='button';
+  toggle.className='longUserMessageToggle';
+  toggle.setAttribute('aria-controls',body.id);
+  const setExpanded=(expanded)=>{
+    el.classList.toggle('expanded',expanded);
+    toggle.setAttribute('aria-expanded',String(expanded));
+    const label=expanded?'收起全文':'展开全文';
+    setIconLabel(toggle,expanded?'chevron-up':'chevron-down',label);
+    toggle.setAttribute('aria-label',label);
+    toggle.title=label;
+  };
+  toggle.addEventListener('click',(event)=>{
+    event.stopPropagation();
+    const wasExpanded=toggle.getAttribute('aria-expanded')==='true';
+    const anchorTop=toggle.getBoundingClientRect().top;
+    setExpanded(!wasExpanded);
+    if(wasExpanded)requestAnimationFrame(()=>{
+      const delta=toggle.getBoundingClientRect().top-anchorTop;
+      if(Number.isFinite(delta)&&chat)chat.scrollTop+=delta;
+    });
+  });
+  const actions=el.querySelector(':scope > .msgActions');
+  el.insertBefore(toggle,actions||null);
+  setExpanded(false);
+}
 function addMsg(role,text,options={}){
   const kind=String(options.kind||'');
   if(role==='assistant'&&isHandoffSummaryText(text))return null;
   if(role==='context'&&kind==='handoff_summary')return null;
   const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
   const steeringUser=role==='user'&&['steering_user','steering_browser_comment'].includes(kind);
+  const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage(text);
   const completedSteeringTimeline=steeringUser?completionTimelineForTurn(options.turnId):null;
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   if(role!=='user'&&!inputImage)latestUserElement=null;
@@ -14201,7 +14703,7 @@ function addMsg(role,text,options={}){
     const body=document.createElement('div');
     body.className='msgBody';
     if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text);
-    else if(role==='user')renderMessageMarkdown(body,text);
+    else if(role==='user')renderMessageMarkdown(body,automationInstructionDisplayText(text));
     else body.textContent=text;
     const actions=document.createElement('div');
     actions.className='msgActions';
@@ -14289,6 +14791,7 @@ function addMsg(role,text,options={}){
       el.appendChild(body);
       if(browserCommentUser)body.classList.add('browserCommentSource');
       el.appendChild(actions);
+      if(longUser)bindLongUserMessage(el,body);
     }
     el._messageBody=body;
   }

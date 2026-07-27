@@ -9,6 +9,7 @@ const MAX_FRAME_BYTES = 256 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_MS = 1500;
 const DEFAULT_REQUEST_TIMEOUT_MS = 20000;
 const DEFAULT_HISTORY_REQUEST_TIMEOUT_MS = 305000;
+const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 4000];
 const METHOD_VERSIONS = new Map([
   ['initialize', 0],
   ['thread-follower-start-turn', 1],
@@ -90,6 +91,9 @@ export class CodexDesktopIpcClient extends EventEmitter {
     this.readBuffer = Buffer.alloc(0);
     this.pending = new Map();
     this.closing = false;
+    this.reconnectDelaysMs = normalizeReconnectDelays(options.reconnectDelaysMs);
+    this.reconnectAttempt = 0;
+    this.reconnectTimer = null;
   }
 
   get connected() {
@@ -103,9 +107,14 @@ export class CodexDesktopIpcClient extends EventEmitter {
     if (this.connected) return;
     if (this.startPromise) return this.startPromise;
 
-    this.startPromise = this.connectAndInitialize().finally(() => {
-      this.startPromise = null;
-    });
+    this.startPromise = this.connectAndInitialize()
+      .catch((error) => {
+        this.scheduleReconnect();
+        throw error;
+      })
+      .finally(() => {
+        this.startPromise = null;
+      });
     return this.startPromise;
   }
 
@@ -231,6 +240,9 @@ export class CodexDesktopIpcClient extends EventEmitter {
 
   close() {
     this.closing = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
     const socket = this.socket;
     this.socket = null;
     this.clientId = INITIAL_CLIENT_ID;
@@ -273,6 +285,9 @@ export class CodexDesktopIpcClient extends EventEmitter {
       const clientId = String(response?.clientId || '');
       if (!clientId) throw new Error('Codex Desktop IPC 初始化未返回 client id');
       this.clientId = clientId;
+      this.reconnectAttempt = 0;
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
       this.emit('connected', { clientId, socketPath: this.socketPath });
     } catch (error) {
       if (this.socket === socket) this.socket = null;
@@ -416,7 +431,22 @@ export class CodexDesktopIpcClient extends EventEmitter {
     this.clientId = INITIAL_CLIENT_ID;
     this.readBuffer = Buffer.alloc(0);
     this.rejectPending(error);
-    if (!this.closing) this.emit('disconnect', error);
+    if (!this.closing) {
+      this.emit('disconnect', error);
+      this.scheduleReconnect();
+    }
+  }
+
+  scheduleReconnect() {
+    if (this.closing || !this.enabled || this.connected || this.reconnectTimer) return;
+    const delay = this.reconnectDelaysMs[this.reconnectAttempt];
+    if (!Number.isFinite(delay)) return;
+    this.reconnectAttempt += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.start().catch(() => {});
+    }, delay);
+    this.reconnectTimer.unref?.();
   }
 
   rejectPending(error) {
@@ -468,4 +498,13 @@ function waitForConnect(socket, timeoutMs) {
 function positiveTimeout(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
+function normalizeReconnectDelays(value) {
+  const source = Array.isArray(value) ? value : DEFAULT_RECONNECT_DELAYS_MS;
+  const delays = source
+    .map((entry) => Number(entry))
+    .filter((entry) => Number.isFinite(entry) && entry >= 0)
+    .map((entry) => Math.floor(entry));
+  return delays.length ? delays : DEFAULT_RECONNECT_DELAYS_MS;
 }

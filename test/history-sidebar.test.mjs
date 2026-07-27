@@ -166,7 +166,9 @@ test('the task section is rendered before project groups and can collapse indepe
 
 test('workspace-kind changes are watched and included in session signatures', () => {
   assert.match(nativeSource, /relative !== '\.codex-global-state\.json'/);
-  assert.match(nativeSource, /state\?\.\['projectless-thread-ids'\]/);
+  assert.match(nativeSource, /state\['projectless-thread-ids'\]/);
+  assert.match(nativeSource, /parsed\['projectless-thread-ids'\]/);
+  assert.match(nativeSource, /legacy-projectless-thread-ids/);
   assert.match(nativeSource, /workspaceKind: this\.workspaceStateAvailable/);
   assert.match(nativeSource, /entry\.workspaceKind \|\| ''/);
 });

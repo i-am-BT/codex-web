@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "compression": "^1.8.1",
-    "dompurify": "^3.4.11",
+    "dompurify": "^3.4.12",
     "express": "^4.22.2",
     "lucide": "^1.24.0",
     "marked": "^18.0.6"

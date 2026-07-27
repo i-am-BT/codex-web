@@ -386,6 +386,63 @@ test('routes supported Desktop request responses to the selected owner', async (
   }
 });
 
+test('reconnects after a transient Desktop IPC disconnect', async () => {
+  const fixture = await createRouterFixture();
+  let initializeCount = 0;
+  fixture.onMessage = (socket, message) => {
+    if (message.method === 'initialize') {
+      initializeCount += 1;
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        result: { clientId: `web-client-${initializeCount}` },
+      });
+      return;
+    }
+    assert.equal(message.method, 'thread-follower-load-complete-history');
+    sendFrame(socket, {
+      type: 'response',
+      requestId: message.requestId,
+      resultType: 'success',
+      method: message.method,
+      handledByClientId: 'desktop-owner-id',
+      result: { result: { ok: true, generation: initializeCount } },
+    });
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    connectTimeoutMs: 500,
+    requestTimeoutMs: 500,
+    reconnectDelaysMs: [10, 20, 40],
+  });
+
+  try {
+    await client.start();
+    assert.equal(initializeCount, 1);
+    const reconnected = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Desktop IPC reconnect timed out')), 1000);
+      client.once('connected', (event) => {
+        clearTimeout(timeout);
+        resolve(event);
+      });
+    });
+    fixture.disconnectClients();
+    const event = await reconnected;
+    assert.equal(event.clientId, 'web-client-2');
+    assert.equal(initializeCount, 2);
+    assert.equal(client.connected, true);
+    assert.deepEqual(await client.loadCompleteHistory('thread-reconnect'), {
+      result: { ok: true, generation: 2 },
+    });
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
 async function createRouterFixture() {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'codex-desktop-ipc-test-'));
   const socketPath = path.join(temporary, 'router.sock');
@@ -393,6 +450,9 @@ async function createRouterFixture() {
   const fixture = {
     socketPath,
     onMessage: () => {},
+    disconnectClients() {
+      for (const socket of sockets) socket.destroy();
+    },
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
