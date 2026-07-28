@@ -10,6 +10,30 @@ import {
 } from '../sub-quota.mjs';
 // CPA Codex + Sub2API quota adapters
 
+function cpaAuthFile(id) {
+  return {
+    id,
+    name: `${id}.json`,
+    type: 'codex',
+    email: `${id}@example.test`,
+    auth_index: `auth-${id}`,
+    account_id: `account-${id}`,
+    disabled: false,
+  };
+}
+
+function cpaUsageEnvelope(usedPercent) {
+  return {
+    status_code: 200,
+    body: {
+      plan_type: 'plus',
+      rate_limit: {
+        primary_window: { used_percent: usedPercent, limit_window_seconds: 18000 },
+      },
+    },
+  };
+}
+
 test('normalizes editable Sub2API URLs and rejects unsafe values', () => {
   assert.equal(normalizeSubQuotaBaseUrl(' https://sub.example.test/ '), 'https://sub.example.test');
   assert.equal(normalizeSubQuotaBaseUrl('https://sub.example.test/v1'), 'https://sub.example.test');
@@ -325,6 +349,371 @@ test('fetches all sources, isolates errors, and caches the result', async () => 
   assert.equal(first.availableCount, 1);
   assert.equal(first.quotas[0].remaining, 12);
   assert.match(first.quotas[1].error, /MISSING_KEY/);
+});
+
+test('uses recent source success after a timeout and replaces it after recovery', async () => {
+  let now = Date.parse('2026-07-19T00:00:00Z');
+  let mode = 'ready';
+  let requests = 0;
+  const service = new SubQuotaService({
+    sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
+    now: () => now,
+    fetchImpl: async () => {
+      requests += 1;
+      if (mode === 'timeout') throw new DOMException('aborted', 'AbortError');
+      const remaining = mode === 'recovered' ? 34 : 12;
+      return new Response(JSON.stringify({ isValid: true, remaining, unit: 'USD' }), { status: 200 });
+    },
+  });
+
+  const ready = await service.list();
+  const originalFetchedAt = ready.quotas[0].fetchedAt;
+  mode = 'timeout';
+  now += 1000;
+  const stale = await service.list({ refresh: true });
+  assert.equal(stale.availableCount, 1);
+  assert.equal(stale.quotas[0].remaining, 12);
+  assert.equal(stale.quotas[0].fetchedAt, originalFetchedAt);
+  assert.equal(stale.quotas[0].stale, true);
+  assert.equal(stale.quotas[0].warning, '请求超时');
+  assert.equal(stale.quotas[0].error, undefined);
+
+  mode = 'recovered';
+  now += 1000;
+  const recovered = await service.list({ refresh: true });
+  assert.equal(recovered.quotas[0].remaining, 34);
+  assert.notEqual(recovered.quotas[0].fetchedAt, originalFetchedAt);
+  assert.equal(recovered.quotas[0].stale, undefined);
+  assert.equal(recovered.quotas[0].warning, undefined);
+  assert.equal(requests, 3);
+});
+
+test('returns an initial timeout error and retries an error cache after five seconds', async () => {
+  let now = Date.parse('2026-07-19T00:00:00Z');
+  let healthy = false;
+  let requests = 0;
+  const service = new SubQuotaService({
+    sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
+    cacheTtlMs: 30000,
+    now: () => now,
+    fetchImpl: async () => {
+      requests += 1;
+      if (!healthy) throw new DOMException('aborted', 'AbortError');
+      return new Response(JSON.stringify({ isValid: true, remaining: 21, unit: 'USD' }), { status: 200 });
+    },
+  });
+
+  const failed = await service.list();
+  assert.equal(failed.availableCount, 0);
+  assert.equal(failed.quotas[0].error, '请求超时');
+  assert.equal(failed.quotas[0].stale, undefined);
+
+  now += 4999;
+  assert.equal(await service.list(), failed);
+  assert.equal(requests, 1);
+
+  healthy = true;
+  now += 1;
+  const recovered = await service.list();
+  assert.equal(recovered.availableCount, 1);
+  assert.equal(recovered.quotas[0].remaining, 21);
+  assert.equal(requests, 2);
+});
+
+test('keeps last-known-good fallback for at most five minutes', async () => {
+  let now = Date.parse('2026-07-19T00:00:00Z');
+  let timeout = false;
+  const service = new SubQuotaService({
+    sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
+    now: () => now,
+    fetchImpl: async () => {
+      if (timeout) throw new DOMException('aborted', 'AbortError');
+      return new Response(JSON.stringify({ isValid: true, remaining: 8, unit: 'USD' }), { status: 200 });
+    },
+  });
+
+  const ready = await service.list();
+  timeout = true;
+  now += 5 * 60 * 1000;
+  const boundary = await service.list({ refresh: true });
+  assert.equal(boundary.quotas[0].remaining, 8);
+  assert.equal(boundary.quotas[0].fetchedAt, ready.quotas[0].fetchedAt);
+  assert.equal(boundary.quotas[0].stale, true);
+
+  now += 1;
+  const expired = await service.list({ refresh: true });
+  assert.equal(expired.availableCount, 0);
+  assert.equal(expired.quotas[0].error, '请求超时');
+  assert.equal(expired.quotas[0].stale, undefined);
+});
+
+test('isolates last-known-good results by source during transient failures', async () => {
+  let now = Date.parse('2026-07-19T00:00:00Z');
+  let round = 1;
+  const service = new SubQuotaService({
+    sources: [
+      { id: 'alpha', name: 'Alpha', apiKeyEnv: 'ALPHA_KEY', apiKey: 'alpha-key', usageUrl: 'https://alpha.test/v1/usage' },
+      { id: 'beta', name: 'Beta', apiKeyEnv: 'BETA_KEY', apiKey: 'beta-key', usageUrl: 'https://beta.test/v1/usage' },
+    ],
+    now: () => now,
+    fetchImpl: async (url) => {
+      if (round === 2 && String(url).includes('alpha.test')) throw new TypeError('fetch failed');
+      const remaining = String(url).includes('alpha.test') ? 10 : (round === 1 ? 20 : 30);
+      return new Response(JSON.stringify({ isValid: true, remaining, unit: 'USD' }), { status: 200 });
+    },
+  });
+
+  const first = await service.list();
+  const firstAlpha = first.quotas.find((item) => item.id === 'alpha');
+  round = 2;
+  now += 1000;
+  const second = await service.list({ refresh: true });
+  const alpha = second.quotas.find((item) => item.id === 'alpha');
+  const beta = second.quotas.find((item) => item.id === 'beta');
+  assert.equal(alpha.remaining, 10);
+  assert.equal(alpha.fetchedAt, firstAlpha.fetchedAt);
+  assert.equal(alpha.stale, true);
+  assert.equal(alpha.warning, 'fetch failed');
+  assert.equal(beta.remaining, 30);
+  assert.notEqual(beta.fetchedAt, firstAlpha.fetchedAt);
+  assert.equal(beta.stale, undefined);
+});
+
+test('returns expired usable cache immediately while refreshing once in the background', async () => {
+  let now = Date.parse('2026-07-19T00:00:00Z');
+  let requests = 0;
+  let resolveRefresh;
+  const pendingResponse = new Promise((resolve) => { resolveRefresh = resolve; });
+  const service = new SubQuotaService({
+    sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
+    cacheTtlMs: 1000,
+    now: () => now,
+    fetchImpl: async () => {
+      requests += 1;
+      if (requests === 1) {
+        return new Response(JSON.stringify({ isValid: true, remaining: 40, unit: 'USD' }), { status: 200 });
+      }
+      return pendingResponse;
+    },
+  });
+
+  const first = await service.list();
+  now += 1001;
+  let immediateTimer;
+  const immediate = await Promise.race([
+    service.list(),
+    new Promise((_, reject) => {
+      immediateTimer = setTimeout(() => reject(new Error('expired cache did not return immediately')), 50);
+    }),
+  ]).finally(() => clearTimeout(immediateTimer));
+  assert.equal(immediate, first);
+  assert.equal(await service.list(), first);
+  assert.equal(requests, 2);
+
+  const refresh = service.list({ refresh: true });
+  assert.equal(requests, 2);
+  resolveRefresh(new Response(JSON.stringify({ isValid: true, remaining: 55, unit: 'USD' }), { status: 200 }));
+  const updated = await refresh;
+  assert.equal(updated.quotas[0].remaining, 55);
+  assert.equal(requests, 2);
+  assert.equal((await service.list()).quotas[0].remaining, 55);
+});
+
+test('clears source last-known-good after an unauthorized response', async () => {
+  let mode = 'ready';
+  const service = new SubQuotaService({
+    sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
+    fetchImpl: async () => {
+      if (mode === 'unauthorized') return new Response('{}', { status: 401 });
+      if (mode === 'timeout') throw new DOMException('aborted', 'AbortError');
+      return new Response(JSON.stringify({ isValid: true, remaining: 18, unit: 'USD' }), { status: 200 });
+    },
+  });
+
+  await service.list();
+  mode = 'unauthorized';
+  const unauthorized = await service.list({ refresh: true });
+  assert.equal(unauthorized.availableCount, 0);
+  assert.equal(unauthorized.quotas[0].error, 'HTTP 401');
+
+  mode = 'timeout';
+  const timeout = await service.list({ refresh: true });
+  assert.equal(timeout.availableCount, 0);
+  assert.equal(timeout.quotas[0].error, '请求超时');
+  assert.equal(timeout.quotas[0].stale, undefined);
+});
+
+test('treats invalid quota as unavailable, short-lived, and ineligible for fallback', async () => {
+  let now = Date.parse('2026-07-19T00:00:00Z');
+  let mode = 'ready';
+  let requests = 0;
+  const service = new SubQuotaService({
+    sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
+    cacheTtlMs: 30000,
+    now: () => now,
+    fetchImpl: async () => {
+      requests += 1;
+      if (mode === 'timeout') throw new DOMException('aborted', 'AbortError');
+      return new Response(JSON.stringify({ isValid: mode !== 'invalid', remaining: 18, unit: 'USD' }), { status: 200 });
+    },
+  });
+
+  await service.list();
+  mode = 'invalid';
+  now += 1000;
+  const invalid = await service.list({ refresh: true });
+  assert.equal(invalid.availableCount, 0);
+  assert.equal(invalid.quotas[0].valid, false);
+  assert.equal(requests, 2);
+
+  now += 4999;
+  assert.equal(await service.list(), invalid);
+  assert.equal(requests, 2);
+
+  mode = 'timeout';
+  now += 1;
+  const timeout = await service.list();
+  assert.equal(timeout.availableCount, 0);
+  assert.equal(timeout.quotas[0].error, '请求超时');
+  assert.equal(timeout.quotas[0].stale, undefined);
+  assert.equal(requests, 3);
+});
+
+test('falls back for a transient CPA api-call status code', async () => {
+  let round = 1;
+  const file = cpaAuthFile('alpha');
+  const service = new SubQuotaService({
+    sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files: [file] }), { status: 200 });
+      }
+      if (round === 2) {
+        return new Response(JSON.stringify({ status_code: 503, body: { error: 'upstream busy' } }), { status: 200 });
+      }
+      return new Response(JSON.stringify(cpaUsageEnvelope(20)), { status: 200 });
+    },
+  });
+
+  const ready = await service.list();
+  round = 2;
+  const stale = await service.list({ refresh: true });
+  assert.equal(stale.availableCount, 1);
+  assert.equal(stale.quotas[0].id, 'alpha');
+  assert.equal(stale.quotas[0].rateLimits[0].remaining, 80);
+  assert.equal(stale.quotas[0].fetchedAt, ready.quotas[0].fetchedAt);
+  assert.equal(stale.quotas[0].stale, true);
+  assert.equal(stale.quotas[0].warning, 'HTTP 503: upstream busy');
+});
+
+test('does not revive CPA quota for an unauthorized status containing network wording', async () => {
+  let round = 1;
+  const file = cpaAuthFile('alpha');
+  const service = new SubQuotaService({
+    sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files: [file] }), { status: 200 });
+      }
+      if (round === 2) {
+        return new Response(JSON.stringify({
+          status_code: 401,
+          body: { error: 'upstream connection timed out' },
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify(cpaUsageEnvelope(20)), { status: 200 });
+    },
+  });
+
+  await service.list();
+  round = 2;
+  const unauthorized = await service.list({ refresh: true });
+  assert.equal(unauthorized.availableCount, 0);
+  assert.equal(unauthorized.quotas[0].error, 'HTTP 401: upstream connection timed out');
+  assert.equal(unauthorized.quotas[0].stale, undefined);
+});
+
+test('merges fresh and stale CPA accounts by stable account id', async () => {
+  let now = Date.parse('2026-07-19T00:00:00Z');
+  let round = 1;
+  const files = [cpaAuthFile('alpha'), cpaAuthFile('beta')];
+  const service = new SubQuotaService({
+    sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
+    now: () => now,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files }), { status: 200 });
+      }
+      const authIndex = JSON.parse(init.body).auth_index;
+      if (round === 2 && authIndex === 'auth-beta') throw new DOMException('aborted', 'AbortError');
+      const usedPercent = authIndex === 'auth-alpha' ? (round === 1 ? 10 : 30) : 20;
+      return new Response(JSON.stringify(cpaUsageEnvelope(usedPercent)), { status: 200 });
+    },
+  });
+
+  const first = await service.list();
+  const firstBeta = first.quotas.find((item) => item.id === 'beta');
+  round = 2;
+  now += 1000;
+  const second = await service.list({ refresh: true });
+  const alpha = second.quotas.find((item) => item.id === 'alpha');
+  const beta = second.quotas.find((item) => item.id === 'beta');
+  assert.equal(alpha.rateLimits[0].remaining, 70);
+  assert.equal(alpha.stale, undefined);
+  assert.equal(beta.rateLimits[0].remaining, 80);
+  assert.equal(beta.fetchedAt, firstBeta.fetchedAt);
+  assert.equal(beta.stale, true);
+  assert.equal(beta.warning, '请求超时');
+});
+
+test('uses all recent CPA accounts after a source-wide transient failure', async () => {
+  let round = 1;
+  const files = [cpaAuthFile('alpha'), cpaAuthFile('beta')];
+  const service = new SubQuotaService({
+    sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith('/auth-files')) {
+        if (round === 2) throw new DOMException('aborted', 'AbortError');
+        return new Response(JSON.stringify({ files }), { status: 200 });
+      }
+      const authIndex = JSON.parse(init.body).auth_index;
+      return new Response(JSON.stringify(cpaUsageEnvelope(authIndex === 'auth-alpha' ? 10 : 20)), { status: 200 });
+    },
+  });
+
+  await service.list();
+  round = 2;
+  const stale = await service.list({ refresh: true });
+  assert.deepEqual(stale.quotas.map((item) => item.id), ['alpha', 'beta']);
+  assert.ok(stale.quotas.every((item) => item.stale === true && item.warning === '请求超时'));
+  assert.equal(stale.availableCount, 2);
+});
+
+test('removes disappeared CPA accounts from source-wide fallback state', async () => {
+  let round = 1;
+  const alpha = cpaAuthFile('alpha');
+  const beta = cpaAuthFile('beta');
+  const service = new SubQuotaService({
+    sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith('/auth-files')) {
+        if (round === 3) throw new DOMException('aborted', 'AbortError');
+        return new Response(JSON.stringify({ files: round === 1 ? [alpha, beta] : [alpha] }), { status: 200 });
+      }
+      const authIndex = JSON.parse(init.body).auth_index;
+      return new Response(JSON.stringify(cpaUsageEnvelope(authIndex === 'auth-alpha' ? 10 : 20)), { status: 200 });
+    },
+  });
+
+  await service.list();
+  round = 2;
+  const reduced = await service.list({ refresh: true });
+  assert.deepEqual(reduced.quotas.map((item) => item.id), ['alpha']);
+
+  round = 3;
+  const stale = await service.list({ refresh: true });
+  assert.deepEqual(stale.quotas.map((item) => item.id), ['alpha']);
+  assert.equal(stale.quotas[0].stale, true);
 });
 
 test('cancels an oversized upstream response stream', async () => {

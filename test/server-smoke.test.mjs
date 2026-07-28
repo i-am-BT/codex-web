@@ -1637,7 +1637,10 @@ updated_at = 1784422800000
     assert.match(page, /setIconLabel\(subQuotaToggle,'gauge','额度',false\)/);
     assert.match(page, /subQuotaToggle\.setAttribute\('aria-controls','subQuotaSettingsDialog'\)/);
     assert.match(page, /subQuotaPopover\.id='subQuotaPopover'/);
-    assert.match(page, /pointerenter.*showSubQuotaPreview/);
+    assert.match(page, /subQuotaToggle\.addEventListener\('pointerenter'.*showSubQuotaPreview/);
+    assert.match(page, /subQuotaToggle\.addEventListener\('pointerleave',scheduleSubQuotaPreviewHide\)/);
+    assert.doesNotMatch(page, /subQuotaToggle\.addEventListener\('mouseenter'/);
+    assert.doesNotMatch(page, /subQuotaToggle\.addEventListener\('mouseleave'/);
     assert.match(page, /subQuotaToggle\.addEventListener\('click',handleSubQuotaToggleClick\)/);
     assert.match(page, /function handleSubQuotaToggleClick\(event\)/);
     assert.match(page, /const coarse=isCoarsePointer\(\)\|\|event\.pointerType==='touch'/);
@@ -1646,6 +1649,10 @@ updated_at = 1784422800000
     assert.doesNotMatch(page, /providerName\+\(quota\.name&&quota\.name!==providerName/);
     assert.match(page, /finiteSubQuotaNumber\(quota\.subscription\.monthly\?\.limit\)>0/);
     assert.match(page, /重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
+    assert.match(page, /if\(stale\)appendSubQuotaMeta\(meta,subQuotaStaleMetaText\(quota\)\)/);
+    assert.match(page, /subQuotaStatus\.textContent=subQuotaFetchedStatusText\(data\.fetchedAt,hasStale\)/);
+    assert.match(page, /if\(quota\.valid===false\)\{/);
+    assert.doesNotMatch(page, /if\(quota\.valid===false&&!?stale\)/);
     assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
     assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
     assert.match(page, /title\.textContent='额度监控'/);
@@ -1855,6 +1862,65 @@ updated_at = 1784422800000
     )();
     assert.equal(formatSubQuotaDateTime('2026-07-29T14:08:28'), '07/29 14:08');
     assert.equal(formatSubQuotaDateTime('invalid'), '');
+    const subQuotaPreviewHelpers = inlineScript.match(/(function showSubQuotaPreview[\s\S]*?)(?=function cancelSubQuotaPreviewHide)/)?.[1];
+    assert.ok(subQuotaPreviewHelpers);
+    const previewClasses = new Set(['hidden']);
+    const previewAttributes = new Map();
+    const previewPopover = {
+      classList: {
+        contains: (name) => previewClasses.has(name),
+        add: (name) => previewClasses.add(name),
+        remove: (name) => previewClasses.delete(name),
+      },
+    };
+    const previewToggle = {
+      dataset: {},
+      setAttribute: (name, value) => previewAttributes.set(name, String(value)),
+    };
+    let subQuotaLoads = 0;
+    const subQuotaPreviewApi = new Function(
+      'subQuotaPopover',
+      'subQuotaToggle',
+      'subQuotaSettingsOverlay',
+      'cancelSubQuotaPreviewHide',
+      'loadSubQuota',
+      subQuotaPreviewHelpers + '; return { showSubQuotaPreview, hideSubQuotaPreview };',
+    )(
+      previewPopover,
+      previewToggle,
+      null,
+      () => {},
+      async () => { subQuotaLoads += 1; },
+    );
+    subQuotaPreviewApi.showSubQuotaPreview();
+    subQuotaPreviewApi.showSubQuotaPreview();
+    assert.equal(subQuotaLoads, 1);
+    assert.equal(previewClasses.has('hidden'), false);
+    assert.equal(previewAttributes.get('aria-expanded'), 'true');
+    assert.equal(previewToggle.dataset.previewOpen, '1');
+    subQuotaPreviewApi.hideSubQuotaPreview();
+    assert.equal(previewClasses.has('hidden'), true);
+    assert.equal(previewAttributes.get('aria-expanded'), 'false');
+    assert.equal(previewToggle.dataset.previewOpen, undefined);
+    subQuotaPreviewApi.showSubQuotaPreview();
+    assert.equal(subQuotaLoads, 2);
+    const subQuotaStaleHelpers = inlineScript.match(/(function subQuotaStaleMetaText[\s\S]*?)(?=function renderSubQuotaError)/)?.[1];
+    assert.ok(subQuotaStaleHelpers);
+    const subQuotaStaleApi = new Function(
+      'formatSubQuotaTime',
+      subQuotaStaleHelpers + '; return { subQuotaStaleMetaText, subQuotaFetchedStatusText };',
+    )((value) => value === 'stale-at' ? '10:02' : value === 'checked-at' ? '10:12' : '');
+    assert.equal(
+      subQuotaStaleApi.subQuotaStaleMetaText({ stale: true, fetchedAt: 'stale-at', warning: '请求超时' }),
+      '刷新失败，显示 10:02 的上次数据 · 请求超时',
+    );
+    assert.equal(
+      subQuotaStaleApi.subQuotaStaleMetaText({ stale: true, fetchedAt: 'stale-at', warning: '刷新失败：请求超时' }),
+      '刷新失败，显示 10:02 的上次数据 · 请求超时',
+    );
+    assert.equal(subQuotaStaleApi.subQuotaStaleMetaText({ stale: true }), '刷新失败，显示上次数据');
+    assert.equal(subQuotaStaleApi.subQuotaFetchedStatusText('checked-at', true), '检查于 10:12');
+    assert.equal(subQuotaStaleApi.subQuotaFetchedStatusText('checked-at', false), '更新于 10:12');
     const singleFlightHelper = inlineScript.match(/(function createTrailingSingleFlight[\s\S]*?)(?=function readPromptQueues)/)?.[1];
     assert.ok(singleFlightHelper);
     const createTrailingSingleFlight = new Function(

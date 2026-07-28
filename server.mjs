@@ -9178,9 +9178,7 @@ function enhanceSubQuota(sideActions){
   ensureSubQuotaSettingsDialog();
 
   subQuotaToggle.addEventListener('pointerenter',(event)=>{if(!isCoarsePointer()&&event.pointerType!=='touch')showSubQuotaPreview()});
-  subQuotaToggle.addEventListener('mouseenter',()=>{if(!isCoarsePointer())showSubQuotaPreview()});
   subQuotaToggle.addEventListener('pointerleave',scheduleSubQuotaPreviewHide);
-  subQuotaToggle.addEventListener('mouseleave',scheduleSubQuotaPreviewHide);
   subQuotaToggle.addEventListener('focus',()=>{if(!suppressSubQuotaFocusPreview&&!isCoarsePointer())showSubQuotaPreview()});
   subQuotaToggle.addEventListener('blur',(event)=>{if(!subQuotaPopover.contains(event.relatedTarget))scheduleSubQuotaPreviewHide()});
   subQuotaToggle.addEventListener('click',handleSubQuotaToggleClick);
@@ -9213,10 +9211,11 @@ function handleSubQuotaToggleClick(event){
 function showSubQuotaPreview(){
   if(!subQuotaPopover||!subQuotaToggle)return;
   cancelSubQuotaPreviewHide();
+  const wasHidden=subQuotaPopover.classList.contains('hidden');
   subQuotaPopover.classList.remove('hidden');
   subQuotaToggle.setAttribute('aria-expanded','true');
   subQuotaToggle.dataset.previewOpen='1';
-  loadSubQuota();
+  if(wasHidden)void loadSubQuota();
 }
 function hideSubQuotaPreview(){
   if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
@@ -9250,9 +9249,11 @@ function renderSubQuota(data){
   if(!data?.configured){renderSubQuotaError('尚未配置额度渠道');return}
   const quotas=Array.isArray(data.quotas)?data.quotas:[];
   if(!quotas.length){renderSubQuotaError('未返回额度数据');return}
+  const hasStale=quotas.some((quota)=>quota?.stale);
   let rendered=0;
   for(const quota of quotas){
-    if(quota.error){
+    const stale=Boolean(quota?.stale);
+    if(quota.error&&!stale){
       const error=document.createElement('div');
       error.className='subQuotaError';
       error.textContent=(quota.name?quota.name+'：':'')+'暂不可用：'+quota.error;
@@ -9309,6 +9310,7 @@ function renderSubQuota(data){
     for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
       if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit.window)+'重置 '+formatSubQuotaDateTime(rateLimit.resetAt));
     }
+    if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
     if(!detailCount&&!meta.childElementCount)continue;
     if(meta.childElementCount)source.appendChild(meta);
     subQuotaContent.appendChild(source);
@@ -9316,7 +9318,7 @@ function renderSubQuota(data){
   }
   if(!rendered){renderSubQuotaError('未返回可显示的额度数据');return}
   delete subQuotaStatus.dataset.state;
-  subQuotaStatus.textContent=data.fetchedAt?'更新于 '+formatSubQuotaTime(data.fetchedAt):'';
+  subQuotaStatus.textContent=subQuotaFetchedStatusText(data.fetchedAt,hasStale);
 }
 function subQuotaProgressPercent(used,limit,remaining,unit){
   const progressAmount=remaining!==null?remaining:used;
@@ -9374,6 +9376,16 @@ function formatSubQuotaAmount(value,unit){const number=finiteSubQuotaNumber(valu
 function formatSubQuotaDate(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'}):String(value||'')}
 function formatSubQuotaDateTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}):''}
 function formatSubQuotaTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
+function subQuotaStaleMetaText(quota){
+  const staleTime=formatSubQuotaTime(quota?.fetchedAt);
+  const warning=String(quota?.warning||quota?.error||'').trim().replace(/^刷新失败[：:]\s*/,'').slice(0,120);
+  const message=staleTime?'刷新失败，显示 '+staleTime+' 的上次数据':'刷新失败，显示上次数据';
+  return warning?message+' · '+warning:message;
+}
+function subQuotaFetchedStatusText(fetchedAt,hasStale){
+  const time=formatSubQuotaTime(fetchedAt);
+  return time?(hasStale?'检查于 ':'更新于 ')+time:'';
+}
 function renderSubQuotaError(message){
   subQuotaContent.replaceChildren();
   const error=document.createElement('div');
