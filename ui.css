@@ -9794,13 +9794,13 @@ body .composer > .box:focus-within {
   }
 
   .promptQueueRow {
-    grid-template-columns: 16px minmax(0, 1fr) auto 28px 28px;
+    grid-template-columns: 22px minmax(0, 1fr) auto 28px 28px;
     gap: 2px;
     padding-inline: 8px 5px;
   }
 
   .promptQueueRow.appOwned {
-    grid-template-columns: 16px minmax(0, 1fr);
+    grid-template-columns: 22px minmax(0, 1fr);
   }
 
   .promptQueueGuide {
