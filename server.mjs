@@ -984,7 +984,9 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       && message.turnId
     ));
     if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户或助手消息创建分支' });
-    const forkedThroughTurnId = target.role === 'assistant' ? target.turnId : target.previousTurnId;
+    const forkedThroughTurnId = target.role === 'assistant'
+      ? target.retrySourceTurnId || target.turnId
+      : target.previousTurnId;
     if (target.role === 'user' && !forkedThroughTurnId && source.truncated) {
       return res.status(409).json({ error: '会话历史已截断，无法确定这条消息之前的 turn' });
     }

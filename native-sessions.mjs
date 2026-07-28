@@ -968,6 +968,8 @@ function createDetailCache(entry, options) {
     currentTurnTokenUsage: null,
     turnStartScanComplete: startOffset === 0,
     displayUserMessagesInTurn: 0,
+    pendingThreadRollbackTurnId: '',
+    retryFallbackAssistant: null,
     lastTimestamp: '',
     subagentTurnIds: new Set(),
     contentMutated: false,
@@ -1302,6 +1304,7 @@ function applyEventRecord(cache, record, payload, maxMessages) {
       break;
     case 'task_complete': {
       cache.status = 'done';
+      restoreRolledBackRetryAssistant(cache, maxMessages);
       // Promote the latest unphased assistant bubble of this turn to final_answer so Web history
       // keeps intermediate progress separate from the permanent reply.
       promoteLatestAssistantFinalAnswer(cache);
@@ -1321,7 +1324,11 @@ function applyEventRecord(cache, record, payload, maxMessages) {
     case 'turn_aborted':
     case 'error':
       cache.status = 'error';
+      restoreRolledBackRetryAssistant(cache, maxMessages);
       appendNativeMessage(cache, 'process', payload.message || payload.error || '任务中断', record, maxMessages, payload.type);
+      break;
+    case 'thread_rolled_back':
+      cache.pendingThreadRollbackTurnId = cache.currentTurnId || cache.latestTurnId || '';
       break;
     case 'context_compacted':
       if (cache.messages.at(-1)?.kind !== 'context_compacted') {
@@ -1436,6 +1443,14 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   }
   if (payload.role === 'user' && !contexts.length && (displayText || images.length)) {
     const turnId = String(payload.internal_chat_message_metadata_passthrough?.turn_id || '');
+    if (cache.displayUserMessagesInTurn === 0) {
+      if (turnId && turnId === cache.currentTurnId) {
+        collapseRolledBackRetryTurn(cache, displayText, images.length > 0);
+      } else {
+        cache.pendingThreadRollbackTurnId = '';
+        cache.retryFallbackAssistant = null;
+      }
+    }
     if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
       messageKind = browserComments ? 'steering_browser_comment' : 'steering_user';
     }
@@ -1454,6 +1469,86 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
     ? ['steering_user', 'steering_browser_comment'].includes(messageKind) ? 'steering_input_image' : 'input_image'
     : 'output_image';
   for (const image of images) appendNativeMessage(cache, 'image', image, record, maxMessages, imageKind);
+}
+
+function collapseRolledBackRetryTurn(cache, displayText, hasImages) {
+  const rolledBackTurnId = String(cache.pendingThreadRollbackTurnId || '');
+  cache.pendingThreadRollbackTurnId = '';
+  if (!rolledBackTurnId || hasImages || !isExplicitRetryRequest(displayText)) {
+    cache.retryFallbackAssistant = null;
+    return false;
+  }
+
+  const currentTurnId = String(cache.currentTurnId || '');
+  if (!currentTurnId || currentTurnId === rolledBackTurnId) {
+    cache.retryFallbackAssistant = null;
+    return false;
+  }
+
+  const rolledBackMessages = cache.messages.filter((message) => message.turnId === rolledBackTurnId);
+  const rolledBackUsers = rolledBackMessages.filter((message) => message.role === 'user');
+  if (
+    rolledBackUsers.length !== 1
+    || !['', 'message'].includes(String(rolledBackUsers[0].kind || ''))
+    || !isExplicitRetryRequest(rolledBackUsers[0].content)
+    || rolledBackMessages.some((message) => message.role === 'image')
+  ) {
+    cache.retryFallbackAssistant = null;
+    return false;
+  }
+
+  const previousTurnId = String(rolledBackUsers[0].previousTurnId || '');
+  const fallback = latestRetryAssistantResult(rolledBackMessages) || cache.retryFallbackAssistant;
+  cache.messages = cache.messages.filter((message) => message.turnId !== rolledBackTurnId);
+  for (const message of cache.messages) {
+    if (message.turnId === currentTurnId) message.previousTurnId = previousTurnId || undefined;
+  }
+  cache.previousTurnId = previousTurnId;
+  cache.retryFallbackAssistant = fallback ? { ...fallback } : null;
+  cache.contentMutated = true;
+  return true;
+}
+
+function isExplicitRetryRequest(text) {
+  return String(text || '').replace(/\s+/g, '') === '重试';
+}
+
+function latestRetryAssistantResult(messages) {
+  const candidates = messages.filter((message) => (
+    message.role === 'assistant'
+    && !shouldHideHandoffMessage(message)
+    && ['', 'message', 'final_answer'].includes(String(message.kind || ''))
+  ));
+  return [...candidates].reverse().find((message) => message.kind === 'final_answer')
+    || [...candidates].reverse().find((message) => !isProgressStyleText(message.content))
+    || null;
+}
+
+function restoreRolledBackRetryAssistant(cache, maxMessages) {
+  const fallback = cache.retryFallbackAssistant;
+  if (!fallback) return;
+  cache.retryFallbackAssistant = null;
+  const currentTurnId = String(cache.currentTurnId || '');
+  if (!currentTurnId) return;
+  const currentMessages = cache.messages.filter((message) => message.turnId === currentTurnId);
+  if (currentMessages.some((message) => (
+    message.role === 'assistant'
+    && !shouldHideHandoffMessage(message)
+    && canMergeAssistantKind(message.kind)
+  ))) return;
+
+  cache.messages.push({
+    ...fallback,
+    seq: cache.nextSequence++,
+    kind: 'final_answer',
+    turnId: currentTurnId,
+    previousTurnId: cache.previousTurnId || undefined,
+    retrySourceTurnId: fallback.retrySourceTurnId || fallback.turnId || undefined,
+  });
+  if (cache.messages.length > maxMessages) {
+    cache.messages.splice(0, cache.messages.length - maxMessages);
+    cache.messagesTruncated = true;
+  }
 }
 
 function isBrowserCommentsMessage(text) {

@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const [serverSource, uiStyles] = await Promise.all([
+const [serverSource, uiStyles, nativeSessionSource] = await Promise.all([
   readFile(new URL('../server.mjs', import.meta.url), 'utf8'),
   readFile(new URL('../ui.css', import.meta.url), 'utf8'),
+  readFile(new URL('../native-sessions.mjs', import.meta.url), 'utf8'),
 ]);
 const rawInlineScript = serverSource.match(/<script>([\s\S]*?)<\/script>/)?.[1] || '';
 const inlineScript = rawInlineScript.replaceAll('\\\\', '\\');
@@ -999,6 +1000,14 @@ test('reset while a native turn is still running reloads the conversation instea
   assert.match(inlineScript, /\['','message','commentary','final_answer'\]\.includes\(kind\)/);
   assert.match(inlineScript, /const syncDelay=webRunActive&&currentConversationSource==='codex'\?80:260/);
   assert.match(inlineScript, /dataset\.nativeMessageSeq/);
+});
+
+test('rolled-back retry collapse invalidates the open page before appending the latest attempt', () => {
+  assert.match(nativeSessionSource, /case 'thread_rolled_back':[\s\S]*?pendingThreadRollbackTurnId/);
+  assert.match(nativeSessionSource, /function collapseRolledBackRetryTurn[\s\S]*?cache\.contentMutated = true/);
+  const syncSource = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
+  assert.ok(syncSource.indexOf('if(conversation.reset)') < syncSource.indexOf('for(const msg of conversation.messages||[])'));
+  assert.match(syncSource, /if\(conversation\.reset\)[\s\S]*?await loadConversation\(id,'codex'\)/);
 });
 
 test('message action chrome stays hidden until hover or touch selection', () => {

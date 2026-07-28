@@ -1602,6 +1602,188 @@ test('hides hash-title handoff agent summaries from web history', async () => {
   }
 });
 
+test('collapses consecutive rolled-back retries into the latest logical reply', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-retry-collapse-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019fa649-3c45-77c1-90a6-f505aa4098ad';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '28');
+  const sessionFile = path.join(sessionDir, 'rollout-2026-07-28T09-00-00-' + id + '.jsonl');
+  let store;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(path.join(codexHome, 'session_index.jsonl'), [
+      JSON.stringify({ id, thread_name: 'retry collapse', updated_at: '2026-07-28T01:00:00Z' }),
+      '',
+    ].join('\n'));
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-28T01:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, timestamp: '2026-07-28T01:00:00.000Z', cwd: temporary, source: 'vscode' },
+      },
+      { timestamp: '2026-07-28T01:00:01.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'base-turn' } },
+      {
+        timestamp: '2026-07-28T01:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '启动任务' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'base-turn' },
+        },
+      },
+      { timestamp: '2026-07-28T01:00:03.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'base-turn', duration_ms: 2000 } },
+      { timestamp: '2026-07-28T01:01:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'retry-a' } },
+      {
+        timestamp: '2026-07-28T01:01:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '重试\n' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'retry-a' },
+        },
+      },
+      {
+        timestamp: '2026-07-28T01:01:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '上一次有效结果' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'retry-a' },
+        },
+      },
+      { timestamp: '2026-07-28T01:01:03.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'retry-a', duration_ms: 38000 } },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const before = store.get(id);
+    assert.equal(before.messages.filter((message) => message.role === 'user' && message.content === '重试').length, 1);
+
+    await appendFile(sessionFile, jsonl([
+      { timestamp: '2026-07-28T01:02:00.000Z', type: 'event_msg', payload: { type: 'thread_rolled_back' } },
+      { timestamp: '2026-07-28T01:02:01.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'retry-b' } },
+      {
+        timestamp: '2026-07-28T01:02:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '  重试  ' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'retry-b' },
+        },
+      },
+    ]));
+    store.refresh();
+
+    const incremental = store.get(id, {
+      after: before.cursor,
+      generation: before.generation,
+      limit: 80,
+    });
+    assert.equal(incremental.reset, true, 'the open Web page must reload to remove the old retry turn');
+    const running = store.get(id);
+    assert.equal(running.status, 'running');
+    assert.deepEqual(
+      running.messages.filter((message) => message.role === 'user' && message.content === '重试').map((message) => ({
+        turnId: message.turnId,
+        previousTurnId: message.previousTurnId,
+      })),
+      [{ turnId: 'retry-b', previousTurnId: 'base-turn' }],
+    );
+    assert.equal(running.messages.some((message) => message.turnId === 'retry-a'), false);
+    assert.equal(running.messages.some((message) => message.content === '上一次有效结果'), false);
+
+    await appendFile(sessionFile, jsonl([
+      { timestamp: '2026-07-28T01:03:49.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'retry-b', duration_ms: 107000 } },
+    ]));
+    store.refresh();
+    const completed = store.get(id);
+    const retryUsers = completed.messages.filter((message) => message.role === 'user' && message.content === '重试');
+    const retryCompletions = completed.messages.filter((message) => message.kind === 'task_complete' && message.turnId.startsWith('retry-'));
+    const retainedResult = completed.messages.find((message) => message.content === '上一次有效结果');
+    assert.equal(retryUsers.length, 1);
+    assert.deepEqual(retryCompletions.map((message) => message.turnId), ['retry-b']);
+    assert.equal(retainedResult.turnId, 'retry-b');
+    assert.equal(retainedResult.retrySourceTurnId, 'retry-a');
+    assert.equal(retainedResult.kind, 'final_answer');
+    assert.ok(retainedResult.seq > retryUsers[0].seq);
+
+    await appendFile(sessionFile, jsonl([
+      { timestamp: '2026-07-28T01:03:50.000Z', type: 'event_msg', payload: { type: 'thread_rolled_back' } },
+      { timestamp: '2026-07-28T01:03:51.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'retry-c' } },
+      {
+        timestamp: '2026-07-28T01:03:52.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '重试' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'retry-c' },
+        },
+      },
+      {
+        timestamp: '2026-07-28T01:03:53.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: '最新短结果' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'retry-c' },
+        },
+      },
+      { timestamp: '2026-07-28T01:03:54.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'retry-c' } },
+    ]));
+    store.refresh();
+    const latestResult = store.get(id);
+    assert.deepEqual(
+      latestResult.messages.filter((message) => message.role === 'user' && message.content === '重试').map((message) => message.turnId),
+      ['retry-c'],
+    );
+    assert.equal(latestResult.messages.some((message) => message.content === '上一次有效结果'), false);
+    const latestAssistant = latestResult.messages.find((message) => message.content === '最新短结果');
+    assert.equal(latestAssistant.turnId, 'retry-c');
+    assert.equal(latestAssistant.kind, 'final_answer');
+
+    await appendFile(sessionFile, jsonl([
+      { timestamp: '2026-07-28T01:04:00.000Z', type: 'event_msg', payload: { type: 'thread_rolled_back' } },
+      { timestamp: '2026-07-28T01:04:01.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'ordinary-a' } },
+      {
+        timestamp: '2026-07-28T01:04:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '检查状态' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'ordinary-a' },
+        },
+      },
+      { timestamp: '2026-07-28T01:04:03.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'ordinary-a' } },
+      { timestamp: '2026-07-28T01:05:00.000Z', type: 'event_msg', payload: { type: 'thread_rolled_back' } },
+      { timestamp: '2026-07-28T01:05:01.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'ordinary-b' } },
+      {
+        timestamp: '2026-07-28T01:05:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '检查状态' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'ordinary-b' },
+        },
+      },
+      { timestamp: '2026-07-28T01:05:03.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'ordinary-b' } },
+    ]));
+    store.refresh();
+    const ordinary = store.get(id);
+    assert.equal(ordinary.messages.filter((message) => message.role === 'user' && message.content === '检查状态').length, 2);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 function jsonl(records) {
   return records.map((record) => JSON.stringify(record)).join('\n') + '\n';
 }
