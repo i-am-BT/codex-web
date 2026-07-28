@@ -930,6 +930,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live:not\(\[open\]\)\s*\{[^}]*width:\s*max-content;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.turnResultHead > \.turnResultFileLabel\s*\{[^}]*flex:\s*0 0 auto;[^}]*overflow:\s*visible;[^}]*text-overflow:\s*clip/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\)\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 34px\)\);[^}]*border:\s*0;[^}]*background:\s*transparent;[^}]*padding:\s*0;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.composerProjectPicker\s*\{[^}]*width:\s*calc\(100% - 29px\)/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.box\s*\{[^}]*width:\s*100%/s);
