@@ -1577,6 +1577,25 @@ test('hides hash-title handoff agent summaries from web history', async () => {
         },
       },
       {
+        timestamp: '2026-07-23T10:00:02.750Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            'Context checkpoint:',
+            '',
+            '**Current State**',
+            '- Repo: /workspace/codex-web',
+            '- Branch: fix/internal-summary',
+            '',
+            '**Implementation Direction**',
+            '1. Continue from the compacted context.',
+          ].join('\n') }],
+        },
+      },
+      {
         timestamp: '2026-07-23T10:00:03.000Z',
         type: 'response_item',
         payload: {
@@ -1593,6 +1612,8 @@ test('hides hash-title handoff agent summaries from web history', async () => {
     assert.ok(conversation);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Handoff: Codex Web UI')), false);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Current Progress')), false);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Context checkpoint')), false);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('fix/internal-summary')), false);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Send the final response')), false);
     assert.equal(conversation.messages.some((message) => message.kind === 'handoff_summary'), false);
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content.includes('已隐藏交接摘要')));

@@ -1819,6 +1819,13 @@ updated_at = 1784422800000
     assert.equal(isCompletedNativeRuntimeTurn('', 'turn-old', 'turn-old'), false);
     assert.doesNotMatch(inlineScript, /function\s+([A-Za-z_$][\w$]*)function\s+\1\b/);
     assert.doesNotThrow(() => new Function(inlineScript));
+    const handoffDisplayHelper = inlineScript.match(/(function isHandoffSummaryText[\s\S]*?)(?=function isProgressStyleAssistantText)/)?.[1];
+    assert.ok(handoffDisplayHelper);
+    const isHandoffSummaryText = new Function(
+      handoffDisplayHelper + '; return isHandoffSummaryText;',
+    )();
+    assert.equal(isHandoffSummaryText('Context checkpoint:\n\n**Current State**\n- Repo: /workspace'), true);
+    assert.equal(isHandoffSummaryText('已完成 Context checkpoint 显示修复。'), false);
     const subQuotaProgressHelper = inlineScript.match(/(function subQuotaProgressPercent[\s\S]*?)(?=function appendSubQuotaWindow)/)?.[1];
     assert.ok(subQuotaProgressHelper);
     const subQuotaProgressPercent = new Function(

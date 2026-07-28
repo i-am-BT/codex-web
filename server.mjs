@@ -13727,7 +13727,7 @@ function isHandoffSummaryText(text){
   if(!normalized)return false;
   const firstLine=normalized.split('\\n',1)[0].trim();
   const plain=firstLine.replace(/^#{1,6}\\s+/,'').replace(/^\\*{1,2}|\\*{1,2}$/g,'').replace(/^_+|_+$/g,'').trim().toLowerCase();
-  if(plain==='handoff'||plain==='handoff summary'||plain==='current task'||plain==='current progress'||plain.startsWith('handoff:')||plain.startsWith('handoff summary:')||plain.startsWith('current task:')||plain.startsWith('current progress:')||plain.startsWith('交接摘要')||/^\\*\\*handoff(?:\\s+summary)?\\*\\*/i.test(firstLine)||/^\\*\\*current task\\*\\*/i.test(firstLine)||/^\\*\\*current progress\\*\\*/i.test(firstLine))return true;
+  if(plain==='handoff'||plain==='handoff summary'||plain==='context checkpoint'||plain==='current task'||plain==='current progress'||plain.startsWith('handoff:')||plain.startsWith('handoff summary:')||plain.startsWith('context checkpoint:')||plain.startsWith('current task:')||plain.startsWith('current progress:')||plain.startsWith('交接摘要')||/^\\*\\*handoff(?:\\s+summary)?\\*\\*/i.test(firstLine)||/^\\*\\*current task\\*\\*/i.test(firstLine)||/^\\*\\*current progress\\*\\*/i.test(firstLine))return true;
   const head=normalized.slice(0,1200).toLowerCase();
   const hasGoal=head.includes('## goal')||head.includes('## 目标');
   const hasOps=head.includes('service / ops')||head.includes('immediate next steps')||head.includes('already done')||head.includes('key files')||head.includes('constraints');

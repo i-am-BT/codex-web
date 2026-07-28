@@ -1397,10 +1397,12 @@ function isHandoffSummaryText(text) {
   if (
     plain === 'handoff'
     || plain === 'handoff summary'
+    || plain === 'context checkpoint'
     || plain === 'current task'
     || plain === 'current progress'
     || plain.startsWith('handoff:')
     || plain.startsWith('handoff summary:')
+    || plain.startsWith('context checkpoint:')
     || plain.startsWith('current task:')
     || plain.startsWith('current progress:')
     || plain.startsWith('交接摘要')
