@@ -4174,6 +4174,21 @@ body .msg.assistant .markdownBody li + li {
   color: var(--primary-hover, var(--primary));
 }
 
+.markdownBody a.markdownFileLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+  vertical-align: -1px;
+}
+
+.markdownBody a.markdownFileLink .markdownFileLinkIcon {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  stroke-width: 1.9;
+}
+
 .chatLinkMenu {
   position: fixed;
   z-index: 1200;

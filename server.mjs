@@ -11977,6 +11977,17 @@ function normalizeMarkdownUrl(value){
   }catch(e){}
   return '';
 }
+function markdownLocalFileIcon(href){
+  let path=String(href||'').trim().split(/[?#]/,1)[0];
+  try{path=decodeURIComponent(path)}catch(e){}
+  if(!/^\\/(?:Users|Volumes|workspace|opt|var|tmp|home|root)\\//.test(path))return'';
+  path=path.replace(/:\\d+(?::\\d+)?$/,'');
+  const extension=path.match(/\\.([A-Za-z0-9]+)$/)?.[1]?.toLowerCase()||'';
+  if(['css','scss','sass','less'].includes(extension))return'hash';
+  if(['md','mdx','txt','log','rst'].includes(extension))return'file-text';
+  if(['png','jpg','jpeg','webp','gif','svg','avif'].includes(extension))return'image';
+  return extension?'file-code-2':'file';
+}
 function decorateMarkdownLink(link,href){
   if(!link||!href)return link;
   link.classList.add('markdownLink');
@@ -11984,6 +11995,15 @@ function decorateMarkdownLink(link,href){
   link.rel='noopener noreferrer';
   if(!link.title)link.title=href;
   link.dataset.linkUrl=href;
+  const fileIcon=markdownLocalFileIcon(href);
+  if(fileIcon&&!link.querySelector(':scope > .markdownFileLinkIcon')){
+    link.classList.add('markdownFileLink');
+    const icon=document.createElement('i');
+    icon.className='markdownFileLinkIcon';
+    icon.setAttribute('data-lucide',fileIcon);
+    icon.setAttribute('aria-hidden','true');
+    link.prepend(icon);
+  }
   return link;
 }
 function createMarkdownLink(href,label){
@@ -14092,11 +14112,10 @@ function createEditedFilesResultCard(files,turnId,{live=false,plan=[]}={}){
 }
 function moveLiveEditedFilesResultToEnd(){
   if(!liveEditedFilesResult?.isConnected||!composer||!dropZone)return;
-  // The capsule is the visual boundary: every output/status artifact must stay
-  // above it. attachmentTray follows dropZone in the DOM, so using it as the
-  // anchor puts the live result below the input after history hydration.
-  if(liveEditedFilesResult.parentNode!==composer||liveEditedFilesResult.nextSibling!==dropZone){
-    composer.insertBefore(liveEditedFilesResult,dropZone);
+  // File changes belong above the queue; both stay above the input capsule.
+  const anchor=promptQueuePanel?.parentNode===composer?promptQueuePanel:dropZone;
+  if(liveEditedFilesResult.parentNode!==composer||liveEditedFilesResult.nextSibling!==anchor){
+    composer.insertBefore(liveEditedFilesResult,anchor);
   }
 }
 function refreshLiveEditedFilesResult(){

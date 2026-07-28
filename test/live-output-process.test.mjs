@@ -367,14 +367,14 @@ test('the live progress pill stays out of completion artifacts', () => {
   };
   const promptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
   const hiddenAttachmentTray = { kind: 'hidden-attachment-tray', parentNode: null, isConnected: true };
-  const dropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [promptQueuePanel] };
+  const dropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [] };
   let composerInsertCalls = 0;
   const composer = {
-    // Match the real composer DOM: input capsule first, attachment tray after it.
-    children: [dropZone, hiddenAttachmentTray],
+    // Match enhanceComposer(): queue, attachment tray, then input capsule.
+    children: [promptQueuePanel, hiddenAttachmentTray, dropZone],
     insertBefore(node, reference) {
       composerInsertCalls += 1;
-      assert.strictEqual(reference, dropZone);
+      assert.strictEqual(reference, promptQueuePanel);
       detachNode(node);
       const index = this.children.indexOf(reference);
       assert.notEqual(index, -1);
@@ -394,7 +394,7 @@ test('the live progress pill stays out of completion artifacts', () => {
       return previous;
     },
   };
-  promptQueuePanel.parentNode = dropZone;
+  promptQueuePanel.parentNode = composer;
   hiddenAttachmentTray.parentNode = composer;
   dropZone.parentNode = composer;
   const toolArtifact = { kind: 'tool-artifact' };
@@ -455,11 +455,13 @@ test('the live progress pill stays out of completion artifacts', () => {
   const second = api.refresh();
   assert.notStrictEqual(first, second);
   assert.deepEqual(timeline.children, []);
-  assert.deepEqual(composer.children, [second, dropZone, hiddenAttachmentTray]);
+  assert.deepEqual(composer.children, [second, promptQueuePanel, hiddenAttachmentTray, dropZone]);
   assert.strictEqual(second.parentNode, composer);
-  assert.strictEqual(second.nextSibling, dropZone);
-  assert.ok(composer.children.indexOf(second) < composer.children.indexOf(dropZone));
-  assert.ok(promptQueuePanel.parentNode === dropZone || promptQueuePanel.parentNode === composer);
+  assert.strictEqual(second.nextSibling, promptQueuePanel);
+  assert.ok(composer.children.indexOf(second) < composer.children.indexOf(promptQueuePanel));
+  assert.ok(composer.children.indexOf(promptQueuePanel) < composer.children.indexOf(hiddenAttachmentTray));
+  assert.ok(composer.children.indexOf(hiddenAttachmentTray) < composer.children.indexOf(dropZone));
+  assert.strictEqual(promptQueuePanel.parentNode, composer);
   assert.equal(composerInsertCalls, 1);
   assert.deepEqual(api.state().turnProcessElements, [toolArtifact]);
   assert.equal(api.state().turnProcessElements.includes(second), false);

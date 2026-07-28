@@ -1826,6 +1826,19 @@ updated_at = 1784422800000
     )();
     assert.equal(isHandoffSummaryText('Context checkpoint:\n\n**Current State**\n- Repo: /workspace'), true);
     assert.equal(isHandoffSummaryText('已完成 Context checkpoint 显示修复。'), false);
+    const markdownFileIconHelper = inlineScript.match(/(function markdownLocalFileIcon[\s\S]*?)(?=function decorateMarkdownLink)/)?.[1];
+    assert.ok(markdownFileIconHelper);
+    const markdownLocalFileIcon = new Function(
+      markdownFileIconHelper + '; return markdownLocalFileIcon;',
+    )();
+    assert.equal(markdownLocalFileIcon('/Volumes/ikirito/docker/codex-web/server.mjs:11980'), 'file-code-2');
+    assert.equal(markdownLocalFileIcon('/Volumes/ikirito/docker/codex-web/ui.css'), 'hash');
+    assert.equal(markdownLocalFileIcon('/Users/ikirito/Documents/notes.md'), 'file-text');
+    assert.equal(markdownLocalFileIcon('https://example.com/app.js'), '');
+    assert.equal(markdownLocalFileIcon('/playground/index.html'), '');
+    assert.match(inlineScript, /link\.prepend\(icon\)/);
+    assert.match(uiStyles, /\.markdownBody a\.markdownFileLink\s*\{[^}]*display:\s*inline-flex;[^}]*gap:\s*3px/s);
+    assert.match(uiStyles, /\.markdownFileLinkIcon\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px/s);
     const subQuotaProgressHelper = inlineScript.match(/(function subQuotaProgressPercent[\s\S]*?)(?=function appendSubQuotaWindow)/)?.[1];
     assert.ok(subQuotaProgressHelper);
     const subQuotaProgressPercent = new Function(
@@ -2845,6 +2858,36 @@ updated_at = 1784422800000
     assert.equal(planTooltip.attributes.get('role'), 'tooltip');
     assert.deepEqual(planTooltip.children.map((node) => node.children.find((child) => child.className === 'turnPlanTooltipText')?.textContent), referencePlan.map((item) => item.step));
 
+    const revealEditedFilesHelper = inlineScript.match(
+      /(function revealExpandedEditedFilesCard[\s\S]*?)(?=function createEditedFilesResultCard)/,
+    )?.[1];
+    assert.ok(revealEditedFilesHelper);
+    const revealScrollCalls = [];
+    const revealFollowStates = [];
+    const revealExpandedEditedFilesCard = new Function(
+      'chat',
+      'setNativeLiveFollowBottom',
+      revealEditedFilesHelper + '; return revealExpandedEditedFilesCard;',
+    )(
+      {
+        scrollTop: 400,
+        getBoundingClientRect: () => ({ top: 100 }),
+        scrollTo: (options) => revealScrollCalls.push(options),
+      },
+      (value) => revealFollowStates.push(value),
+    );
+    const expandedEditedCard = {
+      open: true,
+      isConnected: true,
+      getBoundingClientRect: () => ({ top: 520 }),
+    };
+    revealExpandedEditedFilesCard(expandedEditedCard);
+    assert.deepEqual(revealFollowStates, [false]);
+    assert.deepEqual(revealScrollCalls, [{ top: 808, behavior: 'smooth' }]);
+    expandedEditedCard.open = false;
+    revealExpandedEditedFilesCard(expandedEditedCard);
+    assert.equal(revealScrollCalls.length, 1);
+
     const liveResultHelpers = inlineScript.match(
       /(function moveLiveEditedFilesResultToEnd[\s\S]*?)(?=function createWebPreviewResultCard)/,
     )?.[1];
@@ -2876,14 +2919,14 @@ updated_at = 1784422800000
     };
     const livePromptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
     const liveAttachmentTray = { kind: 'attachment-tray', parentNode: null, isConnected: true };
-    const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [livePromptQueuePanel] };
+    const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [] };
     let liveComposerInsertCalls = 0;
     const liveComposer = {
-      // Match the real composer DOM: input capsule first, attachment tray after it.
-      children: [liveDropZone, liveAttachmentTray],
+      // Match enhanceComposer(): queue, attachment tray, then input capsule.
+      children: [livePromptQueuePanel, liveAttachmentTray, liveDropZone],
       insertBefore(node, reference) {
         liveComposerInsertCalls += 1;
-        assert.strictEqual(reference, liveDropZone);
+        assert.strictEqual(reference, livePromptQueuePanel);
         detachLiveNode(node);
         const index = this.children.indexOf(reference);
         assert.notEqual(index, -1);
@@ -2903,7 +2946,7 @@ updated_at = 1784422800000
         return previous;
       },
     };
-    livePromptQueuePanel.parentNode = liveDropZone;
+    livePromptQueuePanel.parentNode = liveComposer;
     liveAttachmentTray.parentNode = liveComposer;
     liveDropZone.parentNode = liveComposer;
     const toolArtifact = { kind: 'tool-artifact' };
@@ -2971,17 +3014,21 @@ updated_at = 1784422800000
     const secondLivePill = liveResultApi.refresh();
     assert.notStrictEqual(firstLivePill, secondLivePill);
     assert.deepEqual(liveTimeline.children, []);
-    assert.deepEqual(liveComposer.children, [secondLivePill, liveDropZone, liveAttachmentTray]);
+    assert.deepEqual(liveComposer.children, [secondLivePill, livePromptQueuePanel, liveAttachmentTray, liveDropZone]);
     assert.strictEqual(secondLivePill.parentNode, liveComposer);
-    assert.strictEqual(secondLivePill.nextSibling, liveDropZone);
-    assert.ok(liveComposer.children.indexOf(secondLivePill) < liveComposer.children.indexOf(liveDropZone));
-    assert.strictEqual(livePromptQueuePanel.parentNode, liveDropZone);
+    assert.strictEqual(secondLivePill.nextSibling, livePromptQueuePanel);
+    assert.ok(liveComposer.children.indexOf(secondLivePill) < liveComposer.children.indexOf(livePromptQueuePanel));
+    assert.ok(liveComposer.children.indexOf(livePromptQueuePanel) < liveComposer.children.indexOf(liveAttachmentTray));
+    assert.ok(liveComposer.children.indexOf(liveAttachmentTray) < liveComposer.children.indexOf(liveDropZone));
+    assert.strictEqual(livePromptQueuePanel.parentNode, liveComposer);
     assert.equal(liveComposerInsertCalls, 1);
     assert.deepEqual(liveResultApi.state().turnProcessElements, [toolArtifact]);
     assert.equal(liveResultApi.state().turnProcessElements.includes(secondLivePill), false);
     assert.equal(createdLiveCards.length, 2);
     assert.deepEqual(createdLiveCards.at(-1).options, { live: true, plan: referencePlan });
-    assert.match(inlineScript, /composer\.insertBefore\(liveEditedFilesResult,dropZone\)/);
+    assert.match(inlineScript, /const anchor=promptQueuePanel\?\.parentNode===composer\?promptQueuePanel:dropZone/);
+    assert.match(inlineScript, /composer\.insertBefore\(liveEditedFilesResult,anchor\)/);
+    assert.match(inlineScript, /card\.addEventListener\('toggle',[\s\S]*?revealExpandedEditedFilesCard\(card\)/);
     assert.match(inlineScript, /if\(files\.length\)container\.appendChild\(createEditedFilesResultCard\(files,turnId\)\)/);
 
     const searchActivity = createToolActivityItem({
