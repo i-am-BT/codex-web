@@ -875,6 +875,28 @@ test('queue send and explicit guide are mutually exclusive', () => {
   assert.match(inlineScript, /while\(promptQueueServerSyncInflight\.has\(id\)\)await promptQueueServerSyncInflight\.get\(id\)/);
 });
 
+test('Codex App queue entries stay visible but are never dispatched by Web', () => {
+  const renderer = sourceBetween('function renderPromptQueue', 'function enqueuePrompt');
+  const sideChat = sourceBetween('async function openQueuedPromptInSideChat', 'async function sendSideChatMessage');
+  const restore = sourceBetween('async function restoreQueuedPrompt', 'function schedulePromptQueueDispatch');
+  const schedule = sourceBetween('function schedulePromptQueueDispatch', 'function showNativePromptOptimistically');
+  const steer = sourceBetween('async function steerQueuedPrompt', 'async function dispatchNextQueuedPrompt');
+  const dispatch = sourceBetween('async function dispatchNextQueuedPrompt', 'function closeComposerPopovers');
+
+  assert.match(inlineScript, /function isAppOwnedQueuedPrompt\(item\)\{return item\?\.source==='codex-app'\}/);
+  assert.match(renderer, /const appOwned=isAppOwnedQueuedPrompt\(item\)/);
+  assert.match(renderer, /if\(!appOwned\)bindPromptQueueDrag\(row,threadId,item\.id\)/);
+  assert.match(renderer, /meta\.textContent='Codex App'/);
+  assert.match(renderer, /if\(appOwned\)\{\s*promptQueueList\.appendChild\(row\);\s*return;/);
+  assert.match(sideChat, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.match(restore, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.match(schedule, /isAppOwnedQueuedPrompt\(promptQueueFor\(threadId\)\[0\]\)/);
+  assert.match(steer, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.match(dispatch, /!item\|\|isAppOwnedQueuedPrompt\(item\)\|\|queueDispatchingThreads/);
+  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\)/s);
+  assert.match(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueBody:disabled\s*\{[^}]*opacity:\s*1/s);
+});
+
 test('queue fallback removes only the matching id when messages are identical', () => {
   const dismissalSource = sourceBetween('function promptQueueFor', 'function promptQueueFingerprint');
   const removeSource = sourceBetween('function removeQueuedPromptLocal', 'async function steerQueuedPrompt');

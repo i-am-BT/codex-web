@@ -1365,7 +1365,9 @@ app.delete('/api/prompt-queues/:threadId/items/:itemId', requireAuth, (req, res)
     // back to its message-based key when the id was server-generated — otherwise a
     // Codex App item with no source id would reappear once its id regenerates on the
     // next sync (see queueItemDismissKeys / normalizeServerQueuedPrompt).
-    const target = getPromptQueueItems(threadId).find((entry) => String(entry?.id || '') === itemId) || { id: itemId };
+    const current = getPromptQueueState(threadId);
+    const target = current.items.find((entry) => String(entry?.id || '') === itemId) || { id: itemId };
+    assertWebOwnedPromptQueueItem(target, current);
     const queue = consumePromptQueueItem(threadId, target);
     res.json({ ok: true, threadId, ...queue });
   } catch (err) {
@@ -4656,7 +4658,7 @@ function extractAppQueueCommentText(item) {
   return texts;
 }
 
-function appQueuedFollowUpToWebItem(item) {
+function appQueuedFollowUpToWebItem(item, threadId = '', mirrorOccurrences = null) {
   if (!item || typeof item !== 'object') return null;
   const commentTexts = extractAppQueueCommentText(item);
   const direct = String(item.text || item.message || item.prompt || '').trim();
@@ -4670,12 +4672,26 @@ function appQueuedFollowUpToWebItem(item) {
   const createdAtRaw = item.createdAt;
   const createdAt = typeof createdAtRaw === 'number'
     ? new Date(createdAtRaw).toISOString()
-    : String(createdAtRaw || new Date().toISOString());
+    : String(createdAtRaw || '1970-01-01T00:00:00.000Z');
+  const sourceId = String(item.id || '').trim();
+  const cwd = String(item.cwd || item?.context?.workspaceRoots?.[0] || '');
+  const mirrorFingerprint = JSON.stringify([
+    cleanNativeThreadId(threadId),
+    message,
+    createdAt,
+    cwd,
+  ]);
+  const occurrence = sourceId ? 0 : Number(mirrorOccurrences?.get(mirrorFingerprint) || 0);
+  if (!sourceId && mirrorOccurrences) mirrorOccurrences.set(mirrorFingerprint, occurrence + 1);
+  const mirrorId = sourceId || `codex-app-${createHash('sha256')
+    .update(JSON.stringify([mirrorFingerprint, occurrence]))
+    .digest('hex')
+    .slice(0, 24)}`;
   return normalizeServerQueuedPrompt({
-    id: String(item.id || ''),
+    id: mirrorId,
     message,
     attachments: [],
-    cwd: String(item.cwd || item?.context?.workspaceRoots?.[0] || ''),
+    cwd,
     createdAt,
     provider: '',
     model: '',
@@ -4696,7 +4712,11 @@ function loadAppQueuedFollowUps() {
     for (const [rawId, items] of Object.entries(source)) {
       const threadId = cleanNativeThreadId(rawId);
       if (!threadId || !Array.isArray(items)) continue;
-      const converted = items.map(appQueuedFollowUpToWebItem).filter(Boolean).slice(0, 50);
+      const mirrorOccurrences = new Map();
+      const converted = items
+        .map((item) => appQueuedFollowUpToWebItem(item, threadId, mirrorOccurrences))
+        .filter(Boolean)
+        .slice(0, 50);
       if (converted.length) queues[threadId] = converted;
     }
     return queues;
@@ -4783,10 +4803,8 @@ function syncAppQueuedFollowUpsIntoWeb({ force = false } = {}) {
     // App can add new follow-ups, but never resurrect web-dismissed items.
     const filteredApp = filterDismissedPromptQueueItems(threadId, appItems, dismissed);
     const filteredExisting = filterDismissedPromptQueueItems(threadId, existing, dismissed);
-    const removedAppItems = filteredExisting.filter((item) => (
-      isAppSourcedQueueItem(item) && !queueItemStillInApp(item, filteredApp)
-    ));
-    if (removedAppItems.length) markPromptQueueDismissed(threadId, removedAppItems, dismissed);
+    // App consumption is not a Web dismissal. Remove stale mirrors without
+    // permanently blocking the same App-owned identity if App queues it again.
     const retainedExisting = filteredExisting.filter((item) => (
       !isAppSourcedQueueItem(item) || queueItemStillInApp(item, filteredApp)
     ));
@@ -5018,7 +5036,13 @@ function setPromptQueueItems(threadId, items, expectedRevision) {
     throw error;
   }
   const incoming = (Array.isArray(items) ? items : []).slice(0, 50).map(normalizeServerQueuedPrompt).filter(Boolean);
-  const cleanItems = filterDismissedPromptQueueItems(id, incoming, dismissed).slice(0, 50);
+  const appOwned = current.items.filter(isAppSourcedQueueItem);
+  const webOwned = incoming.filter((item) => !isAppSourcedQueueItem(item));
+  const cleanItems = filterDismissedPromptQueueItems(
+    id,
+    mergePromptQueueItems(appOwned, webOwned),
+    dismissed,
+  ).slice(0, 50);
   if (JSON.stringify(current.items) === JSON.stringify(cleanItems)) return current;
   const updatedAt = new Date().toISOString();
   const revision = current.revision + 1;
@@ -5065,6 +5089,11 @@ function promptQueueConflict(message, current = null) {
   return error;
 }
 
+function assertWebOwnedPromptQueueItem(item, current = null) {
+  if (!isAppSourcedQueueItem(item)) return;
+  throw promptQueueConflict('该队列条目由 Codex App 管理，将由 App 发送', current);
+}
+
 function promptQueueReservationKey(threadId, itemId) {
   return `${cleanNativeThreadId(threadId)}:${String(itemId || '').trim()}`;
 }
@@ -5093,8 +5122,10 @@ function reservePromptQueueItem(threadId, itemId) {
   if (promptQueueItemReservations.has(key)) {
     throw promptQueueConflict('队列条目正在发送，请稍后重试', getPromptQueueState(id));
   }
-  const item = getPromptQueueItems(id).find((entry) => String(entry?.id || '').trim() === cleanItemId);
-  if (!item) throw promptQueueConflict('队列条目不存在或已消费', getPromptQueueState(id));
+  const current = getPromptQueueState(id);
+  const item = current.items.find((entry) => String(entry?.id || '').trim() === cleanItemId);
+  if (!item) throw promptQueueConflict('队列条目不存在或已消费', current);
+  assertWebOwnedPromptQueueItem(item, current);
   const reservation = { key, threadId: id, itemId: cleanItemId, item };
   promptQueueItemReservations.set(key, reservation);
   return reservation;
@@ -5683,6 +5714,12 @@ function normalizeQueuedPrompt(item){
     source:inferredSource,
   };
 }
+function isAppOwnedQueuedPrompt(item){return item?.source==='codex-app'}
+function blockAppOwnedQueueAction(item){
+  if(!isAppOwnedQueuedPrompt(item))return false;
+  statusEl.textContent='该消息由 Codex App 队列管理，将由 App 发送';
+  return true;
+}
 function makePromptQueueId(){return window.crypto?.randomUUID?.()||Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10)}
 function persistPromptQueues(){try{localStorage.setItem(PROMPT_QUEUE_STORAGE_KEY,JSON.stringify(promptQueues))}catch(e){statusEl.textContent='队列已保留在当前页面，但浏览器无法持久化'}}
 function promptQueueFor(threadId=currentConversationId){return Array.isArray(promptQueues[threadId])?promptQueues[threadId]:[]}
@@ -6015,6 +6052,7 @@ function promptQueueMenuItem(label,handler,{danger=false}={}){
 }
 function openPromptQueueMenu(threadId,item,anchor){
   if(!threadId||!item||!anchor)return;
+  if(blockAppOwnedQueueAction(item))return;
   const menu=ensurePromptQueueMenu();
   const openId=threadId+':'+item.id;
   if(promptQueueMenuOpenId===openId&&!menu.classList.contains('hidden')){
@@ -6553,6 +6591,7 @@ async function openQueuedPromptInSideChat(threadId,itemId){
   if(currentConversationSource!=='codex'||currentConversationId!==threadId)return;
   const item=promptQueueFor(threadId).find((entry)=>entry.id===itemId);
   if(!item)return;
+  if(blockAppOwnedQueueAction(item))return;
   queueFailures.delete(itemId);
   statusEl.textContent='正在打开 side chat…';
   try{
@@ -6698,21 +6737,22 @@ function renderPromptQueue(){
   if(count)count.textContent=String(items.length);
   items.forEach((item,index)=>{
     const row=document.createElement('div');
+    const appOwned=isAppOwnedQueuedPrompt(item);
     const dispatching=index===0&&queueDispatchingThreads.has(threadId);
     const guiding=queueGuidingItems.has(item.id);
-    row.className='promptQueueRow'+(dispatching||guiding?' sending':'')+(queueFailures.has(item.id)?' failed':'');
+    row.className='promptQueueRow'+(appOwned?' appOwned':'')+(dispatching||guiding?' sending':'')+(queueFailures.has(item.id)?' failed':'');
     row.dataset.queueId=item.id;
     row.draggable=false;
-    bindPromptQueueDrag(row,threadId,item.id);
+    if(!appOwned)bindPromptQueueDrag(row,threadId,item.id);
     const lead=document.createElement('i');
     lead.className='promptQueueLead';
-    lead.setAttribute('data-lucide',dispatching||guiding?'loader-circle':'grip-vertical');
+    lead.setAttribute('data-lucide',appOwned?'monitor-smartphone':dispatching||guiding?'loader-circle':'grip-vertical');
     lead.setAttribute('aria-hidden','true');
-    lead.title=dispatching||guiding?'发送中':'拖动调整顺序';
+    lead.title=appOwned?'由 Codex App 管理并发送':dispatching||guiding?'发送中':'拖动调整顺序';
     const body=document.createElement('button');
     body.type='button';
     body.className='promptQueueBody';
-    body.title='编辑队列消息';
+    body.title=appOwned?'由 Codex App 管理并发送':'编辑队列消息';
     const label=document.createElement('span');
     label.className='promptQueueText';
     label.textContent=queuedPromptLabel(item);
@@ -6723,9 +6763,22 @@ function renderPromptQueue(){
       meta.textContent=item.attachments.length+' 个附件';
       body.appendChild(meta);
     }
-    body.addEventListener('click',()=>restoreQueuedPrompt(threadId,item.id));
+    if(appOwned){
+      const meta=document.createElement('span');
+      meta.className='promptQueueMeta';
+      meta.textContent='Codex App';
+      body.appendChild(meta);
+    }else{
+      body.addEventListener('click',()=>restoreQueuedPrompt(threadId,item.id));
+    }
     const busy=dispatching||guiding||steerSubmitting;
-    body.disabled=busy;
+    body.disabled=busy||appOwned;
+    row.appendChild(lead);
+    row.appendChild(body);
+    if(appOwned){
+      promptQueueList.appendChild(row);
+      return;
+    }
     const guide=queueActionButton(queueFailures.has(item.id)?'rotate-cw':'corner-down-left',queueFailures.has(item.id)?'重试':'引导',()=>{
       if(queueFailures.has(item.id))dispatchNextQueuedPrompt(threadId,{force:true});else steerQueuedPrompt(threadId,item.id);
     },true);
@@ -6739,8 +6792,6 @@ function renderPromptQueue(){
       openPromptQueueMenu(threadId,item,event.currentTarget||more);
     });
     more.disabled=busy;
-    row.appendChild(lead);
-    row.appendChild(body);
     row.appendChild(guide);
     row.appendChild(remove);
     row.appendChild(more);
@@ -6773,6 +6824,7 @@ function enqueuePrompt(message,attachments){
 async function deleteQueuedPrompt(threadId,itemId){
   const firstId=promptQueueFor(threadId)[0]?.id;
   const victim=promptQueueFor(threadId).find((item)=>item.id===itemId)||{id:itemId};
+  if(blockAppOwnedQueueAction(victim))return;
   queueFailures.delete(itemId);
   try{
     await consumeQueuedPromptOnServer(threadId,itemId);
@@ -6785,6 +6837,7 @@ function moveQueuedPrompt(threadId,itemId,toIndex){
   const items=[...promptQueueFor(threadId)];
   const fromIndex=items.findIndex((item)=>item.id===itemId);
   if(fromIndex<0)return false;
+  if(blockAppOwnedQueueAction(items[fromIndex]))return false;
   const next=Math.max(0,Math.min(items.length-1,Number(toIndex)));
   if(!Number.isInteger(next)||next===fromIndex)return false;
   const [item]=items.splice(fromIndex,1);
@@ -6969,6 +7022,7 @@ async function restoreQueuedPrompt(threadId,itemId){
   if(currentConversationSource!=='codex'||currentConversationId!==threadId)return;
   const item=promptQueueFor(threadId).find((entry)=>entry.id===itemId);
   if(!item)return;
+  if(blockAppOwnedQueueAction(item))return;
   if((input.value.trim()||pendingAttachments.length)&&!confirm('用队列消息替换当前输入内容？'))return;
   queueFailures.delete(itemId);
   try{await consumeQueuedPromptOnServer(threadId,itemId)}catch(error){statusEl.textContent=error.message||'恢复队列消息失败';return}
@@ -6990,7 +7044,7 @@ async function restoreQueuedPrompt(threadId,itemId){
   input.focus();
 }
 function schedulePromptQueueDispatch(threadId,delay=120){
-  if(!threadId||!promptQueueFor(threadId).length)return;
+  if(!threadId||!promptQueueFor(threadId).length||isAppOwnedQueuedPrompt(promptQueueFor(threadId)[0]))return;
   setTimeout(()=>dispatchNextQueuedPrompt(threadId),delay);
 }
 function showNativePromptOptimistically(item){
@@ -7063,6 +7117,7 @@ async function steerQueuedPrompt(threadId,itemId,preloadedItem=null){
   if(!preloadedItem && currentConversationId!==threadId)return;
   const item=preloadedItem||promptQueueFor(threadId).find((entry)=>entry.id===itemId);
   if(!item)return;
+  if(blockAppOwnedQueueAction(item))return;
   if(!webRunActive){schedulePromptQueueDispatch(threadId,0);return}
   if(queueDispatchingThreads.has(threadId)){
     statusEl.textContent='队列消息正在发送，请稍后再引导';
@@ -7105,7 +7160,7 @@ async function steerQueuedPrompt(threadId,itemId,preloadedItem=null){
 }
 async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
   const item=promptQueueFor(threadId)[0];
-  if(!item||queueDispatchingThreads.has(threadId)||queueGuidingItems.has(item.id)||steerSubmitting)return false;
+  if(!item||isAppOwnedQueuedPrompt(item)||queueDispatchingThreads.has(threadId)||queueGuidingItems.has(item.id)||steerSubmitting)return false;
   const current=currentConversationSource==='codex'&&currentConversationId===threadId;
   if(current&&(webRunActive||steerSubmitting))return false;
   if(queueFailures.has(item.id)&&!force)return false;

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -86,6 +86,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const traceFile = path.join(temporary, 'codex-trace.json');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
   const appServerControlFile = path.join(temporary, 'app-server-control.json');
+  const codexGlobalStateFile = path.join(codexHome, '.codex-global-state.json');
+  const imagePromptFetchFixture = path.join(temporary, 'image-prompt-fetch-fixture.mjs');
   const webEnv = path.join(temporary, 'web.env');
   const toolImagePath = path.join(temporary, 'tool-preview.png');
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
@@ -96,6 +98,10 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const archivedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa730';
   const automationNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa731';
   const subagentNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa732';
+  const appQueueOwnershipThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa733';
+  const appQueueNoIdThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa734';
+  const appQueueDuplicateNoIdThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa735';
+  const appOwnedQueueItemId = 'app-owned-queue-item';
   let child;
   let desktopIpc;
   let providerServer;
@@ -257,6 +263,21 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
       toolImagePath,
       Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
     );
+    await writeFile(imagePromptFetchFixture, `
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (input, options) => {
+  const url = typeof input === 'string' ? input : String(input?.url || input || '');
+  if (url.endsWith('/data/images/case520.jpg')) {
+    const body = new Uint8Array(2048);
+    body[0] = 0xff;
+    body[1] = 0xd8;
+    body[body.length - 2] = 0xff;
+    body[body.length - 1] = 0xd9;
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'image/jpeg' } });
+  }
+  return originalFetch(input, options);
+};
+`);
     await writeFile(path.join(codexHome, 'config.toml'), `model_provider = "fake"
 model = "test-model"
 model_reasoning_effort = "max"
@@ -268,10 +289,37 @@ wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "test-token"
 `);
-    await writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+    await writeFile(codexGlobalStateFile, JSON.stringify({
       'pinned-thread-ids': [nativeSessionId, archivedNativeSessionId],
       'projectless-thread-ids': [],
       'thread-project-assignments': {},
+      'queued-follow-ups': {
+        [appQueueOwnershipThreadId]: [{
+          id: appOwnedQueueItemId,
+          text: 'Codex App owns this queued prompt',
+          createdAt: 1785204000000,
+        }],
+        [appQueueNoIdThreadId]: [
+          {
+            text: 'Legacy predecessor without an id',
+            createdAt: 1785204000500,
+          },
+          {
+            text: 'Legacy Codex App prompt without an id',
+            createdAt: 1785204001000,
+          },
+        ],
+        [appQueueDuplicateNoIdThreadId]: [
+          {
+            text: 'Duplicate legacy prompt without an id',
+            createdAt: 1785204002000,
+          },
+          {
+            text: 'Duplicate legacy prompt without an id',
+            createdAt: 1785204002000,
+          },
+        ],
+      },
     }));
     const nativeSessionDir = path.join(codexHome, 'sessions', '2026', '07', '11');
     await mkdir(nativeSessionDir, { recursive: true });
@@ -731,6 +779,7 @@ if (args[0] === 'app-server') {
       traceFile,
       appServerTraceFile,
       appServerControlFile,
+      fetchFixture: pathToFileURL(imagePromptFetchFixture).href,
       desktopIpcEnabled: 'true',
       desktopIpcSocket: desktopIpc.socketPath,
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
@@ -4072,6 +4121,228 @@ updated_at = 1784422800000
     assert.equal(interruptedConcurrentTurn.status, 200);
     await writeFile(appServerControlFile, '{}');
 
+    const appOwnedQueue = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appOwnedQueue.status, 200);
+    const appOwnedQueuePayload = await appOwnedQueue.json();
+    assert.equal(appOwnedQueuePayload.items.length, 1);
+    assert.equal(appOwnedQueuePayload.items[0].id, appOwnedQueueItemId);
+    assert.equal(appOwnedQueuePayload.items[0].source, 'codex-app');
+
+    const appQueueWithoutIdFirst = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueWithoutIdFirst.status, 200);
+    const appQueueWithoutIdFirstPayload = await appQueueWithoutIdFirst.json();
+    assert.equal(appQueueWithoutIdFirstPayload.items.length, 2);
+    const stableNoIdItem = appQueueWithoutIdFirstPayload.items.find((item) => (
+      item.message === 'Legacy Codex App prompt without an id'
+    ));
+    assert.match(stableNoIdItem?.id || '', /^codex-app-[0-9a-f]{24}$/);
+    assert.equal(stableNoIdItem?.source, 'codex-app');
+    const appQueueWithoutIdSecond = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueWithoutIdSecond.status, 200);
+    const appQueueWithoutIdSecondPayload = await appQueueWithoutIdSecond.json();
+    assert.deepEqual(appQueueWithoutIdSecondPayload.items, appQueueWithoutIdFirstPayload.items);
+
+    const appStateAfterPredecessorRemoval = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterPredecessorRemoval['queued-follow-ups'][appQueueNoIdThreadId] = [{
+      text: 'Legacy Codex App prompt without an id',
+      createdAt: 1785204001000,
+    }];
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterPredecessorRemoval));
+    const appQueueAfterPredecessorRemoval = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueAfterPredecessorRemoval.status, 200);
+    const appQueueAfterPredecessorRemovalPayload = await appQueueAfterPredecessorRemoval.json();
+    assert.equal(appQueueAfterPredecessorRemovalPayload.items.length, 1);
+    assert.equal(appQueueAfterPredecessorRemovalPayload.items[0].id, stableNoIdItem.id);
+
+    const appStateAfterPredecessorInsert = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterPredecessorInsert['queued-follow-ups'][appQueueNoIdThreadId] = [
+      {
+        text: 'New predecessor without an id',
+        createdAt: 1785204000750,
+      },
+      {
+        text: 'Legacy Codex App prompt without an id',
+        createdAt: 1785204001000,
+      },
+    ];
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterPredecessorInsert));
+    const appQueueAfterPredecessorInsert = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueAfterPredecessorInsert.status, 200);
+    const appQueueAfterPredecessorInsertPayload = await appQueueAfterPredecessorInsert.json();
+    assert.equal(appQueueAfterPredecessorInsertPayload.items.length, 2);
+    assert.equal(
+      appQueueAfterPredecessorInsertPayload.items.find((item) => (
+        item.message === 'Legacy Codex App prompt without an id'
+      ))?.id,
+      stableNoIdItem.id,
+    );
+
+    const duplicateNoIdQueueFirst = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueDuplicateNoIdThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(duplicateNoIdQueueFirst.status, 200);
+    const duplicateNoIdQueueFirstPayload = await duplicateNoIdQueueFirst.json();
+    assert.equal(duplicateNoIdQueueFirstPayload.items.length, 2);
+    assert.equal(new Set(duplicateNoIdQueueFirstPayload.items.map((item) => item.id)).size, 2);
+
+    const appStateAfterDuplicateRemoval = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterDuplicateRemoval['queued-follow-ups'][appQueueDuplicateNoIdThreadId] = [{
+      text: 'Duplicate legacy prompt without an id',
+      createdAt: 1785204002000,
+    }];
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterDuplicateRemoval));
+    const duplicateNoIdQueueAfterRemoval = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueDuplicateNoIdThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(duplicateNoIdQueueAfterRemoval.status, 200);
+    assert.equal((await duplicateNoIdQueueAfterRemoval.json()).items.length, 1);
+
+    const appStateAfterDuplicateRestore = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterDuplicateRestore['queued-follow-ups'][appQueueDuplicateNoIdThreadId] = [
+      {
+        text: 'Duplicate legacy prompt without an id',
+        createdAt: 1785204002000,
+      },
+      {
+        text: 'Duplicate legacy prompt without an id',
+        createdAt: 1785204002000,
+      },
+    ];
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterDuplicateRestore));
+    const duplicateNoIdQueueAfterRestore = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueDuplicateNoIdThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(duplicateNoIdQueueAfterRestore.status, 200);
+    const duplicateNoIdQueueAfterRestorePayload = await duplicateNoIdQueueAfterRestore.json();
+    assert.equal(duplicateNoIdQueueAfterRestorePayload.items.length, 2);
+    assert.deepEqual(
+      duplicateNoIdQueueAfterRestorePayload.items.map((item) => item.id),
+      duplicateNoIdQueueFirstPayload.items.map((item) => item.id),
+    );
+
+    const attemptedAppQueueOverwrite = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ revision: appOwnedQueuePayload.revision, items: [] }),
+    });
+    assert.equal(attemptedAppQueueOverwrite.status, 200);
+    const appQueueAfterOverwrite = await attemptedAppQueueOverwrite.json();
+    assert.deepEqual(appQueueAfterOverwrite.items.map((item) => item.id), [appOwnedQueueItemId]);
+
+    const attemptedAppQueueSourceSpoof = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        revision: appQueueAfterOverwrite.revision,
+        items: [{
+          id: appOwnedQueueItemId,
+          message: 'Web attempted to take ownership',
+          provider: 'fake',
+          model: 'test-model',
+          source: 'web',
+        }],
+      }),
+    });
+    assert.equal(attemptedAppQueueSourceSpoof.status, 200);
+    const appQueueAfterSourceSpoof = await attemptedAppQueueSourceSpoof.json();
+    assert.equal(appQueueAfterSourceSpoof.items.length, 1);
+    assert.equal(appQueueAfterSourceSpoof.items[0].id, appOwnedQueueItemId);
+    assert.equal(appQueueAfterSourceSpoof.items[0].source, 'codex-app');
+    assert.equal(appQueueAfterSourceSpoof.items[0].message, 'Codex App owns this queued prompt');
+
+    const attemptedAppQueueDelete = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}/items/${appOwnedQueueItemId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(attemptedAppQueueDelete.status, 409);
+    assert.match((await attemptedAppQueueDelete.json()).error, /Codex App 管理/);
+
+    const appQueueTraceBefore = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
+    const attemptedAppQueueTurn = await fetch(`${baseUrl}/api/native-sessions/${appQueueOwnershipThreadId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: 'Codex App owns this queued prompt',
+        queueItemId: appOwnedQueueItemId,
+      }),
+    });
+    assert.equal(attemptedAppQueueTurn.status, 409);
+    assert.match((await attemptedAppQueueTurn.json()).error, /Codex App 管理/);
+    const attemptedAppQueueSteer = await fetch(`${baseUrl}/api/native-sessions/${appQueueOwnershipThreadId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'Codex App owns this queued prompt',
+        turnId: 'app-owned-running-turn',
+        queueItemId: appOwnedQueueItemId,
+      }),
+    });
+    assert.equal(attemptedAppQueueSteer.status, 409);
+    assert.match((await attemptedAppQueueSteer.json()).error, /Codex App 管理/);
+    const attemptedAppQueueSideChat = await fetch(`${baseUrl}/api/native-sessions`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: 'Codex App owns this queued prompt',
+        sideChat: true,
+        sourceThreadId: appQueueOwnershipThreadId,
+        queueItemId: appOwnedQueueItemId,
+      }),
+    });
+    assert.equal(attemptedAppQueueSideChat.status, 409);
+    assert.match((await attemptedAppQueueSideChat.json()).error, /Codex App 管理/);
+    const appQueueTraceAfter = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
+    assert.equal(appQueueTraceAfter, appQueueTraceBefore);
+
+    const codexGlobalState = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    delete codexGlobalState['queued-follow-ups'];
+    await writeFile(codexGlobalStateFile, JSON.stringify(codexGlobalState));
+    const appQueueAfterAppRemoval = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueAfterAppRemoval.status, 200);
+    assert.deepEqual((await appQueueAfterAppRemoval.json()).items, []);
+    const appQueueWithoutIdAfterAppRemoval = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueWithoutIdAfterAppRemoval.status, 200);
+    assert.deepEqual((await appQueueWithoutIdAfterAppRemoval.json()).items, []);
+    const duplicateNoIdQueueAfterAppRemoval = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueDuplicateNoIdThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(duplicateNoIdQueueAfterAppRemoval.status, 200);
+    assert.deepEqual((await duplicateNoIdQueueAfterAppRemoval.json()).items, []);
+    const appQueueTraceAfterRemoval = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
+    assert.equal(appQueueTraceAfterRemoval, appQueueTraceBefore);
+
     const queueItemA = {
       id: 'queue-client-a',
       message: 'same queue prompt',
@@ -4913,6 +5184,7 @@ function startServer({
   desktopIpcEnabled = 'false',
   desktopIpcSocket = '',
   playgroundProxyAllowedOrigins = '',
+  fetchFixture = '',
   sub2ApiBaseUrl,
   sub2ApiKey,
 }) {
@@ -4947,6 +5219,9 @@ function startServer({
     FAKE_APP_SERVER_TRACE: appServerTraceFile,
     FAKE_APP_SERVER_CONTROL: appServerControlFile,
   };
+  if (fetchFixture) {
+    env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--import=${fetchFixture}`].filter(Boolean).join(' ');
+  }
   env.CPA_QUOTA_BASE_URL = '';
   env.CPA_QUOTA_API_KEY = '';
   delete env.SUB2API_BASE_URL;
