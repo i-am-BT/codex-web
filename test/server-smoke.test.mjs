@@ -101,7 +101,88 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const appQueueOwnershipThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa733';
   const appQueueNoIdThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa734';
   const appQueueDuplicateNoIdThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa735';
+  const appQueueEditThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa736';
   const appOwnedQueueItemId = 'app-owned-queue-item';
+  const appQueueInlineImage = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+  const appOwnedQueueRawItem = {
+    id: appOwnedQueueItemId,
+    text: '',
+    context: {
+      addedFiles: [{
+        label: 'added-context.mjs',
+        path: path.join(temporary, 'added-context.mjs'),
+        fsPath: path.join(temporary, 'added-context.mjs'),
+      }],
+      chatGptConversationContexts: [],
+      prompt: '',
+      ideContext: null,
+      imageAttachments: [{
+        id: 'app-queue-image',
+        filename: 'tool-preview.png',
+        src: `file://${toolImagePath}`,
+        localPath: toolImagePath,
+      }],
+      imageCommentDrafts: [],
+      appshotContexts: [],
+      fileAttachments: [{
+        label: 'queue-context.mjs',
+        path: path.join(temporary, 'queue-context.mjs'),
+        fsPath: path.join(temporary, 'queue-context.mjs'),
+        startLine: 4,
+        endLine: 8,
+      }],
+      pastedTextAttachments: [{
+        characterCount: 21,
+        preview: 'pasted queue context',
+        file: {
+          label: 'pasted-text.txt',
+          path: path.join(temporary, 'pasted-text.txt'),
+          fsPath: path.join(temporary, 'pasted-text.txt'),
+        },
+      }],
+      inAppBrowserContext: {
+        currentUrls: ['http://127.0.0.1:36354/rich-queue'],
+        isOpen: true,
+        openTabCount: 1,
+      },
+      commentAttachments: [{
+        type: 'comment',
+        content: [{ content_type: 'text', text: 'Codex App owns this queued prompt' }],
+        position: { side: 'right', path: 'browser:Rich queue fixture', line: 1 },
+        localBrowserContext: {
+          pageUrl: 'http://127.0.0.1:36354/rich-queue',
+          framePath: [],
+          frameUrl: null,
+          targetDescription: 'Rich queue fixture',
+          targetSelector: 'section.promptQueue',
+          targetPath: 'main > section',
+          nearbyText: 'queue context nearby text',
+        },
+        localBrowserCommentMetadata: {
+          kind: 'element',
+          markerViewportPoint: { x: 320, y: 640 },
+          viewportSize: { width: 1145, height: 954 },
+        },
+        localBrowserScreenshot: { dataUrl: appQueueInlineImage },
+      }],
+      responseTextAnnotations: [],
+      selectedTextAttachments: [],
+      mcpAppModelContextAttachments: [],
+      workspaceRoots: [temporary],
+    },
+    cwd: temporary,
+    createdAt: 1785204000000,
+  };
+  const appOwnedEditQueueRawItem = {
+    ...appOwnedQueueRawItem,
+    id: 'app-owned-edit-item',
+    text: 'Original editable prompt',
+    context: {
+      ...appOwnedQueueRawItem.context,
+      prompt: 'Original editable prompt',
+    },
+    createdAt: 1785204000100,
+  };
   let child;
   let desktopIpc;
   let providerServer;
@@ -294,11 +375,8 @@ experimental_bearer_token = "test-token"
       'projectless-thread-ids': [],
       'thread-project-assignments': {},
       'queued-follow-ups': {
-        [appQueueOwnershipThreadId]: [{
-          id: appOwnedQueueItemId,
-          text: 'Codex App owns this queued prompt',
-          createdAt: 1785204000000,
-        }],
+        [appQueueOwnershipThreadId]: [appOwnedQueueRawItem],
+        [appQueueEditThreadId]: [appOwnedEditQueueRawItem],
         [appQueueNoIdThreadId]: [
           {
             text: 'Legacy predecessor without an id',
@@ -805,6 +883,7 @@ if (args[0] === 'app-server') {
       fetchFixture: pathToFileURL(imagePromptFetchFixture).href,
       desktopIpcEnabled: 'true',
       desktopIpcSocket: desktopIpc.socketPath,
+      desktopIpcTimeoutMs: '5000',
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
       sub2ApiBaseUrl: providerBaseUrl,
       sub2ApiKey: 'test-sub-key',
@@ -1588,7 +1667,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=queue-spacing-20260728a"/);
+    assert.match(page, /href="\/ui\.css\?v=app-queue-actions-20260728b"/);
     assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260728a"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -4335,13 +4414,6 @@ updated_at = 1784422800000
     assert.equal(appQueueAfterSourceSpoof.items[0].source, 'codex-app');
     assert.equal(appQueueAfterSourceSpoof.items[0].message, 'Codex App owns this queued prompt');
 
-    const attemptedAppQueueDelete = await fetch(
-      `${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}/items/${appOwnedQueueItemId}`,
-      { method: 'DELETE', headers: { Cookie: cookie } },
-    );
-    assert.equal(attemptedAppQueueDelete.status, 409);
-    assert.match((await attemptedAppQueueDelete.json()).error, /Codex App 管理/);
-
     const appQueueTraceBefore = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
@@ -4358,17 +4430,6 @@ updated_at = 1784422800000
     });
     assert.equal(attemptedAppQueueTurn.status, 409);
     assert.match((await attemptedAppQueueTurn.json()).error, /Codex App 管理/);
-    const attemptedAppQueueSteer = await fetch(`${baseUrl}/api/native-sessions/${appQueueOwnershipThreadId}/steer`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: 'Codex App owns this queued prompt',
-        turnId: 'app-owned-running-turn',
-        queueItemId: appOwnedQueueItemId,
-      }),
-    });
-    assert.equal(attemptedAppQueueSteer.status, 409);
-    assert.match((await attemptedAppQueueSteer.json()).error, /Codex App 管理/);
     const attemptedAppQueueSideChat = await fetch(`${baseUrl}/api/native-sessions`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -4388,6 +4449,266 @@ updated_at = 1784422800000
       .map((line) => JSON.parse(line))
       .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
     assert.equal(appQueueTraceAfter, appQueueTraceBefore);
+
+    desktopIpc.ownerAvailable = true;
+    const editedAppQueueMessage = 'Edited in Web without losing App context';
+    const editedAppQueue = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueEditThreadId}/items/${appOwnedEditQueueRawItem.id}`,
+      {
+        method: 'PATCH',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: editedAppQueueMessage }),
+      },
+    );
+    const editedAppQueuePayload = await editedAppQueue.json();
+    assert.equal(editedAppQueue.status, 200, editedAppQueuePayload.error);
+    assert.equal(editedAppQueuePayload.updated.message, editedAppQueueMessage);
+    assert.equal(editedAppQueuePayload.updated.source, 'codex-app');
+    const stateAfterAppQueueEdit = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    assert.deepEqual(
+      stateAfterAppQueueEdit['queued-follow-ups'][appQueueEditThreadId],
+      [{
+        ...appOwnedEditQueueRawItem,
+        text: editedAppQueueMessage,
+        context: {
+          ...appOwnedEditQueueRawItem.context,
+          prompt: editedAppQueueMessage,
+        },
+      }],
+    );
+    assert.deepEqual(
+      stateAfterAppQueueEdit['queued-follow-ups'][appQueueOwnershipThreadId],
+      [appOwnedQueueRawItem],
+    );
+
+    desktopIpc.ignoreNextQueuedFollowUpsBroadcast = true;
+    desktopIpc.failNextQueuedFollowUpsSet = true;
+    const failedAppQueueDelete = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}/items/${appOwnedQueueItemId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(failedAppQueueDelete.status, 502);
+    assert.match((await failedAppQueueDelete.json()).error, /controlled-queued-follow-ups-failure/);
+    const stateAfterFailedAppQueueDelete = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    assert.deepEqual(
+      stateAfterFailedAppQueueDelete['queued-follow-ups'][appQueueOwnershipThreadId],
+      [appOwnedQueueRawItem],
+    );
+    const queueAfterFailedAppQueueDelete = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.deepEqual(
+      (await queueAfterFailedAppQueueDelete.json()).items.map((item) => item.id),
+      [appOwnedQueueItemId],
+    );
+
+    desktopIpc.ignoreNextQueuedFollowUpsBroadcast = true;
+    desktopIpc.failAfterWriteNextQueuedFollowUpsSet = true;
+    const desktopMessagesBeforeFailedAfterWriteDelete = desktopIpc.messages.length;
+    const failedAfterWriteAppQueueDelete = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}/items/${appOwnedQueueItemId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(failedAfterWriteAppQueueDelete.status, 200);
+    const failedAfterWriteDeletePayload = await failedAfterWriteAppQueueDelete.json();
+    assert.deepEqual(failedAfterWriteDeletePayload.items, []);
+    const stateAfterFailedAfterWriteDelete = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    assert.equal(stateAfterFailedAfterWriteDelete['queued-follow-ups'][appQueueOwnershipThreadId], undefined);
+    assert.deepEqual(
+      desktopIpc.messages.slice(desktopMessagesBeforeFailedAfterWriteDelete)
+        .filter((message) => message.method === 'thread-follower-set-queued-follow-ups-state')
+        .map((message) => message.method),
+      ['thread-follower-set-queued-follow-ups-state'],
+    );
+
+    const stateBeforeAppQueueSteer = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    stateBeforeAppQueueSteer['queued-follow-ups'][appQueueOwnershipThreadId] = [appOwnedQueueRawItem];
+    await writeFile(codexGlobalStateFile, JSON.stringify(stateBeforeAppQueueSteer));
+    const reloadedAppQueueBeforeSteer = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.deepEqual((await reloadedAppQueueBeforeSteer.json()).items.map((item) => item.id), [appOwnedQueueItemId]);
+
+    const desktopMessagesBeforeAppQueueSteer = desktopIpc.messages.length;
+    const appQueueSteer = await fetch(`${baseUrl}/api/native-sessions/${appQueueOwnershipThreadId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'stale browser copy must not win',
+        turnId: 'app-owned-running-turn',
+        queueItemId: appOwnedQueueItemId,
+      }),
+    });
+    const appQueueSteerPayload = await appQueueSteer.json();
+    assert.equal(appQueueSteer.status, 202, appQueueSteerPayload.error);
+    assert.deepEqual(appQueueSteerPayload.queue.items, []);
+    const stateAfterAppQueueSteer = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    assert.equal(stateAfterAppQueueSteer['queued-follow-ups'][appQueueOwnershipThreadId], undefined);
+    const appQueueSteerDesktopMessages = desktopIpc.messages.slice(desktopMessagesBeforeAppQueueSteer);
+    assert.deepEqual(
+      appQueueSteerDesktopMessages
+        .filter((message) => /queued-follow-?ups/.test(message.method || '') || message.method === 'thread-follower-steer-turn')
+        .map((message) => message.method),
+      ['thread-queued-followups-changed', 'thread-follower-steer-turn'],
+    );
+    const appQueueSteerDesktop = appQueueSteerDesktopMessages.find((message) => (
+      message.method === 'thread-follower-steer-turn'
+    ));
+    const appQueueSteerText = appQueueSteerDesktop?.params?.input?.[0]?.text || '';
+    assert.match(appQueueSteerText, /# Files mentioned by the user:/);
+    assert.match(appQueueSteerText, /queue-context\.mjs/);
+    assert.match(appQueueSteerText, /# Browser comments:/);
+    assert.match(appQueueSteerText, /Codex App owns this queued prompt/);
+    assert.match(appQueueSteerText, /Page URL: http:\/\/127\.0\.0\.1:36354\/rich-queue/);
+    assert.match(appQueueSteerText, /<in-app-browser-context source="ambient-ui-state">/);
+    assert.match(appQueueSteerText, /## My request for Codex:/);
+    assert.deepEqual(
+      appQueueSteerDesktop.params.input.slice(1).map(({ type }) => type),
+      ['localImage', 'text', 'image'],
+    );
+    assert.equal(appQueueSteerDesktop.params.input[1].path, toolImagePath);
+    assert.equal(appQueueSteerDesktop.params.input[3].url, appQueueInlineImage);
+    assert.deepEqual(appQueueSteerDesktop.params.restoreMessage, appOwnedQueueRawItem);
+    assert.deepEqual(
+      appQueueSteerDesktop.params.attachments.map((attachment) => attachment.path),
+      [
+        path.join(temporary, 'queue-context.mjs'),
+        path.join(temporary, 'pasted-text.txt'),
+        path.join(temporary, 'added-context.mjs'),
+        toolImagePath,
+      ],
+    );
+
+    const timeoutSteerText = 'Desktop write then timeout must reconcile exactly once';
+    const timeoutSteerRawItem = {
+      id: 'app-owned-steer-timeout-item',
+      text: timeoutSteerText,
+      context: {
+        prompt: timeoutSteerText,
+        workspaceRoots: [temporary],
+      },
+      cwd: temporary,
+      createdAt: 1785204000200,
+    };
+    const stateBeforeTimeoutSteer = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    stateBeforeTimeoutSteer['queued-follow-ups'][nativeSessionId] = [timeoutSteerRawItem];
+    await writeFile(codexGlobalStateFile, JSON.stringify(stateBeforeTimeoutSteer));
+    const timeoutSteerQueue = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    const timeoutSteerQueuePayload = await timeoutSteerQueue.json();
+    assert.equal(timeoutSteerQueue.status, 200, timeoutSteerQueuePayload.error);
+    assert.deepEqual(timeoutSteerQueuePayload.items.map((item) => item.id), [timeoutSteerRawItem.id]);
+
+    desktopIpc.steerMode = 'echo-only';
+    desktopIpc.onSteer = async (message) => {
+      const text = message.params.input.find((item) => item.type === 'text')?.text || '';
+      assert.match(text, new RegExp(timeoutSteerText));
+      assert.equal(message.params.restoreMessage.id, timeoutSteerRawItem.id);
+      assert.equal(message.params.restoreMessage.text, timeoutSteerRawItem.text);
+      assert.equal(message.params.restoreMessage.context.prompt, timeoutSteerText);
+      assert.deepEqual(message.params.restoreMessage.context.workspaceRoots, [temporary]);
+      await appendFile(nativeSessionFile, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text }],
+        },
+      })}\n`);
+    };
+    const desktopMessagesBeforeTimeoutSteer = desktopIpc.messages.length;
+    const timeoutSteerStartedAt = Date.now();
+    let timeoutSteer;
+    try {
+      timeoutSteer = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: 'stale browser copy must not win after timeout',
+          turnId: echoedContinuationPayload.turnId,
+          queueItemId: timeoutSteerRawItem.id,
+        }),
+      });
+    } finally {
+      desktopIpc.steerMode = 'respond';
+      desktopIpc.onSteer = null;
+    }
+    const timeoutSteerPayload = await timeoutSteer.json();
+    assert.equal(timeoutSteer.status, 202, timeoutSteerPayload.error);
+    assert.equal(timeoutSteerPayload.turnId, echoedContinuationPayload.turnId);
+    assert.deepEqual(timeoutSteerPayload.queue.items, []);
+    assert.ok(Date.now() - timeoutSteerStartedAt < 3000, 'native steer echo did not win before the 5s IPC timeout');
+    assert.equal(desktopIpc.lastError, null);
+    const stateAfterTimeoutSteer = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    assert.equal(stateAfterTimeoutSteer['queued-follow-ups'][nativeSessionId], undefined);
+    const timeoutSteerDesktopMessages = desktopIpc.messages.slice(desktopMessagesBeforeTimeoutSteer)
+      .filter((message) => /queued-follow-?ups/.test(message.method || '') || message.method === 'thread-follower-steer-turn');
+    assert.deepEqual(
+      timeoutSteerDesktopMessages.map((message) => message.method),
+      ['thread-queued-followups-changed', 'thread-follower-steer-turn'],
+    );
+    const timeoutSteerRequests = timeoutSteerDesktopMessages.filter((message) => (
+      message.method === 'thread-follower-steer-turn'
+    ));
+    assert.equal(timeoutSteerRequests.length, 1);
+    assert.match(timeoutSteerRequests[0].params.clientUserMessageId, /^[a-f0-9]{32}$/);
+    assert.equal((await readFile(nativeSessionFile, 'utf8')).split(timeoutSteerText).length - 1, 1);
+    const interruptedTimeoutSteer = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: timeoutSteerPayload.turnId }),
+    });
+    assert.equal(interruptedTimeoutSteer.status, 200);
+
+    const stateBeforeFailedAppQueueSteer = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    stateBeforeFailedAppQueueSteer['queued-follow-ups'][appQueueOwnershipThreadId] = [appOwnedQueueRawItem];
+    await writeFile(codexGlobalStateFile, JSON.stringify(stateBeforeFailedAppQueueSteer));
+    const restoredAppQueue = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.deepEqual((await restoredAppQueue.json()).items.map((item) => item.id), [appOwnedQueueItemId]);
+
+    desktopIpc.failNextSteer = true;
+    const desktopMessagesBeforeFailedSteer = desktopIpc.messages.length;
+    const failedAppQueueSteer = await fetch(`${baseUrl}/api/native-sessions/${appQueueOwnershipThreadId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'Codex App owns this queued prompt',
+        turnId: 'app-owned-running-turn',
+        queueItemId: appOwnedQueueItemId,
+      }),
+    });
+    assert.equal(failedAppQueueSteer.status, 502);
+    assert.match((await failedAppQueueSteer.json()).error, /controlled-steer-failure/);
+    const stateAfterFailedAppQueueSteer = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    assert.deepEqual(stateAfterFailedAppQueueSteer['queued-follow-ups'][appQueueOwnershipThreadId], [appOwnedQueueRawItem]);
+    assert.deepEqual(
+      desktopIpc.messages.slice(desktopMessagesBeforeFailedSteer)
+        .filter((message) => /queued-follow-?ups/.test(message.method || '') || message.method === 'thread-follower-steer-turn')
+        .map((message) => message.method),
+      [
+        'thread-queued-followups-changed',
+        'thread-follower-steer-turn',
+        'thread-queued-followups-changed',
+      ],
+    );
+
+    const appQueueDelete = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}/items/${appOwnedQueueItemId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(appQueueDelete.status, 200);
+    const appQueueDeletePayload = await appQueueDelete.json();
+    assert.equal(appQueueDeletePayload.consumed.source, 'codex-app');
+    assert.deepEqual(appQueueDeletePayload.items, []);
+    const stateAfterAppQueueDelete = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    assert.equal(stateAfterAppQueueDelete['queued-follow-ups'][appQueueOwnershipThreadId], undefined);
+    desktopIpc.ownerAvailable = false;
 
     const codexGlobalState = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
     delete codexGlobalState['queued-follow-ups'];
@@ -4429,18 +4750,24 @@ updated_at = 1784422800000
       createdAt: '2026-07-26T10:00:01.000Z',
       source: 'web',
     };
+    const queueBaseline = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    const queueBaselinePayload = await queueBaseline.json();
+    assert.equal(queueBaseline.status, 200, queueBaselinePayload.error);
+    assert.deepEqual(queueBaselinePayload.items, []);
     const queueClientA = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ revision: 0, items: [queueItemA] }),
+      body: JSON.stringify({ revision: queueBaselinePayload.revision, items: [queueItemA] }),
     });
     assert.equal(queueClientA.status, 200);
     const queueClientAPayload = await queueClientA.json();
-    assert.equal(queueClientAPayload.revision, 1);
+    assert.equal(queueClientAPayload.revision, queueBaselinePayload.revision + 1);
     const staleQueueClientB = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ revision: 0, items: [queueItemB] }),
+      body: JSON.stringify({ revision: queueBaselinePayload.revision, items: [queueItemB] }),
     });
     assert.equal(staleQueueClientB.status, 409);
     const staleQueuePayload = await staleQueueClientB.json();
@@ -5291,6 +5618,7 @@ function startServer({
   configWritable = 'false',
   desktopIpcEnabled = 'false',
   desktopIpcSocket = '',
+  desktopIpcTimeoutMs = '',
   playgroundProxyAllowedOrigins = '',
   fetchFixture = '',
   sub2ApiBaseUrl,
@@ -5327,6 +5655,7 @@ function startServer({
     FAKE_APP_SERVER_TRACE: appServerTraceFile,
     FAKE_APP_SERVER_CONTROL: appServerControlFile,
   };
+  if (desktopIpcTimeoutMs) env.CODEX_DESKTOP_IPC_TIMEOUT_MS = desktopIpcTimeoutMs;
   if (fetchFixture) {
     env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--import=${fetchFixture}`].filter(Boolean).join(' ');
   }
@@ -5346,6 +5675,7 @@ function startServer({
 
 async function createDesktopIpcFixture(temporary) {
   const socketPath = path.join(tmpdir(), `cwi-${path.basename(temporary)}.sock`);
+  const queuedFollowUpsStateFile = path.join(temporary, 'codex-home', '.codex-global-state.json');
   await unlink(socketPath).catch(() => {});
   const sockets = new Set();
   const fixture = {
@@ -5354,6 +5684,12 @@ async function createDesktopIpcFixture(temporary) {
     ownerAvailable: true,
     startTurnMode: 'respond',
     onStartTurn: null,
+    steerMode: 'respond',
+    onSteer: null,
+    failNextSteer: false,
+    failNextQueuedFollowUpsSet: false,
+    failAfterWriteNextQueuedFollowUpsSet: false,
+    ignoreNextQueuedFollowUpsBroadcast: false,
     lastError: null,
     initializeCount: 0,
     historySnapshots: new Map(),
@@ -5385,13 +5721,95 @@ async function createDesktopIpcFixture(temporary) {
         });
         return;
       }
-      if (message.type === 'broadcast') return;
+      if (message.type === 'broadcast') {
+        if (message.method !== 'thread-queued-followups-changed' || !fixture.ownerAvailable) return;
+        if (fixture.ignoreNextQueuedFollowUpsBroadcast) {
+          fixture.ignoreNextQueuedFollowUpsBroadcast = false;
+          return;
+        }
+        void (async () => {
+          const globalState = JSON.parse(await readFile(queuedFollowUpsStateFile, 'utf8'));
+          const queued = globalState['queued-follow-ups'] && typeof globalState['queued-follow-ups'] === 'object'
+            ? { ...globalState['queued-follow-ups'] }
+            : {};
+          const conversationId = String(message.params?.conversationId || '');
+          const messages = Array.isArray(message.params?.messages) ? message.params.messages : [];
+          if (messages.length) queued[conversationId] = messages;
+          else delete queued[conversationId];
+          globalState['queued-follow-ups'] = queued;
+          await writeFile(queuedFollowUpsStateFile, JSON.stringify(globalState));
+        })().catch((error) => {
+          fixture.lastError = error;
+        });
+        return;
+      }
       if (!fixture.ownerAvailable) {
         writeDesktopFrame(socket, {
           type: 'response',
           requestId: message.requestId,
           resultType: 'error',
           error: 'no-client-found',
+        });
+        return;
+      }
+      if (message.method === 'thread-follower-set-queued-follow-ups-state') {
+        if (fixture.failNextQueuedFollowUpsSet) {
+          fixture.failNextQueuedFollowUpsSet = false;
+          writeDesktopFrame(socket, {
+            type: 'response',
+            requestId: message.requestId,
+            resultType: 'error',
+            error: 'controlled-queued-follow-ups-failure',
+          });
+          return;
+        }
+        const failAfterWrite = fixture.failAfterWriteNextQueuedFollowUpsSet;
+        fixture.failAfterWriteNextQueuedFollowUpsSet = false;
+        void (async () => {
+          const globalState = JSON.parse(await readFile(queuedFollowUpsStateFile, 'utf8'));
+          globalState['queued-follow-ups'] = message.params?.state || {};
+          await writeFile(queuedFollowUpsStateFile, JSON.stringify(globalState));
+          if (failAfterWrite) {
+            writeDesktopFrame(socket, {
+              type: 'response',
+              requestId: message.requestId,
+              resultType: 'error',
+              error: 'controlled-queued-follow-ups-after-write-failure',
+            });
+            return;
+          }
+          writeDesktopFrame(socket, {
+            type: 'response',
+            requestId: message.requestId,
+            resultType: 'success',
+            method: message.method,
+            handledByClientId: 'desktop-owner',
+            result: { result: { ok: true } },
+          });
+        })().catch((error) => {
+          fixture.lastError = error;
+          writeDesktopFrame(socket, {
+            type: 'response',
+            requestId: message.requestId,
+            resultType: 'error',
+            error: `controlled-queued-follow-ups-write-failure: ${error.message}`,
+          });
+        });
+        return;
+      }
+      if (message.method === 'thread-follower-steer-turn' && fixture.failNextSteer) {
+        fixture.failNextSteer = false;
+        writeDesktopFrame(socket, {
+          type: 'response',
+          requestId: message.requestId,
+          resultType: 'error',
+          error: 'controlled-steer-failure',
+        });
+        return;
+      }
+      if (message.method === 'thread-follower-steer-turn' && fixture.steerMode === 'echo-only') {
+        Promise.resolve(fixture.onSteer?.(message)).catch((error) => {
+          fixture.lastError = error;
         });
         return;
       }

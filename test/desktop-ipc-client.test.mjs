@@ -80,7 +80,7 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
 
     if (message.type === 'broadcast') {
       outboundBroadcasts.push(message);
-      if (outboundBroadcasts.length === 3) outboundBroadcastsHandled(outboundBroadcasts);
+      if (outboundBroadcasts.length === 4) outboundBroadcastsHandled(outboundBroadcasts);
       return;
     }
 
@@ -135,6 +135,7 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
     assert.deepEqual(approval, { ok: true });
     await client.threadArchived('thread-1', '/workspace/project');
     await client.threadUnarchived('thread-1', '/workspace/project');
+    await client.threadQueuedFollowUpsChanged('thread-1', [{ id: 'queue-1', text: 'queued prompt' }]);
     await client.invalidateQueryCache(['archived-threads']);
     assert.deepEqual(await discoveryHandled, {
       type: 'client-discovery-response',
@@ -168,6 +169,16 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
           hostId: 'local',
           conversationId: 'thread-1',
           cwd: '/workspace/project',
+        },
+      },
+      {
+        type: 'broadcast',
+        method: 'thread-queued-followups-changed',
+        sourceClientId: 'web-client-id',
+        version: 1,
+        params: {
+          conversationId: 'thread-1',
+          messages: [{ id: 'queue-1', text: 'queued prompt' }],
         },
       },
       {
@@ -333,6 +344,9 @@ test('routes supported Desktop request responses to the selected owner', async (
   const userInputResponse = { answers: { choice: { answers: ['yes'] } } };
   const permissionsResponse = { permissions: { network: true }, scope: 'turn' };
   const mcpResponse = { action: 'accept', content: { value: 'approved' } };
+  const queuedFollowUpsState = {
+    'thread-3': [{ id: 'queued-1', text: 'queued follow-up' }],
+  };
 
   try {
     await client.loadCompleteHistory('thread-3', options);
@@ -341,6 +355,7 @@ test('routes supported Desktop request responses to the selected owner', async (
     await client.permissionsApprovalResponse('thread-3', 'permissions-1', permissionsResponse, options);
     await client.submitUserInput('thread-3', 'input-1', userInputResponse, options);
     await client.submitMcpElicitationResponse('thread-3', 'mcp-1', mcpResponse, options);
+    await client.setQueuedFollowUpsState('thread-3', queuedFollowUpsState, options);
 
     assert.deepEqual(received, [
       {
@@ -378,6 +393,12 @@ test('routes supported Desktop request responses to the selected owner', async (
         version: 1,
         targetClientId: 'desktop-owner-id',
         params: { conversationId: 'thread-3', requestId: 'mcp-1', response: mcpResponse },
+      },
+      {
+        method: 'thread-follower-set-queued-follow-ups-state',
+        version: 1,
+        targetClientId: 'desktop-owner-id',
+        params: { conversationId: 'thread-3', state: queuedFollowUpsState },
       },
     ]);
   } finally {
