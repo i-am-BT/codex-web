@@ -668,6 +668,29 @@ if (args[0] === 'app-server') {
       appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify(message) + '\\n');
       if (!Object.hasOwn(message, 'id') || !message.method) continue;
       if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake' } });
+      else if (message.method === 'model/list') {
+        send({
+          id: message.id,
+          result: {
+            data: [
+              {
+                id: 'test-model',
+                displayName: 'Test model',
+                serviceTiers: [
+                  { id: 'default', name: 'Standard' },
+                  { id: 'priority', name: 'Fast', description: '1.5x speed, increased usage' }
+                ]
+              },
+              {
+                id: 'standard-only-model',
+                displayName: 'Standard only',
+                serviceTiers: [{ id: 'default', name: 'Standard' }]
+              }
+            ],
+            nextCursor: null
+          }
+        });
+      }
       else if (message.method === 'thread/list') {
         const control = archiveControl();
         const raceToken = String(control.unarchiveAfterFirstListToken || '');
@@ -1055,6 +1078,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedSubQuotas.status, 401);
     const unauthorizedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`);
     assert.equal(unauthorizedSubQuotaConfig.status, 401);
+    const unauthorizedModelCapabilities = await fetch(`${baseUrl}/api/native-model-capabilities`);
+    assert.equal(unauthorizedModelCapabilities.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
@@ -1827,9 +1852,9 @@ updated_at = 1784422800000
     assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*permissionMode:composerPermissionMode,sandbox:/);
     assert.match(page, /if\(!preserveProviderModel&&\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&metadata\.modelProvider/);
-    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval\)/);
-    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval\)/);
-    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort,item\.permissionMode,item\.sandbox,item\.approval\);/);
+    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier\)/);
+    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier\)/);
+    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort,item\.permissionMode,item\.sandbox,item\.approval,item\.serviceTier\);/);
     assert.match(page, /permissionMode:\s*composerPermissionMode/);
     assert.match(page, /\.\.\.composerPermissionPayload\(item\.permissionMode,item\.sandbox,item\.approval\)/);
     assert.match(page, /\.\.\.composerPermissionPayload\(\)/);
@@ -1850,7 +1875,7 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerChrome\(\);\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -3166,9 +3191,32 @@ updated_at = 1784422800000
     const config = await configResponse.json();
     assert.equal(config.defaults.model, 'test-model');
     assert.equal(config.defaults.reasoningEffort, 'max');
+    assert.equal(config.defaults.serviceTier, null);
     assert.equal(config.capabilities.manageProviders, false);
     assert.equal(config.appearance.chatBackground, 'default');
     assert.deepEqual(config.pinnedThreadIds, [nativeSessionId, archivedNativeSessionId]);
+
+    const modelCapabilitiesResponse = await fetch(`${baseUrl}/api/native-model-capabilities`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(modelCapabilitiesResponse.status, 200);
+    assert.match(modelCapabilitiesResponse.headers.get('cache-control'), /no-store/);
+    const modelCapabilities = await modelCapabilitiesResponse.json();
+    assert.equal(modelCapabilities.ok, true);
+    assert.equal(modelCapabilities.models.length, 2);
+    assert.equal(modelCapabilities.models.every((entry) => !('displayName' in entry)), true);
+    assert.equal(
+      modelCapabilities.models
+        .find((entry) => entry.id === 'test-model')
+        ?.serviceTiers.some((tier) => tier.id === 'priority'),
+      true,
+    );
+    assert.equal(
+      modelCapabilities.models
+        .find((entry) => entry.id === 'standard-only-model')
+        ?.serviceTiers.some((tier) => tier.id === 'priority'),
+      false,
+    );
 
     const playgroundConfigResponse = await fetch(`${baseUrl}/api/playground-config`, {
       headers: { Cookie: cookie },
@@ -3693,6 +3741,7 @@ updated_at = 1784422800000
         messageSeq: nativeTargetMessage.seq,
         provider: 'fake',
         model: 'test-model',
+        serviceTier: 'priority',
         cwd: temporary,
         sandbox: 'workspace-write',
         approval: 'on-request',
@@ -3742,6 +3791,7 @@ updated_at = 1784422800000
         provider: 'fake',
         model: 'test-model',
         reasoningEffort: 'ultra',
+        serviceTier: 'priority',
         cwd: temporary,
         sandbox: 'read-only',
         approval: 'on-request',
@@ -4068,7 +4118,13 @@ updated_at = 1784422800000
     }]);
     assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
     assert.equal(desktopStart.params.turnStartParams.model, 'test-model');
+    assert.equal(desktopStart.params.turnStartParams.serviceTier, 'priority');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
+    const standardDesktopStart = desktopIpc.messages.find((message) => (
+      message.method === 'thread-follower-start-turn'
+      && message.params.turnStartParams.input.some((item) => item.text === 'recover from native echo')
+    ));
+    assert.equal(standardDesktopStart.params.turnStartParams.serviceTier, null);
     const desktopSteer = desktopIpc.messages.find((message) => message.method === 'thread-follower-steer-turn');
     assert.equal(desktopSteer.params.conversationId, nativeSessionId);
     assert.deepEqual(desktopSteer.params.input, [{
@@ -4348,12 +4404,14 @@ updated_at = 1784422800000
     const queueItemA = {
       id: 'queue-client-a',
       message: 'same queue prompt',
+      serviceTier: 'priority',
       createdAt: '2026-07-26T10:00:00.000Z',
       source: 'web',
     };
     const queueItemB = {
       id: 'queue-client-b',
       message: 'same queue prompt',
+      serviceTier: null,
       createdAt: '2026-07-26T10:00:01.000Z',
       source: 'web',
     };
@@ -4384,6 +4442,7 @@ updated_at = 1784422800000
     assert.equal(mergedQueueClientB.status, 200);
     const mergedQueuePayload = await mergedQueueClientB.json();
     assert.deepEqual(mergedQueuePayload.items.map((item) => item.id), [queueItemB.id, queueItemA.id]);
+    assert.deepEqual(mergedQueuePayload.items.map((item) => item.serviceTier), [null, 'priority']);
 
     const queueTurn = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
       method: 'POST',
@@ -4391,6 +4450,7 @@ updated_at = 1784422800000
       body: JSON.stringify({
         ...concurrentTurnPayload,
         message: queueItemA.message,
+        serviceTier: queueItemA.serviceTier,
         queueItemId: queueItemA.id,
       }),
     });
@@ -4504,6 +4564,7 @@ updated_at = 1784422800000
       body: JSON.stringify({
         ...concurrentTurnPayload,
         message: queueItemB.message,
+        serviceTier: queueItemB.serviceTier,
         sideChat: true,
         sourceThreadId: nativeSessionId,
         queueItemId: queueItemB.id,
@@ -4675,6 +4736,7 @@ updated_at = 1784422800000
         provider: 'fake',
         model: 'test-model',
         reasoningEffort: 'max',
+        serviceTier: 'priority',
         cwd: temporary,
         sandbox: 'workspace-write',
         approval: 'on-request',
@@ -4782,6 +4844,7 @@ updated_at = 1784422800000
         provider: 'custom',
         model: 'custom-model',
         reasoningEffort: 'max',
+        serviceTier: 'priority',
         cwd: temporary,
         sandbox: 'read-only',
         approval: 'on-request',
@@ -4854,6 +4917,11 @@ updated_at = 1784422800000
       && message.sub2ApiKey === undefined
     )));
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
+    assert.ok(protocolMessages.some((message) => (
+      message.method === 'model/list'
+      && message.params.limit === 100
+      && message.params.includeHidden === false
+    )));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
     assert.ok(protocolMessages.some((message) => (
       message.method === 'thread/list'
@@ -4940,12 +5008,14 @@ updated_at = 1784422800000
     ));
     assert.ok(switchedProviderResume);
     assert.equal(switchedProviderResume.params.model, 'custom-model');
+    assert.equal(switchedProviderResume.params.serviceTier, 'priority');
     const restartFromFirstMessage = protocolMessages.find((message) => (
       message.method === 'thread/start'
       && message.params.sandbox === 'read-only'
       && message.params.approvalPolicy === 'untrusted'
     ));
     assert.ok(restartFromFirstMessage);
+    assert.equal(restartFromFirstMessage.params.serviceTier, null);
     const forkMessages = protocolMessages.filter((message) => message.method === 'thread/fork');
     assert.equal(forkMessages.length, 2);
     const forkMessage = forkMessages[0];
@@ -4953,6 +5023,8 @@ updated_at = 1784422800000
     assert.equal(forkMessage.params.lastTurnId, nativeFirstTurnId);
     assert.equal(forkMessage.params.sandbox, 'workspace-write');
     assert.equal(forkMessage.params.approvalPolicy, 'on-request');
+    assert.equal(forkMessage.params.serviceTier, 'priority');
+    assert.equal(forkMessages[1].params.serviceTier, null);
     const turnStartMessages = protocolMessages.filter((message) => message.method === 'turn/start');
     const turnStartText = (message) => (
       message.params.input.find((item) => item.type === 'text')?.text || ''
@@ -4960,11 +5032,31 @@ updated_at = 1784422800000
     const createdTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'create native thread');
     assert.equal(createdTurnStart.params.sandboxPolicy.type, 'workspaceWrite');
     assert.deepEqual(createdTurnStart.params.sandboxPolicy.writableRoots, [temporary]);
+    assert.equal(createdTurnStart.params.serviceTier, 'priority');
+    const createdTurnStartIndex = protocolMessages.indexOf(createdTurnStart);
+    const createdThreadStart = protocolMessages
+      .slice(0, createdTurnStartIndex)
+      .reverse()
+      .find((message) => message.method === 'thread/start');
+    assert.equal(createdThreadStart.params.serviceTier, 'priority');
     const approvalTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'needs approval');
     assert.equal(approvalTurnStart.params.sandboxPolicy.type, 'readOnly');
+    assert.equal(approvalTurnStart.params.serviceTier, null);
     const switchedProviderTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'switch native provider');
     assert.equal(switchedProviderTurnStart.params.model, 'custom-model');
     assert.equal(switchedProviderTurnStart.params.effort, 'max');
+    assert.equal(switchedProviderTurnStart.params.serviceTier, 'priority');
+    const queuedFastTurnStart = turnStartMessages.find((message) => (
+      message.params.threadId === nativeSessionId
+      && turnStartText(message) === queueItemA.message
+      && message.params.serviceTier === 'priority'
+    ));
+    assert.ok(queuedFastTurnStart);
+    const standardSideChatTurnStart = turnStartMessages.find((message) => (
+      message.params.threadId === runningSideChatId
+      && turnStartText(message) === queueItemB.message
+    ));
+    assert.equal(standardSideChatTurnStart.params.serviceTier, null);
     const steerMessage = protocolMessages.find((message) => (
       message.method === 'turn/steer'
       && message.params.input?.some((item) => item.text === 'change direction while running')

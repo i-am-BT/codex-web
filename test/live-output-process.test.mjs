@@ -877,6 +877,19 @@ test('queue send and explicit guide are mutually exclusive', () => {
   assert.match(inlineScript, /while\(promptQueueServerSyncInflight\.has\(id\)\)await promptQueueServerSyncInflight\.get\(id\)/);
 });
 
+test('queued prompts preserve the Fast service tier through dispatch and restore', () => {
+  const normalizeSource = sourceBetween('function normalizeQueuedPrompt', 'function isAppOwnedQueuedPrompt');
+  const queuePayloadSource = sourceBetween('function createQueuedPrompt', 'function applyServerPromptQueue');
+  const restoreSource = sourceBetween('async function restoreQueuedPrompt', 'function schedulePromptQueueDispatch');
+
+  assert.match(normalizeSource, /serviceTier/);
+  assert.match(normalizeSource, /normalizeComposerServiceTier/);
+  assert.match(queuePayloadSource, /serviceTier:composerServiceTier/);
+  assert.match(queuePayloadSource, /serviceTier:item\.serviceTier/);
+  assert.match(restoreSource, /composerServiceTier/);
+  assert.match(restoreSource, /renderComposerFastToggle|reconcileComposerFastSupport/);
+});
+
 test('Codex App queue entries stay visible but are never dispatched by Web', () => {
   const renderer = sourceBetween('function renderPromptQueue', 'function enqueuePrompt');
   const sideChat = sourceBetween('async function openQueuedPromptInSideChat', 'async function sendSideChatMessage');

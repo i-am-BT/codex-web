@@ -1296,6 +1296,14 @@ function applyEventRecord(cache, record, payload, maxMessages) {
     cache.currentTurnTokenUsage = null;
   }
   switch (payload.type) {
+    case 'thread_settings_applied': {
+      const settings = payload.thread_settings;
+      if (!settings || typeof settings !== 'object' || !Object.hasOwn(settings, 'service_tier')) break;
+      const serviceTier = normalizeServiceTier(settings.service_tier);
+      if (serviceTier === undefined) break;
+      cache.metadata = { ...cache.metadata, serviceTier };
+      break;
+    }
     case 'task_started':
       cache.status = 'running';
       if (!cache.currentTurnStartedAt) cache.currentTurnStartedAt = String(record.timestamp || '');
@@ -2206,6 +2214,15 @@ function normalizeSandboxPolicy(value) {
   if (typeof value === 'string') return value;
   if (typeof value === 'object') return value.type || value.mode || '';
   return '';
+}
+
+function normalizeServiceTier(value) {
+  if (value === null) return null;
+  if (value === undefined) return undefined;
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized || normalized === 'default') return null;
+  if (normalized === 'priority') return 'priority';
+  return undefined;
 }
 
 function buildConversation(entry, cache, options, runningWindowMs) {

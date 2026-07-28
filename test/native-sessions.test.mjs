@@ -652,6 +652,73 @@ This block is automatically supplied ambient UI state, not part of the user's re
   }
 });
 
+test('native session store restores service tier from thread settings events', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-service-tier-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f99cf-949c-7b10-a5a9-84d4a0f15a01';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '28');
+  const sessionFile = path.join(sessionDir, `rollout-2026-07-28T10-00-00-${id}.jsonl`);
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-28T10:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace', source: 'vscode' },
+      },
+      {
+        timestamp: '2026-07-28T10:00:00.100Z',
+        type: 'event_msg',
+        payload: {
+          type: 'thread_settings_applied',
+          thread_settings: { model: 'gpt-5.6-sol', service_tier: 'priority' },
+        },
+      },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.equal(store.get(id)?.metadata.serviceTier, 'priority');
+
+    await appendFile(sessionFile, jsonl([{
+      timestamp: '2026-07-28T10:00:01.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: { service_tier: 'default' },
+      },
+    }]));
+    store.refresh();
+    assert.equal(store.get(id)?.metadata.serviceTier, null);
+
+    await appendFile(sessionFile, jsonl([{
+      timestamp: '2026-07-28T10:00:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: { service_tier: 'priority' },
+      },
+    }]));
+    store.refresh();
+    assert.equal(store.get(id)?.metadata.serviceTier, 'priority');
+
+    await appendFile(sessionFile, jsonl([{
+      timestamp: '2026-07-28T10:00:03.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: { service_tier: null },
+      },
+    }]));
+    store.refresh();
+    assert.equal(store.get(id)?.metadata.serviceTier, null);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('native session store recovers a truncated active turn start from tail metadata within a bounded scan', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-turn-start-'));
   const codexHome = path.join(temporary, '.codex');

@@ -97,6 +97,8 @@ const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAG
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
 const NATIVE_SESSION_POLL_MS = Number(process.env.NATIVE_SESSION_POLL_MS || 3000);
 const APP_SERVER_REQUEST_TIMEOUT_MS = Number(process.env.APP_SERVER_REQUEST_TIMEOUT_MS || 30000);
+const NATIVE_MODEL_CAPABILITIES_CACHE_MS = 5 * 60 * 1000;
+const NATIVE_MODEL_CAPABILITIES_TIMEOUT_MS = Math.min(APP_SERVER_REQUEST_TIMEOUT_MS, 8000);
 const CODEX_DESKTOP_IPC_ENABLED = parseBoolean(
   process.env.CODEX_DESKTOP_IPC_ENABLED,
   process.platform === 'darwin' || process.platform === 'win32',
@@ -228,6 +230,7 @@ const loginAttempts = new Map();
 let activeProcess = null;
 let activeConversationId = '';
 let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
+let nativeModelCapabilitiesCache = { models: [], expiresAt: 0 };
 
 nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
@@ -486,6 +489,7 @@ app.get('/api/config', requireAuth, (req, res) => {
       model: defaults.model || DEFAULT_MODEL,
       provider: defaults.provider || DEFAULT_PROVIDER,
       reasoningEffort: defaults.reasoningEffort || '',
+      serviceTier: defaults.serviceTier === 'priority' ? 'priority' : null,
       cwd: DEFAULT_CWD,
       sandbox: FORCE_FULL_ACCESS ? 'danger-full-access' : DEFAULT_SANDBOX,
       approval: FORCE_FULL_ACCESS ? 'never' : DEFAULT_APPROVAL,
@@ -500,6 +504,16 @@ app.get('/api/config', requireAuth, (req, res) => {
       forceFullAccess: FORCE_FULL_ACCESS,
     },
   });
+});
+
+app.get('/api/native-model-capabilities', requireAuth, async (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const models = await readNativeModelCapabilities();
+    res.json({ ok: true, models });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `读取 Codex 模型能力失败: ${err.message}` });
+  }
 });
 
 app.get('/api/playground-config', requireAuth, (_req, res) => {
@@ -991,9 +1005,12 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       return res.status(409).json({ error: '会话历史已截断，无法确定这条消息之前的 turn' });
     }
 
-    const settings = parseNativeThreadSettings(req.body || {});
+    const settingsOptions = Object.hasOwn(source.metadata || {}, 'serviceTier')
+      ? { fallbackServiceTier: source.metadata.serviceTier }
+      : {};
+    const settings = parseNativeThreadSettings(req.body || {}, settingsOptions);
     const result = forkedThroughTurnId
-      ? await appServerClient.request('thread/fork', compactObject({
+      ? await appServerClient.request('thread/fork', compactObjectWithServiceTier({
         threadId,
         lastTurnId: forkedThroughTurnId,
         cwd: settings.cwd,
@@ -1003,8 +1020,8 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
         approvalPolicy: settings.approval,
         approvalsReviewer: settings.approvalsReviewer,
         threadSource: 'user',
-      }))
-      : await appServerClient.request('thread/start', compactObject({
+      }, settings.serviceTier))
+      : await appServerClient.request('thread/start', compactObjectWithServiceTier({
         cwd: settings.cwd,
         model: settings.model,
         modelProvider: settings.provider,
@@ -1012,7 +1029,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
         approvalPolicy: settings.approval,
         approvalsReviewer: settings.approvalsReviewer,
         threadSource: 'user',
-      }));
+      }, settings.serviceTier));
     const forkedThreadId = cleanNativeThreadId(result?.thread?.id);
     if (!forkedThreadId) throw new Error('Codex app-server 未返回有效分支 thread id');
 
@@ -1020,7 +1037,12 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
     const persisted = nativeSessions.get(forkedThreadId);
     const conversation = persisted
       ? decorateNativeConversation(persisted)
-      : nativeConversationFromThread(result.thread, '');
+      : nativeConversationFromThread(result.thread, '', {
+        cwd: result?.cwd || settings.cwd,
+        model: result?.model || settings.model,
+        modelProvider: result?.modelProvider || settings.provider,
+        serviceTier: Object.hasOwn(result || {}, 'serviceTier') ? result.serviceTier : settings.serviceTier,
+      });
     res.status(201).json({
       ok: true,
       threadId: forkedThreadId,
@@ -1048,7 +1070,7 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       if (!sourceThreadId) throw promptQueueConflict('队列来源会话无效', getPromptQueueState(sourceThreadId));
       queueReservation = reservePromptQueueItem(sourceThreadId, queueItemId);
     }
-    const started = await appServerClient.request('thread/start', compactObject({
+    const started = await appServerClient.request('thread/start', compactObjectWithServiceTier({
       cwd: turn.cwd,
       model: turn.model,
       modelProvider: turn.provider,
@@ -1056,7 +1078,7 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       approvalPolicy: turn.approval,
       approvalsReviewer: turn.approvalsReviewer,
       threadSource: 'user',
-    }));
+    }, turn.serviceTier));
     const threadId = cleanNativeThreadId(started?.thread?.id);
     if (!threadId) throw new Error('Codex app-server 未返回有效 thread id');
     createdThreadId = threadId;
@@ -1074,7 +1096,12 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       ok: true,
       threadId,
       turnId: turnStarted.turnId,
-      conversation: nativeConversationFromThread(started.thread, turnStarted.turnId),
+      conversation: nativeConversationFromThread(started.thread, turnStarted.turnId, {
+        cwd: started?.cwd || turn.cwd,
+        model: started?.model || turn.model,
+        modelProvider: started?.modelProvider || turn.provider,
+        serviceTier: Object.hasOwn(started || {}, 'serviceTier') ? started.serviceTier : turn.serviceTier,
+      }),
       ...(queue ? { queue } : {}),
     });
   } catch (err) {
@@ -1107,7 +1134,11 @@ app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
   let queueReservation = null;
 
   try {
-    const turn = parseNativeTurnPayload(req.body || {});
+    const current = nativeSessions.get(threadId);
+    const settingsOptions = Object.hasOwn(current?.metadata || {}, 'serviceTier')
+      ? { fallbackServiceTier: current.metadata.serviceTier }
+      : {};
+    const turn = parseNativeTurnPayload(req.body || {}, settingsOptions);
     const queueItemId = String(req.body?.queueItemId || '').trim();
     if (queueItemId) queueReservation = reservePromptQueueItem(threadId, queueItemId);
     const turnStarted = await continueNativeTurn(threadId, turn);
@@ -2907,6 +2938,8 @@ function setNativeTurnState(threadId, state) {
       : String(state.startedAt || current?.startedAt || ''),
     updatedAt,
   };
+  if (Object.hasOwn(state, 'serviceTier')) next.serviceTier = cleanServiceTier(state.serviceTier);
+  else if (Object.hasOwn(current || {}, 'serviceTier')) next.serviceTier = current.serviceTier;
   activeNativeTurns.set(cleanId, next);
   if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
   broadcastNativeRuntime({ type: 'turn', threadId: cleanId, ...next });
@@ -3189,6 +3222,7 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
       ...conversation.metadata,
       ...(active.provider ? { modelProvider: active.provider } : {}),
       ...(active.model ? { model: active.model } : {}),
+      ...(Object.hasOwn(active, 'serviceTier') ? { serviceTier: active.serviceTier } : {}),
     }
     : conversation.metadata;
   return {
@@ -3252,6 +3286,7 @@ async function continueNativeTurn(threadId, turn) {
       transport: 'desktop-ipc',
       provider: turn.provider,
       model: turn.model,
+      serviceTier: turn.serviceTier,
     });
     return { turnId, result, transport: 'desktop-ipc' };
   }
@@ -3267,7 +3302,7 @@ async function continueNativeTurn(threadId, turn) {
 }
 
 async function resumeNativeTurn(threadId, turn) {
-  await appServerClient.request('thread/resume', compactObject({
+  await appServerClient.request('thread/resume', compactObjectWithServiceTier({
     threadId,
     cwd: turn.cwd,
     model: turn.model,
@@ -3276,7 +3311,7 @@ async function resumeNativeTurn(threadId, turn) {
     approvalPolicy: turn.approval,
     approvalsReviewer: turn.approvalsReviewer,
     excludeTurns: true,
-  }));
+  }, turn.serviceTier));
   return startNativeTurn(threadId, turn);
 }
 
@@ -3316,6 +3351,7 @@ function recoverDesktopNativeTurn(threadId, conversation, turn = {}) {
     transport: 'desktop-ipc',
     provider: turn.provider,
     model: turn.model,
+    serviceTier: turn.serviceTier,
   });
   if (status !== 'running') {
     setTimeout(() => {
@@ -3417,7 +3453,7 @@ async function notifyDesktopAutomationsChanged() {
 }
 
 async function startNativeTurn(threadId, turn) {
-  const result = await appServerClient.request('turn/start', compactObject({
+  const result = await appServerClient.request('turn/start', compactObjectWithServiceTier({
     threadId,
     input: turn.input,
     cwd: turn.cwd,
@@ -3427,7 +3463,7 @@ async function startNativeTurn(threadId, turn) {
     approvalsReviewer: turn.approvalsReviewer,
     sandboxPolicy: turn.sandbox ? nativeSandboxPolicy(turn.sandbox, turn.cwd) : undefined,
     useAppServerPermissionDefault: turn.permissionMode === 'custom' ? true : undefined,
-  }));
+  }, turn.serviceTier));
   const turnId = String(result?.turn?.id || '');
   if (!turnId) throw new Error('Codex app-server 未返回有效 turn id');
   setNativeTurnState(threadId, {
@@ -3435,13 +3471,14 @@ async function startNativeTurn(threadId, turn) {
     status: 'running',
     provider: turn.provider,
     model: turn.model,
+    serviceTier: turn.serviceTier,
   });
   return { turnId, result };
 }
 
 function buildDesktopTurnStartParams(turn) {
   const workspaceWrite = turn.sandbox === 'workspace-write';
-  return compactObject({
+  return compactObjectWithServiceTier({
     input: buildDesktopTurnInput(turn.input),
     cwd: turn.cwd,
     model: turn.model,
@@ -3452,7 +3489,7 @@ function buildDesktopTurnStartParams(turn) {
     runtimeWorkspaceRoots: turn.sandbox ? (workspaceWrite ? [turn.cwd] : undefined) : undefined,
     useAppServerPermissionDefault: turn.permissionMode === 'custom' ? true : undefined,
     attachments: [],
-  });
+  }, turn.serviceTier);
 }
 
 function buildDesktopTurnInput(input) {
@@ -3521,6 +3558,10 @@ function parseNativeThreadSettings(body, options = {}) {
   const provider = cleanValue(body.provider) || DEFAULT_PROVIDER;
   const permissions = permissionSettingsFromRequest(body);
   const reasoningEffort = cleanReasoningEffort(body.reasoningEffort);
+  const fallbackServiceTier = Object.hasOwn(options, 'fallbackServiceTier')
+    ? options.fallbackServiceTier
+    : readCodexDefaults().serviceTier;
+  const serviceTier = cleanServiceTier(Object.hasOwn(body, 'serviceTier') ? body.serviceTier : fallbackServiceTier);
   return {
     cwd,
     projectless,
@@ -3531,6 +3572,7 @@ function parseNativeThreadSettings(body, options = {}) {
     approval: permissions.approval,
     approvalsReviewer: permissions.approvalsReviewer,
     reasoningEffort,
+    serviceTier,
   };
 }
 
@@ -3582,7 +3624,7 @@ function buildNativeTurnInput(message, attachments) {
   return input;
 }
 
-function nativeConversationFromThread(thread, activeTurnId) {
+function nativeConversationFromThread(thread, activeTurnId, settings = {}) {
   const createdAt = unixSecondsToIso(thread?.createdAt) || new Date().toISOString();
   const updatedAt = unixSecondsToIso(thread?.updatedAt) || createdAt;
   return {
@@ -3596,8 +3638,10 @@ function nativeConversationFromThread(thread, activeTurnId) {
     activeTurnId,
     messages: [],
     metadata: {
-      cwd: String(thread?.cwd || ''),
-      modelProvider: String(thread?.modelProvider || ''),
+      cwd: String(settings.cwd || thread?.cwd || ''),
+      model: String(settings.model || thread?.model || ''),
+      modelProvider: String(settings.modelProvider || thread?.modelProvider || ''),
+      serviceTier: cleanServiceTier(settings.serviceTier),
       cliVersion: String(thread?.cliVersion || ''),
     },
   };
@@ -3635,6 +3679,13 @@ function compactObject(value) {
   return Object.fromEntries(
     Object.entries(value).filter(([, item]) => item !== undefined && item !== null && item !== ''),
   );
+}
+
+function compactObjectWithServiceTier(value, serviceTier) {
+  return {
+    ...compactObject(value),
+    serviceTier: cleanServiceTier(serviceTier),
+  };
 }
 
 function nativeAppErrorStatus(error) {
@@ -4309,6 +4360,39 @@ function buildCodexProcessEnvironment() {
   return env;
 }
 
+async function readNativeModelCapabilities() {
+  const now = Date.now();
+  if (nativeModelCapabilitiesCache.expiresAt > now) return nativeModelCapabilitiesCache.models;
+  const result = await appServerClient.request('model/list', {
+    limit: 100,
+    includeHidden: false,
+  }, { timeoutMs: NATIVE_MODEL_CAPABILITIES_TIMEOUT_MS });
+  if (!Array.isArray(result?.data)) throw new Error('model/list 未返回模型列表');
+  const models = result.data.map((model) => {
+    const id = String(model?.id || '').trim();
+    const modelId = String(model?.model || id).trim();
+    if (!id && !modelId) return null;
+    const serviceTiers = (Array.isArray(model?.serviceTiers) ? model.serviceTiers : [])
+      .map((tier) => ({
+        id: String(tier?.id || '').trim(),
+        name: String(tier?.name || '').trim(),
+        description: String(tier?.description || '').trim(),
+      }))
+      .filter((tier) => tier.id);
+    return {
+      id: id || modelId,
+      model: modelId || id,
+      serviceTiers,
+      defaultServiceTier: String(model?.defaultServiceTier || '').trim().toLowerCase() === 'priority' ? 'priority' : null,
+    };
+  }).filter(Boolean);
+  nativeModelCapabilitiesCache = {
+    models,
+    expiresAt: now + NATIVE_MODEL_CAPABILITIES_CACHE_MS,
+  };
+  return models;
+}
+
 function readCodexDefaults() {
   if (!existsSync(CODEX_CONFIG_FILE)) return {};
   const content = readFileSync(CODEX_CONFIG_FILE, 'utf8');
@@ -4316,6 +4400,9 @@ function readCodexDefaults() {
     provider: content.match(/^model_provider\s*=\s*"([^"]+)"/m)?.[1] || '',
     model: content.match(/^model\s*=\s*"([^"]+)"/m)?.[1] || '',
     reasoningEffort: content.match(/^model_reasoning_effort\s*=\s*"([^"]+)"/m)?.[1] || '',
+    serviceTier: String(content.match(/^service_tier\s*=\s*"([^"]+)"/m)?.[1] || '').trim().toLowerCase() === 'priority'
+      ? 'priority'
+      : null,
   };
 }
 
@@ -4475,6 +4562,14 @@ function cleanReasoningEffort(value) {
   return effort;
 }
 
+function cleanServiceTier(value) {
+  if (value === undefined || value === null) return null;
+  const serviceTier = String(value).trim().toLowerCase();
+  if (!serviceTier || serviceTier === 'default') return null;
+  if (serviceTier === 'priority') return 'priority';
+  throw new Error('Codex Fast 模式无效');
+}
+
 function replaceTopLevelTomlValue(content, key, value) {
   const line = `${key} = "${tomlEscape(value)}"`;
   const pattern = new RegExp(`^${key}\\s*=\\s*"[^"]*"`, 'm');
@@ -4625,6 +4720,7 @@ function normalizeServerQueuedPrompt(item) {
     provider: String(item.provider || ''),
     model: String(item.model || ''),
     reasoningEffort: String(item.reasoningEffort || ''),
+    serviceTier: String(item.serviceTier || '').trim().toLowerCase() === 'priority' ? 'priority' : null,
     cwd: String(item.cwd || ''),
     permissionMode,
     sandbox: String(item.sandbox || (permissionMode === 'custom' ? '' : 'read-only')),
@@ -5220,7 +5316,7 @@ body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=dual-quota-20260725l">
+<link rel="stylesheet" href="/ui.css?v=fast-mode-20260728a">
   <link rel="stylesheet" href="/image-prompt.css?v=image-prompt-main-20260723g">
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
@@ -5339,6 +5435,11 @@ let composerModelSubmenuTitle = null;
 let composerModelSubmenuOptions = null;
 let composerModelRunHint = null;
 let composerModelMenuRows = new Map();
+let composerFastToggle = null;
+let composerServiceTier = null;
+let defaultComposerServiceTier = null;
+let nativeModelCapabilitiesLoaded = false;
+let nativeModelServiceTiers = new Map();
 let composerSlashPanel = null;
 let composerSlashList = null;
 let composerSlashStatus = null;
@@ -5489,6 +5590,58 @@ function composerModelLabel(value){
   return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
 }
 function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'极高'})[String(value||'')]||String(value||'默认')}
+function normalizeComposerServiceTier(value){return String(value||'').trim().toLowerCase()==='priority'?'priority':null}
+function composerModelCapabilityKeys(value=model.value){
+  const clean=String(value||'').trim().toLowerCase();
+  if(!clean)return[];
+  const short=clean.includes('/')?clean.split('/').at(-1):clean;
+  return short&&short!==clean?[clean,short]:[clean];
+}
+function composerFastSupported(value=model.value){
+  return composerModelCapabilityKeys(value).some((key)=>(nativeModelServiceTiers.get(key)||[]).includes('priority'));
+}
+function renderComposerFastToggle(){
+  if(!composerFastToggle)return;
+  const active=composerServiceTier==='priority';
+  const supported=composerFastSupported();
+  const visible=supported||(!nativeModelCapabilitiesLoaded&&active);
+  composerFastToggle.classList.toggle('hidden',!visible);
+  composerFastToggle.classList.toggle('active',active);
+  composerFastToggle.disabled=!supported&&!active;
+  composerFastToggle.setAttribute('aria-pressed',String(active));
+  composerFastToggle.setAttribute('aria-label',active?'关闭 Fast 模式':'开启 Fast 模式');
+  composerFastToggle.title=active?'Fast 已开启 · 点击恢复标准消耗':'开启 Fast · 更快响应并增加额度消耗';
+}
+function reconcileComposerFastSupport(){
+  if(nativeModelCapabilitiesLoaded&&composerServiceTier==='priority'&&!composerFastSupported())composerServiceTier=null;
+  renderComposerFastToggle();
+}
+function setComposerServiceTier(value,{remember=true}={}){
+  const next=normalizeComposerServiceTier(value);
+  if(next==='priority'&&!composerFastSupported())return false;
+  composerServiceTier=next;
+  if(remember)rememberNativeComposerOverride();
+  renderComposerFastToggle();
+  return true;
+}
+async function loadNativeModelCapabilities(){
+  try{
+    const res=await fetch('/api/native-model-capabilities',{headers:{Accept:'application/json'}});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||'Fast 模型能力读取失败');
+    const tiers=new Map();
+    for(const entry of Array.isArray(data.models)?data.models:[]){
+      const values=(Array.isArray(entry?.serviceTiers)?entry.serviceTiers:[]).map((tier)=>String(tier?.id||'').trim().toLowerCase()).filter(Boolean);
+      for(const key of [entry?.id,entry?.model].map((item)=>String(item||'').trim().toLowerCase()).filter(Boolean))tiers.set(key,values);
+    }
+    nativeModelServiceTiers=tiers;
+    nativeModelCapabilitiesLoaded=true;
+    reconcileComposerFastSupport();
+  }catch(e){
+    nativeModelCapabilitiesLoaded=false;
+    renderComposerFastToggle();
+  }
+}
 function composerSelectedOptionLabel(select,fallback='默认'){return select?.selectedOptions?.[0]?.textContent?.trim()||fallback}
 function composerModelMenuSource(kind){return kind==='model'?composerModelSelect:kind==='reasoning'?composerReasoningSelect:composerProviderSelect}
 function composerModelMenuValue(kind){return kind==='model'?composerModelLabel(model.value):kind==='reasoning'?composerEffortLabel(reasoningEffort.value):composerSelectedOptionLabel(provider,'默认')}
@@ -5518,6 +5671,7 @@ function showComposerModelMainMenu({focus=false}={}){
   if(composerReasoningInline&&composerReasoningSelect){
     composerReasoningInline.replaceChildren();
     renderComposerReasoningSlider(composerReasoningSelect,composerReasoningInline,{focus:false,compact:true});
+    if(composerFastToggle)composerReasoningInline.appendChild(composerFastToggle);
   }
   renderComposerModelMenuState();
   if(focus)composerModelMainMenu?.querySelector('button:not(:disabled)')?.focus();
@@ -5533,6 +5687,7 @@ function renderComposerModelMenuState(){
     row.button.setAttribute('aria-label',(kind==='model'?'模型 ':kind==='reasoning'?'推理强度 ':'高级，服务商 ')+row.value.textContent);
   }
   composerModelRunHint?.classList.toggle('hidden',!webRunActive||currentConversationSource!=='codex');
+  renderComposerFastToggle();
 }
 function renderComposerReasoningSlider(source,target=composerModelSubmenuOptions,{focus=true,compact=false}={}){
   const entries=[...source.options]
@@ -5706,6 +5861,7 @@ function normalizeQueuedPrompt(item){
     provider:String(item.provider||''),
     model:String(item.model||''),
     reasoningEffort:String(item.reasoningEffort||''),
+    serviceTier:normalizeComposerServiceTier(item.serviceTier),
     cwd:String(item.cwd||''),
     permissionMode,
     sandbox:String(item.sandbox||(permissionMode==='custom'?'':'read-only')),
@@ -5768,6 +5924,7 @@ function promptQueueFingerprint(items){
     provider:item.provider,
     model:item.model,
     reasoningEffort:item.reasoningEffort,
+    serviceTier:item.serviceTier,
     cwd:item.cwd,
     permissionMode:item.permissionMode,
     sandbox:item.sandbox,
@@ -5921,12 +6078,12 @@ function applyRemotePromptQueueEvent(event){
 }
 function createQueuedPrompt(message,attachments){return normalizeQueuedPrompt({
   id:makePromptQueueId(),message,attachments,provider:provider.value,model:model.value,
-  reasoningEffort:reasoningEffort.value,cwd:cwd.value,permissionMode:composerPermissionMode,sandbox:sandbox.value,
+  reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,permissionMode:composerPermissionMode,sandbox:sandbox.value,
   approval:approval.value,createdAt:new Date().toISOString(),source:'web',
 })}
 function queuedPromptPayload(item){return{
   message:item.message,attachments:item.attachments,provider:item.provider,model:item.model,
-  reasoningEffort:item.reasoningEffort,cwd:item.cwd,...composerPermissionPayload(item.permissionMode,item.sandbox,item.approval),
+  reasoningEffort:item.reasoningEffort,serviceTier:item.serviceTier,cwd:item.cwd,...composerPermissionPayload(item.permissionMode,item.sandbox,item.approval),
   queueItemId:item.id,
 }}
 
@@ -6665,6 +6822,7 @@ async function sendSideChatMessage(){
           provider:provider.value,
           model:model.value,
           reasoningEffort:reasoningEffort.value,
+          serviceTier:composerServiceTier,
           cwd:cwd.value,
           ...composerPermissionPayload(),
         }),
@@ -7033,6 +7191,8 @@ async function restoreQueuedPrompt(threadId,itemId){
   if([...provider.options].some((option)=>option.value===item.provider))provider.value=item.provider;
   await loadModels(provider.value,item.model);
   if(['low','medium','high','xhigh','max','ultra',''].includes(item.reasoningEffort))reasoningEffort.value=item.reasoningEffort;
+  composerServiceTier=normalizeComposerServiceTier(item.serviceTier);
+  reconcileComposerFastSupport();
   composerPermissionMode=['ask','auto','full','custom'].includes(item.permissionMode)?item.permissionMode:'legacy';
   if(composerPermissionMode!=='custom'&&['read-only','workspace-write','danger-full-access'].includes(item.sandbox))sandbox.value=item.sandbox;
   if(composerPermissionMode!=='custom'&&['never','on-request','untrusted'].includes(item.approval))approval.value=item.approval;
@@ -7189,7 +7349,7 @@ async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
     }
     if(!applyServerPromptQueue(threadId,data.queue))removeQueuedPromptLocal(threadId,item,{persist:false});
     if(currentConversationSource==='codex'&&currentConversationId===threadId){
-      setNativeComposerOverride(threadId,item.provider,item.model,item.reasoningEffort,item.permissionMode,item.sandbox,item.approval);
+      setNativeComposerOverride(threadId,item.provider,item.model,item.reasoningEffort,item.permissionMode,item.sandbox,item.approval,item.serviceTier);
       showNativePromptOptimistically(item);
       activeNativeTurnId=data.turnId||'';
       webRunActive=true;
@@ -7348,6 +7508,7 @@ function syncComposerChrome(){
   syncComposerSelect(provider,composerProviderSelect);
   syncComposerSelect(model,composerModelSelect);
   syncComposerSelect(reasoningEffort,composerReasoningSelect);
+  reconcileComposerFastSupport();
   if(composerModelName)composerModelName.textContent=composerModelLabel(model.value);
   if(composerEffortName)composerEffortName.textContent=composerEffortLabel(reasoningEffort.value);
   const projectPath=normalizeProjectPath(cwd.value);
@@ -8436,6 +8597,13 @@ function enhanceComposer(){
   composerReasoningInline=document.createElement('div');
   composerReasoningInline.className='composerReasoningInline';
   composerReasoningInline.setAttribute('aria-label','推理强度滑条');
+  composerFastToggle=document.createElement('button');
+  composerFastToggle.type='button';
+  composerFastToggle.className='composerFastToggle hidden';
+  setIconLabel(composerFastToggle,'zap','Fast',true);
+  composerFastToggle.addEventListener('click',()=>{
+    setComposerServiceTier(composerServiceTier==='priority'?null:'priority');
+  });
   composerModelMainMenu.appendChild(composerReasoningInline);
   const modelMenuDivider=document.createElement('div');
   modelMenuDivider.className='composerModelMenuDivider';
@@ -8466,7 +8634,7 @@ function enhanceComposer(){
   composerPermissionToggle.addEventListener('click',(event)=>{event.preventDefault();expandComposer();toggleComposerPopover(composerPermissionPanel,composerPermissionToggle)});
   composerModelToggle.addEventListener('click',(event)=>{event.preventDefault();expandComposer();toggleComposerPopover(composerModelPanel,composerModelToggle)});
   composerProviderSelect.addEventListener('change',async()=>{provider.value=composerProviderSelect.value;rememberNativeComposerOverride();await loadModels(provider.value);rememberNativeComposerOverride();syncComposerChrome()});
-  composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;rememberNativeComposerOverride();syncComposerChrome()});
+  composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;reconcileComposerFastSupport();rememberNativeComposerOverride();syncComposerChrome()});
   composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;rememberNativeComposerOverride();syncComposerChrome()});
   input.addEventListener('focus',()=>{closeComposerPopovers();expandComposer()});
   input.addEventListener('blur',scheduleComposerCollapse);
@@ -9710,7 +9878,7 @@ async function handleCustomBackground(file){if(!file){await saveAppearance({chat
 async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
 document.addEventListener('click',(event)=>{if(!event.target.closest('.msg.user, .msg.assistant, .msgActions'))clearMessageActionsOpen()});
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);if(selectRecent&&data.conversations.length){const saved=readActiveConversationPreference();const conversations=Array.isArray(data.conversations)?data.conversations:[];const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=match||conversations[0];if(target)await loadConversation(target.id,target.source||'codex');}await restoreSideChatIfNeeded()}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(selectRecent&&data.conversations.length){const saved=readActiveConversationPreference();const conversations=Array.isArray(data.conversations)?data.conversations:[];const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=match||conversations[0];if(target)await loadConversation(target.id,target.source||'codex');}await restoreSideChatIfNeeded()}
 function flushPendingHistoryRefresh(){
   if(!historyRefreshPending||activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive)return;
   historyRefreshPending=false;
@@ -11240,11 +11408,11 @@ function resetNewTaskComposerCwd(){
 function clearNativeComposerOverride(){nativeComposerOverride=null}
 function rememberNativeComposerOverride(){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
-  nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||''),permissionMode:composerPermissionMode,sandbox:String(sandbox.value||''),approval:String(approval.value||'')};
+  nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||''),serviceTier:normalizeComposerServiceTier(composerServiceTier),permissionMode:composerPermissionMode,sandbox:String(sandbox.value||''),approval:String(approval.value||'')};
 }
-function setNativeComposerOverride(threadId,selectedProvider,selectedModel,selectedReasoningEffort,selectedPermissionMode=composerPermissionMode,selectedSandbox=sandbox.value,selectedApproval=approval.value){
+function setNativeComposerOverride(threadId,selectedProvider,selectedModel,selectedReasoningEffort,selectedPermissionMode=composerPermissionMode,selectedSandbox=sandbox.value,selectedApproval=approval.value,selectedServiceTier=composerServiceTier){
   if(!threadId)return;
-  nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||''),permissionMode:String(selectedPermissionMode||'legacy'),sandbox:String(selectedSandbox||''),approval:String(selectedApproval||'')};
+  nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||''),serviceTier:normalizeComposerServiceTier(selectedServiceTier),permissionMode:String(selectedPermissionMode||'legacy'),sandbox:String(selectedSandbox||''),approval:String(selectedApproval||'')};
 }
 function nativeComposerOverrideApplies(threadId){return Boolean(nativeComposerOverride?.threadId&&nativeComposerOverride.threadId===threadId)}
 function newChat(){showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeComposerOverride();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
@@ -11400,6 +11568,12 @@ function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,p
     }
     model.value=metadata.model;
   }
+  if(!preserveProviderModel){
+    composerServiceTier=Object.hasOwn(metadata,'serviceTier')
+      ?normalizeComposerServiceTier(metadata.serviceTier)
+      :defaultComposerServiceTier;
+    reconcileComposerFastSupport();
+  }
   if(forceFullAccess){
     sandbox.value='danger-full-access';
     approval.value='never';
@@ -11418,7 +11592,7 @@ async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
   const sourceThreadId=currentConversationId;
   statusEl.textContent='正在创建历史分支...';
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,...composerPermissionPayload()})});
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||'创建历史分支失败');
     clearPendingAttachments();
@@ -11541,10 +11715,8 @@ async function syncCurrentNativeConversationOnce(){
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
   const data=await res.json();
   const conversation=data.conversation;
-  if(conversation.status==='running'){
-    applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
-    syncComposerChrome();
-  }
+  applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
+  syncComposerChrome();
   if(conversation.reset){
     // generation invalidates the incremental cursor. Never advance the cursor and drop
     // later fields while a turn is still running — that forced users to hard-refresh.
@@ -15247,16 +15419,17 @@ async function send(){
     const requestedProvider=provider.value;
     const requestedModel=model.value;
     const requestedReasoningEffort=reasoningEffort.value;
+    const requestedServiceTier=composerServiceTier;
     const requestedPermissionMode=composerPermissionMode;
     const requestedSandbox=sandbox.value;
     const requestedApproval=approval.value;
-    setNativeComposerOverride(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval);
-    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,attachments,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,cwd:cwd.value,...composerPermissionPayload()})});
+    setNativeComposerOverride(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier);
+    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,attachments,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:requestedServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||res.statusText);
     currentConversationSource='codex';
     currentConversationId=data.threadId;
-    setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval);
+    setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier);
     activeNativeTurnId=data.turnId||'';
     if(!existingId){nativeCursor=0;nativeGeneration=0}
     updateActiveHistory();

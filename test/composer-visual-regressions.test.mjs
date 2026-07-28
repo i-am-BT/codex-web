@@ -164,6 +164,40 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   );
 });
 
+test('Fast mode is an accessible model capability beside the reasoning slider', () => {
+  assert.match(serverSource, /let composerServiceTier = null/);
+  assert.match(serverSource, /let composerFastToggle = null/);
+  assert.match(serverSource, /let nativeModelServiceTiers = new Map\(\)/);
+  assert.match(serverSource, /function loadNativeModelCapabilities\(/);
+  assert.match(serverSource, /fetch\('\/api\/native-model-capabilities'/);
+
+  const renderStart = serverSource.indexOf('function renderComposerFastToggle(');
+  const renderEnd = serverSource.indexOf('\nfunction ', renderStart + 1);
+  assert.ok(renderStart >= 0 && renderEnd > renderStart, 'missing Fast toggle renderer');
+  const renderSource = serverSource.slice(renderStart, renderEnd);
+  assert.match(renderSource, /composerFastSupported/);
+  assert.match(renderSource, /composerFastToggle/);
+  assert.match(renderSource, /priority/);
+  assert.match(renderSource, /aria-pressed/);
+  assert.match(renderSource, /hidden|disabled/);
+
+  const supportStart = serverSource.indexOf('function composerFastSupported(');
+  const supportEnd = serverSource.indexOf('\nfunction ', supportStart + 1);
+  assert.ok(supportStart >= 0 && supportEnd > supportStart, 'missing Fast capability check');
+  const supportSource = serverSource.slice(supportStart, supportEnd);
+  assert.match(supportSource, /nativeModelServiceTiers/);
+  assert.match(supportSource, /priority/);
+
+  assert.match(serverSource, /composerFastToggle\.className='composerFastToggle(?: hidden)?'/);
+  assert.match(serverSource, /setIconLabel\(composerFastToggle,'zap','Fast',true\)/);
+  assert.match(
+    uiStyles,
+    /\.composerReasoningInline\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\) auto/s,
+  );
+  assert.match(uiStyles, /\.composerFastToggle\s*\{/);
+  assert.match(uiStyles, /\.composerFastToggle(?:\.active|\[aria-pressed="true"\])\s*\{/);
+});
+
 test('permission picker mirrors native approval profiles and preserves custom config semantics', () => {
   const helperStart = serverSource.indexOf('function cleanSandbox(value)');
   const helperEnd = serverSource.indexOf('function nativeSandboxPolicy(value, cwd)');
