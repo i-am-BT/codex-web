@@ -21,10 +21,12 @@ const METHOD_VERSIONS = new Map([
   ['thread-follower-permissions-request-approval-response', 1],
   ['thread-follower-submit-user-input', 1],
   ['thread-follower-submit-mcp-server-elicitation-response', 1],
+  ['thread-follower-set-queued-follow-ups-state', 1],
 ]);
 const BROADCAST_VERSIONS = new Map([
   ['thread-archived', 2],
   ['thread-unarchived', 1],
+  ['thread-queued-followups-changed', 1],
   ['query-cache-invalidate', 0],
 ]);
 const SAFE_FALLBACK_ERRORS = new Set([
@@ -192,6 +194,13 @@ export class CodexDesktopIpcClient extends EventEmitter {
     });
   }
 
+  async threadQueuedFollowUpsChanged(conversationId, messages) {
+    return this.broadcast('thread-queued-followups-changed', {
+      conversationId,
+      messages: Array.isArray(messages) ? messages : [],
+    });
+  }
+
   async invalidateQueryCache(queryKey) {
     const parts = Array.isArray(queryKey) ? queryKey.map((item) => String(item || '')).filter(Boolean) : [];
     if (!parts.length) throw new Error('Codex Desktop 查询缓存键不能为空');
@@ -235,6 +244,14 @@ export class CodexDesktopIpcClient extends EventEmitter {
       conversationId,
       requestId,
       response,
+    }, options);
+  }
+
+  async setQueuedFollowUpsState(conversationId, state, options = {}) {
+    const nextState = state && typeof state === 'object' && !Array.isArray(state) ? state : {};
+    return this.request('thread-follower-set-queued-follow-ups-state', {
+      conversationId,
+      state: nextState,
     }, options);
   }
 

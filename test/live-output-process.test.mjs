@@ -502,7 +502,7 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.equal((inlineScript.match(/fileChanges:msg\.fileChanges/g) || []).length, 2);
 });
 
-test('the prompt queue shares one visual surface with the composer and stays operable', () => {
+test('the prompt queue stays out of Web while retaining its backing actions', () => {
   const ruleBody = (selector) => {
     const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const body = uiStyles.match(new RegExp(`(?:^|\\n)\\s*${escapedSelector}\\s*\\{([^}]*)\\}`, 'm'))?.[1];
@@ -520,8 +520,8 @@ test('the prompt queue shares one visual surface with the composer and stays ope
   assert.match(queueRule, /Above the input capsule/);
   assert.doesNotMatch(queueRule, /Nested inside \.box/);
   assert.doesNotMatch(queueRule, /grid-column:\s*1 \/ -1/);
-  assert.match(queueRule, /width:\s*min\(calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
-  assert.match(queueRule, /max-width:\s*min\(calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
+  assert.match(queueRule, /width:\s*min\(680px, calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
+  assert.match(queueRule, /max-width:\s*min\(680px, calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
   assert.match(queueRule, /margin:\s*0 auto 8px(?:;|$)/);
   assert.match(queueRule, /border-radius:\s*16px(?:;|$)/);
   assert.match(queueRule, /background:\s*color-mix\(in srgb, var\(--surface\)/);
@@ -538,17 +538,22 @@ test('the prompt queue shares one visual surface with the composer and stays ope
   assert.match(ruleBody('.promptQueueHead'), /display:\s*none(?:;|$)/);
   assert.match(
     uiStyles,
-    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px 28px;[^}]*gap:\s*2px[^}]*\}\s*\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\)/s,
+    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px 28px;[^}]*gap:\s*2px[^}]*\}\s*\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px/s,
   );
 
   const queueStart = inlineScript.indexOf('function renderPromptQueue(){');
   const queueEnd = inlineScript.indexOf('function enqueuePrompt', queueStart);
   assert.ok(queueStart >= 0 && queueEnd > queueStart, 'missing prompt queue renderer source');
   const queueRenderer = inlineScript.slice(queueStart, queueEnd);
+  assert.match(queueRenderer, /const showInWeb=false/);
+  assert.match(queueRenderer, /classList\.toggle\('hidden',!showInWeb\|\|!threadId\|\|!items\.length\)/);
+  assert.match(queueRenderer, /if\(!showInWeb\|\|!threadId\|\|!items\.length\)/);
   assert.doesNotMatch(queueRenderer, /queueActionButton\('pencil'/);
   assert.match(queueRenderer, /queueActionButton\('ellipsis','队列操作'/);
+  assert.match(queueRenderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
   assert.match(queueRenderer, /body\.disabled=busy/);
-  assert.match(queueRenderer, /guide\.disabled=busy\|\|\(!webRunActive&&!queueFailures\.has\(item\.id\)\)/);
+  assert.match(queueRenderer, /const retryable=queueFailures\.has\(item\.id\)&&!appOwned/);
+  assert.match(queueRenderer, /guide\.disabled=busy\|\|\(!webRunActive&&!retryable\)/);
   assert.match(queueRenderer, /remove\.disabled=busy/);
   assert.match(queueRenderer, /more\.disabled=busy/);
   assert.deepEqual(
@@ -870,7 +875,7 @@ test('queue send and explicit guide are mutually exclusive', () => {
   assert.doesNotMatch(inlineScript, /PROMPT_QUEUE_MODE_KEY|setPromptQueueMode|readPromptQueueMode/);
   assert.match(steerSource, /queueItemId:item\.id/);
   assert.match(steerSource, /applyServerPromptQueue\(threadId,data\.queue\)/);
-  assert.match(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:false\}\)/);
+  assert.match(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:false,dismiss:!isAppOwnedQueuedPrompt\(item\)\}\)/);
   assert.doesNotMatch(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:true\}\)/);
   assert.ok(steerSource.indexOf('await flushPromptQueueToServer(threadId)') < steerSource.indexOf("fetch('/api/native-sessions/"));
   assert.ok(steerSource.indexOf("fetch('/api/native-sessions/") < steerSource.indexOf('applyServerPromptQueue(threadId,data.queue)'));
@@ -894,26 +899,52 @@ test('queued prompts preserve the Fast service tier through dispatch and restore
   assert.match(restoreSource, /renderComposerFastToggle|reconcileComposerFastSupport/);
 });
 
-test('Codex App queue entries stay visible but are never dispatched by Web', () => {
+test('Codex App queue entries keep direct actions but are never dispatched or moved by Web', () => {
   const renderer = sourceBetween('function renderPromptQueue', 'function enqueuePrompt');
+  const applyQueue = sourceBetween('function applyPromptQueueLocal', 'function setPromptQueue');
+  const remove = sourceBetween('async function deleteQueuedPrompt', 'function moveQueuedPrompt');
+  const move = sourceBetween('function moveQueuedPrompt', 'let promptQueueDragState');
   const sideChat = sourceBetween('async function openQueuedPromptInSideChat', 'async function sendSideChatMessage');
+  const restoreQueued = sourceBetween('async function restoreQueuedPrompt', 'async function saveAppQueueEdit');
   const restore = sourceBetween('async function restoreQueuedPrompt', 'function schedulePromptQueueDispatch');
   const schedule = sourceBetween('function schedulePromptQueueDispatch', 'function showNativePromptOptimistically');
   const steer = sourceBetween('async function steerQueuedPrompt', 'async function dispatchNextQueuedPrompt');
   const dispatch = sourceBetween('async function dispatchNextQueuedPrompt', 'function closeComposerPopovers');
+  const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
 
   assert.match(inlineScript, /function isAppOwnedQueuedPrompt\(item\)\{return item\?\.source==='codex-app'\}/);
   assert.match(renderer, /const appOwned=isAppOwnedQueuedPrompt\(item\)/);
   assert.match(renderer, /if\(!appOwned\)bindPromptQueueDrag\(row,threadId,item\.id\)/);
   assert.match(renderer, /meta\.textContent='Codex App'/);
-  assert.match(renderer, /if\(appOwned\)\{\s*promptQueueList\.appendChild\(row\);\s*return;/);
+  assert.match(renderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
+  assert.match(renderer, /const busy=dispatching\|\|guiding\|\|steerSubmitting\|\|appQueueEditSaving/);
+  assert.match(renderer, /row\.appendChild\(guide\);\s*row\.appendChild\(remove\);\s*if\(!appOwned\)\{/);
+  assert.doesNotMatch(renderer, /if\(appOwned\)\{\s*promptQueueList\.appendChild\(row\);\s*return;/);
+  assert.match(applyQueue, /if\(appQueueEditDraft\?\.threadId===threadId&&!appQueueEditSaving&&!clean\.some\(\(item\)=>item\.id===appQueueEditDraft\.itemId\)\)\{/);
+  assert.match(applyQueue, /appQueueEditDraft=null;[\s\S]*?input\.value='';[\s\S]*?clearPendingAttachments\(\);[\s\S]*?该队列消息已在 Codex App 处理/);
+  assert.doesNotMatch(remove, /blockAppOwnedQueueAction/);
+  assert.match(remove, /if\(!isAppOwnedQueuedPrompt\(victim\)\)rememberQueueDismissed\(threadId,victim\)/);
+  assert.match(remove, /if\(firstId===itemId&&!webRunActive&&!isAppOwnedQueuedPrompt\(victim\)\)schedulePromptQueueDispatch\(threadId,100\)/);
+  assert.match(move, /if\(blockAppOwnedQueueAction\(items\[fromIndex\]\)\)return false/);
   assert.match(sideChat, /if\(blockAppOwnedQueueAction\(item\)\)return/);
-  assert.match(restore, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.doesNotMatch(restore, /blockAppOwnedQueueAction/);
+  assert.match(restore, /if\(isAppOwnedQueuedPrompt\(item\)\)\{[\s\S]*?appQueueEditDraft=\{threadId,itemId,originalMessage:item\.message\}[\s\S]*?return;/);
+  assert.ok(restore.indexOf('if(isAppOwnedQueuedPrompt(item))') < restore.indexOf('consumeQueuedPromptOnServer(threadId,itemId)'));
+  assert.ok(restoreQueued.indexOf('await consumeQueuedPromptOnServer(threadId,itemId)') < restoreQueued.indexOf('appQueueEditDraft=null'));
+  assert.match(restore, /method:'PATCH'/);
+  assert.match(restore, /context.*保留原附件|保留原附件/);
+  assert.match(restore, /const stillEditingDraft=appQueueEditDraft===draft/);
+  assert.match(restore, /if\(stillEditingDraft&&currentConversationSource==='codex'&&currentConversationId===draft\.threadId\)/);
+  assert.match(restore, /if\(appQueueEditDraft===draft&&currentConversationSource==='codex'&&currentConversationId===draft\.threadId\)/);
   assert.match(schedule, /isAppOwnedQueuedPrompt\(promptQueueFor\(threadId\)\[0\]\)/);
-  assert.match(steer, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.doesNotMatch(steer, /blockAppOwnedQueueAction/);
+  assert.match(steer, /if\(isAppOwnedQueuedPrompt\(item\)\)\{statusEl\.textContent='任务运行时才可发送引导';return\}/);
+  assert.match(steer, /dismiss:!isAppOwnedQueuedPrompt\(item\)/);
   assert.match(dispatch, /!item\|\|isAppOwnedQueuedPrompt\(item\)\|\|queueDispatchingThreads/);
-  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\)/s);
-  assert.match(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueBody:disabled\s*\{[^}]*opacity:\s*1/s);
+  assert.match(loadConversation, /if\(conversationChanged&&appQueueEditSaving\)\{statusEl\.textContent='正在保存队列修改，请稍后切换会话';return false\}/);
+  assert.match(loadConversation, /if\(conversationChanged&&appQueueEditDraft\)\{appQueueEditDraft=null;input\.value='';input\.style\.height='auto';clearPendingAttachments\(\)\}/);
+  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto (?:30|28)px/s);
+  assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueBody:disabled/);
 });
 
 test('queue fallback removes only the matching id when messages are identical', () => {
@@ -947,6 +978,15 @@ test('queue fallback removes only the matching id when messages are identical', 
   );
 
   assert.deepEqual(api.items().map((item) => item.id), ['queue-b']);
+  assert.deepEqual(api.dismissed(), ['id:queue-a']);
+
+  api.removeQueuedPromptLocal(
+    'thread-1',
+    { id: 'queue-b', message: 'same prompt', createdAt: '2026-07-26T10:00:01.000Z' },
+    { persist: false, dismiss: false },
+  );
+
+  assert.deepEqual(api.items(), []);
   assert.deepEqual(api.dismissed(), ['id:queue-a']);
 });
 
