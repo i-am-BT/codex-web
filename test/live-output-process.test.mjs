@@ -680,7 +680,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   runNextTimer();
   assert.ok(message.content.startsWith(first.text));
   assert.notEqual(first.text, message.content);
-  assert.ok(first.text.length <= 56, 'persisted snapshot should advance in bounded steps');
+  assert.ok(first.text.length <= 64, 'persisted snapshot should advance in bounded steps');
   assert.equal(first.element.dataset.messageText, first.text);
   assert.equal(first.element.classList.contains('streaming'), true);
   assert.deepEqual([...timers.values()].map((timer) => timer.delay).sort((a, b) => a - b), [60, 120]);
@@ -850,7 +850,7 @@ test('streaming output has no blinking text caret', () => {
 
 test('streaming output uses the faster balanced render pace', () => {
   assert.match(inlineScript, /function scheduleNativeLiveRender\(live\)[\s\S]*?\},60\);/);
-  assert.match(inlineScript, /function nativeLiveRenderStep\(live,remaining\)\{\s*if\(live\.source==='snapshot'\)return remaining>1200\?56:remaining>480\?22:remaining>160\?10:remaining>60\?5:2;\s*return remaining>1500\?112:remaining>600\?48:remaining>180\?18:remaining>60\?8:4;/);
+  assert.match(inlineScript, /function nativeLiveRenderStep\(live,remaining\)\{\s*if\(live\.source==='snapshot'\)return remaining>1200\?64:remaining>480\?25:remaining>160\?11:remaining>60\?6:2;\s*return remaining>1500\?128:remaining>600\?54:remaining>180\?20:remaining>60\?9:4;/);
 });
 
 test('queue send and explicit guide are mutually exclusive', () => {

@@ -15107,8 +15107,8 @@ function scheduleNativeLiveRender(live){
   },60);
 }
 function nativeLiveRenderStep(live,remaining){
-  if(live.source==='snapshot')return remaining>1200?56:remaining>480?22:remaining>160?10:remaining>60?5:2;
-  return remaining>1500?112:remaining>600?48:remaining>180?18:remaining>60?8:4;
+  if(live.source==='snapshot')return remaining>1200?64:remaining>480?25:remaining>160?11:remaining>60?6:2;
+  return remaining>1500?128:remaining>600?54:remaining>180?20:remaining>60?9:4;
 }
 function pumpNativeLiveRender(live){
   const remaining=live.targetText.length-live.text.length;
