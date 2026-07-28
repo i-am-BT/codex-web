@@ -502,7 +502,7 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.equal((inlineScript.match(/fileChanges:msg\.fileChanges/g) || []).length, 2);
 });
 
-test('the prompt queue shares one visual surface with the composer and stays operable', () => {
+test('the prompt queue stays out of Web while retaining its backing actions', () => {
   const ruleBody = (selector) => {
     const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const body = uiStyles.match(new RegExp(`(?:^|\\n)\\s*${escapedSelector}\\s*\\{([^}]*)\\}`, 'm'))?.[1];
@@ -520,8 +520,8 @@ test('the prompt queue shares one visual surface with the composer and stays ope
   assert.match(queueRule, /Above the input capsule/);
   assert.doesNotMatch(queueRule, /Nested inside \.box/);
   assert.doesNotMatch(queueRule, /grid-column:\s*1 \/ -1/);
-  assert.match(queueRule, /width:\s*min\(calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
-  assert.match(queueRule, /max-width:\s*min\(calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
+  assert.match(queueRule, /width:\s*min\(680px, calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
+  assert.match(queueRule, /max-width:\s*min\(680px, calc\(var\(--composer-width\) - 48px\), calc\(100% - 108px\)\)/);
   assert.match(queueRule, /margin:\s*0 auto 8px(?:;|$)/);
   assert.match(queueRule, /border-radius:\s*16px(?:;|$)/);
   assert.match(queueRule, /background:\s*color-mix\(in srgb, var\(--surface\)/);
@@ -545,6 +545,9 @@ test('the prompt queue shares one visual surface with the composer and stays ope
   const queueEnd = inlineScript.indexOf('function enqueuePrompt', queueStart);
   assert.ok(queueStart >= 0 && queueEnd > queueStart, 'missing prompt queue renderer source');
   const queueRenderer = inlineScript.slice(queueStart, queueEnd);
+  assert.match(queueRenderer, /const showInWeb=false/);
+  assert.match(queueRenderer, /classList\.toggle\('hidden',!showInWeb\|\|!threadId\|\|!items\.length\)/);
+  assert.match(queueRenderer, /if\(!showInWeb\|\|!threadId\|\|!items\.length\)/);
   assert.doesNotMatch(queueRenderer, /queueActionButton\('pencil'/);
   assert.match(queueRenderer, /queueActionButton\('ellipsis','队列操作'/);
   assert.match(queueRenderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
