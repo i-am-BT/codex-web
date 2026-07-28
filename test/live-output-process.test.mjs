@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-const [serverSource, uiStyles] = await Promise.all([
+const [serverSource, uiStyles, nativeSessionSource] = await Promise.all([
   readFile(new URL('../server.mjs', import.meta.url), 'utf8'),
   readFile(new URL('../ui.css', import.meta.url), 'utf8'),
+  readFile(new URL('../native-sessions.mjs', import.meta.url), 'utf8'),
 ]);
 const rawInlineScript = serverSource.match(/<script>([\s\S]*?)<\/script>/)?.[1] || '';
 const inlineScript = rawInlineScript.replaceAll('\\\\', '\\');
@@ -366,14 +367,14 @@ test('the live progress pill stays out of completion artifacts', () => {
   };
   const promptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
   const hiddenAttachmentTray = { kind: 'hidden-attachment-tray', parentNode: null, isConnected: true };
-  const dropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [promptQueuePanel] };
+  const dropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [] };
   let composerInsertCalls = 0;
   const composer = {
-    // Match the real composer DOM: input capsule first, attachment tray after it.
-    children: [dropZone, hiddenAttachmentTray],
+    // Match enhanceComposer(): queue, attachment tray, then input capsule.
+    children: [promptQueuePanel, hiddenAttachmentTray, dropZone],
     insertBefore(node, reference) {
       composerInsertCalls += 1;
-      assert.strictEqual(reference, dropZone);
+      assert.strictEqual(reference, promptQueuePanel);
       detachNode(node);
       const index = this.children.indexOf(reference);
       assert.notEqual(index, -1);
@@ -393,7 +394,7 @@ test('the live progress pill stays out of completion artifacts', () => {
       return previous;
     },
   };
-  promptQueuePanel.parentNode = dropZone;
+  promptQueuePanel.parentNode = composer;
   hiddenAttachmentTray.parentNode = composer;
   dropZone.parentNode = composer;
   const toolArtifact = { kind: 'tool-artifact' };
@@ -454,11 +455,13 @@ test('the live progress pill stays out of completion artifacts', () => {
   const second = api.refresh();
   assert.notStrictEqual(first, second);
   assert.deepEqual(timeline.children, []);
-  assert.deepEqual(composer.children, [second, dropZone, hiddenAttachmentTray]);
+  assert.deepEqual(composer.children, [second, promptQueuePanel, hiddenAttachmentTray, dropZone]);
   assert.strictEqual(second.parentNode, composer);
-  assert.strictEqual(second.nextSibling, dropZone);
-  assert.ok(composer.children.indexOf(second) < composer.children.indexOf(dropZone));
-  assert.ok(promptQueuePanel.parentNode === dropZone || promptQueuePanel.parentNode === composer);
+  assert.strictEqual(second.nextSibling, promptQueuePanel);
+  assert.ok(composer.children.indexOf(second) < composer.children.indexOf(promptQueuePanel));
+  assert.ok(composer.children.indexOf(promptQueuePanel) < composer.children.indexOf(hiddenAttachmentTray));
+  assert.ok(composer.children.indexOf(hiddenAttachmentTray) < composer.children.indexOf(dropZone));
+  assert.strictEqual(promptQueuePanel.parentNode, composer);
   assert.equal(composerInsertCalls, 1);
   assert.deepEqual(api.state().turnProcessElements, [toolArtifact]);
   assert.equal(api.state().turnProcessElements.includes(second), false);
@@ -493,6 +496,8 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
   assert.match(uiStyles, /conic-gradient\(#339cff var\(--turn-plan-progress\), #2b3c4f 0\)/);
   assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
+  assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live:not\(\[open\]\)\s*\{[^}]*width:\s*max-content;[^}]*max-width:\s*100%/s);
+  assert.match(uiStyles, /\.turnResultHead > \.turnResultFileLabel\s*\{[^}]*flex:\s*0 0 auto;[^}]*overflow:\s*visible;[^}]*text-overflow:\s*clip/s);
   assert.doesNotMatch(uiStyles, /\.liveProcessTimeline > \.editedFilesResult\.live/);
   assert.equal((inlineScript.match(/fileChanges:msg\.fileChanges/g) || []).length, 2);
 });
@@ -531,6 +536,10 @@ test('the prompt queue shares one visual surface with the composer and stays ope
   assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*border-color:/s);
 
   assert.match(ruleBody('.promptQueueHead'), /display:\s*none(?:;|$)/);
+  assert.match(
+    uiStyles,
+    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px 28px;[^}]*gap:\s*2px[^}]*\}\s*\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\)/s,
+  );
 
   const queueStart = inlineScript.indexOf('function renderPromptQueue(){');
   const queueEnd = inlineScript.indexOf('function enqueuePrompt', queueStart);
@@ -677,7 +686,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   runNextTimer();
   assert.ok(message.content.startsWith(first.text));
   assert.notEqual(first.text, message.content);
-  assert.ok(first.text.length <= 56, 'persisted snapshot should advance in bounded steps');
+  assert.ok(first.text.length <= 64, 'persisted snapshot should advance in bounded steps');
   assert.equal(first.element.dataset.messageText, first.text);
   assert.equal(first.element.classList.contains('streaming'), true);
   assert.deepEqual([...timers.values()].map((timer) => timer.delay).sort((a, b) => a - b), [60, 120]);
@@ -847,7 +856,7 @@ test('streaming output has no blinking text caret', () => {
 
 test('streaming output uses the faster balanced render pace', () => {
   assert.match(inlineScript, /function scheduleNativeLiveRender\(live\)[\s\S]*?\},60\);/);
-  assert.match(inlineScript, /function nativeLiveRenderStep\(live,remaining\)\{\s*if\(live\.source==='snapshot'\)return remaining>1200\?56:remaining>480\?22:remaining>160\?10:remaining>60\?5:2;\s*return remaining>1500\?112:remaining>600\?48:remaining>180\?18:remaining>60\?8:4;/);
+  assert.match(inlineScript, /function nativeLiveRenderStep\(live,remaining\)\{\s*if\(live\.source==='snapshot'\)return remaining>1200\?64:remaining>480\?25:remaining>160\?11:remaining>60\?6:2;\s*return remaining>1500\?128:remaining>600\?54:remaining>180\?20:remaining>60\?9:4;/);
 });
 
 test('queue send and explicit guide are mutually exclusive', () => {
@@ -870,6 +879,41 @@ test('queue send and explicit guide are mutually exclusive', () => {
   assert.match(dispatchSource, /queueGuidingItems\.has\(item\.id\)\|\|steerSubmitting/);
   assert.match(inlineScript, /Array\.isArray\(data\.items\)&&!promptQueueServerSyncPending\.has\(id\)/);
   assert.match(inlineScript, /while\(promptQueueServerSyncInflight\.has\(id\)\)await promptQueueServerSyncInflight\.get\(id\)/);
+});
+
+test('queued prompts preserve the Fast service tier through dispatch and restore', () => {
+  const normalizeSource = sourceBetween('function normalizeQueuedPrompt', 'function isAppOwnedQueuedPrompt');
+  const queuePayloadSource = sourceBetween('function createQueuedPrompt', 'function applyServerPromptQueue');
+  const restoreSource = sourceBetween('async function restoreQueuedPrompt', 'function schedulePromptQueueDispatch');
+
+  assert.match(normalizeSource, /serviceTier/);
+  assert.match(normalizeSource, /normalizeComposerServiceTier/);
+  assert.match(queuePayloadSource, /serviceTier:composerServiceTier/);
+  assert.match(queuePayloadSource, /serviceTier:item\.serviceTier/);
+  assert.match(restoreSource, /composerServiceTier/);
+  assert.match(restoreSource, /renderComposerFastToggle|reconcileComposerFastSupport/);
+});
+
+test('Codex App queue entries stay visible but are never dispatched by Web', () => {
+  const renderer = sourceBetween('function renderPromptQueue', 'function enqueuePrompt');
+  const sideChat = sourceBetween('async function openQueuedPromptInSideChat', 'async function sendSideChatMessage');
+  const restore = sourceBetween('async function restoreQueuedPrompt', 'function schedulePromptQueueDispatch');
+  const schedule = sourceBetween('function schedulePromptQueueDispatch', 'function showNativePromptOptimistically');
+  const steer = sourceBetween('async function steerQueuedPrompt', 'async function dispatchNextQueuedPrompt');
+  const dispatch = sourceBetween('async function dispatchNextQueuedPrompt', 'function closeComposerPopovers');
+
+  assert.match(inlineScript, /function isAppOwnedQueuedPrompt\(item\)\{return item\?\.source==='codex-app'\}/);
+  assert.match(renderer, /const appOwned=isAppOwnedQueuedPrompt\(item\)/);
+  assert.match(renderer, /if\(!appOwned\)bindPromptQueueDrag\(row,threadId,item\.id\)/);
+  assert.match(renderer, /meta\.textContent='Codex App'/);
+  assert.match(renderer, /if\(appOwned\)\{\s*promptQueueList\.appendChild\(row\);\s*return;/);
+  assert.match(sideChat, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.match(restore, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.match(schedule, /isAppOwnedQueuedPrompt\(promptQueueFor\(threadId\)\[0\]\)/);
+  assert.match(steer, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.match(dispatch, /!item\|\|isAppOwnedQueuedPrompt\(item\)\|\|queueDispatchingThreads/);
+  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\)/s);
+  assert.match(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueBody:disabled\s*\{[^}]*opacity:\s*1/s);
 });
 
 test('queue fallback removes only the matching id when messages are identical', () => {
@@ -999,6 +1043,14 @@ test('reset while a native turn is still running reloads the conversation instea
   assert.match(inlineScript, /\['','message','commentary','final_answer'\]\.includes\(kind\)/);
   assert.match(inlineScript, /const syncDelay=webRunActive&&currentConversationSource==='codex'\?80:260/);
   assert.match(inlineScript, /dataset\.nativeMessageSeq/);
+});
+
+test('rolled-back retry collapse invalidates the open page before appending the latest attempt', () => {
+  assert.match(nativeSessionSource, /case 'thread_rolled_back':[\s\S]*?pendingThreadRollbackTurnId/);
+  assert.match(nativeSessionSource, /function collapseRolledBackRetryTurn[\s\S]*?cache\.contentMutated = true/);
+  const syncSource = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
+  assert.ok(syncSource.indexOf('if(conversation.reset)') < syncSource.indexOf('for(const msg of conversation.messages||[])'));
+  assert.match(syncSource, /if\(conversation\.reset\)[\s\S]*?await loadConversation\(id,'codex'\)/);
 });
 
 test('message action chrome stays hidden until hover or touch selection', () => {

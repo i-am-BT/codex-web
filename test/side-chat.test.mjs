@@ -72,3 +72,41 @@ test('side chat queue menu and pane helpers are present', () => {
     assert.ok(server.includes(needle), needle);
   }
 });
+
+test('side chat follow-up service tier stays isolated per tab', () => {
+  const server = fs.readFileSync(path.join(root, 'server.mjs'), 'utf8');
+  const sendStart = server.indexOf('async function sendSideChatMessage()');
+  const sendEnd = server.indexOf('async function restoreSideChatIfNeeded()', sendStart);
+  const queueOpenStart = server.indexOf('async function openQueuedPromptInSideChat(');
+  assert.ok(sendStart >= 0 && sendEnd > sendStart, 'sendSideChatMessage source');
+  assert.ok(queueOpenStart >= 0 && sendStart > queueOpenStart, 'openQueuedPromptInSideChat source');
+  const sendSource = server.slice(sendStart, sendEnd);
+  const queueOpenSource = server.slice(queueOpenStart, sendStart);
+
+  assert.match(server, /const hasServiceTier=Object\.hasOwn\(options,'serviceTier'\)/);
+  assert.match(server, /serviceTier:normalizeComposerServiceTier\(tab\.serviceTier\)/);
+  assert.match(server, /if\(tab&&Object\.hasOwn\(metadata,'serviceTier'\)\)tab\.serviceTier=normalizeComposerServiceTier\(metadata\.serviceTier\)/);
+  assert.match(queueOpenSource, /title:queuedPromptLabel\(item\)[\s\S]*serviceTier:item\.serviceTier/);
+  assert.match(sendSource, /const sideChatServiceTier=normalizeComposerServiceTier\(tab\?\.serviceTier\)/);
+  assert.match(sendSource, /serviceTier:sideChatServiceTier/);
+  assert.doesNotMatch(sendSource, /serviceTier:composerServiceTier/);
+
+  // Both explicit states must survive persistence; null represents Standard and priority represents Fast.
+  assert.match(server, /serviceTier:hasServiceTier\?normalizeComposerServiceTier\(options\.serviceTier\):null/);
+  assert.match(server, /serviceTier:normalizeComposerServiceTier\(tab\?\.serviceTier\)/);
+
+  const normalizeSource = server.match(/function normalizeComposerServiceTier\(value\)\{[^}]+\}/)?.[0];
+  const upsertStart = server.indexOf('function upsertSideChatTab(options={})');
+  const upsertEnd = server.indexOf('function removeSideChatTab(', upsertStart);
+  assert.ok(normalizeSource && upsertStart >= 0 && upsertEnd > upsertStart, 'side chat tier helpers');
+  const upsertSource = server.slice(upsertStart, upsertEnd);
+  const storedTiers = Function(`
+    let sideChatOpenTabs=[];
+    ${normalizeSource}
+    ${upsertSource}
+    upsertSideChatTab({threadId:'standard-tab',serviceTier:null});
+    upsertSideChatTab({threadId:'fast-tab',serviceTier:'priority'});
+    return sideChatOpenTabs.map((tab)=>tab.serviceTier);
+  `)();
+  assert.deepEqual(storedTiers, [null, 'priority']);
+});

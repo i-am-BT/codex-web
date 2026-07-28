@@ -1,5 +1,7 @@
 const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_CACHE_TTL_MS = 30000;
+const ERROR_CACHE_TTL_MS = 5000;
+const LAST_GOOD_TTL_MS = 5 * 60 * 1000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 const ENV_KEY_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
@@ -12,6 +14,8 @@ const CODEX_USAGE_HEADERS = {
   Accept: 'application/json',
   'User-Agent': 'codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal',
 };
+const TRANSIENT_FETCH_ERROR = Symbol('transientFetchError');
+const SOURCE_WIDE_FETCH_ERROR = Symbol('sourceWideFetchError');
 
 export class SubQuotaService {
   constructor(options = {}) {
@@ -23,6 +27,7 @@ export class SubQuotaService {
     this.configurationError = String(options.configurationError || '');
     this.cache = null;
     this.pending = null;
+    this.lastSuccessfulBySource = new Map();
   }
 
   static fromEnvironment(env = process.env, options = {}) {
@@ -46,25 +51,39 @@ export class SubQuotaService {
 
   async list({ refresh = false } = {}) {
     const now = this.now();
-    if (!refresh && this.cache && now - this.cache.cachedAt < this.cacheTtlMs) return this.cache.value;
-    if (this.pending) return this.pending;
+    if (!refresh && this.cache) {
+      if (now - this.cache.cachedAt < this.cache.ttlMs) return this.cache.value;
+      if (hasUsableQuota(this.cache.value)) {
+        void this.refreshCache().catch(() => {});
+        return this.cache.value;
+      }
+    }
+    return this.refreshCache();
+  }
 
-    this.pending = this.load().then((value) => {
-      this.cache = { cachedAt: this.now(), value };
+  refreshCache() {
+    if (this.pending) return this.pending;
+    const pending = this.load().then((value) => {
+      this.cache = {
+        cachedAt: this.now(),
+        ttlMs: cacheTtlFor(value, this.cacheTtlMs),
+        value,
+      };
       return value;
     }).finally(() => {
-      this.pending = null;
+      if (this.pending === pending) this.pending = null;
     });
-    return this.pending;
+    this.pending = pending;
+    return pending;
   }
 
   async load() {
     const fetchedAt = new Date(this.now()).toISOString();
-    const quotas = (await Promise.all(this.sources.map((source) => this.fetchSource(source, fetchedAt)))).flat();
+    const quotas = (await Promise.all(this.sources.map((source) => this.fetchSourceWithFallback(source, fetchedAt)))).flat();
     return {
       configured: this.sources.length > 0,
       count: quotas.length,
-      availableCount: quotas.filter((item) => !item.error).length,
+      availableCount: quotas.filter(isUsableQuota).length,
       fetchedAt,
       quotas,
       ...(this.configurationError ? { configurationError: this.configurationError } : {}),
@@ -74,6 +93,54 @@ export class SubQuotaService {
   async fetchSource(source, fetchedAt) {
     if (source.provider === 'cpa-codex') return this.fetchCpaCodexSource(source, fetchedAt);
     return this.fetchSub2ApiSource(source, fetchedAt);
+  }
+
+  async fetchSourceWithFallback(source, fetchedAt) {
+    const quotas = await this.fetchSource(source, fetchedAt);
+    const now = this.now();
+    const previous = this.lastSuccessfulBySource.get(source) || new Map();
+    const sourceWideFailure = quotas.find((item) => item[SOURCE_WIDE_FETCH_ERROR]);
+    if (sourceWideFailure) {
+      if (!sourceWideFailure[TRANSIENT_FETCH_ERROR]) {
+        this.lastSuccessfulBySource.delete(source);
+        return quotas;
+      }
+      const fallback = [];
+      const fresh = new Map();
+      for (const [key, entry] of previous) {
+        if (now - entry.succeededAt > LAST_GOOD_TTL_MS) continue;
+        fresh.set(key, entry);
+        fallback.push(staleQuota(entry.quota, sourceWideFailure.error));
+      }
+      if (fresh.size) this.lastSuccessfulBySource.set(source, fresh);
+      else this.lastSuccessfulBySource.delete(source);
+      return fallback.length ? fallback : quotas;
+    }
+
+    const next = new Map(previous);
+    const returnedKeys = new Set();
+    const resolved = quotas.map((item, index) => {
+      const key = quotaItemKey(item, index);
+      returnedKeys.add(key);
+      if (isUsableQuota(item)) {
+        next.set(key, { succeededAt: now, quota: { ...item } });
+        return item;
+      }
+      if (item[TRANSIENT_FETCH_ERROR]) {
+        const entry = previous.get(key);
+        if (entry && now - entry.succeededAt <= LAST_GOOD_TTL_MS) {
+          return staleQuota(entry.quota, item.error);
+        }
+      }
+      next.delete(key);
+      return item;
+    });
+    for (const key of next.keys()) {
+      if (!returnedKeys.has(key)) next.delete(key);
+    }
+    if (next.size) this.lastSuccessfulBySource.set(source, next);
+    else this.lastSuccessfulBySource.delete(source);
+    return resolved;
   }
 
   async fetchSub2ApiSource(source, fetchedAt) {
@@ -89,7 +156,7 @@ export class SubQuotaService {
       });
       return [{ ...base, ...normalizeSubQuota(data) }];
     } catch (error) {
-      return [{ ...base, error: formatFetchError(error) }];
+      return [fetchErrorQuota(base, error, { sourceWide: true })];
     }
   }
 
@@ -118,12 +185,12 @@ export class SubQuotaService {
           const usage = await this.fetchCpaCodexUsage(source, file, accountId);
           quotas.push({ ...accountBase, ...normalizeCpaCodexQuota(usage, file) });
         } catch (error) {
-          quotas.push({ ...accountBase, error: formatFetchError(error) });
+          quotas.push(fetchErrorQuota(accountBase, error));
         }
       }
       return quotas;
     } catch (error) {
-      return [{ ...base, error: formatFetchError(error) }];
+      return [fetchErrorQuota(base, error, { sourceWide: true })];
     }
   }
 
@@ -174,7 +241,9 @@ export class SubQuotaService {
     const body = parseMaybeJson(outer?.body ?? outer?.bodyText ?? outer);
     if (statusCode && (statusCode < 200 || statusCode >= 300)) {
       const detail = cleanText(body?.error || body?.detail || body?.message || JSON.stringify(body || {}), 120);
-      throw new Error(detail ? `HTTP ${statusCode}: ${detail}` : `HTTP ${statusCode}`);
+      const error = new Error(detail ? `HTTP ${statusCode}: ${detail}` : `HTTP ${statusCode}`);
+      error.statusCode = statusCode;
+      throw error;
     }
     if (!isRecord(body)) throw new Error('Codex 额度响应无效');
     return body;
@@ -195,7 +264,11 @@ export class SubQuotaService {
         throw new Error('响应内容过大');
       }
       const bodyText = await readLimitedBody(response, MAX_RESPONSE_BYTES);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}`);
+        error.statusCode = response.status;
+        throw error;
+      }
       let data;
       try {
         data = JSON.parse(bodyText);
@@ -553,6 +626,50 @@ function parseMaybeJson(value) {
 function formatFetchError(error) {
   const message = error?.name === 'AbortError' ? '请求超时' : String(error?.message || '请求失败');
   return message.slice(0, 160);
+}
+
+function fetchErrorQuota(base, error, { sourceWide = false } = {}) {
+  const quota = { ...base, error: formatFetchError(error) };
+  if (isTransientFetchError(error)) {
+    Object.defineProperty(quota, TRANSIENT_FETCH_ERROR, { value: true });
+  }
+  if (sourceWide) Object.defineProperty(quota, SOURCE_WIDE_FETCH_ERROR, { value: true });
+  return quota;
+}
+
+function isTransientFetchError(error) {
+  if (error?.name === 'AbortError') return true;
+  const statusCode = Number(error?.statusCode || 0);
+  if (statusCode > 0) return statusCode === 408 || statusCode === 429 || statusCode >= 500;
+  const code = String(error?.cause?.code || error?.code || '').toUpperCase();
+  if (/^(?:ECONN|ENET|EHOST|EAI_|ETIMEDOUT|UND_ERR_)/.test(code)) return true;
+  return /(?:fetch failed|network|socket|connection|timed?\s*out)/i.test(String(error?.message || ''));
+}
+
+function hasUsableQuota(value) {
+  return Array.isArray(value?.quotas) && value.quotas.some(isUsableQuota);
+}
+
+function cacheTtlFor(value, healthyTtlMs) {
+  const degraded = Boolean(value?.configurationError)
+    || (Array.isArray(value?.quotas) && value.quotas.some((item) => !isUsableQuota(item) || item?.stale));
+  return degraded ? Math.min(healthyTtlMs, ERROR_CACHE_TTL_MS) : healthyTtlMs;
+}
+
+function isUsableQuota(item) {
+  return Boolean(item) && !item.error && item.valid !== false;
+}
+
+function quotaItemKey(item, index) {
+  return String(item?.id || `${item?.provider || 'quota'}:${item?.name || index}`);
+}
+
+function staleQuota(quota, warning) {
+  return {
+    ...quota,
+    stale: true,
+    warning: String(warning || '请求失败'),
+  };
 }
 
 function quotaWindow(usedValue, limitValue, remainingValue, { zeroLimitUnlimited = false } = {}) {

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -86,6 +86,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const traceFile = path.join(temporary, 'codex-trace.json');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
   const appServerControlFile = path.join(temporary, 'app-server-control.json');
+  const codexGlobalStateFile = path.join(codexHome, '.codex-global-state.json');
+  const imagePromptFetchFixture = path.join(temporary, 'image-prompt-fetch-fixture.mjs');
   const webEnv = path.join(temporary, 'web.env');
   const toolImagePath = path.join(temporary, 'tool-preview.png');
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
@@ -96,6 +98,10 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const archivedNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa730';
   const automationNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa731';
   const subagentNativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa732';
+  const appQueueOwnershipThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa733';
+  const appQueueNoIdThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa734';
+  const appQueueDuplicateNoIdThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa735';
+  const appOwnedQueueItemId = 'app-owned-queue-item';
   let child;
   let desktopIpc;
   let providerServer;
@@ -257,6 +263,21 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
       toolImagePath,
       Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
     );
+    await writeFile(imagePromptFetchFixture, `
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (input, options) => {
+  const url = typeof input === 'string' ? input : String(input?.url || input || '');
+  if (url.endsWith('/data/images/case520.jpg')) {
+    const body = new Uint8Array(2048);
+    body[0] = 0xff;
+    body[1] = 0xd8;
+    body[body.length - 2] = 0xff;
+    body[body.length - 1] = 0xd9;
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'image/jpeg' } });
+  }
+  return originalFetch(input, options);
+};
+`);
     await writeFile(path.join(codexHome, 'config.toml'), `model_provider = "fake"
 model = "test-model"
 model_reasoning_effort = "max"
@@ -268,10 +289,37 @@ wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "test-token"
 `);
-    await writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+    await writeFile(codexGlobalStateFile, JSON.stringify({
       'pinned-thread-ids': [nativeSessionId, archivedNativeSessionId],
       'projectless-thread-ids': [],
       'thread-project-assignments': {},
+      'queued-follow-ups': {
+        [appQueueOwnershipThreadId]: [{
+          id: appOwnedQueueItemId,
+          text: 'Codex App owns this queued prompt',
+          createdAt: 1785204000000,
+        }],
+        [appQueueNoIdThreadId]: [
+          {
+            text: 'Legacy predecessor without an id',
+            createdAt: 1785204000500,
+          },
+          {
+            text: 'Legacy Codex App prompt without an id',
+            createdAt: 1785204001000,
+          },
+        ],
+        [appQueueDuplicateNoIdThreadId]: [
+          {
+            text: 'Duplicate legacy prompt without an id',
+            createdAt: 1785204002000,
+          },
+          {
+            text: 'Duplicate legacy prompt without an id',
+            createdAt: 1785204002000,
+          },
+        ],
+      },
     }));
     const nativeSessionDir = path.join(codexHome, 'sessions', '2026', '07', '11');
     await mkdir(nativeSessionDir, { recursive: true });
@@ -620,6 +668,29 @@ if (args[0] === 'app-server') {
       appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify(message) + '\\n');
       if (!Object.hasOwn(message, 'id') || !message.method) continue;
       if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake' } });
+      else if (message.method === 'model/list') {
+        send({
+          id: message.id,
+          result: {
+            data: [
+              {
+                id: 'test-model',
+                displayName: 'Test model',
+                serviceTiers: [
+                  { id: 'default', name: 'Standard' },
+                  { id: 'priority', name: 'Fast', description: '1.5x speed, increased usage' }
+                ]
+              },
+              {
+                id: 'standard-only-model',
+                displayName: 'Standard only',
+                serviceTiers: [{ id: 'default', name: 'Standard' }]
+              }
+            ],
+            nextCursor: null
+          }
+        });
+      }
       else if (message.method === 'thread/list') {
         const control = archiveControl();
         const raceToken = String(control.unarchiveAfterFirstListToken || '');
@@ -731,6 +802,7 @@ if (args[0] === 'app-server') {
       traceFile,
       appServerTraceFile,
       appServerControlFile,
+      fetchFixture: pathToFileURL(imagePromptFetchFixture).href,
       desktopIpcEnabled: 'true',
       desktopIpcSocket: desktopIpc.socketPath,
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
@@ -881,6 +953,8 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.turnPlanProgressRing::after\s*\{[^}]*inset:\s*2px/s);
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*align-self:\s*center;[^}]*margin:\s*0 auto 8px/s);
     assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none/s);
+    assert.match(uiStyles, /body \.composer > \.editedFilesResult\.live:not\(\[open\]\)\s*\{[^}]*width:\s*max-content;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.turnResultHead > \.turnResultFileLabel\s*\{[^}]*flex:\s*0 0 auto;[^}]*overflow:\s*visible;[^}]*text-overflow:\s*clip/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\)\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 34px\)\);[^}]*border:\s*0;[^}]*background:\s*transparent;[^}]*padding:\s*0;[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.composerProjectPicker\s*\{[^}]*width:\s*calc\(100% - 29px\)/s);
     assert.match(uiStyles, /body \.composer:has\(> \.composerProjectPicker:not\(\.hidden\)\) > \.box\s*\{[^}]*width:\s*100%/s);
@@ -951,6 +1025,9 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptStyles, /\.imagePromptViewTab\.active/);
     assert.match(imagePromptStyles, /\.imagePromptSyncStatus\[data-status="error"\]/);
     assert.match(imagePromptStyles, /\.imagePromptSyncButton\.syncing \.lucide/);
+    assert.match(imagePromptStyles, /grid-template-columns:\s*38px minmax\(0, 1fr\) minmax\(64px, min\(24vw, 124px\)\)/);
+    assert.match(imagePromptStyles, /\.topConversationContext\s*\{[^}]*display:\s*block;[^}]*max-width:\s*124px;[^}]*text-align:\s*right/s);
+    assert.match(imagePromptStyles, /\.topConversationContext #status,[^}]*\.main\.imagePromptMain \.topConversationContext\s*\{[^}]*display:\s*none/s);
 
     const imagePromptScriptResponse = await fetch(`${baseUrl}/image-prompt.js`);
     assert.equal(imagePromptScriptResponse.status, 200);
@@ -1004,6 +1081,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedSubQuotas.status, 401);
     const unauthorizedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`);
     assert.equal(unauthorizedSubQuotaConfig.status, 401);
+    const unauthorizedModelCapabilities = await fetch(`${baseUrl}/api/native-model-capabilities`);
+    assert.equal(unauthorizedModelCapabilities.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
     assert.equal(unauthorizedPlayground.status, 401);
 
@@ -1509,8 +1588,9 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260723g"/);
-    assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260723g"/);
+    assert.match(page, /href="\/ui\.css\?v=queue-spacing-20260728a"/);
+    assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260728a"/);
+    assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
     assert.match(page, /function createDreamSkinGenerator/);
@@ -1637,7 +1717,10 @@ updated_at = 1784422800000
     assert.match(page, /setIconLabel\(subQuotaToggle,'gauge','额度',false\)/);
     assert.match(page, /subQuotaToggle\.setAttribute\('aria-controls','subQuotaSettingsDialog'\)/);
     assert.match(page, /subQuotaPopover\.id='subQuotaPopover'/);
-    assert.match(page, /pointerenter.*showSubQuotaPreview/);
+    assert.match(page, /subQuotaToggle\.addEventListener\('pointerenter'.*showSubQuotaPreview/);
+    assert.match(page, /subQuotaToggle\.addEventListener\('pointerleave',scheduleSubQuotaPreviewHide\)/);
+    assert.doesNotMatch(page, /subQuotaToggle\.addEventListener\('mouseenter'/);
+    assert.doesNotMatch(page, /subQuotaToggle\.addEventListener\('mouseleave'/);
     assert.match(page, /subQuotaToggle\.addEventListener\('click',handleSubQuotaToggleClick\)/);
     assert.match(page, /function handleSubQuotaToggleClick\(event\)/);
     assert.match(page, /const coarse=isCoarsePointer\(\)\|\|event\.pointerType==='touch'/);
@@ -1646,6 +1729,10 @@ updated_at = 1784422800000
     assert.doesNotMatch(page, /providerName\+\(quota\.name&&quota\.name!==providerName/);
     assert.match(page, /finiteSubQuotaNumber\(quota\.subscription\.monthly\?\.limit\)>0/);
     assert.match(page, /重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
+    assert.match(page, /if\(stale\)appendSubQuotaMeta\(meta,subQuotaStaleMetaText\(quota\)\)/);
+    assert.match(page, /subQuotaStatus\.textContent=subQuotaFetchedStatusText\(data\.fetchedAt,hasStale\)/);
+    assert.match(page, /if\(quota\.valid===false\)\{/);
+    assert.doesNotMatch(page, /if\(quota\.valid===false&&!?stale\)/);
     assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
     assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
     assert.match(page, /title\.textContent='额度监控'/);
@@ -1726,6 +1813,16 @@ updated_at = 1784422800000
     assert.match(page, /function renderAutomations/);
     assert.match(page, /new CustomEvent\('codex-web:main-view'/);
     assert.match(page, /event\.detail\?\.view==='image-prompts'&&activeMainView!=='chat'/);
+    assert.match(page, /let currentConversationTitle = '新任务'/);
+    assert.match(page, /function renderTopConversationTitle\(\)/);
+    assert.match(page, /function setCurrentConversationTitle\(value,fallback='新任务'\)/);
+    assert.match(page, /function setMainView\(view\)\{[\s\S]*?renderTopConversationTitle\(\);\s*\}/);
+    assert.match(page, /function setSideChatView\(view\)\{[\s\S]*?renderSideChatTabs\(\);\s*renderTopConversationTitle\(\)/);
+    assert.match(page, /async function syncSideChatConversation\(\)\{[\s\S]*?if\(tab\)tab\.title=title;\s*renderTopConversationTitle\(\)/);
+    assert.match(page, /async function renameConversation\(id,title,source='codex'\)\{[\s\S]*?currentConversationId===id[\s\S]*?setCurrentConversationTitle\(clean\)/);
+    assert.match(page, /function newChat\(\)\{[^\n]*setCurrentConversationTitle\('新任务'\)/);
+    assert.match(page, /async function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(conversation\.title\|\|'Chat','Chat'\)/);
+    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false\}=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
     assert.match(page, /automationStatus\.textContent=automationNotice\|\|''/);
     assert.match(page, /function openArchivedView/);
     assert.match(page, /ask:\{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'\}/);
@@ -1769,9 +1866,9 @@ updated_at = 1784422800000
     assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*permissionMode:composerPermissionMode,sandbox:/);
     assert.match(page, /if\(!preserveProviderModel&&\['low','medium','high','xhigh','max','ultra'\]\.includes\(metadata\.reasoningEffort\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&metadata\.modelProvider/);
-    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval\)/);
-    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval\)/);
-    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort,item\.permissionMode,item\.sandbox,item\.approval\);/);
+    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier\)/);
+    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier\)/);
+    assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort,item\.permissionMode,item\.sandbox,item\.approval,item\.serviceTier\);/);
     assert.match(page, /permissionMode:\s*composerPermissionMode/);
     assert.match(page, /\.\.\.composerPermissionPayload\(item\.permissionMode,item\.sandbox,item\.approval\)/);
     assert.match(page, /\.\.\.composerPermissionPayload\(\)/);
@@ -1792,7 +1889,7 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*if\(conversation\.status==='running'\)\{\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerChrome\(\);\s*\}\s*if\(conversation\.reset\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerChrome\(\);\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -1819,6 +1916,26 @@ updated_at = 1784422800000
     assert.equal(isCompletedNativeRuntimeTurn('', 'turn-old', 'turn-old'), false);
     assert.doesNotMatch(inlineScript, /function\s+([A-Za-z_$][\w$]*)function\s+\1\b/);
     assert.doesNotThrow(() => new Function(inlineScript));
+    const handoffDisplayHelper = inlineScript.match(/(function isHandoffSummaryText[\s\S]*?)(?=function isProgressStyleAssistantText)/)?.[1];
+    assert.ok(handoffDisplayHelper);
+    const isHandoffSummaryText = new Function(
+      handoffDisplayHelper + '; return isHandoffSummaryText;',
+    )();
+    assert.equal(isHandoffSummaryText('Context checkpoint:\n\n**Current State**\n- Repo: /workspace'), true);
+    assert.equal(isHandoffSummaryText('已完成 Context checkpoint 显示修复。'), false);
+    const markdownFileIconHelper = inlineScript.match(/(function markdownLocalFileIcon[\s\S]*?)(?=function decorateMarkdownLink)/)?.[1];
+    assert.ok(markdownFileIconHelper);
+    const markdownLocalFileIcon = new Function(
+      markdownFileIconHelper + '; return markdownLocalFileIcon;',
+    )();
+    assert.equal(markdownLocalFileIcon('/Volumes/ikirito/docker/codex-web/server.mjs:11980'), 'file-code-2');
+    assert.equal(markdownLocalFileIcon('/Volumes/ikirito/docker/codex-web/ui.css'), 'hash');
+    assert.equal(markdownLocalFileIcon('/Users/ikirito/Documents/notes.md'), 'file-text');
+    assert.equal(markdownLocalFileIcon('https://example.com/app.js'), '');
+    assert.equal(markdownLocalFileIcon('/playground/index.html'), '');
+    assert.match(inlineScript, /link\.prepend\(icon\)/);
+    assert.match(uiStyles, /\.markdownBody a\.markdownFileLink\s*\{[^}]*display:\s*inline-flex;[^}]*gap:\s*3px/s);
+    assert.match(uiStyles, /\.markdownFileLinkIcon\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px/s);
     const subQuotaProgressHelper = inlineScript.match(/(function subQuotaProgressPercent[\s\S]*?)(?=function appendSubQuotaWindow)/)?.[1];
     assert.ok(subQuotaProgressHelper);
     const subQuotaProgressPercent = new Function(
@@ -1835,6 +1952,65 @@ updated_at = 1784422800000
     )();
     assert.equal(formatSubQuotaDateTime('2026-07-29T14:08:28'), '07/29 14:08');
     assert.equal(formatSubQuotaDateTime('invalid'), '');
+    const subQuotaPreviewHelpers = inlineScript.match(/(function showSubQuotaPreview[\s\S]*?)(?=function cancelSubQuotaPreviewHide)/)?.[1];
+    assert.ok(subQuotaPreviewHelpers);
+    const previewClasses = new Set(['hidden']);
+    const previewAttributes = new Map();
+    const previewPopover = {
+      classList: {
+        contains: (name) => previewClasses.has(name),
+        add: (name) => previewClasses.add(name),
+        remove: (name) => previewClasses.delete(name),
+      },
+    };
+    const previewToggle = {
+      dataset: {},
+      setAttribute: (name, value) => previewAttributes.set(name, String(value)),
+    };
+    let subQuotaLoads = 0;
+    const subQuotaPreviewApi = new Function(
+      'subQuotaPopover',
+      'subQuotaToggle',
+      'subQuotaSettingsOverlay',
+      'cancelSubQuotaPreviewHide',
+      'loadSubQuota',
+      subQuotaPreviewHelpers + '; return { showSubQuotaPreview, hideSubQuotaPreview };',
+    )(
+      previewPopover,
+      previewToggle,
+      null,
+      () => {},
+      async () => { subQuotaLoads += 1; },
+    );
+    subQuotaPreviewApi.showSubQuotaPreview();
+    subQuotaPreviewApi.showSubQuotaPreview();
+    assert.equal(subQuotaLoads, 1);
+    assert.equal(previewClasses.has('hidden'), false);
+    assert.equal(previewAttributes.get('aria-expanded'), 'true');
+    assert.equal(previewToggle.dataset.previewOpen, '1');
+    subQuotaPreviewApi.hideSubQuotaPreview();
+    assert.equal(previewClasses.has('hidden'), true);
+    assert.equal(previewAttributes.get('aria-expanded'), 'false');
+    assert.equal(previewToggle.dataset.previewOpen, undefined);
+    subQuotaPreviewApi.showSubQuotaPreview();
+    assert.equal(subQuotaLoads, 2);
+    const subQuotaStaleHelpers = inlineScript.match(/(function subQuotaStaleMetaText[\s\S]*?)(?=function renderSubQuotaError)/)?.[1];
+    assert.ok(subQuotaStaleHelpers);
+    const subQuotaStaleApi = new Function(
+      'formatSubQuotaTime',
+      subQuotaStaleHelpers + '; return { subQuotaStaleMetaText, subQuotaFetchedStatusText };',
+    )((value) => value === 'stale-at' ? '10:02' : value === 'checked-at' ? '10:12' : '');
+    assert.equal(
+      subQuotaStaleApi.subQuotaStaleMetaText({ stale: true, fetchedAt: 'stale-at', warning: '请求超时' }),
+      '刷新失败，显示 10:02 的上次数据 · 请求超时',
+    );
+    assert.equal(
+      subQuotaStaleApi.subQuotaStaleMetaText({ stale: true, fetchedAt: 'stale-at', warning: '刷新失败：请求超时' }),
+      '刷新失败，显示 10:02 的上次数据 · 请求超时',
+    );
+    assert.equal(subQuotaStaleApi.subQuotaStaleMetaText({ stale: true }), '刷新失败，显示上次数据');
+    assert.equal(subQuotaStaleApi.subQuotaFetchedStatusText('checked-at', true), '检查于 10:12');
+    assert.equal(subQuotaStaleApi.subQuotaFetchedStatusText('checked-at', false), '更新于 10:12');
     const singleFlightHelper = inlineScript.match(/(function createTrailingSingleFlight[\s\S]*?)(?=function readPromptQueues)/)?.[1];
     assert.ok(singleFlightHelper);
     const createTrailingSingleFlight = new Function(
@@ -2149,6 +2325,35 @@ updated_at = 1784422800000
         },
       ],
     });
+    const inboxHelpers = inlineScript.match(/(function parseInboxItemDirective[\s\S]*?)(?=function extractCodeComments)/)?.[1];
+    assert.ok(inboxHelpers);
+    const inboxApi = new Function(
+      inboxHelpers + '; return { parseInboxItemDirective, extractInboxItems };',
+    )();
+    assert.deepEqual(
+      inboxApi.parseInboxItemDirective('::inbox-item{title="Linux.do \\"启动\\"重试已更新" summary="无响应时最多刷新重试三轮"}'),
+      { title: 'Linux.do "启动"重试已更新', summary: '无响应时最多刷新重试三轮' },
+    );
+    assert.deepEqual(inboxApi.extractInboxItems([
+      '已完成启动重试修复。',
+      '',
+      '::inbox-item{title="第一条" summary="摘要一"}',
+      '::inbox-item{title="第二条"}',
+    ].join('\n')), {
+      markdown: '已完成启动重试修复。',
+      items: [
+        { title: '第一条', summary: '摘要一' },
+        { title: '第二条', summary: '' },
+      ],
+    });
+    assert.deepEqual(inboxApi.extractInboxItems('正文\n::inbox-item{title="缺少结束括号"'), {
+      markdown: '正文\n::inbox-item{title="缺少结束括号"',
+      items: [],
+    });
+    assert.match(inlineScript, /title\.textContent=item\.title/);
+    assert.match(inlineScript, /summary\.textContent=item\.summary/);
+    assert.match(uiStyles, /\.inboxItems\s*\{[^}]*width:\s*min\(520px, 100%\)/s);
+    assert.match(uiStyles, /\.inboxItem\s*\{[^}]*grid-template-columns:\s*24px minmax\(0, 1fr\)[^}]*border-radius:\s*8px/s);
     const activityHelpers = inlineScript.match(/(function decodeEmbeddedToolString[\s\S]*?)(?=function toolMessageTitle)/)?.[1];
     assert.ok(activityHelpers);
     const activityApi = new Function(`${activityHelpers}; return { normalizeTurnPlanItems, toolActivityPresentations, activityClusterPresentation, activityClusterMatchesBrowserTarget, markCurrentActivityItem };`)();
@@ -2809,6 +3014,36 @@ updated_at = 1784422800000
     assert.equal(planTooltip.attributes.get('role'), 'tooltip');
     assert.deepEqual(planTooltip.children.map((node) => node.children.find((child) => child.className === 'turnPlanTooltipText')?.textContent), referencePlan.map((item) => item.step));
 
+    const revealEditedFilesHelper = inlineScript.match(
+      /(function revealExpandedEditedFilesCard[\s\S]*?)(?=function createEditedFilesResultCard)/,
+    )?.[1];
+    assert.ok(revealEditedFilesHelper);
+    const revealScrollCalls = [];
+    const revealFollowStates = [];
+    const revealExpandedEditedFilesCard = new Function(
+      'chat',
+      'setNativeLiveFollowBottom',
+      revealEditedFilesHelper + '; return revealExpandedEditedFilesCard;',
+    )(
+      {
+        scrollTop: 400,
+        getBoundingClientRect: () => ({ top: 100 }),
+        scrollTo: (options) => revealScrollCalls.push(options),
+      },
+      (value) => revealFollowStates.push(value),
+    );
+    const expandedEditedCard = {
+      open: true,
+      isConnected: true,
+      getBoundingClientRect: () => ({ top: 520 }),
+    };
+    revealExpandedEditedFilesCard(expandedEditedCard);
+    assert.deepEqual(revealFollowStates, [false]);
+    assert.deepEqual(revealScrollCalls, [{ top: 808, behavior: 'smooth' }]);
+    expandedEditedCard.open = false;
+    revealExpandedEditedFilesCard(expandedEditedCard);
+    assert.equal(revealScrollCalls.length, 1);
+
     const liveResultHelpers = inlineScript.match(
       /(function moveLiveEditedFilesResultToEnd[\s\S]*?)(?=function createWebPreviewResultCard)/,
     )?.[1];
@@ -2840,14 +3075,14 @@ updated_at = 1784422800000
     };
     const livePromptQueuePanel = { kind: 'prompt-queue', parentNode: null, isConnected: true };
     const liveAttachmentTray = { kind: 'attachment-tray', parentNode: null, isConnected: true };
-    const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [livePromptQueuePanel] };
+    const liveDropZone = { kind: 'drop-zone', parentNode: null, isConnected: true, children: [] };
     let liveComposerInsertCalls = 0;
     const liveComposer = {
-      // Match the real composer DOM: input capsule first, attachment tray after it.
-      children: [liveDropZone, liveAttachmentTray],
+      // Match enhanceComposer(): queue, attachment tray, then input capsule.
+      children: [livePromptQueuePanel, liveAttachmentTray, liveDropZone],
       insertBefore(node, reference) {
         liveComposerInsertCalls += 1;
-        assert.strictEqual(reference, liveDropZone);
+        assert.strictEqual(reference, livePromptQueuePanel);
         detachLiveNode(node);
         const index = this.children.indexOf(reference);
         assert.notEqual(index, -1);
@@ -2867,7 +3102,7 @@ updated_at = 1784422800000
         return previous;
       },
     };
-    livePromptQueuePanel.parentNode = liveDropZone;
+    livePromptQueuePanel.parentNode = liveComposer;
     liveAttachmentTray.parentNode = liveComposer;
     liveDropZone.parentNode = liveComposer;
     const toolArtifact = { kind: 'tool-artifact' };
@@ -2935,17 +3170,21 @@ updated_at = 1784422800000
     const secondLivePill = liveResultApi.refresh();
     assert.notStrictEqual(firstLivePill, secondLivePill);
     assert.deepEqual(liveTimeline.children, []);
-    assert.deepEqual(liveComposer.children, [secondLivePill, liveDropZone, liveAttachmentTray]);
+    assert.deepEqual(liveComposer.children, [secondLivePill, livePromptQueuePanel, liveAttachmentTray, liveDropZone]);
     assert.strictEqual(secondLivePill.parentNode, liveComposer);
-    assert.strictEqual(secondLivePill.nextSibling, liveDropZone);
-    assert.ok(liveComposer.children.indexOf(secondLivePill) < liveComposer.children.indexOf(liveDropZone));
-    assert.strictEqual(livePromptQueuePanel.parentNode, liveDropZone);
+    assert.strictEqual(secondLivePill.nextSibling, livePromptQueuePanel);
+    assert.ok(liveComposer.children.indexOf(secondLivePill) < liveComposer.children.indexOf(livePromptQueuePanel));
+    assert.ok(liveComposer.children.indexOf(livePromptQueuePanel) < liveComposer.children.indexOf(liveAttachmentTray));
+    assert.ok(liveComposer.children.indexOf(liveAttachmentTray) < liveComposer.children.indexOf(liveDropZone));
+    assert.strictEqual(livePromptQueuePanel.parentNode, liveComposer);
     assert.equal(liveComposerInsertCalls, 1);
     assert.deepEqual(liveResultApi.state().turnProcessElements, [toolArtifact]);
     assert.equal(liveResultApi.state().turnProcessElements.includes(secondLivePill), false);
     assert.equal(createdLiveCards.length, 2);
     assert.deepEqual(createdLiveCards.at(-1).options, { live: true, plan: referencePlan });
-    assert.match(inlineScript, /composer\.insertBefore\(liveEditedFilesResult,dropZone\)/);
+    assert.match(inlineScript, /const anchor=promptQueuePanel\?\.parentNode===composer\?promptQueuePanel:dropZone/);
+    assert.match(inlineScript, /composer\.insertBefore\(liveEditedFilesResult,anchor\)/);
+    assert.match(inlineScript, /card\.addEventListener\('toggle',[\s\S]*?revealExpandedEditedFilesCard\(card\)/);
     assert.match(inlineScript, /if\(files\.length\)container\.appendChild\(createEditedFilesResultCard\(files,turnId\)\)/);
 
     const searchActivity = createToolActivityItem({
@@ -2966,9 +3205,32 @@ updated_at = 1784422800000
     const config = await configResponse.json();
     assert.equal(config.defaults.model, 'test-model');
     assert.equal(config.defaults.reasoningEffort, 'max');
+    assert.equal(config.defaults.serviceTier, null);
     assert.equal(config.capabilities.manageProviders, false);
     assert.equal(config.appearance.chatBackground, 'default');
     assert.deepEqual(config.pinnedThreadIds, [nativeSessionId, archivedNativeSessionId]);
+
+    const modelCapabilitiesResponse = await fetch(`${baseUrl}/api/native-model-capabilities`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(modelCapabilitiesResponse.status, 200);
+    assert.match(modelCapabilitiesResponse.headers.get('cache-control'), /no-store/);
+    const modelCapabilities = await modelCapabilitiesResponse.json();
+    assert.equal(modelCapabilities.ok, true);
+    assert.equal(modelCapabilities.models.length, 2);
+    assert.equal(modelCapabilities.models.every((entry) => !('displayName' in entry)), true);
+    assert.equal(
+      modelCapabilities.models
+        .find((entry) => entry.id === 'test-model')
+        ?.serviceTiers.some((tier) => tier.id === 'priority'),
+      true,
+    );
+    assert.equal(
+      modelCapabilities.models
+        .find((entry) => entry.id === 'standard-only-model')
+        ?.serviceTiers.some((tier) => tier.id === 'priority'),
+      false,
+    );
 
     const playgroundConfigResponse = await fetch(`${baseUrl}/api/playground-config`, {
       headers: { Cookie: cookie },
@@ -3493,6 +3755,7 @@ updated_at = 1784422800000
         messageSeq: nativeTargetMessage.seq,
         provider: 'fake',
         model: 'test-model',
+        serviceTier: 'priority',
         cwd: temporary,
         sandbox: 'workspace-write',
         approval: 'on-request',
@@ -3542,6 +3805,7 @@ updated_at = 1784422800000
         provider: 'fake',
         model: 'test-model',
         reasoningEffort: 'ultra',
+        serviceTier: 'priority',
         cwd: temporary,
         sandbox: 'read-only',
         approval: 'on-request',
@@ -3868,7 +4132,13 @@ updated_at = 1784422800000
     }]);
     assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
     assert.equal(desktopStart.params.turnStartParams.model, 'test-model');
+    assert.equal(desktopStart.params.turnStartParams.serviceTier, 'priority');
     assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
+    const standardDesktopStart = desktopIpc.messages.find((message) => (
+      message.method === 'thread-follower-start-turn'
+      && message.params.turnStartParams.input.some((item) => item.text === 'recover from native echo')
+    ));
+    assert.equal(standardDesktopStart.params.turnStartParams.serviceTier, null);
     const desktopSteer = desktopIpc.messages.find((message) => message.method === 'thread-follower-steer-turn');
     assert.equal(desktopSteer.params.conversationId, nativeSessionId);
     assert.deepEqual(desktopSteer.params.input, [{
@@ -3923,15 +4193,239 @@ updated_at = 1784422800000
     assert.equal(interruptedConcurrentTurn.status, 200);
     await writeFile(appServerControlFile, '{}');
 
+    const appOwnedQueue = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appOwnedQueue.status, 200);
+    const appOwnedQueuePayload = await appOwnedQueue.json();
+    assert.equal(appOwnedQueuePayload.items.length, 1);
+    assert.equal(appOwnedQueuePayload.items[0].id, appOwnedQueueItemId);
+    assert.equal(appOwnedQueuePayload.items[0].source, 'codex-app');
+
+    const appQueueWithoutIdFirst = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueWithoutIdFirst.status, 200);
+    const appQueueWithoutIdFirstPayload = await appQueueWithoutIdFirst.json();
+    assert.equal(appQueueWithoutIdFirstPayload.items.length, 2);
+    const stableNoIdItem = appQueueWithoutIdFirstPayload.items.find((item) => (
+      item.message === 'Legacy Codex App prompt without an id'
+    ));
+    assert.match(stableNoIdItem?.id || '', /^codex-app-[0-9a-f]{24}$/);
+    assert.equal(stableNoIdItem?.source, 'codex-app');
+    const appQueueWithoutIdSecond = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueWithoutIdSecond.status, 200);
+    const appQueueWithoutIdSecondPayload = await appQueueWithoutIdSecond.json();
+    assert.deepEqual(appQueueWithoutIdSecondPayload.items, appQueueWithoutIdFirstPayload.items);
+
+    const appStateAfterPredecessorRemoval = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterPredecessorRemoval['queued-follow-ups'][appQueueNoIdThreadId] = [{
+      text: 'Legacy Codex App prompt without an id',
+      createdAt: 1785204001000,
+    }];
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterPredecessorRemoval));
+    const appQueueAfterPredecessorRemoval = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueAfterPredecessorRemoval.status, 200);
+    const appQueueAfterPredecessorRemovalPayload = await appQueueAfterPredecessorRemoval.json();
+    assert.equal(appQueueAfterPredecessorRemovalPayload.items.length, 1);
+    assert.equal(appQueueAfterPredecessorRemovalPayload.items[0].id, stableNoIdItem.id);
+
+    const appStateAfterPredecessorInsert = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterPredecessorInsert['queued-follow-ups'][appQueueNoIdThreadId] = [
+      {
+        text: 'New predecessor without an id',
+        createdAt: 1785204000750,
+      },
+      {
+        text: 'Legacy Codex App prompt without an id',
+        createdAt: 1785204001000,
+      },
+    ];
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterPredecessorInsert));
+    const appQueueAfterPredecessorInsert = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueAfterPredecessorInsert.status, 200);
+    const appQueueAfterPredecessorInsertPayload = await appQueueAfterPredecessorInsert.json();
+    assert.equal(appQueueAfterPredecessorInsertPayload.items.length, 2);
+    assert.equal(
+      appQueueAfterPredecessorInsertPayload.items.find((item) => (
+        item.message === 'Legacy Codex App prompt without an id'
+      ))?.id,
+      stableNoIdItem.id,
+    );
+
+    const duplicateNoIdQueueFirst = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueDuplicateNoIdThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(duplicateNoIdQueueFirst.status, 200);
+    const duplicateNoIdQueueFirstPayload = await duplicateNoIdQueueFirst.json();
+    assert.equal(duplicateNoIdQueueFirstPayload.items.length, 2);
+    assert.equal(new Set(duplicateNoIdQueueFirstPayload.items.map((item) => item.id)).size, 2);
+
+    const appStateAfterDuplicateRemoval = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterDuplicateRemoval['queued-follow-ups'][appQueueDuplicateNoIdThreadId] = [{
+      text: 'Duplicate legacy prompt without an id',
+      createdAt: 1785204002000,
+    }];
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterDuplicateRemoval));
+    const duplicateNoIdQueueAfterRemoval = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueDuplicateNoIdThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(duplicateNoIdQueueAfterRemoval.status, 200);
+    assert.equal((await duplicateNoIdQueueAfterRemoval.json()).items.length, 1);
+
+    const appStateAfterDuplicateRestore = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterDuplicateRestore['queued-follow-ups'][appQueueDuplicateNoIdThreadId] = [
+      {
+        text: 'Duplicate legacy prompt without an id',
+        createdAt: 1785204002000,
+      },
+      {
+        text: 'Duplicate legacy prompt without an id',
+        createdAt: 1785204002000,
+      },
+    ];
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterDuplicateRestore));
+    const duplicateNoIdQueueAfterRestore = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueDuplicateNoIdThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(duplicateNoIdQueueAfterRestore.status, 200);
+    const duplicateNoIdQueueAfterRestorePayload = await duplicateNoIdQueueAfterRestore.json();
+    assert.equal(duplicateNoIdQueueAfterRestorePayload.items.length, 2);
+    assert.deepEqual(
+      duplicateNoIdQueueAfterRestorePayload.items.map((item) => item.id),
+      duplicateNoIdQueueFirstPayload.items.map((item) => item.id),
+    );
+
+    const attemptedAppQueueOverwrite = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ revision: appOwnedQueuePayload.revision, items: [] }),
+    });
+    assert.equal(attemptedAppQueueOverwrite.status, 200);
+    const appQueueAfterOverwrite = await attemptedAppQueueOverwrite.json();
+    assert.deepEqual(appQueueAfterOverwrite.items.map((item) => item.id), [appOwnedQueueItemId]);
+
+    const attemptedAppQueueSourceSpoof = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        revision: appQueueAfterOverwrite.revision,
+        items: [{
+          id: appOwnedQueueItemId,
+          message: 'Web attempted to take ownership',
+          provider: 'fake',
+          model: 'test-model',
+          source: 'web',
+        }],
+      }),
+    });
+    assert.equal(attemptedAppQueueSourceSpoof.status, 200);
+    const appQueueAfterSourceSpoof = await attemptedAppQueueSourceSpoof.json();
+    assert.equal(appQueueAfterSourceSpoof.items.length, 1);
+    assert.equal(appQueueAfterSourceSpoof.items[0].id, appOwnedQueueItemId);
+    assert.equal(appQueueAfterSourceSpoof.items[0].source, 'codex-app');
+    assert.equal(appQueueAfterSourceSpoof.items[0].message, 'Codex App owns this queued prompt');
+
+    const attemptedAppQueueDelete = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}/items/${appOwnedQueueItemId}`,
+      { method: 'DELETE', headers: { Cookie: cookie } },
+    );
+    assert.equal(attemptedAppQueueDelete.status, 409);
+    assert.match((await attemptedAppQueueDelete.json()).error, /Codex App 管理/);
+
+    const appQueueTraceBefore = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
+    const attemptedAppQueueTurn = await fetch(`${baseUrl}/api/native-sessions/${appQueueOwnershipThreadId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: 'Codex App owns this queued prompt',
+        queueItemId: appOwnedQueueItemId,
+      }),
+    });
+    assert.equal(attemptedAppQueueTurn.status, 409);
+    assert.match((await attemptedAppQueueTurn.json()).error, /Codex App 管理/);
+    const attemptedAppQueueSteer = await fetch(`${baseUrl}/api/native-sessions/${appQueueOwnershipThreadId}/steer`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'Codex App owns this queued prompt',
+        turnId: 'app-owned-running-turn',
+        queueItemId: appOwnedQueueItemId,
+      }),
+    });
+    assert.equal(attemptedAppQueueSteer.status, 409);
+    assert.match((await attemptedAppQueueSteer.json()).error, /Codex App 管理/);
+    const attemptedAppQueueSideChat = await fetch(`${baseUrl}/api/native-sessions`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: 'Codex App owns this queued prompt',
+        sideChat: true,
+        sourceThreadId: appQueueOwnershipThreadId,
+        queueItemId: appOwnedQueueItemId,
+      }),
+    });
+    assert.equal(attemptedAppQueueSideChat.status, 409);
+    assert.match((await attemptedAppQueueSideChat.json()).error, /Codex App 管理/);
+    const appQueueTraceAfter = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
+    assert.equal(appQueueTraceAfter, appQueueTraceBefore);
+
+    const codexGlobalState = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    delete codexGlobalState['queued-follow-ups'];
+    await writeFile(codexGlobalStateFile, JSON.stringify(codexGlobalState));
+    const appQueueAfterAppRemoval = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueAfterAppRemoval.status, 200);
+    assert.deepEqual((await appQueueAfterAppRemoval.json()).items, []);
+    const appQueueWithoutIdAfterAppRemoval = await fetch(`${baseUrl}/api/prompt-queues/${appQueueNoIdThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appQueueWithoutIdAfterAppRemoval.status, 200);
+    assert.deepEqual((await appQueueWithoutIdAfterAppRemoval.json()).items, []);
+    const duplicateNoIdQueueAfterAppRemoval = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueDuplicateNoIdThreadId}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(duplicateNoIdQueueAfterAppRemoval.status, 200);
+    assert.deepEqual((await duplicateNoIdQueueAfterAppRemoval.json()).items, []);
+    const appQueueTraceAfterRemoval = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
+    assert.equal(appQueueTraceAfterRemoval, appQueueTraceBefore);
+
     const queueItemA = {
       id: 'queue-client-a',
       message: 'same queue prompt',
+      serviceTier: 'priority',
       createdAt: '2026-07-26T10:00:00.000Z',
       source: 'web',
     };
     const queueItemB = {
       id: 'queue-client-b',
       message: 'same queue prompt',
+      serviceTier: null,
       createdAt: '2026-07-26T10:00:01.000Z',
       source: 'web',
     };
@@ -3962,6 +4456,7 @@ updated_at = 1784422800000
     assert.equal(mergedQueueClientB.status, 200);
     const mergedQueuePayload = await mergedQueueClientB.json();
     assert.deepEqual(mergedQueuePayload.items.map((item) => item.id), [queueItemB.id, queueItemA.id]);
+    assert.deepEqual(mergedQueuePayload.items.map((item) => item.serviceTier), [null, 'priority']);
 
     const queueTurn = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
       method: 'POST',
@@ -3969,6 +4464,7 @@ updated_at = 1784422800000
       body: JSON.stringify({
         ...concurrentTurnPayload,
         message: queueItemA.message,
+        serviceTier: queueItemA.serviceTier,
         queueItemId: queueItemA.id,
       }),
     });
@@ -4082,6 +4578,7 @@ updated_at = 1784422800000
       body: JSON.stringify({
         ...concurrentTurnPayload,
         message: queueItemB.message,
+        serviceTier: queueItemB.serviceTier,
         sideChat: true,
         sourceThreadId: nativeSessionId,
         queueItemId: queueItemB.id,
@@ -4253,6 +4750,7 @@ updated_at = 1784422800000
         provider: 'fake',
         model: 'test-model',
         reasoningEffort: 'max',
+        serviceTier: 'priority',
         cwd: temporary,
         sandbox: 'workspace-write',
         approval: 'on-request',
@@ -4360,6 +4858,7 @@ updated_at = 1784422800000
         provider: 'custom',
         model: 'custom-model',
         reasoningEffort: 'max',
+        serviceTier: 'priority',
         cwd: temporary,
         sandbox: 'read-only',
         approval: 'on-request',
@@ -4432,6 +4931,11 @@ updated_at = 1784422800000
       && message.sub2ApiKey === undefined
     )));
     assert.ok(protocolMessages.some((message) => message.method === 'initialize'));
+    assert.ok(protocolMessages.some((message) => (
+      message.method === 'model/list'
+      && message.params.limit === 100
+      && message.params.includeHidden === false
+    )));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/start'));
     assert.ok(protocolMessages.some((message) => (
       message.method === 'thread/list'
@@ -4518,12 +5022,14 @@ updated_at = 1784422800000
     ));
     assert.ok(switchedProviderResume);
     assert.equal(switchedProviderResume.params.model, 'custom-model');
+    assert.equal(switchedProviderResume.params.serviceTier, 'priority');
     const restartFromFirstMessage = protocolMessages.find((message) => (
       message.method === 'thread/start'
       && message.params.sandbox === 'read-only'
       && message.params.approvalPolicy === 'untrusted'
     ));
     assert.ok(restartFromFirstMessage);
+    assert.equal(restartFromFirstMessage.params.serviceTier, null);
     const forkMessages = protocolMessages.filter((message) => message.method === 'thread/fork');
     assert.equal(forkMessages.length, 2);
     const forkMessage = forkMessages[0];
@@ -4531,6 +5037,8 @@ updated_at = 1784422800000
     assert.equal(forkMessage.params.lastTurnId, nativeFirstTurnId);
     assert.equal(forkMessage.params.sandbox, 'workspace-write');
     assert.equal(forkMessage.params.approvalPolicy, 'on-request');
+    assert.equal(forkMessage.params.serviceTier, 'priority');
+    assert.equal(forkMessages[1].params.serviceTier, null);
     const turnStartMessages = protocolMessages.filter((message) => message.method === 'turn/start');
     const turnStartText = (message) => (
       message.params.input.find((item) => item.type === 'text')?.text || ''
@@ -4538,11 +5046,31 @@ updated_at = 1784422800000
     const createdTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'create native thread');
     assert.equal(createdTurnStart.params.sandboxPolicy.type, 'workspaceWrite');
     assert.deepEqual(createdTurnStart.params.sandboxPolicy.writableRoots, [temporary]);
+    assert.equal(createdTurnStart.params.serviceTier, 'priority');
+    const createdTurnStartIndex = protocolMessages.indexOf(createdTurnStart);
+    const createdThreadStart = protocolMessages
+      .slice(0, createdTurnStartIndex)
+      .reverse()
+      .find((message) => message.method === 'thread/start');
+    assert.equal(createdThreadStart.params.serviceTier, 'priority');
     const approvalTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'needs approval');
     assert.equal(approvalTurnStart.params.sandboxPolicy.type, 'readOnly');
+    assert.equal(approvalTurnStart.params.serviceTier, null);
     const switchedProviderTurnStart = turnStartMessages.find((message) => turnStartText(message) === 'switch native provider');
     assert.equal(switchedProviderTurnStart.params.model, 'custom-model');
     assert.equal(switchedProviderTurnStart.params.effort, 'max');
+    assert.equal(switchedProviderTurnStart.params.serviceTier, 'priority');
+    const queuedFastTurnStart = turnStartMessages.find((message) => (
+      message.params.threadId === nativeSessionId
+      && turnStartText(message) === queueItemA.message
+      && message.params.serviceTier === 'priority'
+    ));
+    assert.ok(queuedFastTurnStart);
+    const standardSideChatTurnStart = turnStartMessages.find((message) => (
+      message.params.threadId === runningSideChatId
+      && turnStartText(message) === queueItemB.message
+    ));
+    assert.equal(standardSideChatTurnStart.params.serviceTier, null);
     const steerMessage = protocolMessages.find((message) => (
       message.method === 'turn/steer'
       && message.params.input?.some((item) => item.text === 'change direction while running')
@@ -4764,6 +5292,7 @@ function startServer({
   desktopIpcEnabled = 'false',
   desktopIpcSocket = '',
   playgroundProxyAllowedOrigins = '',
+  fetchFixture = '',
   sub2ApiBaseUrl,
   sub2ApiKey,
 }) {
@@ -4798,6 +5327,9 @@ function startServer({
     FAKE_APP_SERVER_TRACE: appServerTraceFile,
     FAKE_APP_SERVER_CONTROL: appServerControlFile,
   };
+  if (fetchFixture) {
+    env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--import=${fetchFixture}`].filter(Boolean).join(' ');
+  }
   env.CPA_QUOTA_BASE_URL = '';
   env.CPA_QUOTA_API_KEY = '';
   delete env.SUB2API_BASE_URL;

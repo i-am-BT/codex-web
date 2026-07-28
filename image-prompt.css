@@ -1092,13 +1092,28 @@ body[data-theme="light"] .imagePromptToolbar {
 
 @media (max-width: 820px) {
   body .top {
-    grid-template-columns: 38px minmax(0, 1fr) auto;
+    grid-template-columns: 38px minmax(0, 1fr) minmax(64px, min(24vw, 124px));
     gap: 7px;
   }
 
-  .topConversationContext,
-  body #modeLabel {
+  .topConversationContext {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    max-width: 124px;
+    justify-self: end;
+    overflow: hidden;
+    text-align: right;
+  }
+
+  .topConversationContext #status,
+  body #modeLabel,
+  .main.imagePromptMain .topConversationContext {
     display: none;
+  }
+
+  .main.imagePromptMain > .top {
+    grid-template-columns: 38px minmax(0, 1fr) auto;
   }
 
   .workspaceNav {
