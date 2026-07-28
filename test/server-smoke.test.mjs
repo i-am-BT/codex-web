@@ -1025,6 +1025,9 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptStyles, /\.imagePromptViewTab\.active/);
     assert.match(imagePromptStyles, /\.imagePromptSyncStatus\[data-status="error"\]/);
     assert.match(imagePromptStyles, /\.imagePromptSyncButton\.syncing \.lucide/);
+    assert.match(imagePromptStyles, /grid-template-columns:\s*38px minmax\(0, 1fr\) minmax\(64px, min\(24vw, 124px\)\)/);
+    assert.match(imagePromptStyles, /\.topConversationContext\s*\{[^}]*display:\s*block;[^}]*max-width:\s*124px;[^}]*text-align:\s*right/s);
+    assert.match(imagePromptStyles, /\.topConversationContext #status,[^}]*\.main\.imagePromptMain \.topConversationContext\s*\{[^}]*display:\s*none/s);
 
     const imagePromptScriptResponse = await fetch(`${baseUrl}/image-prompt.js`);
     assert.equal(imagePromptScriptResponse.status, 200);
@@ -1585,8 +1588,8 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260723g"/);
-    assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260723g"/);
+    assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260728a"/);
+    assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
     assert.match(page, /function createDreamSkinGenerator/);
@@ -1809,6 +1812,16 @@ updated_at = 1784422800000
     assert.match(page, /function renderAutomations/);
     assert.match(page, /new CustomEvent\('codex-web:main-view'/);
     assert.match(page, /event\.detail\?\.view==='image-prompts'&&activeMainView!=='chat'/);
+    assert.match(page, /let currentConversationTitle = '新任务'/);
+    assert.match(page, /function renderTopConversationTitle\(\)/);
+    assert.match(page, /function setCurrentConversationTitle\(value,fallback='新任务'\)/);
+    assert.match(page, /function setMainView\(view\)\{[\s\S]*?renderTopConversationTitle\(\);\s*\}/);
+    assert.match(page, /function setSideChatView\(view\)\{[\s\S]*?renderSideChatTabs\(\);\s*renderTopConversationTitle\(\)/);
+    assert.match(page, /async function syncSideChatConversation\(\)\{[\s\S]*?if\(tab\)tab\.title=title;\s*renderTopConversationTitle\(\)/);
+    assert.match(page, /async function renameConversation\(id,title,source='codex'\)\{[\s\S]*?currentConversationId===id[\s\S]*?setCurrentConversationTitle\(clean\)/);
+    assert.match(page, /function newChat\(\)\{[^\n]*setCurrentConversationTitle\('新任务'\)/);
+    assert.match(page, /async function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(conversation\.title\|\|'Chat','Chat'\)/);
+    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false\}=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
     assert.match(page, /automationStatus\.textContent=automationNotice\|\|''/);
     assert.match(page, /function openArchivedView/);
     assert.match(page, /ask:\{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'\}/);

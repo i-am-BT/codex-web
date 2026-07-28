@@ -5317,7 +5317,7 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
 <link rel="stylesheet" href="/ui.css?v=fast-mode-20260728a">
-  <link rel="stylesheet" href="/image-prompt.css?v=image-prompt-main-20260723g">
+  <link rel="stylesheet" href="/image-prompt.css?v=image-prompt-main-20260728a">
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
@@ -5345,6 +5345,7 @@ const nativeRequestModal = document.getElementById('nativeRequestModal'), native
 const titleEl = document.querySelector('.top .title');
 let currentConversationId = '';
 let currentConversationSource = 'codex';
+let currentConversationTitle = '新任务';
 let currentNativeWorkspaceKind = '';
 let defaultComposerCwd = '';
 let activeMainView = 'chat';
@@ -6284,6 +6285,26 @@ function removeSideChatTab(threadId){
 function getSideChatTab(threadId){
   return sideChatOpenTabs.find((tab)=>tab.threadId===String(threadId||''))||null;
 }
+function normalizeConversationTitle(value,fallback='新任务'){
+  return String(value||fallback).trim().replace(/\s+/g,' ').slice(0,80)||fallback;
+}
+function topConversationTitle(){
+  if(activeMainView==='archive')return'已归档任务';
+  if(activeMainView==='automation')return'自动化安排';
+  if(sideChatView==='side'&&sideChatThreadId){
+    return normalizeConversationTitle(getSideChatTab(sideChatThreadId)?.title||sideChatTitle?.textContent,'临时侧聊');
+  }
+  return normalizeConversationTitle(currentConversationTitle,currentConversationId?'Chat':'新任务');
+}
+function renderTopConversationTitle(){
+  const title=topConversationTitle();
+  if(titleEl){titleEl.textContent=title;titleEl.title=title}
+  return title;
+}
+function setCurrentConversationTitle(value,fallback='新任务'){
+  currentConversationTitle=normalizeConversationTitle(value,fallback);
+  return renderTopConversationTitle();
+}
 function renderSideChatTabs(){
   ensureSideChatTabs();
   if(!sideChatTabs)return;
@@ -6341,6 +6362,7 @@ function setSideChatView(view){
     else pane.style.removeProperty('display');
   }
   renderSideChatTabs();
+  renderTopConversationTitle();
   if(sideChatView==='side') renderSideChatWidth();
   else {
     document.documentElement.style.setProperty('--side-chat-width','0px');
@@ -6497,6 +6519,7 @@ function setSideChatOpen(open){
     finishSideChatResize();
     syncSideChatResizeHandle();
   }
+  renderTopConversationTitle();
 }
 function resetActiveSideChatUi(){
   sideChatRunning=false;
@@ -6651,6 +6674,7 @@ async function syncSideChatConversation(){
     if(sideChatPane)sideChatPane.setAttribute('aria-label','Side chat · '+title);
     const tab=getSideChatTab(syncId);
     if(tab)tab.title=title;
+    renderTopConversationTitle();
     const metadata=conversation.metadata&&typeof conversation.metadata==='object'?conversation.metadata:{};
     if(tab&&Object.hasOwn(metadata,'serviceTier'))tab.serviceTier=normalizeComposerServiceTier(metadata.serviceTier);
     const messages=Array.isArray(conversation.messages)?conversation.messages:[];
@@ -9687,7 +9711,7 @@ function enhanceInterface(){
   enhanceSideChatResize();
   enhanceComposer();
   setIconLabel(loginForm?.querySelector('.primary'),'log-in','登录');
-  if(titleEl)titleEl.textContent='新任务';
+  setCurrentConversationTitle('新任务');
   statusEl?.classList.add('topStatus');
   const historyTitle=history?.previousElementSibling;
   if(historyTitle){
@@ -9964,15 +9988,14 @@ function setMainView(view){
   automationToggle?.classList.toggle('active',automated);
   if(archived){
     closeComposerPopovers();
-    if(titleEl)titleEl.textContent='已归档任务';
     statusEl.textContent=archivedLoading?'正在读取归档列表...':'Codex App · 已归档';
     setIconLabel(modeLabel,'archive','已归档');
   }else if(automated){
     closeComposerPopovers();
-    if(titleEl)titleEl.textContent='自动化安排';
     statusEl.textContent=automationLoading?'正在读取自动化...':'Codex App · 自动化';
     setIconLabel(modeLabel,'calendar-clock','自动化');
   }else applyConversationMode();
+  renderTopConversationTitle();
 }
 window.addEventListener('codex-web:workspace-view',(event)=>{
   if(event.detail?.view==='image-prompts'&&activeMainView!=='chat')setMainView('chat');
@@ -11343,6 +11366,7 @@ async function renameConversation(id,title,source='codex'){
     const res=await fetch(endpoint+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:clean})});
     const data=await res.json().catch(()=>({}));
     if(!res.ok){statusEl.textContent=data.error||'改名失败';return false}
+    if(currentConversationId===id&&currentConversationSource===(source==='web'?'web':'codex'))setCurrentConversationTitle(clean);
     return true;
   }catch(error){statusEl.textContent=error.message||'改名失败';return false}
 }
@@ -11433,7 +11457,7 @@ function setNativeComposerOverride(threadId,selectedProvider,selectedModel,selec
   nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||''),serviceTier:normalizeComposerServiceTier(selectedServiceTier),permissionMode:String(selectedPermissionMode||'legacy'),sandbox:String(selectedSandbox||''),approval:String(selectedApproval||'')};
 }
 function nativeComposerOverrideApplies(threadId){return Boolean(nativeComposerOverride?.threadId&&nativeComposerOverride.threadId===threadId)}
-function newChat(){showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeComposerOverride();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();if(titleEl)titleEl.textContent='新任务';applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeComposerOverride();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -11521,7 +11545,7 @@ async function loadConversation(id,source='web',options={}){
   const data=await res.json();
   if(seq!==conversationLoadSeq)return false;
   const conversation=data.conversation;
-  if(titleEl)titleEl.textContent=conversation.title||'Chat';
+  setCurrentConversationTitle(conversation.title||'Chat','Chat');
   currentConversationId=conversation.id;
   currentConversationSource=conversation.source==='codex'?'codex':'web';
   currentNativeWorkspaceKind=currentConversationSource==='codex'?String(conversation.metadata?.workspaceKind||''):'';
@@ -11619,7 +11643,7 @@ async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
       newChat();
       currentConversationId=data.threadId;
       currentConversationSource='codex';
-      if(titleEl)titleEl.textContent=data.conversation?.title||'新分支';
+      setCurrentConversationTitle(data.conversation?.title||'新分支','新分支');
       nativeNotice.textContent='Codex App 会话 · 历史分支';
       statusEl.textContent='Codex App · 新分支';
       applyNativeConversationMetadata(data.conversation?.metadata||{});
@@ -15471,7 +15495,7 @@ async function send(){
   }
 }
 </script>
-  <script src="/image-prompt.js?v=image-prompt-main-20260723g"></script>
+  <script src="/image-prompt.js?v=image-prompt-main-20260728a"></script>
 </body>
 </html>`;
 }
