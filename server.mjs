@@ -6255,16 +6255,25 @@ function sideChatTabLabel(title){
   const clean=String(title||sideChatTitle?.textContent||'Side chat').trim()||'Side chat';
   return clean.length>22?clean.slice(0,21)+'…':clean;
 }
-function upsertSideChatTab({threadId,sourceThreadId='',title=''}={}){
+function upsertSideChatTab(options={}){
+  const {threadId,sourceThreadId='',title=''}=options;
   const id=String(threadId||'').trim();
   if(!id)return;
+  const hasServiceTier=Object.hasOwn(options,'serviceTier');
   const existing=sideChatOpenTabs.find((tab)=>tab.threadId===id);
   if(existing){
     if(title)existing.title=String(title).trim()||existing.title;
     if(sourceThreadId)existing.sourceThreadId=String(sourceThreadId);
+    if(hasServiceTier)existing.serviceTier=normalizeComposerServiceTier(options.serviceTier);
     return existing;
   }
-  const tab={threadId:id,sourceThreadId:String(sourceThreadId||''),title:String(title||'临时侧聊').trim()||'临时侧聊',running:false};
+  const tab={
+    threadId:id,
+    sourceThreadId:String(sourceThreadId||''),
+    title:String(title||'临时侧聊').trim()||'临时侧聊',
+    serviceTier:hasServiceTier?normalizeComposerServiceTier(options.serviceTier):null,
+    running:false,
+  };
   sideChatOpenTabs.push(tab);
   return tab;
 }
@@ -6435,7 +6444,7 @@ function persistSideChatState(){
       return;
     }
     localStorage.setItem(SIDE_CHAT_STORAGE_KEY,JSON.stringify({
-      tabs:sideChatOpenTabs.map((tab)=>({threadId:tab.threadId,sourceThreadId:tab.sourceThreadId||'',title:tab.title||''})),
+      tabs:sideChatOpenTabs.map((tab)=>({threadId:tab.threadId,sourceThreadId:tab.sourceThreadId||'',title:tab.title||'',serviceTier:normalizeComposerServiceTier(tab.serviceTier)})),
       activeThreadId:sideChatThreadId||sideChatOpenTabs[0]?.threadId||'',
       view:sideChatView==='main'?'main':'side',
       // legacy fields for older builds
@@ -6453,6 +6462,7 @@ function readSideChatState(){
         threadId:String(tab?.threadId||'').trim(),
         sourceThreadId:String(tab?.sourceThreadId||'').trim(),
         title:String(tab?.title||'临时侧聊').trim()||'临时侧聊',
+        serviceTier:normalizeComposerServiceTier(tab?.serviceTier),
         running:false,
       })).filter((tab)=>tab.threadId);
       if(!tabs.length)return null;
@@ -6462,7 +6472,7 @@ function readSideChatState(){
     const threadId=String(parsed.threadId||'').trim();
     if(!threadId)return null;
     return {
-      tabs:[{threadId,sourceThreadId:String(parsed.sourceThreadId||'').trim(),title:'临时侧聊',running:false}],
+      tabs:[{threadId,sourceThreadId:String(parsed.sourceThreadId||'').trim(),title:'临时侧聊',serviceTier:normalizeComposerServiceTier(parsed.serviceTier),running:false}],
       activeThreadId:threadId,
       view:'side',
     };
@@ -6641,6 +6651,8 @@ async function syncSideChatConversation(){
     if(sideChatPane)sideChatPane.setAttribute('aria-label','Side chat · '+title);
     const tab=getSideChatTab(syncId);
     if(tab)tab.title=title;
+    const metadata=conversation.metadata&&typeof conversation.metadata==='object'?conversation.metadata:{};
+    if(tab&&Object.hasOwn(metadata,'serviceTier'))tab.serviceTier=normalizeComposerServiceTier(metadata.serviceTier);
     const messages=Array.isArray(conversation.messages)?conversation.messages:[];
     renderSideChatMessages(messages);
     const runtime=conversation.runtime||data.runtime||{};
@@ -6734,13 +6746,15 @@ async function activateSideChatTab(threadId,{force=false}={}){
   scheduleSideChatSync(500);
   sideChatInput?.focus();
 }
-async function openSideChat(threadId,{sourceThreadId='',title=''}={}){
+async function openSideChat(threadId,options={}){
   if(!threadId)return;
+  const {sourceThreadId='',title=''}=options;
   ensureSideChatPane();
   upsertSideChatTab({
     threadId,
     sourceThreadId:sourceThreadId||currentConversationId||'',
     title:title||'临时侧聊',
+    ...(Object.hasOwn(options,'serviceTier')?{serviceTier:options.serviceTier}:{}),
   });
   await activateSideChatTab(threadId,{force:true});
 }
@@ -6772,6 +6786,7 @@ async function openQueuedPromptInSideChat(threadId,itemId){
     await openSideChat(newThreadId,{
       sourceThreadId:threadId,
       title:queuedPromptLabel(item).slice(0,48)||'临时侧聊',
+      serviceTier:item.serviceTier,
     });
     statusEl.textContent='已在 side chat 打开 · 当前 '+sideChatOpenTabs.length+' 个标签';
     refreshHistory();
@@ -6796,6 +6811,7 @@ async function sendSideChatMessage(){
   if(sideChatStatus)sideChatStatus.textContent=wasRunning?'发送引导…':'发送中…';
   sideChatMessages?.appendChild(sideChatMessageNode({role:'user',content:text}));
   sideChatMessages.scrollTop=sideChatMessages.scrollHeight;
+  const sideChatServiceTier=normalizeComposerServiceTier(tab?.serviceTier);
   try{
     let res;
     if(wasRunning){
@@ -6822,7 +6838,7 @@ async function sendSideChatMessage(){
           provider:provider.value,
           model:model.value,
           reasoningEffort:reasoningEffort.value,
-          serviceTier:composerServiceTier,
+          serviceTier:sideChatServiceTier,
           cwd:cwd.value,
           ...composerPermissionPayload(),
         }),
@@ -7904,6 +7920,7 @@ async function runComposerSlashCommand(item){
       ensureSideChatPane();
       setSideChatOpen(true);
       if(sideChatStatus)sideChatStatus.textContent='创建中…';
+      const requestedServiceTier=normalizeComposerServiceTier(composerServiceTier);
       const res=await fetch('/api/native-sessions',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
@@ -7913,6 +7930,7 @@ async function runComposerSlashCommand(item){
           provider:provider.value,
           model:model.value,
           reasoningEffort:reasoningEffort.value,
+          serviceTier:requestedServiceTier,
           cwd:cwd.value,
           sideChat:true,
           sourceThreadId:currentConversationId,
@@ -7923,7 +7941,7 @@ async function runComposerSlashCommand(item){
       if(!res.ok)throw new Error(data.error||'创建副任务失败');
       const newThreadId=String(data.threadId||'').trim();
       if(!newThreadId)throw new Error('未返回 side chat thread id');
-      await openSideChat(newThreadId,{sourceThreadId:currentConversationId,title:'副任务'});
+      await openSideChat(newThreadId,{sourceThreadId:currentConversationId,title:'副任务',serviceTier:requestedServiceTier});
       statusEl.textContent='副任务侧聊已打开';
       refreshHistory();
     }catch(error){
