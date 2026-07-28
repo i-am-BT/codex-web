@@ -680,17 +680,32 @@ test('native session store restores service tier from thread settings events', a
 
     store = new NativeSessionStore(codexHome, { watchChanges: false });
     assert.equal(store.get(id)?.metadata.serviceTier, 'priority');
+    assert.equal(store.get(id)?.metadata.model, 'gpt-5.6-sol');
 
     await appendFile(sessionFile, jsonl([{
-      timestamp: '2026-07-28T10:00:01.000Z',
+      timestamp: '2026-07-28T10:00:00.200Z',
       type: 'event_msg',
       payload: {
         type: 'thread_settings_applied',
-        thread_settings: { service_tier: 'default' },
+        thread_settings: {
+          model: 'gpt-5.6-sol',
+          model_provider_id: 'custom',
+          reasoning_effort: 'ultra',
+          approval_policy: 'on-request',
+          approvals_reviewer: 'auto_review',
+          sandbox_policy: { type: 'workspace-write' },
+          service_tier: 'default',
+        },
       },
     }]));
     store.refresh();
     assert.equal(store.get(id)?.metadata.serviceTier, null);
+    assert.equal(store.get(id)?.metadata.model, 'gpt-5.6-sol');
+    assert.equal(store.get(id)?.metadata.modelProvider, 'custom');
+    assert.equal(store.get(id)?.metadata.reasoningEffort, 'ultra');
+    assert.equal(store.get(id)?.metadata.approvalPolicy, 'on-request');
+    assert.equal(store.get(id)?.metadata.approvalsReviewer, 'auto_review');
+    assert.equal(store.get(id)?.metadata.sandboxPolicy, 'workspace-write');
 
     await appendFile(sessionFile, jsonl([{
       timestamp: '2026-07-28T10:00:02.000Z',
@@ -1690,6 +1705,98 @@ test('hides hash-title handoff agent summaries from web history', async () => {
   }
 });
 
+test('hides collab goal/current-status agent summaries from web history', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-goal-status-hide-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019fa8b3-09e8-75a0-abd8-5ece634e5144';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '28');
+  const sessionFile = path.join(sessionDir, 'rollout-2026-07-28T13-00-00-' + id + '.jsonl');
+  let store;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(path.join(codexHome, 'session_index.jsonl'), [
+      JSON.stringify({ id, thread_name: 'goal status hide', updated_at: '2026-07-28T13:00:03Z' }),
+      '',
+    ].join('\n'));
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-28T13:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id,
+          timestamp: '2026-07-28T13:00:00.000Z',
+          cwd: temporary,
+          model_provider: 'custom',
+          originator: 'Codex Desktop',
+          source: 'vscode',
+          cli_version: '0.144.0-alpha.4',
+        },
+      },
+      {
+        timestamp: '2026-07-28T13:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '将服务改成docker部署' }],
+        },
+      },
+      {
+        timestamp: '2026-07-28T13:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            '## Goal',
+            '- User asked to convert **codex-web** (`http://127.0.0.1:36354`) from current host/LaunchAgent runtime to **Docker deployment**.',
+            '- Workspace: `/Volumes/ikirito/docker`.',
+            '',
+            '## Current status',
+            '- Immediate prior issue was already fixed.',
+            '- Current request is Dockerize codex-web.',
+            '- Investigation started; Docker packaging not created/deployed yet.',
+            '',
+            '## Key findings about codex-web',
+            '- Currently runs as host Node process via LaunchAgent.',
+            '',
+            '## Important constraints / preferences',
+            '- Prefer live-target inspection.',
+            '',
+            '## What remains',
+            '1. Add Docker packaging.',
+            '',
+            '## Useful references',
+            '- App dir: `/Volumes/ikirito/docker/codex-web`',
+          ].join('\n') }],
+        },
+      },
+      {
+        timestamp: '2026-07-28T13:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '已开始按仓库习惯做 Docker 部署。' }],
+        },
+      },
+    ]));
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    store.refresh();
+    const conversation = store.get(id);
+    assert.ok(conversation);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('User asked to convert')), false);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Key findings about codex-web')), false);
+    assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content.includes('已开始按仓库习惯做 Docker 部署')));
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+
 test('collapses consecutive rolled-back retries into the latest logical reply', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-retry-collapse-'));
   const codexHome = path.join(temporary, '.codex');
@@ -1871,6 +1978,103 @@ test('collapses consecutive rolled-back retries into the latest logical reply', 
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test('native session store prefers user/assistant history over trailing tool spam', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-trim-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019fa8b3-09e8-75a0-abd8-5ece634e5144';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '28');
+  const sessionFile = path.join(sessionDir, 'rollout-2026-07-28T20-28-53-' + id + '.jsonl');
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    const records = [
+      {
+        timestamp: '2026-07-28T12:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id,
+          timestamp: '2026-07-28T12:00:00.000Z',
+          cwd: '/workspace',
+          originator: 'Codex Desktop',
+          source: 'vscode',
+        },
+      },
+      {
+        timestamp: '2026-07-28T12:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-trim' },
+      },
+      {
+        timestamp: '2026-07-28T12:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '保留用户正文' }],
+        },
+      },
+      {
+        timestamp: '2026-07-28T12:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: '保留助手正文' }],
+        },
+      },
+    ];
+    for (let index = 0; index < 40; index += 1) {
+      const stamp = String(index).padStart(2, '0');
+      records.push({
+        timestamp: '2026-07-28T12:01:' + stamp + '.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'wait',
+          call_id: 'call-wait-' + index,
+          arguments: JSON.stringify({ yield_time_ms: 1000 }),
+        },
+      });
+      records.push({
+        timestamp: '2026-07-28T12:01:' + stamp + '.100Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-wait-' + index,
+          output: 'wait output ' + index,
+        },
+      });
+    }
+    await writeFile(sessionFile, jsonl(records));
+
+    store = new NativeSessionStore(codexHome, {
+      pollIntervalMs: 25,
+      watchChanges: false,
+      maxMessages: 12,
+      maxReadBytes: 1024 * 1024,
+    });
+
+    const conversation = store.get(id);
+    assert.equal(conversation.truncated, true);
+    assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '保留用户正文'));
+    assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content === '保留助手正文'));
+    assert.ok(conversation.messages.length <= 12);
+    assert.ok(conversation.messages.filter((message) => message.role === 'tool').length <= 10);
+
+    const limited = store.get(id, { limit: 8 });
+    assert.ok(limited.messages.some((message) => message.role === 'user' && message.content === '保留用户正文'));
+    assert.ok(limited.messages.some((message) => message.role === 'assistant' && message.content === '保留助手正文'));
+    assert.ok(limited.messages.length <= 8);
+    assert.equal(limited.hasEarlierMessages, true);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 
 function jsonl(records) {
   return records.map((record) => JSON.stringify(record)).join('\n') + '\n';

@@ -985,7 +985,9 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /--reasoning-flow-muted:\s*#b0b0b1/);
     assert.match(uiStyles, /\.reasoningStatus\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /> \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*var\(--reasoning-flow-muted\)[^}]*var\(--reasoning-flow-strong\)/s);
-    assert.match(uiStyles, /\.browserCommentSteering > \.browserCommentSource\s*\{[^}]*display:\s*block;[^}]*background:\s*color-mix\(in oklab, var\(--text\) 5%, transparent\)/s);
+    assert.match(uiStyles, /\.browserCommentCard\s*\{[^}]*border-radius:\s*18px/s);
+    assert.match(uiStyles, /\.browserCommentEyebrow\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /\.browserCommentSteering > \.browserCommentSource,\s*\.browserCommentText\s*\{[^}]*display:\s*block;[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
     assert.match(uiStyles, /\.agentActivityItem\[open\] > \.agentActivityRow \.agentActivityChevron/);
@@ -1667,7 +1669,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=web-queue-hidden-20260728c"/);
+    assert.match(page, /href="\/ui\.css\?v=subquota-reset-progress-20260728a"/);
     assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260728a"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -1737,6 +1739,12 @@ updated_at = 1784422800000
     assert.match(page, /className='completionTimeline liveProcessTimeline'/);
     assert.doesNotMatch(page, /function updateTurnProcessLatest/);
     assert.match(page, /function appendInputImageToUser/);
+    assert.match(page, /browserCard/);
+    assert.match(page, /existingNative/);
+    assert.match(page, /1 条注释/);
+    assert.match(page, /function syncBrowserCommentCardChrome/);
+    assert.match(page, /function browserCommentEyebrowText/);
+    assert.match(page, /role!=='assistant'&&Number\.isInteger\(msg\.seq\)/);
     assert.match(page, /latestUserElement/);
     assert.match(page, /addMsg\('image',attachment\.url,\{kind:'input_image'\}\)/);
     assert.match(page, /stack\.classList\.toggle\('single',stack\.children\.length===1\)/);
@@ -1823,7 +1831,7 @@ updated_at = 1784422800000
     assert.match(page, /subQuotaSettingsForm\.appendChild\(createSourceFields\('sub2api','Sub2API'/);
     assert.match(page, /inputs\.baseUrlInput\.value=source\.baseUrl\|\|''/);
     assert.match(page, /source\.keyConfigured\?'Key 已配置，留空保留'/);
-    assert.match(page, /正在保存 CPA 与 Sub2API 配置/);
+    assert.match(page, /正在保存额度配置…/);
     assert.match(page, /JSON\.stringify\(\{sources\}\)/);
     assert.match(page, /检测错误不影响保存/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
@@ -1905,6 +1913,11 @@ updated_at = 1784422800000
     assert.match(page, /automationStatus\.textContent=automationNotice\|\|''/);
     assert.match(page, /function openArchivedView/);
     assert.match(page, /ask:\{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'\}/);
+    assert.match(page, /function isAutoApprovalsReviewer\(value\)\{[^}]*auto_review[^}]*guardian_subagent/);
+    assert.match(page, /function syncNativeComposerServiceTier/);
+    assert.match(page, /method:'PATCH'/);
+    assert.match(page, /JSON\.stringify\(\{serviceTier:requested\}\)/);
+    assert.match(page, /composerPermissionMode=isAutoApprovalsReviewer\(metadata\.approvalsReviewer\)/);
     assert.match(page, /auto:\{sandbox:'workspace-write',approval:'on-request',label:'替我审批',icon:'shield-check'\}/);
     assert.match(page, /full:\{sandbox:'danger-full-access',approval:'never',label:'完全访问',icon:'shield-alert'\}/);
     assert.match(page, /createComposerPermissionOption\('custom','自定义 \(config\.toml\)','使用 config\.toml 中定义的权限','settings'\)/);
@@ -1932,7 +1945,7 @@ updated_at = 1784422800000
     assert.match(page, /function appendConversationElement\(element,role,options=\{\}\)/);
     assert.match(page, /appendConversationElement\(el,role,\{steering:steeringUser\}\)/);
     assert.doesNotMatch(page, /matched\.open=true/);
-    assert.match(page, /if\(completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\);\s*else activateTurnProcessElement\(el\)/);
+    assert.match(page, /if\(browserCommentUser\)\{[\s\S]*?\}else if\(completedSteeringTimeline\)\{\s*completedSteeringTimeline\.appendChild\(el\);\s*\}else\{\s*activateTurnProcessElement\(el\);\s*\}/);
     assert.doesNotMatch(page, /pinSteeringMessageToBottom|pinOpenSteeringMessages|ensureSteeringPinObserver/);
     assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
@@ -1968,7 +1981,7 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerChrome\(\);\s*if\(conversation\.reset\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\),preservePermissions:false\}\);\s*syncComposerChrome\(\);\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -2002,6 +2015,8 @@ updated_at = 1784422800000
     )();
     assert.equal(isHandoffSummaryText('Context checkpoint:\n\n**Current State**\n- Repo: /workspace'), true);
     assert.equal(isHandoffSummaryText('已完成 Context checkpoint 显示修复。'), false);
+    assert.equal(isHandoffSummaryText('## Goal\n- Dockerize codex-web\n\n## Current status\n- Investigation started'), true);
+    assert.equal(isHandoffSummaryText('## Goal\n- only a normal plan without ops sections'), false);
     const markdownFileIconHelper = inlineScript.match(/(function markdownLocalFileIcon[\s\S]*?)(?=function decorateMarkdownLink)/)?.[1];
     assert.ok(markdownFileIconHelper);
     const markdownLocalFileIcon = new Function(
@@ -2117,7 +2132,7 @@ updated_at = 1784422800000
     )();
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
-    assert.equal(composerLabels.composerEffortLabel('ultra'), '极高');
+    assert.equal(composerLabels.composerEffortLabel('ultra'), '极高+');
     const elapsedTitleHelpers = inlineScript.match(/(function processedMessageTitle[\s\S]*?)(?=function clearTurnReasoningStatus)/)?.[1];
     assert.ok(elapsedTitleHelpers);
     const elapsedTitleApi = new Function(
@@ -2179,7 +2194,7 @@ updated_at = 1784422800000
     const automationInstruction = '<heartbeat>\n  <automation_id>09-30-linux-do</automation_id>\n  <current_time_iso>2026-07-27T01:30:27.548Z</current_time_iso>\n  <instructions>每天执行完整任务。</instructions>\n</heartbeat>';
     assert.equal(automationInstructionDisplayText(automationInstruction), '每天执行完整任务。');
     assert.equal(automationInstructionDisplayText('普通用户消息 2026-07-27T01:30:27.548Z'), '普通用户消息 2026-07-27T01:30:27.548Z');
-    assert.match(inlineScript, /renderMessageMarkdown\(body,automationInstructionDisplayText\(text\)\)/);
+    assert.match(inlineScript, /renderMessageMarkdown\(body,automationInstructionDisplayText\(browserCommentUser\?[\s\S]*?:text\)\)/);
     const longUserHelpers = inlineScript.match(/(function shouldCollapseUserMessage[\s\S]*?)(?=function addMsg)/)?.[1];
     assert.ok(longUserHelpers);
     const shouldCollapseUserMessage = new Function(
@@ -5663,6 +5678,12 @@ function startServer({
   env.CPA_QUOTA_API_KEY = '';
   delete env.SUB2API_BASE_URL;
   delete env.SUB2API_API_KEY;
+  delete env.GROK2API_BASE_URL;
+  delete env.GROK2API_ADMIN_PASSWORD;
+  delete env.GROK2API_API_KEY;
+  env.GROK2API_BASE_URL = '';
+  env.GROK2API_ADMIN_PASSWORD = '';
+  env.GROK2API_API_KEY = '';
   env.SUB_QUOTA_PROVIDER = 'cpa-codex';
   if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;
   if (sub2ApiKey !== undefined) env.SUB2API_API_KEY = sub2ApiKey;

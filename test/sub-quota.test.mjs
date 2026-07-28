@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   detectSubQuotaProvider,
   normalizeCpaCodexQuota,
+  normalizeGrok2ApiSummary,
   normalizeSubQuota,
   normalizeSubQuotaBaseUrl,
   parseSubQuotaSources,
@@ -799,5 +800,110 @@ test('rejects unknown upstream when neither provider responds', async () => {
       fetchImpl: async () => new Response('no', { status: 404 }),
     }),
     /无法识别上游服务/,
+  );
+});
+
+test('normalizes Grok2API account summary into callable and abnormal stats', () => {
+  const quota = normalizeGrok2ApiSummary({
+    total: 10,
+    available: 7,
+    recovering: 2,
+    attention: 1,
+    risk: 0,
+    issues: { disabled: 1, reauthRequired: 0 },
+    recovery: { cooldown: 0, waitingReset: 2, probing: 0 },
+    providers: {
+      grok_web: { total: 6, available: 5 },
+      grok_build: { total: 4, available: 2 },
+    },
+  });
+  assert.equal(quota.mode, 'grok2api_accounts');
+  assert.equal(quota.unit, 'accounts');
+  assert.equal(quota.supportsReset, true);
+  assert.equal(quota.planName, 'Grok2API Build');
+  assert.equal(quota.accountStats.pool, 'grok_build');
+  assert.equal(quota.accountStats.total, 4);
+  assert.equal(quota.accountStats.available, 2);
+  assert.equal(quota.accountStats.abnormal, 2);
+  assert.equal(quota.accountStats.providers.grok_web.available, 5);
+  assert.equal(quota.quota.remaining, 2);
+});
+
+test('fetches Grok2API summary with admin login and can reset quotas', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url: String(url), method: options.method || 'GET', body: options.body || null, headers: options.headers || {} });
+    if (String(url).endsWith('/api/admin/v1/auth/login')) {
+      return new Response(JSON.stringify({
+        data: {
+          tokens: {
+            accessToken: 'grok-token',
+            accessTokenExpiresAt: new Date(Date.now() + 60000).toISOString(),
+          },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (String(url).endsWith('/api/admin/v1/accounts/summary')) {
+      assert.equal(options.headers.Authorization, 'Bearer grok-token');
+      return new Response(JSON.stringify({
+        data: {
+          total: 4,
+          available: 3,
+          recovering: 1,
+          attention: 0,
+          risk: 0,
+          issues: { disabled: 0, reauthRequired: 0 },
+          recovery: { cooldown: 0, waitingReset: 1, probing: 0 },
+          providers: {
+            grok_web: { total: 4, available: 3 },
+            grok_build: { total: 5, available: 4 },
+          },
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (String(url).endsWith('/api/admin/v1/accounts/reset-quota')) {
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers.Authorization, 'Bearer grok-token');
+      return new Response(JSON.stringify({ data: { reset: 4 } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    throw new Error(`unexpected url ${url}`);
+  };
+
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'grok2api',
+      name: 'Grok2API',
+      provider: 'grok2api',
+      apiKeyEnv: 'GROK2API_ADMIN_PASSWORD',
+      apiKey: 'admin:secret',
+      baseUrl: 'http://grok.example',
+      usageUrl: '',
+    }],
+    fetchImpl,
+    now: () => 1000000,
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.count, 1);
+  assert.equal(listed.quotas[0].provider, 'grok2api');
+  assert.equal(listed.quotas[0].accountStats.pool, 'grok_build');
+  assert.equal(listed.quotas[0].accountStats.available, 4);
+  assert.equal(listed.quotas[0].accountStats.abnormal, 1);
+  assert.equal(listed.quotas[0].accountStats.total, 5);
+  assert.doesNotMatch(JSON.stringify(listed), /secret|grok-token/);
+
+  const reset = await service.resetGrok2ApiQuota(service.sources[0]);
+  assert.equal(reset.ok, true);
+  assert.equal(reset.reset, 4);
+  assert.ok(calls.some((item) => item.url.endsWith('/api/admin/v1/accounts/reset-quota')));
+});
+
+test('normalizes Grok2API admin URLs', () => {
+  assert.equal(
+    normalizeSubQuotaBaseUrl('http://127.0.0.1:8100/api/admin/v1/accounts', { provider: 'grok2api' }),
+    'http://127.0.0.1:8100',
   );
 });
