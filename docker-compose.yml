@@ -1,0 +1,44 @@
+services:
+  codex-web:
+    image: ${CODEX_WEB_IMAGE:-ikirito9/codex-web:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${CODEX_WEB_CONTAINER_NAME:-codex-web}
+    ports:
+      - "${CODEX_WEB_PORT:-36354}:36354"
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.docker
+        required: false
+    environment:
+      APP_NAME: ${APP_NAME:-Codex Web}
+      HOST: 0.0.0.0
+      PORT: "36354"
+      PUBLIC_HOST: ${PUBLIC_HOST:-127.0.0.1}
+      CODEX_WEB_PASSWORD: ${CODEX_WEB_PASSWORD:?set CODEX_WEB_PASSWORD in .env or the shell}
+      SESSION_SECRET: ${SESSION_SECRET:-please-change-me-to-a-long-random-string}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-168}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      CODEX_HOME: /data/codex
+      CODEX_WEB_RUNTIME_DIR: /data/runtime
+      CODEX_BIN: /usr/local/bin/codex
+      CODEX_CONFIG_WRITABLE: ${CODEX_CONFIG_WRITABLE:-false}
+      CODEX_DESKTOP_IPC_ENABLED: "false"
+      DEFAULT_CWD: /workspaces
+      DEFAULT_SANDBOX: ${DEFAULT_SANDBOX:-workspace-write}
+      DEFAULT_APPROVAL: ${DEFAULT_APPROVAL:-on-request}
+      NATIVE_SESSION_POLL_MS: ${NATIVE_SESSION_POLL_MS:-1000}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ${CODEX_HOME_HOST:-./data/codex}:/data/codex
+      - ${CODEX_WEB_RUNTIME_HOST:-./data/runtime}:/data/runtime
+      - ${CODEX_WEB_WORKSPACES_HOST:-./data/workspaces}:/workspaces
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:36354/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
