@@ -2149,6 +2149,35 @@ updated_at = 1784422800000
         },
       ],
     });
+    const inboxHelpers = inlineScript.match(/(function parseInboxItemDirective[\s\S]*?)(?=function extractCodeComments)/)?.[1];
+    assert.ok(inboxHelpers);
+    const inboxApi = new Function(
+      inboxHelpers + '; return { parseInboxItemDirective, extractInboxItems };',
+    )();
+    assert.deepEqual(
+      inboxApi.parseInboxItemDirective('::inbox-item{title="Linux.do \\"启动\\"重试已更新" summary="无响应时最多刷新重试三轮"}'),
+      { title: 'Linux.do "启动"重试已更新', summary: '无响应时最多刷新重试三轮' },
+    );
+    assert.deepEqual(inboxApi.extractInboxItems([
+      '已完成启动重试修复。',
+      '',
+      '::inbox-item{title="第一条" summary="摘要一"}',
+      '::inbox-item{title="第二条"}',
+    ].join('\n')), {
+      markdown: '已完成启动重试修复。',
+      items: [
+        { title: '第一条', summary: '摘要一' },
+        { title: '第二条', summary: '' },
+      ],
+    });
+    assert.deepEqual(inboxApi.extractInboxItems('正文\n::inbox-item{title="缺少结束括号"'), {
+      markdown: '正文\n::inbox-item{title="缺少结束括号"',
+      items: [],
+    });
+    assert.match(inlineScript, /title\.textContent=item\.title/);
+    assert.match(inlineScript, /summary\.textContent=item\.summary/);
+    assert.match(uiStyles, /\.inboxItems\s*\{[^}]*width:\s*min\(520px, 100%\)/s);
+    assert.match(uiStyles, /\.inboxItem\s*\{[^}]*grid-template-columns:\s*24px minmax\(0, 1fr\)[^}]*border-radius:\s*8px/s);
     const activityHelpers = inlineScript.match(/(function decodeEmbeddedToolString[\s\S]*?)(?=function toolMessageTitle)/)?.[1];
     assert.ok(activityHelpers);
     const activityApi = new Function(`${activityHelpers}; return { normalizeTurnPlanItems, toolActivityPresentations, activityClusterPresentation, activityClusterMatchesBrowserTarget, markCurrentActivityItem };`)();

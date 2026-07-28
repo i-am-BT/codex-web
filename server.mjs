@@ -11849,9 +11849,11 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
   const rawSource=String(text||'');
   const memoryParsed=assistantArtifacts?extractMemoryCitations(rawSource):{markdown:rawSource,citations:[]};
   const parsed=assistantArtifacts?extractCodeComments(memoryParsed.markdown):{markdown:memoryParsed.markdown,comments:[]};
-  const source=parsed.markdown;
+  const inboxParsed=assistantArtifacts?extractInboxItems(parsed.markdown):{markdown:parsed.markdown,items:[]};
+  const source=inboxParsed.markdown;
   if(!window.marked?.parse||!window.DOMPurify?.sanitize){
     body.textContent=source;
+    if(inboxParsed.items.length)renderInboxItems(body,inboxParsed.items);
     if(parsed.comments.length)renderReviewComments(body,parsed.comments);
     if(memoryParsed.citations.length)renderMemoryCitations(body,memoryParsed.citations);
     return;
@@ -11871,6 +11873,7 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
   try{enhanceMarkdownLinks(body)}catch(e){}
   try{enhanceMarkdownImages(body)}catch(e){}
   try{if(assistantArtifacts)enhanceMarkdownCodeBlocks(body)}catch(e){}
+  if(inboxParsed.items.length)renderInboxItems(body,inboxParsed.items);
   if(parsed.comments.length)renderReviewComments(body,parsed.comments);
   if(memoryParsed.citations.length)renderMemoryCitations(body,memoryParsed.citations);
 }
@@ -12287,6 +12290,62 @@ function renderMemoryCitations(body,citations){
   }
   group.appendChild(summary);
   group.appendChild(list);
+  body.appendChild(group);
+  refreshIcons(group);
+}
+function parseInboxItemDirective(line){
+  if(!line.startsWith('::inbox-item{')||!line.endsWith('}'))return null;
+  const attributes={};
+  const source=line.slice('::inbox-item{'.length,-1);
+  const pattern=/([A-Za-z][\\w-]*)="((?:\\\\.|[^"])*)"/g;
+  let match;
+  while((match=pattern.exec(source))){
+    try{attributes[match[1]]=JSON.parse('"'+match[2]+'"')}catch(e){return null}
+  }
+  const remainder=source.replace(pattern,'').trim();
+  if(remainder||!String(attributes.title||'').trim())return null;
+  return{title:String(attributes.title).trim(),summary:String(attributes.summary||'').trim()};
+}
+function extractInboxItems(source){
+  const items=[];
+  const markdown=[];
+  for(const line of String(source||'').split('\\n')){
+    const trimmed=line.trim();
+    const item=parseInboxItemDirective(trimmed);
+    if(item){items.push(item);continue}
+    markdown.push(line);
+  }
+  return{markdown:markdown.join('\\n').replace(/\\n{3,}/g,'\\n\\n').trim(),items};
+}
+function renderInboxItems(body,items){
+  const group=document.createElement('section');
+  group.className='inboxItems';
+  group.setAttribute('aria-label',items.length+' 条状态更新');
+  for(const item of items){
+    const row=document.createElement('div');
+    row.className='inboxItem';
+    const iconWrap=document.createElement('span');
+    iconWrap.className='inboxItemIcon';
+    const icon=document.createElement('i');
+    icon.setAttribute('data-lucide','inbox');
+    icon.setAttribute('aria-hidden','true');
+    iconWrap.appendChild(icon);
+    const copy=document.createElement('span');
+    copy.className='inboxItemCopy';
+    const title=document.createElement('strong');
+    title.className='inboxItemTitle';
+    title.textContent=item.title;
+    copy.appendChild(title);
+    if(item.summary){
+      const summary=document.createElement('span');
+      summary.className='inboxItemSummary';
+      summary.textContent=item.summary;
+      copy.appendChild(summary);
+    }
+    row.appendChild(iconWrap);
+    row.appendChild(copy);
+    group.appendChild(row);
+  }
   body.appendChild(group);
   refreshIcons(group);
 }
