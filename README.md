@@ -45,6 +45,72 @@ npm run setup
 
 `npm run setup` 会生成仅监听 `127.0.0.1` 的 `.env`，自动发现 Codex CLI，并创建随机登录密码和会话密钥。也可以跳过该命令，手动复制并编辑 `.env.example`。
 
+## Docker Compose 部署
+
+适合把 Codex Web 作为独立服务跑在 Docker 里。容器内已安装 Node.js 与 `@openai/codex` CLI；需要把宿主机的 Codex 配置/会话目录挂载到 `/data/codex`，才能读取原生会话。
+
+> 注意：Codex Desktop IPC / 本机 App 窗口联动在容器里通常不可用。容器模式默认关闭 `CODEX_DESKTOP_IPC_ENABLED`，并通过容器内 `codex app-server` 工作。
+
+### 1. 准备环境变量
+
+```bash
+cp .env.docker.example .env
+# 编辑 .env：至少设置 CODEX_WEB_PASSWORD 和 SESSION_SECRET
+```
+
+如果本机已有 Codex 数据，可把 `CODEX_HOME_HOST` 指到真实目录，例如：
+
+```bash
+CODEX_HOME_HOST=$HOME/.codex
+```
+
+### 2. 构建并启动
+
+```bash
+docker compose up -d --build
+docker compose ps
+curl -fsS http://127.0.0.1:36354/api/health
+```
+
+浏览器打开 `http://127.0.0.1:36354`，用 `.env` 中的密码登录。
+
+### 3. 常用命令
+
+```bash
+docker compose logs -f codex-web
+docker compose restart codex-web
+docker compose down
+```
+
+### 4. 发布镜像
+
+默认镜像名：`ikirito9/codex-web:latest`
+
+```bash
+docker build -t ikirito9/codex-web:latest .
+docker push ikirito9/codex-web:latest
+# 或：
+docker compose build
+docker compose push
+```
+
+多架构示例：
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ikirito9/codex-web:latest --push .
+```
+
+### 数据卷
+
+| 容器路径 | 默认宿主机路径 | 内容 |
+| --- | --- | --- |
+| `/data/codex` | `./data/codex` | Codex 配置、session index、原生会话 |
+| `/data/runtime` | `./data/runtime` | Web 运行时状态、上传、队列 |
+| `/workspaces` | `./data/workspaces` | 默认工作目录 |
+
+真实 `.env`、`data/` 与密钥不要提交到 Git。
+
 ## 配置
 
 项目会从项目目录的 `.env` 和 `CODEX_HOME` 下的 Codex 配置文件读取运行配置。
