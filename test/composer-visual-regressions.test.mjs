@@ -202,6 +202,33 @@ test('Fast mode is an accessible model capability beside the reasoning slider', 
   assert.match(uiStyles, /\.composerFastToggle(?:\.active|\[aria-pressed="true"\])\s*\{/);
 });
 
+test('composer context window uses real session data with an accessible progress detail', () => {
+  assert.match(serverSource, /let currentContextUsedTokens = null/);
+  assert.match(serverSource, /let currentContextWindowTokens = null/);
+  assert.match(
+    serverSource,
+    /function syncComposerContextWindow\(contextWindow\)[\s\S]*contextWindow\?\.usedTokens[\s\S]*contextWindow\?\.maxTokens/,
+  );
+  assert.match(serverSource, /composerContextToggle\.setAttribute\('aria-controls','composerContextPanel'\)/);
+  assert.match(serverSource, /composerContextToggle\.setAttribute\('aria-haspopup','dialog'\)/);
+  assert.match(serverSource, /composerContextPanel\.setAttribute\('role','dialog'\)/);
+  assert.match(serverSource, /composerContextToggle\.addEventListener\('mouseenter'/);
+  assert.match(serverSource, /showComposerContextDetails\(\{pinned:true\}\)/);
+  assert.match(serverSource, /syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
+  assert.match(
+    uiStyles,
+    /\.composerContextToggle\s*\{[^}]*width:\s*24px;[^}]*height:\s*24px/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.composerContextRing\s*\{[^}]*width:\s*15px;[^}]*height:\s*15px;[^}]*conic-gradient/s,
+  );
+  assert.match(
+    uiStyles,
+    /body \.composerContextPanel\s*\{[^}]*width:\s*min\(176px,[^}]*border-radius:\s*11px;[^}]*text-align:\s*center/s,
+  );
+});
+
 test('permission picker mirrors native approval profiles and preserves custom config semantics', () => {
   const helperStart = serverSource.indexOf('function cleanSandbox(value)');
   const helperEnd = serverSource.indexOf('function nativeSandboxPolicy(value, cwd)');

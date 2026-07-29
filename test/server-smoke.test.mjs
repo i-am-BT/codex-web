@@ -12,9 +12,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-test('playground profile refresh preserves browser streaming preferences', async () => {
+test('playground refresh preserves browser streaming preferences and completed Agent images', async () => {
+  const playgroundPage = await readFile(
+    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'index.html'),
+    'utf8',
+  );
+  const playgroundAssetPath = playgroundPage.match(/src="\.\/(assets\/[^"\?]+\.js)/)?.[1];
+  assert.ok(playgroundAssetPath);
   const playgroundAssetScript = await readFile(
-    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-BP90Uyg2.js'),
+    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', playgroundAssetPath),
     'utf8',
   );
   const playgroundPatchSource = await readFile(
@@ -24,18 +30,25 @@ test('playground profile refresh preserves browser streaming preferences', async
 
   assert.match(playgroundPatchSource, /streamImages: typeof existing\?\.streamImages === 'boolean'/);
   assert.match(playgroundPatchSource, /streamPartialImages: typeof existing\?\.streamPartialImages === 'number'/);
+  assert.match(playgroundPatchSource, /let agentConversationPersistPromise: Promise<void> \| null = null/);
+  assert.match(playgroundPatchSource, /await updateTaskInStore\(taskId, \{/);
+  assert.match(playgroundPatchSource, /await flushAgentConversationsToIndexedDB\(\)/);
+  assert.match(playgroundPatchSource, /const suppressCompletedImageTimeout = isAssistant/);
+  assert.match(playgroundPatchSource, /AGENT_POST_IMAGE_STREAM_TIMEOUT\.test\(message\)/);
+  assert.match(playgroundPatchSource, /const completeWithSuccessfulImages =/);
+  assert.match(playgroundPatchSource, /status: 'done',\s*\n\+\s*error: null/);
   assert.match(playgroundAssetScript, /streamImages:typeof\(w==null\?void 0:w\.streamImages\)=="boolean"\?w\.streamImages:I\.streamImages/);
   assert.match(playgroundAssetScript, /streamPartialImages:typeof\(w==null\?void 0:w\.streamPartialImages\)=="number"\?w\.streamPartialImages:I\.streamPartialImages/);
   assert.match(
     playgroundAssetScript,
-    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const k of a\.inputImageIds\)OI\(k\)\}/,
+    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const k of a\.inputImageIds\)[A-Za-z_$][\w$]*\(k\)\}/,
   );
   assert.doesNotMatch(
     playgroundAssetScript,
-    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for\(const k of a\.inputImageIds\)OI\(k\)\}/,
+    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for\(const k of a\.inputImageIds\)[A-Za-z_$][\w$]*\(k\)\}/,
   );
   await new Promise((resolve, reject) => {
-    execFile('node', ['--check', path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'assets', 'index-BP90Uyg2.js')], (error, stdout, stderr) => {
+    execFile('node', ['--check', path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', playgroundAssetPath)], (error, stdout, stderr) => {
       if (error) {
         reject(new Error(stderr || stdout || error.message));
         return;
@@ -437,7 +450,7 @@ experimental_bearer_token = "test-token"
         JSON.stringify({
           timestamp: '2026-07-11T04:52:31.990Z',
           type: 'event_msg',
-          payload: { type: 'task_started', turn_id: nativeFirstTurnId },
+          payload: { type: 'task_started', turn_id: nativeFirstTurnId, model_context_window: 258400 },
         }),
         JSON.stringify({
           timestamp: '2026-07-11T04:52:31.995Z',
@@ -498,6 +511,18 @@ experimental_bearer_token = "test-token"
             name: 'exec',
             call_id: 'tool-image-preview',
             input: `const result = await tools.view_image({path:${JSON.stringify(toolImagePath)},detail:"original"});\nimage(result.image_url);`,
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:32.004Z',
+          type: 'event_msg',
+          payload: {
+            type: 'token_count',
+            info: {
+              last_token_usage: { input_tokens: 215308, output_tokens: 775, total_tokens: 216083 },
+              total_token_usage: { total_tokens: 35835711 },
+              model_context_window: 258400,
+            },
           },
         }),
         JSON.stringify({
@@ -709,6 +734,7 @@ if (args[0] === 'app-server') {
   const archivedThreadId = '${archivedNativeSessionId}';
   const archivedThreadIds = new Set([archivedThreadId]);
   const archiveListCounters = new Map();
+  let threadGoal = null;
   const archiveControl = () => {
     try {
       return JSON.parse(readFileSync(process.env.FAKE_APP_SERVER_CONTROL, 'utf8'));
@@ -850,6 +876,27 @@ if (args[0] === 'app-server') {
         archivedThreadIds.delete(message.params.threadId);
         send({ id: message.id, result: {} });
       }
+      else if (message.method === 'thread/goal/set') {
+        const now = Math.floor(Date.now() / 1000);
+        threadGoal = {
+          threadId: message.params.threadId,
+          objective: message.params.objective ?? threadGoal?.objective ?? 'Fixture goal',
+          status: message.params.status ?? threadGoal?.status ?? 'active',
+          tokenBudget: null,
+          tokensUsed: threadGoal?.tokensUsed ?? 0,
+          timeUsedSeconds: threadGoal?.timeUsedSeconds ?? 0,
+          createdAt: threadGoal?.createdAt ?? now,
+          updatedAt: now
+        };
+        send({ id: message.id, result: { goal: threadGoal } });
+        send({ method: 'thread/goal/updated', params: { threadId: message.params.threadId, goal: threadGoal } });
+      }
+      else if (message.method === 'thread/goal/clear') {
+        const cleared = Boolean(threadGoal);
+        threadGoal = null;
+        send({ id: message.id, result: { cleared } });
+        send({ method: 'thread/goal/cleared', params: { threadId: message.params.threadId } });
+      }
       else if (['thread/name/set', 'turn/interrupt'].includes(message.method)) {
         send({ id: message.id, result: {} });
       }
@@ -985,9 +1032,11 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /--reasoning-flow-muted:\s*#b0b0b1/);
     assert.match(uiStyles, /\.reasoningStatus\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /> \.msg\.process\.reasoningStatus\.streaming\s*\{[^}]*var\(--reasoning-flow-muted\)[^}]*var\(--reasoning-flow-strong\)/s);
-    assert.match(uiStyles, /\.browserCommentCard\s*\{[^}]*border-radius:\s*18px/s);
-    assert.match(uiStyles, /\.browserCommentEyebrow\s*\{[^}]*display:\s*none/s);
-    assert.match(uiStyles, /\.browserCommentSteering > \.browserCommentSource,\s*\.browserCommentText\s*\{[^}]*display:\s*block;[^}]*background:\s*transparent/s);
+    assert.match(uiStyles, /body \.msg\.user\.browserCommentSteering\s*,\s*body \.msg\.user\.hasInputImage\.browserCommentSteering\s*\{[^}]*width:\s*fit-content;[^}]*max-width:\s*min\(280px, 88%\)/s);
+    assert.match(uiStyles, /\.browserCommentSteering > \.browserCommentSource\s*\{[^}]*display:\s*block;[^}]*width:\s*fit-content;[^}]*border-radius:\s*16px;[^}]*background:\s*color-mix\(in oklab, var\(--text\) 5%, transparent\)/s);
+    assert.match(uiStyles, /\.browserCommentSteering > \.browserCommentSource\s*\{[^}]*white-space:\s*normal/s);
+    assert.match(uiStyles, /body \.chat > \.msg\.user\.browserCommentSteering > \.msgBody\.browserCommentSource,[^}]*width:\s*fit-content;[^}]*padding:\s*8px 12px;[^}]*white-space:\s*normal/s);
+    assert.doesNotMatch(uiStyles, /\.browserCommentSteering \.msgActions\s*\{[^}]*display:\s*none/s);
     assert.match(uiStyles, /\.activityItem\.fileTarget \.activityTarget/);
     assert.match(uiStyles, /\.activityItem\[open\] > \.activityItemSummary \.activityItemChevron/);
     assert.match(uiStyles, /\.agentActivityItem\[open\] > \.agentActivityRow \.agentActivityChevron/);
@@ -1081,17 +1130,18 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer > \*\s*\{[^}]*pointer-events:\s*auto/s);
     assert.match(uiStyles, /--composer-width:\s*var\(--conversation-width\)/);
     assert.match(uiStyles, /body \.msg\.user\s*\{[^}]*max-width:\s*min\(var\(--conversation-width\), 77%\);[^}]*border-radius:\s*16px;[^}]*background:\s*color-mix\(in oklab, var\(--text\) 5%, transparent\);[^}]*color:\s*var\(--text\);[^}]*padding:\s*8px 12px/s);
-    assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser\s*\{[^}]*max-width:\s*77%;[^}]*padding:\s*10px 12px 8px/s);
+    assert.match(uiStyles, /\.completionTimeline > \.msg\.user\.steeringUser\s*\{[^}]*max-width:\s*77%;[^}]*padding:\s*8px 10px 8px/s);
     assert.match(uiStyles, /\.composer > \*\s*\{[^}]*width:\s*min\(var\(--composer-width\), calc\(100% - 60px\)\)/s);
     assert.match(uiStyles, /body \.box\s*\{[^}]*grid-template-rows:\s*minmax\(50px, auto\) 34px;[^}]*border-radius:\s*20px/s);
     assert.match(uiStyles, /\.composerPermissionToggle\s*\{[^}]*display:\s*inline-flex/);
     assert.match(uiStyles, /\.memoryCitations\s*\{[^}]*width:\s*100%/s);
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
-    assert.match(uiStyles, /\.userAttachmentStack\.single\s*\{[^}]*width:\s*144px/s);
+    assert.match(uiStyles, /\.userAttachmentStack\.single\s*\{[^}]*width:\s*100px/s);
     assert.match(uiStyles, /\.userAttachment\s*\{[^}]*width:\s*100%;[^}]*aspect-ratio:\s*1 \/ 1/s);
     assert.match(uiStyles, /\.userAttachment img\s*\{[^}]*width:\s*100%;[^}]*height:\s*100%;[^}]*max-height:\s*none;[^}]*object-fit:\s*cover/s);
-    assert.match(uiStyles, /\.steeringUser \.userAttachmentStack\.single,[^}]*\.steeringUser\.hasInputImage \.userAttachmentStack\.single\s*\{[^}]*width:\s*144px;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /body \.msg\.user\.steeringUser\.browserCommentSteering \.userAttachmentStack\.single,[^}]*width:\s*100px;[^}]*max-width:\s*100%/s);
+    assert.match(uiStyles, /\.steeringUser \.userAttachmentStack\.single,[^}]*\.steeringUser\.hasInputImage \.userAttachmentStack\.single\s*\{[^}]*width:\s*100px;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.msg\.user\.hasInputImage \.msgBody:empty/);
     assert.match(uiStyles, /\.settingsDialog/);
 
@@ -1216,6 +1266,41 @@ if (args[0] === 'app-server') {
     assert.equal(typeof skillsPayload.count, 'number');
     assert.doesNotMatch(JSON.stringify(skillsPayload), /\/Users\//);
     assert.doesNotMatch(JSON.stringify(skillsPayload), /CODEX_HOME/);
+
+    const unauthorizedGoalUpdate = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/goal`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ objective: 'Unauthorized goal' }),
+    });
+    assert.equal(unauthorizedGoalUpdate.status, 401);
+    const updatedGoal = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/goal`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ objective: 'Verify the native goal controls' }),
+    });
+    assert.equal(updatedGoal.status, 200);
+    assert.equal((await updatedGoal.json()).goal.objective, 'Verify the native goal controls');
+    const pausedGoal = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/goal`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'paused' }),
+    });
+    assert.equal(pausedGoal.status, 200);
+    assert.equal((await pausedGoal.json()).goal.status, 'paused');
+    const sessionWithPausedGoal = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal((await sessionWithPausedGoal.json()).conversation.goal.status, 'paused');
+    const clearedGoal = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/goal`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(clearedGoal.status, 200);
+    assert.equal((await clearedGoal.json()).cleared, true);
+    const sessionWithoutGoal = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal((await sessionWithoutGoal.json()).conversation.goal, null);
 
     const subQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
       headers: { Cookie: cookie },
@@ -1669,7 +1754,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=goal-status-bar-20260729a"/);
+    assert.match(page, /href="\/ui\.css\?v=goal-indicator-20260729e"/);
     assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260728a"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -1739,12 +1824,6 @@ updated_at = 1784422800000
     assert.match(page, /className='completionTimeline liveProcessTimeline'/);
     assert.doesNotMatch(page, /function updateTurnProcessLatest/);
     assert.match(page, /function appendInputImageToUser/);
-    assert.match(page, /browserCard/);
-    assert.match(page, /existingNative/);
-    assert.match(page, /1 条注释/);
-    assert.match(page, /function syncBrowserCommentCardChrome/);
-    assert.match(page, /function browserCommentEyebrowText/);
-    assert.match(page, /role!=='assistant'&&Number\.isInteger\(msg\.seq\)/);
     assert.match(page, /latestUserElement/);
     assert.match(page, /addMsg\('image',attachment\.url,\{kind:'input_image'\}\)/);
     assert.match(page, /stack\.classList\.toggle\('single',stack\.children\.length===1\)/);
@@ -1913,11 +1992,6 @@ updated_at = 1784422800000
     assert.match(page, /automationStatus\.textContent=automationNotice\|\|''/);
     assert.match(page, /function openArchivedView/);
     assert.match(page, /ask:\{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'\}/);
-    assert.match(page, /function isAutoApprovalsReviewer\(value\)\{[^}]*auto_review[^}]*guardian_subagent/);
-    assert.match(page, /function syncNativeComposerServiceTier/);
-    assert.match(page, /method:'PATCH'/);
-    assert.match(page, /JSON\.stringify\(\{serviceTier:requested\}\)/);
-    assert.match(page, /composerPermissionMode=isAutoApprovalsReviewer\(metadata\.approvalsReviewer\)/);
     assert.match(page, /auto:\{sandbox:'workspace-write',approval:'on-request',label:'替我审批',icon:'shield-check'\}/);
     assert.match(page, /full:\{sandbox:'danger-full-access',approval:'never',label:'完全访问',icon:'shield-alert'\}/);
     assert.match(page, /createComposerPermissionOption\('custom','自定义 \(config\.toml\)','使用 config\.toml 中定义的权限','settings'\)/);
@@ -1945,7 +2019,8 @@ updated_at = 1784422800000
     assert.match(page, /function appendConversationElement\(element,role,options=\{\}\)/);
     assert.match(page, /appendConversationElement\(el,role,\{steering:steeringUser\}\)/);
     assert.doesNotMatch(page, /matched\.open=true/);
-    assert.match(page, /if\(browserCommentUser\)\{[\s\S]*?\}else if\(completedSteeringTimeline\)\{\s*completedSteeringTimeline\.appendChild\(el\);\s*\}else\{\s*activateTurnProcessElement\(el\);\s*\}/);
+    assert.match(page, /if\(steeringUser\|\|browserCommentUser\)cleanSteeringMessageDuplicates\(el\)/);
+    assert.match(page, /if\(steeringUser\)\{[\s\S]*?if\(!completedSteeringTimeline\)activateTurnProcessElement\(el\)/);
     assert.doesNotMatch(page, /pinSteeringMessageToBottom|pinOpenSteeringMessages|ensureSteeringPinObserver/);
     assert.doesNotMatch(page, /function resetTurnProcessCollection\(\)[\s\S]*?nativeOptimisticSteering\.clear\(\)[\s\S]*?function beginTurnProcessCollection/);
     assert.match(page, /function dispatchNextQueuedPrompt/);
@@ -1981,7 +2056,7 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\),preservePermissions:false\}\);\s*syncComposerChrome\(\);\s*if\(conversation\.reset\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\);\s*syncComposerChrome\(\);\s*let syncMessages=conversation\.messages\|\|\[\];\s*if\(conversation\.reset\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -2014,9 +2089,49 @@ updated_at = 1784422800000
       handoffDisplayHelper + '; return isHandoffSummaryText;',
     )();
     assert.equal(isHandoffSummaryText('Context checkpoint:\n\n**Current State**\n- Repo: /workspace'), true);
+    assert.equal(isHandoffSummaryText([
+      '## Goal',
+      '',
+      'Active goal: remove the visible scrollbar from the Codex Web sidebar while preserving scrolling.',
+      '',
+      '## Current State',
+      '- Repo: /workspace/codex-web',
+      '',
+      '## Findings',
+      '- Internal context is visible.',
+    ].join('\n')), true);
+    assert.equal(isHandoffSummaryText([
+      '## Goal',
+      'Ship the release.',
+      '',
+      '## Current State',
+      'All checks passed.',
+      '',
+      '## Findings',
+      'No blockers remain.',
+    ].join('\n')), false);
+    assert.equal(isHandoffSummaryText([
+      '## 当前状态',
+      '',
+      '最新需求：目标状态条保留目标正文。',
+      '当前源码仍是上一轮的极简版本。',
+      '上一轮已完成并需保留：真实页面验证。',
+      '',
+      '## 下一步',
+      '1. 补齐内部交接过滤。',
+      '',
+      '工作树有大量用户已有修改和备份文件，禁止清理或回滚。相关位置主要是 server.mjs。',
+    ].join('\n')), true);
+    assert.equal(isHandoffSummaryText([
+      '## 当前状态',
+      '',
+      '最新需求：目标状态条已经修复，服务健康。',
+      '',
+      '## 下一步',
+      '',
+      '工作树有大量用户已有修改，因此没有清理或回滚；等待用户验收。',
+    ].join('\n')), false);
     assert.equal(isHandoffSummaryText('已完成 Context checkpoint 显示修复。'), false);
-    assert.equal(isHandoffSummaryText('## Goal\n- Dockerize codex-web\n\n## Current status\n- Investigation started'), true);
-    assert.equal(isHandoffSummaryText('## Goal\n- only a normal plan without ops sections'), false);
     const markdownFileIconHelper = inlineScript.match(/(function markdownLocalFileIcon[\s\S]*?)(?=function decorateMarkdownLink)/)?.[1];
     assert.ok(markdownFileIconHelper);
     const markdownLocalFileIcon = new Function(
@@ -2132,7 +2247,7 @@ updated_at = 1784422800000
     )();
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
-    assert.equal(composerLabels.composerEffortLabel('ultra'), '极高+');
+    assert.equal(composerLabels.composerEffortLabel('ultra'), '极高');
     const elapsedTitleHelpers = inlineScript.match(/(function processedMessageTitle[\s\S]*?)(?=function clearTurnReasoningStatus)/)?.[1];
     assert.ok(elapsedTitleHelpers);
     const elapsedTitleApi = new Function(
@@ -2141,7 +2256,7 @@ updated_at = 1784422800000
     assert.equal(elapsedTitleApi.completionMessageTitle('任务完成，耗时 0.1s'), '已处理 1s');
     assert.equal(elapsedTitleApi.completionMessageTitle('任务完成，耗时 2159.6s'), '已处理 36m');
     assert.equal(elapsedTitleApi.completionMessageTitle('任务完成', 65), '已处理 1m 5s');
-    assert.equal(elapsedTitleApi.turnTokenUsageLabel({ totalTokens: 12345 }), '12,345 tokens');
+    assert.equal(elapsedTitleApi.turnTokenUsageLabel({ totalTokens: 12345 }), '本轮累计 12,345 tokens');
     assert.equal(elapsedTitleApi.turnTokenUsageLabel(null), '');
     assert.match(inlineScript, /const collapsible=role==='tool'\|\|role==='thinking'\|\|role==='context'/);
     assert.match(inlineScript, /function shouldCollapseUserMessage\(text\)/);
@@ -2194,7 +2309,7 @@ updated_at = 1784422800000
     const automationInstruction = '<heartbeat>\n  <automation_id>09-30-linux-do</automation_id>\n  <current_time_iso>2026-07-27T01:30:27.548Z</current_time_iso>\n  <instructions>每天执行完整任务。</instructions>\n</heartbeat>';
     assert.equal(automationInstructionDisplayText(automationInstruction), '每天执行完整任务。');
     assert.equal(automationInstructionDisplayText('普通用户消息 2026-07-27T01:30:27.548Z'), '普通用户消息 2026-07-27T01:30:27.548Z');
-    assert.match(inlineScript, /renderMessageMarkdown\(body,automationInstructionDisplayText\(browserCommentUser\?[\s\S]*?:text\)\)/);
+    assert.match(inlineScript, /renderMessageMarkdown\(body,automationInstructionDisplayText\(text\)\)/);
     const longUserHelpers = inlineScript.match(/(function shouldCollapseUserMessage[\s\S]*?)(?=function addMsg)/)?.[1];
     assert.ok(longUserHelpers);
     const shouldCollapseUserMessage = new Function(
@@ -3690,6 +3805,7 @@ updated_at = 1784422800000
     const nativeConversation = (await nativeSession.json()).conversation;
     assert.equal(nativeConversation.source, 'codex');
     assert.equal(nativeConversation.readOnly, false);
+    assert.deepEqual(nativeConversation.contextWindow, { usedTokens: 215308, maxTokens: 258400 });
     assert.ok(nativeConversation.messages.some((message) => (
       message.role === 'user' && message.content === 'native fixture message'
     )));
@@ -5421,6 +5537,15 @@ updated_at = 1784422800000
     assert.deepEqual(steerMessage.params.input, [{ type: 'text', text: 'change direction while running' }]);
     assert.ok(protocolMessages.some((message) => message.method === 'turn/interrupt'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/name/set'));
+    assert.ok(protocolMessages.some((message) => (
+      message.method === 'thread/goal/set'
+      && message.params.objective === 'Verify the native goal controls'
+    )));
+    assert.ok(protocolMessages.some((message) => (
+      message.method === 'thread/goal/set'
+      && message.params.status === 'paused'
+    )));
+    assert.ok(protocolMessages.some((message) => message.method === 'thread/goal/clear'));
     assert.ok(protocolMessages.some((message) => message.method === 'thread/archive'));
     assert.ok(protocolMessages.some((message) => message.id === 'approval-1' && message.result?.decision === 'accept'));
 
@@ -5678,12 +5803,6 @@ function startServer({
   env.CPA_QUOTA_API_KEY = '';
   delete env.SUB2API_BASE_URL;
   delete env.SUB2API_API_KEY;
-  delete env.GROK2API_BASE_URL;
-  delete env.GROK2API_ADMIN_PASSWORD;
-  delete env.GROK2API_API_KEY;
-  env.GROK2API_BASE_URL = '';
-  env.GROK2API_ADMIN_PASSWORD = '';
-  env.GROK2API_API_KEY = '';
   env.SUB_QUOTA_PROVIDER = 'cpa-codex';
   if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;
   if (sub2ApiKey !== undefined) env.SUB2API_API_KEY = sub2ApiKey;

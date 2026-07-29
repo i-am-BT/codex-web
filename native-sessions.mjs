@@ -59,6 +59,7 @@ export class NativeSessionStore extends EventEmitter {
     this.titles = new Map();
     this.details = new Map();
     this.threadGoals = new Map();
+    this.clearedThreadGoalIds = new Set();
     this.goalsStamp = '';
     this.sessionMetadataCache = new Map();
     this.indexStamp = '';
@@ -591,9 +592,44 @@ export class NativeSessionStore extends EventEmitter {
     for (const id of changed) {
       const cache = this.details.get(id);
       if (!cache) continue;
-      attachThreadGoal(cache, next.get(id) || null);
+      const dbGoal = next.get(id) || null;
+      if (dbGoal) this.clearedThreadGoalIds.delete(id);
+      attachThreadGoal(
+        cache,
+        this.clearedThreadGoalIds.has(id) ? null : resolveThreadGoal(cache.goal, dbGoal),
+      );
     }
     return changed;
+  }
+
+  applyThreadGoal(rawGoal, fallbackThreadId = '') {
+    const goal = normalizeThreadGoal(rawGoal, fallbackThreadId);
+    if (!goal) return false;
+
+    const previous = this.threadGoals.get(goal.threadId) || null;
+    this.threadGoals.set(goal.threadId, goal);
+    this.clearedThreadGoalIds.delete(goal.threadId);
+    const cacheChanged = attachThreadGoal(this.details.get(goal.threadId), goal);
+    if (sameThreadGoal(previous, goal) && !cacheChanged) return false;
+
+    this.version += 1;
+    this.emit('change', { version: this.version, changedIds: [goal.threadId] });
+    return true;
+  }
+
+  clearThreadGoal(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return false;
+
+    const alreadyCleared = this.clearedThreadGoalIds.has(threadId);
+    const hadGoal = this.threadGoals.delete(threadId);
+    const cacheChanged = attachThreadGoal(this.details.get(threadId), null);
+    this.clearedThreadGoalIds.add(threadId);
+    if (alreadyCleared && !hadGoal && !cacheChanged) return false;
+
+    this.version += 1;
+    this.emit('change', { version: this.version, changedIds: [threadId] });
+    return true;
   }
 
   refreshTitles() {
@@ -734,7 +770,12 @@ export class NativeSessionStore extends EventEmitter {
       );
       cache.turnStartScanComplete = true;
     }
-    attachThreadGoal(cache, this.threadGoals.get(String(entry.id || '').trim().toLowerCase()) || null);
+    const dbGoal = this.threadGoals.get(String(entry.id || '').trim().toLowerCase()) || null;
+    if (dbGoal) this.clearedThreadGoalIds.delete(entry.id);
+    attachThreadGoal(
+      cache,
+      this.clearedThreadGoalIds.has(entry.id) ? null : resolveThreadGoal(cache.goal, dbGoal),
+    );
     return buildConversation(entry, cache, options, this.runningWindowMs);
   }
 
@@ -1023,6 +1064,7 @@ function createDetailCache(entry, options) {
     nextSequence: 1,
     messagesTruncated: startOffset > 0,
     calls: new Map(),
+    pendingGoalUpdates: new Map(),
     metadata: { workspaceKind: entry.workspaceKind || '' },
     goal: null,
     currentTurnId: '',
@@ -1031,6 +1073,11 @@ function createDetailCache(entry, options) {
     latestTurnId: '',
     currentTurnStartedAt: '',
     currentTurnTokenUsage: null,
+    currentTurnTokenUsageBaseline: null,
+    currentTurnFallbackTokenUsage: null,
+    latestTotalTokenUsage: null,
+    contextUsedTokens: null,
+    contextWindowTokens: null,
     turnStartScanComplete: startOffset === 0,
     displayUserMessagesInTurn: 0,
     pendingThreadRollbackTurnId: '',
@@ -1292,12 +1339,23 @@ function applyNativeRecord(cache, record, maxMessages) {
         payload.type,
         toolMessageMetadata(name, input),
       );
+      const goalStatus = extractUpdateGoalStatus(name, input);
+      if (goalStatus) {
+        if (callId) cache.pendingGoalUpdates.set(callId, goalStatus);
+        markThreadGoalStatusFromTool(cache, goalStatus, record);
+      }
       break;
     }
     case 'function_call_output':
     case 'custom_tool_call_output': {
       const callId = String(payload.call_id || '');
       const name = cache.calls.get(callId) || 'tool';
+      const expectedGoalStatus = cache.pendingGoalUpdates.get(callId) || '';
+      if (expectedGoalStatus) {
+        const outputGoal = extractThreadGoalFromToolOutput(payload.output);
+        if (outputGoal) mergeThreadGoalFromToolOutput(cache, outputGoal, expectedGoalStatus, record);
+        cache.pendingGoalUpdates.delete(callId);
+      }
       appendNativeMessage(cache, 'tool', formatToolText(`${name} output`, payload.output), record, maxMessages, payload.type);
       break;
     }
@@ -1359,6 +1417,10 @@ function applyEventRecord(cache, record, payload, maxMessages) {
   if (payload.type === 'task_started') {
     updateNativeTurnId(cache, turnId);
     cache.currentTurnTokenUsage = null;
+    cache.currentTurnTokenUsageBaseline = tokenUsageBaseline(cache.latestTotalTokenUsage);
+    cache.currentTurnFallbackTokenUsage = null;
+    const contextWindowTokens = normalizeContextTokenCount(payload.model_context_window);
+    if (contextWindowTokens !== null) cache.contextWindowTokens = contextWindowTokens;
   }
   switch (payload.type) {
     case 'thread_settings_applied': {
@@ -1439,8 +1501,17 @@ function applyEventRecord(cache, record, payload, maxMessages) {
       break;
     }
     case 'token_count': {
-      const usage = normalizeTurnTokenUsage(payload.info?.last_token_usage);
-      if (usage) cache.currentTurnTokenUsage = addTurnTokenUsage(cache.currentTurnTokenUsage, usage);
+      updateCurrentTurnTokenUsage(
+        cache,
+        payload.info?.last_token_usage,
+        payload.info?.total_token_usage,
+      );
+      const contextUsedTokens = normalizeContextUsedTokens(payload.info?.last_token_usage);
+      if (contextUsedTokens !== null) cache.contextUsedTokens = contextUsedTokens;
+      const contextWindowTokens = normalizeContextTokenCount(
+        payload.info?.model_context_window ?? payload.model_context_window,
+      );
+      if (contextWindowTokens !== null) cache.contextWindowTokens = contextWindowTokens;
       break;
     }
     case 'task_error':
@@ -1496,7 +1567,12 @@ function dropRawHandoffBeforeCompaction(cache, record) {
       if (message?.role === 'tool' || message?.role === 'process') continue;
       break;
     }
-    if (message?.role === 'assistant' && message.kind === 'final_answer' && isHandoffSummaryText(message.content)) {
+    const immediateEmbeddedHandoff = embeddedHandoff && followsHandoffQuickly;
+    if (
+      message?.role === 'assistant'
+      && message.kind === 'final_answer'
+      && (immediateEmbeddedHandoff || isHandoffSummaryText(message.content))
+    ) {
       // Keep the folded handoff summary context; only drop raw final_answer handoffs.
       cache.messages.splice(index, 1);
       return;
@@ -1545,7 +1621,16 @@ function isHandoffSummaryText(text) {
     || /^\*\*current progress\*\*/i.test(firstLine)
   ) return true;
   // Collab handoffs may omit a clean title but still ship the standard sections.
-  const head = normalized.slice(0, 2800).toLowerCase();
+  const head = normalized.slice(0, 6000).toLowerCase();
+  const structuredChineseHandoff = plain === '当前状态' && [
+    '最新需求：',
+    '当前源码仍是',
+    '上一轮已完成并需保留',
+    '## 下一步',
+    '工作树有大量',
+    '禁止清理或回滚',
+  ].every((signal) => head.includes(signal));
+  if (structuredChineseHandoff) return true;
   const hasGoal = head.includes('## goal') || head.includes('## 目标') || head.startsWith('goal\n') || head.startsWith('目标\n');
   const hasOps = head.includes('service / ops')
     || head.includes('immediate next steps')
@@ -1563,7 +1648,20 @@ function isHandoffSummaryText(text) {
     || head.includes('open decisions')
     || head.includes('likely design')
     || head.includes('investigation started');
-  return hasGoal && hasOps;
+  const structuredHandoffSections = [
+    '## current state',
+    '## findings',
+    '## browser state',
+    '## agents',
+    '## next steps',
+    '## 当前状态',
+    '## 发现',
+    '## 浏览器状态',
+    '## 代理',
+    '## 后续步骤',
+  ].filter((section) => head.includes(section)).length;
+  const hasActiveGoalMarker = head.includes('active goal:');
+  return hasGoal && (hasOps || structuredHandoffSections >= 3 || (hasActiveGoalMarker && structuredHandoffSections >= 2));
 }
 
 function shouldHideHandoffMessage(message) {
@@ -1870,27 +1968,91 @@ function normalizeWorkspaceInjectedContext(normalized) {
   return taken.context;
 }
 
-function normalizeTurnTokenUsage(value) {
+const TURN_TOKEN_USAGE_FIELDS = {
+  inputTokens: 'input_tokens',
+  cachedInputTokens: 'cached_input_tokens',
+  outputTokens: 'output_tokens',
+  reasoningOutputTokens: 'reasoning_output_tokens',
+  totalTokens: 'total_tokens',
+};
+
+function normalizeTurnTokenUsageSnapshot(value) {
   if (!value || typeof value !== 'object') return null;
-  const fields = {
-    inputTokens: 'input_tokens',
-    cachedInputTokens: 'cached_input_tokens',
-    outputTokens: 'output_tokens',
-    reasoningOutputTokens: 'reasoning_output_tokens',
-    totalTokens: 'total_tokens',
-  };
   const usage = {};
-  let found = false;
-  for (const [target, source] of Object.entries(fields)) {
+  const fields = new Set();
+  for (const [target, source] of Object.entries(TURN_TOKEN_USAGE_FIELDS)) {
     const numeric = Number(value[source] ?? value[target]);
     if (!Number.isFinite(numeric) || numeric < 0) continue;
     usage[target] = Math.round(numeric);
-    found = true;
+    fields.add(target);
   }
-  if (!found) return null;
-  for (const target of Object.keys(fields)) usage[target] ??= 0;
-  if (!usage.totalTokens) usage.totalTokens = usage.inputTokens + usage.outputTokens;
-  return usage;
+  if (!fields.size) return null;
+  for (const target of Object.keys(TURN_TOKEN_USAGE_FIELDS)) usage[target] ??= 0;
+  if (!fields.has('totalTokens')) {
+    usage.totalTokens = usage.inputTokens + usage.outputTokens;
+    fields.add('totalTokens');
+  }
+  return { usage, fields };
+}
+
+function normalizeTurnTokenUsage(value) {
+  return normalizeTurnTokenUsageSnapshot(value)?.usage || null;
+}
+
+function tokenUsageBaseline(snapshot) {
+  if (!snapshot) return {};
+  return Object.fromEntries([...snapshot.fields].map((field) => [field, snapshot.usage[field]]));
+}
+
+function updateCurrentTurnTokenUsage(cache, lastValue, totalValue) {
+  const lastUsage = normalizeTurnTokenUsage(lastValue);
+  const totalSnapshot = normalizeTurnTokenUsageSnapshot(totalValue);
+  const previousSnapshot = cache.latestTotalTokenUsage;
+  const previousTotal = Number(previousSnapshot?.usage?.totalTokens);
+  const nextTotal = Number(totalSnapshot?.usage?.totalTokens);
+  const cumulativeAdvanced = !totalSnapshot
+    || !Number.isFinite(previousTotal)
+    || (Number.isFinite(nextTotal) && nextTotal > previousTotal);
+
+  if (lastUsage && cumulativeAdvanced) {
+    cache.currentTurnFallbackTokenUsage = addTurnTokenUsage(cache.currentTurnFallbackTokenUsage, lastUsage);
+  }
+
+  if (!totalSnapshot) {
+    if (lastUsage) cache.currentTurnTokenUsage = { ...cache.currentTurnFallbackTokenUsage };
+    return;
+  }
+
+  const baseline = cache.currentTurnTokenUsageBaseline || {};
+  for (const field of totalSnapshot.fields) {
+    if (Number.isFinite(Number(baseline[field]))) continue;
+    baseline[field] = Math.max(0, totalSnapshot.usage[field] - Number(lastUsage?.[field] || 0));
+  }
+  cache.currentTurnTokenUsageBaseline = baseline;
+
+  const fallback = cache.currentTurnFallbackTokenUsage || {};
+  cache.currentTurnTokenUsage = Object.fromEntries(Object.keys(TURN_TOKEN_USAGE_FIELDS).map((field) => {
+    if (totalSnapshot.fields.has(field) && Number.isFinite(Number(baseline[field]))) {
+      return [field, Math.max(0, totalSnapshot.usage[field] - Number(baseline[field]))];
+    }
+    return [field, Number(fallback[field] || 0)];
+  }));
+  cache.latestTotalTokenUsage = totalSnapshot;
+}
+
+function normalizeContextTokenCount(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return Math.round(numeric);
+}
+
+function normalizeContextUsedTokens(value) {
+  if (!value || typeof value !== 'object') return null;
+  const inputTokens = normalizeContextTokenCount(value.input_tokens ?? value.inputTokens);
+  if (inputTokens !== null && inputTokens > 0) return inputTokens;
+  const totalTokens = normalizeContextTokenCount(value.total_tokens ?? value.totalTokens);
+  return totalTokens ?? inputTokens;
 }
 
 function addTurnTokenUsage(current, addition) {
@@ -2480,11 +2642,19 @@ const THREAD_GOAL_STATUSES = new Set([
   'complete',
 ]);
 
+function normalizeThreadGoalStatus(value) {
+  const raw = String(value || '').trim();
+  const collapsed = raw.replace(/[_-]/g, '').toLowerCase();
+  if (collapsed === 'usagelimited') return 'usage_limited';
+  if (collapsed === 'budgetlimited') return 'budget_limited';
+  return raw.toLowerCase();
+}
+
 function normalizeThreadGoal(raw, fallbackThreadId = '') {
   if (!raw || typeof raw !== 'object') return null;
   const threadId = String(raw.threadId || raw.thread_id || fallbackThreadId || '').trim().toLowerCase();
   const objective = String(raw.objective || '').trim();
-  const status = String(raw.status || '').trim().toLowerCase();
+  const status = normalizeThreadGoalStatus(raw.status);
   if (!threadId || !objective || !THREAD_GOAL_STATUSES.has(status)) return null;
   const createdAtRaw = raw.createdAtMs ?? raw.created_at_ms ?? raw.createdAt ?? raw.created_at;
   const updatedAtRaw = raw.updatedAtMs ?? raw.updated_at_ms ?? raw.updatedAt ?? raw.updated_at;
@@ -2524,6 +2694,134 @@ function sameThreadGoal(left, right) {
     && left.timeUsedSeconds === right.timeUsedSeconds
     && left.createdAtMs === right.createdAtMs
     && left.updatedAtMs === right.updatedAtMs;
+}
+
+function resolveThreadGoal(eventGoal, dbGoal) {
+  if (!dbGoal) return eventGoal || null;
+  if (!eventGoal) return dbGoal;
+  const eventUpdated = Number(eventGoal.updatedAtMs) || 0;
+  const dbUpdated = Number(dbGoal.updatedAtMs) || 0;
+  return dbUpdated >= eventUpdated ? dbGoal : eventGoal;
+}
+
+function extractUpdateGoalStatus(name, input) {
+  const toolName = String(name || '').trim().toLowerCase();
+  let raw = input;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try { raw = JSON.parse(trimmed); } catch {}
+    }
+  }
+
+  if (toolName === 'update_goal') {
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      const status = String(raw.status || '').trim().toLowerCase();
+      return THREAD_GOAL_STATUSES.has(status) && (status === 'complete' || status === 'blocked')
+        ? status
+        : null;
+    }
+    return null;
+  }
+
+  const text = typeof input === 'string'
+    ? input
+    : (raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? String(raw.cmd || raw.input || raw.code || raw.source || '')
+      : '');
+  const goalCall = text.match(/\btools\s*\.\s*update_goal\s*\(/i);
+  if (!text || !goalCall) return null;
+
+  // Prefer simple, robust extraction over brittle full-call regexes.
+  const statusMatch = text.match(/\bstatus\s*:\s*["'](complete|blocked)["']/i)
+    || text.match(/["']status["']\s*:\s*["'](complete|blocked)["']/i);
+  if (!statusMatch) return null;
+  // Require that update_goal appears before the status token to avoid false positives.
+  const goalPos = goalCall.index == null ? -1 : goalCall.index;
+  const statusPos = statusMatch.index == null ? -1 : statusMatch.index;
+  if (goalPos < 0 || statusPos < goalPos) return null;
+  return statusMatch[1].toLowerCase();
+}
+
+function parseGoalOutputJson(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return null;
+  try { return JSON.parse(trimmed); } catch {}
+
+  const tail = trimmed.slice(-200000);
+  let attempts = 0;
+  for (let index = tail.lastIndexOf('{'); index >= 0 && attempts < 32; index = tail.lastIndexOf('{', index - 1)) {
+    attempts += 1;
+    try { return JSON.parse(tail.slice(index)); } catch {}
+  }
+  return null;
+}
+
+function extractThreadGoalFromToolOutput(output) {
+  const queue = [{ value: output, depth: 0 }];
+  let inspected = 0;
+  while (queue.length && inspected < 200) {
+    const { value, depth } = queue.shift();
+    inspected += 1;
+    if (value == null || depth > 6) continue;
+    if (typeof value === 'string') {
+      const parsed = parseGoalOutputJson(value);
+      if (parsed != null) queue.unshift({ value: parsed, depth: depth + 1 });
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) queue.push({ value: item, depth: depth + 1 });
+      continue;
+    }
+    if (typeof value !== 'object') continue;
+    if (value.goal && typeof value.goal === 'object' && !Array.isArray(value.goal)) return value.goal;
+    for (const key of ['text', 'output', 'content', 'structuredContent', 'structured_content', 'result']) {
+      if (Object.hasOwn(value, key)) queue.push({ value: value[key], depth: depth + 1 });
+    }
+  }
+  return null;
+}
+
+function mergeThreadGoalFromToolOutput(cache, rawGoal, expectedStatus, record) {
+  if (!cache?.goal || !rawGoal || typeof rawGoal !== 'object') return false;
+  const base = cache.goal;
+  const recordStamp = Date.parse(String(record?.timestamp || ''));
+  const merged = normalizeThreadGoal({
+    threadId: rawGoal.threadId ?? rawGoal.thread_id ?? base.threadId ?? cache.id,
+    goalId: rawGoal.goalId ?? rawGoal.goal_id ?? base.goalId,
+    objective: rawGoal.objective ?? base.objective,
+    status: rawGoal.status ?? expectedStatus,
+    tokenBudget: rawGoal.tokenBudget ?? rawGoal.token_budget ?? base.tokenBudget,
+    tokensUsed: rawGoal.tokensUsed ?? rawGoal.tokens_used ?? base.tokensUsed,
+    timeUsedSeconds: rawGoal.timeUsedSeconds ?? rawGoal.time_used_seconds ?? base.timeUsedSeconds,
+    createdAtMs: rawGoal.createdAtMs ?? rawGoal.created_at_ms ?? rawGoal.createdAt ?? rawGoal.created_at ?? base.createdAtMs,
+    updatedAtMs: rawGoal.updatedAtMs ?? rawGoal.updated_at_ms ?? rawGoal.updatedAt ?? rawGoal.updated_at
+      ?? base.updatedAtMs ?? (Number.isFinite(recordStamp) ? recordStamp : 0),
+  }, base.threadId || cache.id);
+  if (!merged || merged.status !== expectedStatus || merged.threadId !== String(cache.id || '').toLowerCase()) return false;
+  if (base.goalId && merged.goalId && base.goalId !== merged.goalId) return false;
+  return attachThreadGoal(cache, merged);
+}
+
+function markThreadGoalStatusFromTool(cache, status, record) {
+  if (!cache || !THREAD_GOAL_STATUSES.has(status)) return false;
+  if (!cache.goal || !cache.goal.objective) return false;
+  // complete is terminal for the current objective; do not regress it.
+  if (cache.goal.status === 'complete') return false;
+  if (cache.goal.status === status) return false;
+
+  const stamp = Date.parse(String(record?.timestamp || ''));
+  const updatedAtMs = Number.isFinite(stamp) && stamp > 0
+    ? Math.floor(stamp)
+    : Date.now();
+
+  cache.goal = {
+    ...cache.goal,
+    status,
+    updatedAtMs: Math.max(Number(cache.goal.updatedAtMs) || 0, updatedAtMs),
+  };
+  cache.contentMutated = true;
+  return true;
 }
 
 function attachThreadGoal(cache, goal) {
@@ -2572,6 +2870,12 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     revision: `${entry.ino}:${entry.size}:${entry.mtimeMs}`,
     metadata: { ...cache.metadata, workspaceKind: entry.workspaceKind || '' },
     goal: cache.goal ? { ...cache.goal } : null,
+    contextWindow: Number.isFinite(cache.contextUsedTokens) && cache.contextWindowTokens > 0
+      ? {
+          usedTokens: cache.contextUsedTokens,
+          maxTokens: cache.contextWindowTokens,
+        }
+      : null,
     messages: messages.map((message) => ({ ...message })),
   };
 }

@@ -295,6 +295,17 @@ body .side {
   box-shadow: none;
 }
 
+body .side,
+body .history {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+body .side::-webkit-scrollbar,
+body .history::-webkit-scrollbar {
+  display: none;
+}
+
 .sideBrand {
   display: grid;
   gap: 9px;
@@ -484,14 +495,14 @@ body .settingsToggle[aria-expanded="true"] {
   right: 0;
   display: grid;
   width: min(320px, 100%);
-  max-height: min(72dvh, calc(100dvh - 96px));
-  gap: 8px;
-  overflow: hidden;
+  max-height: min(480px, calc(100dvh - 140px));
+  gap: 12px;
+  overflow: auto;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
   color: var(--text);
-  padding: 10px 12px;
+  padding: 14px;
   box-shadow: 0 16px 42px rgba(0, 0, 0, 0.2);
 }
 
@@ -506,12 +517,12 @@ body .settingsToggle[aria-expanded="true"] {
 
 .subQuotaHead {
   display: flex;
-  min-height: 24px;
+  min-height: 28px;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 6px;
+  padding-bottom: 10px;
 }
 
 .subQuotaTitle {
@@ -571,15 +582,15 @@ body .subQuotaClose:hover {
 .subQuotaContent {
   display: grid;
   min-width: 0;
-  gap: 8px;
+  gap: 12px;
 }
 
 .subQuotaSource {
   display: grid;
   min-width: 0;
-  gap: 6px;
+  gap: 10px;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 8px;
+  padding-bottom: 12px;
 }
 
 .subQuotaSource:last-child {
@@ -608,7 +619,7 @@ body .subQuotaClose:hover {
 .subQuotaWindow {
   display: grid;
   min-width: 0;
-  gap: 4px;
+  gap: 6px;
 }
 
 .subQuotaWindowHead {
@@ -629,7 +640,7 @@ body .subQuotaClose:hover {
 }
 
 .subQuotaProgress {
-  height: 5px;
+  height: 6px;
   overflow: hidden;
   border-radius: 999px;
   background: var(--surface-active);
@@ -647,10 +658,10 @@ body .subQuotaClose:hover {
 .subQuotaMeta {
   display: flex;
   flex-wrap: wrap;
-  gap: 2px 8px;
+  gap: 4px 10px;
   color: var(--text-subtle);
   font-size: 10px;
-  line-height: 1.3;
+  line-height: 1.4;
 }
 
 .subQuotaRefresh {
@@ -674,7 +685,7 @@ body .subQuotaClose:hover {
   color: var(--text);
 }
 
- .subQuotaRefresh .lucide {
+.subQuotaRefresh .lucide {
   width: 14px;
   height: 14px;
 }
@@ -684,31 +695,31 @@ body .subQuotaClose:hover {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin-top: 2px;
 }
 
-.subQuotaReset {
+body .subQuotaReset {
   display: inline-flex;
-  min-height: 28px;
+  min-height: 30px;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  border: 1px solid color-mix(in srgb, var(--danger, #d96570) 35%, var(--border));
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--danger, #d96570) 10%, var(--surface-raised));
-  color: var(--danger, #d96570);
+  background: var(--surface-raised);
+  color: var(--text-muted);
   padding: 0 10px;
   font-size: 11px;
   font-weight: 650;
 }
 
-.subQuotaReset:hover {
-  border-color: color-mix(in srgb, var(--danger, #d96570) 55%, var(--border-strong));
-  background: color-mix(in srgb, var(--danger, #d96570) 16%, var(--surface-hover));
+body .subQuotaReset:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
 }
 
-.subQuotaReset:disabled {
-  opacity: 0.6;
+body .subQuotaReset:disabled {
+  opacity: 0.65;
   cursor: wait;
 }
 
@@ -718,15 +729,9 @@ body .subQuotaClose:hover {
 }
 
 .subQuotaResetProgress {
-  min-width: 0;
-  max-width: 12rem;
   color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.3;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .subQuotaResetProgress[data-state="loading"] {
@@ -734,11 +739,11 @@ body .subQuotaClose:hover {
 }
 
 .subQuotaResetProgress[data-state="success"] {
-  color: color-mix(in srgb, var(--success, #3d9a6a) 82%, var(--text));
+  color: var(--success, #16a34a);
 }
 
 .subQuotaResetProgress[data-state="error"] {
-  color: var(--danger, #d96570);
+  color: var(--danger);
 }
 
 .subQuotaSettingsDescription {
@@ -3768,7 +3773,7 @@ body .msg.user.hasInputImage {
 }
 
 .userAttachmentStack.single {
-  width: 144px;
+  width: 100px;
   grid-template-columns: minmax(0, 1fr);
 }
 
@@ -4440,6 +4445,26 @@ body[data-theme] .markdownCodeBlock > pre {
   font-variant-numeric: tabular-nums;
 }
 
+.threadGoalCompletionHint {
+  display: inline-flex;
+  width: max-content;
+  max-width: 100%;
+  align-items: center;
+  gap: 5px;
+  margin-top: 8px;
+  color: var(--text-subtle);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.threadGoalCompletionHint svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 13px;
+  stroke-width: 1.8;
+}
+
 .memoryCitationList {
   display: grid;
   margin: 1px 0 2px 6px;
@@ -5072,7 +5097,7 @@ body[data-theme="dark"] .completionTimeline .markdownBody code {
   width: fit-content;
   max-width: 77%;
   margin: 6px 0 12px auto;
-  padding: 10px 12px 8px;
+  padding: 8px 10px 8px;
   font-size: 13px;
 }
 
@@ -5094,7 +5119,7 @@ body .msg.user.steeringUser {
   box-shadow:
     0 1px 0 color-mix(in srgb, var(--primary) 12%, transparent),
     0 10px 22px color-mix(in srgb, var(--primary) 8%, transparent);
-  padding: 10px 12px 8px;
+  padding: 8px 10px 8px;
   box-sizing: border-box;
 }
 body .msg.user.steeringUser::before {
@@ -5102,7 +5127,7 @@ body .msg.user.steeringUser::before {
   display: inline-flex;
   align-items: center;
   align-self: flex-start;
-  margin: 0 0 7px;
+  margin: 0;
   padding: 2px 8px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--primary) 14%, transparent);
@@ -5164,7 +5189,7 @@ body .msg.user.steeringUser.hasInputImage .userAttachmentStack {
 
 body .msg.user.steeringUser .userAttachmentStack.single,
 body .msg.user.steeringUser.hasInputImage .userAttachmentStack.single {
-  width: 144px;
+  width: 100px;
   max-width: 100%;
   align-self: flex-end;
 }
@@ -5180,416 +5205,102 @@ body .msg.user.steeringUser .messageTime {
   opacity: 0.88;
 }
 
+/* Browser-comment inputs: compact cards that stay in the main conversation flow. */
 body .msg.user.browserCommentSteering,
 body .msg.user.hasInputImage.browserCommentSteering {
   display: flex;
-  width: 100%;
-  max-width: 100%;
+  flex: 0 0 auto;
+  width: fit-content;
+  max-width: min(280px, 88%);
   flex-direction: column;
   align-items: flex-end;
-  gap: 0;
-  margin: 4px 0 8px;
+  gap: 6px;
+  margin: 4px 0 10px auto;
   overflow: visible;
-  background: transparent;
-  color: var(--text);
   padding: 0;
-  border: 0;
-  box-shadow: none;
+  box-sizing: border-box;
 }
 
-body .msg.user.browserCommentSteering.steeringUser::before,
 body .msg.user.steeringUser.browserCommentSteering::before {
-  display: none !important;
-  content: none !important;
+  margin: 0 0 0;
 }
 
 body .msg.user.browserCommentSteering::after {
   display: none;
 }
 
-.browserCommentSteering .msgActions {
-  display: none;
-}
-
-.browserCommentCard {
-  position: relative;
-  display: grid;
-  gap: 0;
-  width: fit-content;
-  max-width: min(300px, 86%);
-  margin: 0;
-  padding: 0;
-  overflow: visible;
-  isolation: isolate;
-  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
-  border-radius: 18px;
-  background:
-    linear-gradient(180deg,
-      color-mix(in srgb, var(--surface) 88%, #ffffff 12%) 0%,
-      color-mix(in srgb, var(--surface) 96%, #000000 4%) 100%);
-  box-shadow:
-    0 1px 0 color-mix(in srgb, #ffffff 6%, transparent),
-    0 12px 28px color-mix(in srgb, #000000 22%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--blue, #6aa8ff) 8%, transparent);
-  color: var(--text);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
-}
-
-.browserCommentCard:hover {
-  border-color: color-mix(in srgb, var(--blue, #6aa8ff) 34%, var(--border));
-  box-shadow:
-    0 1px 0 color-mix(in srgb, #ffffff 8%, transparent),
-    0 16px 34px color-mix(in srgb, #000000 28%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--blue, #6aa8ff) 16%, transparent);
-}
-
-body[data-theme="light"] .browserCommentCard {
-  background:
-    linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
-  border-color: color-mix(in srgb, #d5deea 92%, #ffffff);
-  box-shadow:
-    0 1px 0 rgba(255,255,255,.9),
-    0 12px 28px rgba(31, 41, 55, 0.08),
-    0 0 0 1px rgba(37, 99, 235, 0.04);
-}
-
-body[data-theme="dark"] .browserCommentCard {
-  background:
-    linear-gradient(165deg,
-      color-mix(in srgb, var(--surface) 82%, #2a3344 18%) 0%,
-      color-mix(in srgb, var(--surface) 94%, #0b0f14 6%) 100%);
-  border-color: color-mix(in srgb, var(--border) 82%, #6aa8ff 8%);
-}
-
-.browserCommentCard .userAttachmentStack,
+body .msg.user.steeringUser.browserCommentSteering .userAttachmentStack,
+body .msg.user.steeringUser.browserCommentSteering.hasInputImage .userAttachmentStack,
 .browserCommentSteering .userAttachmentStack {
-  width: 100%;
-  max-width: none;
-  grid-template-columns: 1fr;
-  gap: 0;
+  width: 100px;
+  max-width: 100%;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
   margin: 0;
-  overflow: hidden;
-  border-radius: 18px 18px 0 0;
+  align-self: flex-end;
 }
 
-.browserCommentCard .userAttachmentStack.single,
+body .msg.user.steeringUser.browserCommentSteering .userAttachmentStack.single,
+body .msg.user.steeringUser.browserCommentSteering.hasInputImage .userAttachmentStack.single,
 .browserCommentSteering .userAttachmentStack.single {
-  width: 100%;
-  grid-template-columns: 1fr;
+  width: 100px;
+  max-width: 100%;
+  grid-template-columns: minmax(0, 1fr);
+  align-self: flex-end;
 }
 
-.browserCommentCard .userAttachment,
+body .msg.user.steeringUser.browserCommentSteering .userAttachment,
 .browserCommentSteering .userAttachment {
   width: 100%;
   height: auto;
-  min-height: 96px;
-  max-height: 168px;
   aspect-ratio: 16 / 10;
-  border: 0;
-  border-radius: 0;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
   overflow: hidden;
-  background: #0a0d12;
-  box-shadow: none;
 }
 
-.browserCommentCard .userAttachment img,
+body .msg.user.steeringUser.browserCommentSteering .userAttachment img,
 .browserCommentSteering .userAttachment img {
   width: 100%;
   height: 100%;
   max-height: none;
   object-fit: cover;
-  object-position: center;
+  object-position: center top;
+}
+
+body .msg.user.steeringUser.browserCommentSteering > .msgBody,
+body .msg.user.steeringUser.browserCommentSteering > .msgBody.markdownBody,
+.browserCommentSteering > .browserCommentSource {
   display: block;
-  border-radius: 0;
-}
-
-/* When the card only has an image + meta, keep the image clipped to the card radius. */
-.browserCommentCard > .userAttachmentStack:first-child {
-  border-top-left-radius: 17px;
-  border-top-right-radius: 17px;
-}
-.browserCommentCard > .userAttachmentStack:only-child {
-  border-radius: 17px;
-}
-
-.browserCommentMeta {
-  display: grid;
-  gap: 6px;
-  padding: 12px 14px 12px;
-}
-
-.browserCommentEyebrow {
-  display: none;
-}
-
-.browserCommentEyebrow::before {
-  content: "";
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: radial-gradient(circle at 30% 30%, #9ec5ff, var(--blue, #6aa8ff) 55%, #3b82f6);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue, #6aa8ff) 18%, transparent);
-  flex: 0 0 auto;
-}
-
-.browserCommentSteering > .browserCommentSource,
-.browserCommentText {
-  display: block;
-  width: auto;
+  width: fit-content;
   max-width: 100%;
   margin: 0;
-  border-radius: 0;
-  background: transparent;
-  color: var(--text);
-  padding: 0;
-  font-size: 13.5px;
-  font-weight: 560;
-  line-height: 1.45;
-  letter-spacing: 0.01em;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-/* Comment body floats above the card so the original bubble size stays fixed. */
-.browserCommentCard .browserCommentText,
-.browserCommentCard .browserCommentText.msgBody,
-.browserCommentCard .browserCommentText.markdownBody {
-  position: absolute;
-  top: calc(100% + 10px);
-  right: 0;
-  z-index: 40;
-  display: block;
-  width: max-content;
-  min-width: min(168px, 64vw);
-  max-width: min(280px, 72vw);
-  margin: 0;
-  padding: 11px 13px;
-  border: 1px solid color-mix(in srgb, var(--border) 70%, #6aa8ff 10%);
   border-radius: 16px;
-  background:
-    linear-gradient(165deg,
-      color-mix(in srgb, var(--surface) 78%, #2a3344 22%) 0%,
-      color-mix(in srgb, var(--surface) 92%, #0b0f14 8%) 100%);
-  box-shadow:
-    0 1px 0 color-mix(in srgb, #ffffff 8%, transparent),
-    0 10px 24px color-mix(in srgb, #000000 34%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--blue, #6aa8ff) 10%, transparent);
-  color: color-mix(in srgb, var(--text) 94%, #ffffff 6%);
-  font-size: 13px;
-  font-weight: 560;
-  line-height: 1.45;
-  letter-spacing: 0.01em;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  max-height: none;
-  overflow: visible;
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-  transform: translateY(-4px) scale(0.98);
-  transform-origin: top right;
-  transition: opacity .16s ease, transform .16s ease, visibility .16s ease;
-}
-
-.browserCommentCard .browserCommentText::before,
-.browserCommentCard .browserCommentText.msgBody::before,
-.browserCommentCard .browserCommentText.markdownBody::before {
-  content: "";
-  position: absolute;
-  top: -6px;
-  right: 18px;
-  width: 12px;
-  height: 12px;
-  border-left: 1px solid color-mix(in srgb, var(--border) 70%, #6aa8ff 10%);
-  border-top: 1px solid color-mix(in srgb, var(--border) 70%, #6aa8ff 10%);
-  border-radius: 3px 0 0 0;
-  background: inherit;
-  transform: rotate(45deg);
-  box-shadow: -1px -1px 0 color-mix(in srgb, #ffffff 5%, transparent);
-}
-
-.browserCommentCard:hover .browserCommentText,
-.browserCommentCard:focus-within .browserCommentText,
-.browserCommentCard:focus-within .browserCommentText.msgBody,
-.browserCommentCard:hover .browserCommentText.msgBody,
-.browserCommentCard:hover .browserCommentText.markdownBody,
-.browserCommentCard:focus-within .browserCommentText.markdownBody,
-.browserCommentCard.is-comment-expanded .browserCommentText,
-.browserCommentCard.is-comment-expanded .browserCommentText.msgBody,
-.browserCommentCard.is-comment-expanded .browserCommentText.markdownBody {
-  opacity: 1;
-  visibility: visible;
-  pointer-events: auto;
-  transform: translateY(0) scale(1);
-}
-
-body[data-theme="light"] .browserCommentCard .browserCommentText,
-body[data-theme="light"] .browserCommentCard .browserCommentText.msgBody,
-body[data-theme="light"] .browserCommentCard .browserCommentText.markdownBody {
-  background: linear-gradient(180deg, #ffffff 0%, #f5f8fc 100%);
-  border-color: color-mix(in srgb, #d5deea 88%, #6aa8ff 8%);
-  color: #1f2937;
-  box-shadow:
-    0 1px 0 rgba(255,255,255,.95),
-    0 12px 28px rgba(31, 41, 55, 0.12),
-    0 0 0 1px rgba(37, 99, 235, 0.04);
-}
-
-body[data-theme="dark"] .browserCommentCard .browserCommentText,
-body[data-theme="dark"] .browserCommentCard .browserCommentText.msgBody,
-body[data-theme="dark"] .browserCommentCard .browserCommentText.markdownBody {
-  background:
-    linear-gradient(165deg,
-      color-mix(in srgb, var(--surface) 76%, #334155 24%) 0%,
-      color-mix(in srgb, var(--surface) 90%, #070b10 10%) 100%);
-  border-color: color-mix(in srgb, var(--border) 72%, #6aa8ff 14%);
-}
-
-/* Keep generic bubble resets off the floating comment tooltip. */
-body .msg.user.hasInputImage.browserCommentSteering .browserCommentCard .msgBody:not(.browserCommentText),
-body .msg.user.browserCommentSteering .browserCommentCard .msgBody:not(.browserCommentText) {
-  width: auto;
-  max-width: 100%;
-  border-radius: 0;
-  background: transparent;
+  background: color-mix(in oklab, var(--text) 5%, transparent);
   color: var(--text);
-  padding: 0;
-}
-
-/* Win against generic user/msgBody styles so the hover tooltip keeps its own chrome. */
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.msgBody,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody,
-body .msg.user.hasInputImage.browserCommentSteering .browserCommentCard .browserCommentText,
-body .msg.user.hasInputImage.browserCommentSteering .browserCommentCard .browserCommentText.msgBody,
-body .msg.user.hasInputImage.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody {
-  position: absolute;
-  top: calc(100% + 10px);
-  right: 0;
-  z-index: 40;
-  display: block;
-  width: max-content;
-  min-width: min(168px, 64vw);
-  max-width: min(280px, 72vw);
-  margin: 0;
-  padding: 11px 13px;
-  border: 1px solid color-mix(in srgb, var(--border) 62%, #6aa8ff 18%);
-  border-radius: 16px;
-  background:
-    linear-gradient(160deg,
-      color-mix(in srgb, #1b2433 78%, #6aa8ff 8%) 0%,
-      color-mix(in srgb, #10161f 88%, #000000 12%) 100%);
-  box-shadow:
-    0 1px 0 color-mix(in srgb, #ffffff 10%, transparent),
-    0 18px 36px color-mix(in srgb, #000000 42%, transparent),
-    0 0 0 1px color-mix(in srgb, #6aa8ff 14%, transparent);
-  color: #f3f6fb;
+  padding: 8px 12px;
   font-size: 13px;
-  font-weight: 560;
   line-height: 1.45;
-  letter-spacing: 0.01em;
-  backdrop-filter: blur(16px) saturate(1.15);
-  -webkit-backdrop-filter: blur(16px) saturate(1.15);
-}
-
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText::before,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.msgBody::before,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody::before {
-  content: "";
-  position: absolute;
-  top: -6px;
-  right: 18px;
-  width: 12px;
-  height: 12px;
-  border-left: 1px solid color-mix(in srgb, var(--border) 62%, #6aa8ff 18%);
-  border-top: 1px solid color-mix(in srgb, var(--border) 62%, #6aa8ff 18%);
-  border-radius: 3px 0 0 0;
-  background: linear-gradient(135deg,
-    color-mix(in srgb, #1b2433 78%, #6aa8ff 8%) 0%,
-    color-mix(in srgb, #151c28 90%, #000000 10%) 100%);
-  transform: rotate(45deg);
-}
-
-body[data-theme="light"] .msg.user.browserCommentSteering .browserCommentCard .browserCommentText,
-body[data-theme="light"] .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.msgBody,
-body[data-theme="light"] .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody {
-  background: linear-gradient(180deg, #ffffff 0%, #f4f7fb 100%);
-  border-color: color-mix(in srgb, #d5deea 82%, #6aa8ff 12%);
-  color: #1f2937;
-  box-shadow:
-    0 1px 0 rgba(255,255,255,.96),
-    0 16px 32px rgba(31, 41, 55, 0.14),
-    0 0 0 1px rgba(37, 99, 235, 0.05);
-}
-
-body[data-theme="light"] .msg.user.browserCommentSteering .browserCommentCard .browserCommentText::before,
-body[data-theme="light"] .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.msgBody::before {
-  background: linear-gradient(135deg, #ffffff 0%, #f4f7fb 100%);
-  border-left-color: color-mix(in srgb, #d5deea 82%, #6aa8ff 12%);
-  border-top-color: color-mix(in srgb, #d5deea 82%, #6aa8ff 12%);
-}
-
-/* Kill the extra blank band under single-line hover text. */
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.msgBody,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody,
-body .msg.user.hasInputImage.browserCommentSteering .browserCommentCard .browserCommentText,
-body .msg.user.hasInputImage.browserCommentSteering .browserCommentCard .browserCommentText.msgBody,
-body .msg.user.hasInputImage.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody {
   white-space: normal;
-  padding: 10px 12px;
-  line-height: 1.4;
+  align-self: flex-end;
 }
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody > :first-child,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText > :first-child {
-  margin-top: 0 !important;
-}
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody > :last-child,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText > :last-child {
-  margin-bottom: 0 !important;
-}
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText p,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody p {
+
+.browserCommentSteering > .msgBody.markdownBody p {
   margin: 0;
 }
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText p + p,
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText.markdownBody p + p {
-  margin-top: 6px;
-}
-body .msg.user.browserCommentSteering .browserCommentCard .browserCommentText br:last-child {
-  display: none;
+
+body .msg.user.steeringUser {
+  gap: 6px;
 }
 
-.browserCommentBadge {
-  justify-self: start;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
+body .msg.user.steeringUser .userAttachmentStack,
+body .msg.user.steeringUser.hasInputImage .userAttachmentStack {
   margin: 0;
-  padding: 3px 9px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
-  background: color-mix(in srgb, var(--panel2, var(--surface)) 88%, transparent);
-  color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 650;
-  line-height: 1.3;
 }
 
-.browserCommentBadge::before {
-  content: "";
-  width: 4px;
-  height: 4px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text-muted) 70%, var(--blue, #6aa8ff));
-}
-
-body[data-theme="light"] .browserCommentBadge {
-  background: color-mix(in srgb, #eef3f8 90%, #ffffff);
-  border-color: color-mix(in srgb, #d6deea 85%, #ffffff);
-  color: #627084;
+body .msg.user.steeringUser .msgActions {
+  margin-top: 2px;
 }
 
 .turnResultArtifacts {
@@ -6982,6 +6693,34 @@ body .chat > :is(.msg.user, .msg.image.inputImage) {
   margin-right: max(0px, calc((100% - var(--conversation-width)) / 2));
 }
 
+/* Keep browser-comment cards compact after the generic user-message rail rule. */
+body .chat > .msg.user.browserCommentSteering,
+body .chat > .msg.user.hasInputImage.browserCommentSteering {
+  width: fit-content;
+  max-width: min(280px, 88%);
+}
+
+body .chat > .msg.user.browserCommentSteering > .msgBody.browserCommentSource,
+body .chat > .msg.user.browserCommentSteering > .msgBody.markdownBody.browserCommentSource {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 0;
+  margin: 0;
+  border-radius: 16px;
+  background: color-mix(in oklab, var(--text) 5%, transparent);
+  color: var(--text);
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: normal;
+  align-self: flex-end;
+}
+
+body .chat > .msg.user.browserCommentSteering > .msgBody.browserCommentSource > p {
+  margin: 0;
+}
+
 body .msg.assistant > .msgBody > :not(.memoryCitations),
 body[data-theme] .msg.process,
 body[data-theme] .activityBatch,
@@ -7368,6 +7107,8 @@ body[data-theme] .box.composerCollapsed textarea:focus {
 
 /* Hide expanded-only chrome in capsule mode */
 body .box.composerCollapsed > .composerPermissionToggle,
+body .box.composerCollapsed > .composerGoalIndicator,
+body .box.composerCollapsed > .composerContextToggle,
 body .box.composerCollapsed > .composerModelToggle,
 body .box.composerCollapsed > .send:not(.cancelButton),
 body .box.composerCollapsed > .composerPopover,
@@ -7661,6 +7402,128 @@ body[data-theme] .box .attachBtn {
   line-height: 1;
 }
 
+.composerGoalIndicator {
+  display: inline-flex;
+  grid-row: 2;
+  grid-column: 3;
+  width: 36px;
+  min-width: 36px;
+  height: 24px;
+  box-sizing: border-box;
+  align-items: center;
+  justify-content: flex-end;
+  justify-self: start;
+  margin-left: 8px;
+  border-left: 1px solid color-mix(in srgb, var(--border-strong) 60%, transparent);
+  color: var(--text-muted);
+  padding-left: 10px;
+  pointer-events: none;
+}
+
+.composerGoalIndicator.hidden {
+  display: none !important;
+}
+
+.composerGoalIndicator.isPaused {
+  color: var(--warning, #b7791f);
+}
+
+.composerGoalIndicator.isBlocked {
+  color: var(--danger);
+}
+
+.composerGoalIndicator .lucide {
+  width: 18px;
+  height: 18px;
+}
+
+.composerContextToggle {
+  display: grid;
+  grid-row: 2;
+  grid-column: 3;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  place-items: center;
+  justify-self: end;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0;
+}
+
+.composerContextToggle:hover,
+.composerContextToggle:focus-visible,
+.composerContextToggle[aria-expanded="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.composerContextRing {
+  --context-progress: 0%;
+  position: relative;
+  width: 15px;
+  height: 15px;
+  display: block;
+  flex: 0 0 15px;
+  border-radius: 50%;
+  background: conic-gradient(
+    currentColor var(--context-progress),
+    color-mix(in srgb, currentColor 24%, transparent) 0
+  );
+}
+
+.composerContextRing::after {
+  position: absolute;
+  inset: 2.5px;
+  border-radius: inherit;
+  background: var(--surface);
+  content: "";
+}
+
+body .composerContextPanel {
+  right: 84px;
+  width: min(176px, calc(100vw - 32px));
+  display: grid;
+  justify-items: center;
+  gap: 1px;
+  border-radius: 11px;
+  padding: 7px 10px 8px;
+  text-align: center;
+}
+
+.composerContextTitle {
+  color: var(--text-subtle);
+  font-size: 9px;
+  font-weight: 560;
+  line-height: 1.3;
+}
+
+.composerContextPercent {
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 570;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+
+.composerContextDetails {
+  color: var(--text);
+  font-size: 10.5px;
+  font-weight: 560;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+@media (max-width: 520px) {
+  body .composerContextPanel {
+    right: 50%;
+    transform: translateX(50%);
+  }
+}
+
 .composerModelToggle {
   display: inline-flex;
   grid-row: 2;
@@ -7831,6 +7694,152 @@ body .composer > .promptQueue {
   margin: 0 auto 8px;
 }
 
+.threadGoalBar {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  width: min(720px, calc(var(--composer-width) - 24px), calc(100% - 32px));
+  max-width: min(720px, calc(var(--composer-width) - 24px), calc(100% - 32px));
+  box-sizing: border-box;
+  min-height: 42px;
+  margin: 0 auto 14px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  color: var(--text-muted);
+  padding: 6px 10px;
+  box-shadow: 0 9px 24px rgba(0, 0, 0, 0.10);
+}
+
+.threadGoalBar.hidden {
+  display: none !important;
+}
+
+body .composer > .threadGoalBar {
+  width: min(720px, calc(var(--composer-width) - 24px), calc(100% - 32px));
+  max-width: min(720px, calc(var(--composer-width) - 24px), calc(100% - 32px));
+  margin: 0 auto 14px;
+}
+
+.threadGoalLead {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  color: currentColor;
+}
+
+.threadGoalLead svg {
+  width: 18px;
+  height: 18px;
+}
+
+.threadGoalBody {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.threadGoalTitle {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.threadGoalStatus {
+  flex: 0 0 auto;
+  color: currentColor;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.threadGoalSummary {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.threadGoalTime {
+  color: var(--text-subtle);
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.threadGoalActions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+body .threadGoalAction,
+body .threadGoalAction:hover,
+body .threadGoalAction:active,
+body .threadGoalAction:focus {
+  display: grid;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-subtle);
+  padding: 0;
+}
+
+body .threadGoalAction:hover {
+  color: var(--text);
+}
+
+body .threadGoalAction.isDanger:hover {
+  color: var(--danger);
+}
+
+body .threadGoalAction:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+body .threadGoalAction:disabled {
+  cursor: wait;
+  opacity: 0.45;
+}
+
+.threadGoalAction svg {
+  width: 15px;
+  height: 15px;
+}
+
+.threadGoalBar.isActive .threadGoalStatus {
+  color: var(--primary);
+}
+
+.threadGoalBar.isPaused .threadGoalStatus,
+.threadGoalBar.isBlocked .threadGoalStatus {
+  color: var(--warning, #b7791f);
+}
+
+body[data-theme="dark"] .threadGoalBar {
+  border-color: color-mix(in srgb, #454545 70%, transparent);
+  background: color-mix(in srgb, var(--surface-raised) 94%, transparent);
+  box-shadow: 0 9px 24px rgba(0, 0, 0, 0.24);
+}
+
+.threadRunMobile {
+  display: none;
+}
+
 .promptQueueHead {
   display: none;
 }
@@ -7855,7 +7864,7 @@ body .composer > .promptQueue {
 .promptQueueRow {
   display: grid;
   min-height: 40px;
-  grid-template-columns: 22px minmax(0, 1fr) 30px auto 30px 30px;
+  grid-template-columns: 22px minmax(0, 1fr) auto 30px 30px;
   align-items: center;
   gap: 4px;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 28%, transparent);
@@ -7882,7 +7891,7 @@ body .composer > .promptQueue {
 }
 
 .promptQueueRow.appOwned {
-  grid-template-columns: 22px minmax(0, 1fr) 30px auto 30px;
+  grid-template-columns: 22px minmax(0, 1fr) auto 30px;
 }
 
 body[data-theme="dark"] .promptQueue {
@@ -8018,7 +8027,8 @@ body[data-theme="dark"] .promptQueue {
 }
 
 .promptQueueGuide:disabled,
-.promptQueueIconButton:disabled {
+.promptQueueIconButton:disabled,
+.promptQueueBody:disabled {
   cursor: not-allowed;
   opacity: 0.42;
 }
@@ -8041,58 +8051,121 @@ body[data-theme="dark"] .promptQueue {
 }
 
 .attachmentTray {
-  display: inline-flex;
-  align-self: center;
-  width: fit-content;
-  max-width: min(360px, calc(var(--composer-width) - 72px), calc(100% - 120px));
+  display: flex;
+  grid-row: 1;
+  grid-column: 1 / -1;
+  align-self: start;
+  justify-self: stretch;
+  width: calc(100% - 12px);
+  min-width: 0;
+  max-width: calc(100% - 12px);
   gap: 6px;
-  max-height: 112px;
-  margin: 0 auto 6px;
-  overflow: auto;
+  margin: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
   border: 0;
-  border-radius: 7px;
   background: transparent;
-  padding: 0;
+  padding: 0 0 4px;
   box-shadow: none;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+  scroll-snap-type: x proximity;
+  -webkit-overflow-scrolling: touch;
+}
+
+.attachmentTray::-webkit-scrollbar {
+  display: none;
+}
+
+body .box:has(> .attachmentTray:not(.hidden)) {
+  grid-template-rows: auto minmax(50px, auto) 34px;
+}
+
+body[data-theme] .box:has(> .attachmentTray:not(.hidden)) > textarea {
+  grid-row: 2;
+}
+
+body .box:has(> .attachmentTray:not(.hidden)) > :is(
+  .attachBtn,
+  .composerPermissionToggle,
+  .composerGoalIndicator,
+  .composerContextToggle,
+  .composerModelToggle,
+  .composerMicBtn,
+  .send,
+  .cancelButton
+) {
+  grid-row: 3;
 }
 
 body[data-theme] .attachmentChip {
   display: grid;
-  width: min(168px, calc(100vw - 72px));
-  max-width: 168px;
-  height: 44px;
-  grid-template-columns: 36px minmax(0, 1fr) 24px;
+  width: max-content;
+  min-width: 0;
+  max-width: min(300px, calc(100vw - 72px));
+  min-height: 48px;
+  flex: 0 0 auto;
+  grid-template-columns: 40px minmax(0, auto) 28px;
   align-items: center;
-  gap: 6px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--text-muted);
-  padding: 4px;
-  font-size: 11px;
+  gap: 8px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 14px;
+  background: var(--surface-hover);
+  color: var(--text);
+  padding: 4px 6px 4px 4px;
+  font-size: 13px;
+  scroll-snap-align: start;
 }
 
 body .attachmentChip img,
 body .attachmentChip .attachmentIcon {
-  width: 36px;
-  height: 36px;
-  flex: 0 0 36px;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
   border-radius: 6px;
+}
+
+body .attachmentChip img {
+  object-fit: cover;
 }
 
 body .attachmentText {
   min-width: 0;
-  gap: 1px;
+  display: block;
 }
 
-body .attachmentMeta {
-  font-size: 9px;
+body .attachmentText > span:first-child {
+  display: block;
+  max-width: 200px;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+body .box > .attachmentTray .attachmentMeta {
+  display: none;
 }
 
 body .attachmentChip button {
-  width: 24px;
-  height: 24px;
-  color: var(--danger);
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--text-muted);
+  color: var(--surface);
+  padding: 0;
+}
+
+body .attachmentChip button:hover {
+  background: var(--text);
+  color: var(--surface);
+}
+
+body .attachmentChip button .lucide {
+  width: 16px;
+  height: 16px;
 }
 
 .composerControls {
@@ -9781,11 +9854,6 @@ body .composer > .box:focus-within {
     scroll-padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
   }
 
-  body .main:has(> .composer > .editedFilesResult.live.withPlan) > .chat {
-    padding-bottom: max(calc(178px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 166px) + env(safe-area-inset-bottom, 0px) + 12px));
-    scroll-padding-bottom: max(calc(178px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 166px) + env(safe-area-inset-bottom, 0px) + 12px));
-  }
-
   body .composer {
     position: absolute;
     inset: auto 0 0;
@@ -9875,11 +9943,11 @@ body .composer > .box:focus-within {
     margin: 0 auto 10px;
   }
 
-  body .composer > .attachmentTray {
+  body .box > .attachmentTray {
     display: flex;
-    width: min(360px, calc(100% - 20px));
-    max-width: min(360px, calc(100% - 20px));
-    margin-inline: auto;
+    width: calc(100% - 12px);
+    max-width: calc(100% - 12px);
+    margin: 0;
     box-sizing: border-box;
   }
 
@@ -9895,33 +9963,16 @@ body .composer > .box:focus-within {
   }
 
   body .box.composerCollapsed {
-    grid-template-columns: 36px minmax(0, 1fr) 36px !important;
-    grid-template-rows: 44px !important;
-    min-height: 44px;
+    grid-template-columns: 40px minmax(0, 1fr) 40px !important;
+    grid-template-rows: 52px !important;
+    min-height: 52px;
     border-radius: 999px !important;
-    padding: 0 10px 0 8px !important;
+    padding: 0 12px 0 10px !important;
   }
 
   body .box.composerCollapsed.runActive,
   body .box.composerCollapsed.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-    grid-template-columns: 36px minmax(0, 1fr) 36px 36px !important;
-  }
-
-  body .box.composerCollapsed > .attachBtn,
-  body .box.composerCollapsed > .composerMicBtn,
-  body .box.composerCollapsed.runActive > .cancelButton {
-    width: 32px !important;
-    min-width: 32px;
-    height: 32px !important;
-  }
-
-  body[data-theme] .box.composerCollapsed textarea,
-  body[data-theme] .box.composerCollapsed textarea:focus {
-    height: 30px !important;
-    max-height: 30px !important;
-    padding: 5px 8px !important;
-    font-size: 15px !important;
-    line-height: 20px !important;
+    grid-template-columns: 40px minmax(0, 1fr) 40px 40px !important;
   }
 
   body .box.composerExpanded,
@@ -10107,29 +10158,12 @@ body .composer > .box:focus-within {
   }
 
   body .box.composerCollapsed {
-    grid-template-columns: 34px minmax(0, 1fr) 34px !important;
-    grid-template-rows: 42px !important;
-    min-height: 42px;
+    grid-template-columns: 36px minmax(0, 1fr) 36px !important;
+    grid-template-rows: 48px !important;
+    min-height: 48px;
     gap: 0 !important;
     border-radius: 999px !important;
-    padding: 0 8px 0 6px !important;
-  }
-
-  body .box.composerCollapsed > .attachBtn,
-  body .box.composerCollapsed > .composerMicBtn,
-  body .box.composerCollapsed.runActive > .cancelButton {
-    width: 30px !important;
-    min-width: 30px;
-    height: 30px !important;
-  }
-
-  body[data-theme] .box.composerCollapsed textarea,
-  body[data-theme] .box.composerCollapsed textarea:focus {
-    height: 28px !important;
-    max-height: 28px !important;
-    padding: 4px 6px !important;
-    font-size: 15px !important;
-    line-height: 20px !important;
+    padding: 0 10px 0 8px !important;
   }
 
   body .box.composerCollapsed.runActive,
@@ -10158,9 +10192,9 @@ body .composer > .box:focus-within {
 
   body .box.composerCollapsed > .attachBtn,
   body .box.composerCollapsed > .composerMicBtn {
-    width: 30px !important;
-    min-width: 30px;
-    height: 30px !important;
+    width: 34px !important;
+    min-width: 34px;
+    height: 34px !important;
   }
 
   body .box.runActive {
@@ -10211,6 +10245,18 @@ body .composer > .box:focus-within {
     height: 19px;
   }
 
+  .composerGoalIndicator {
+    width: 30px;
+    min-width: 30px;
+    margin-left: 4px;
+    padding-left: 8px;
+  }
+
+  .composerGoalIndicator .lucide {
+    width: 17px;
+    height: 17px;
+  }
+
   .composerModelToggle {
     min-width: 0;
     max-width: 174px;
@@ -10233,13 +10279,13 @@ body .composer > .box:focus-within {
   }
 
   .promptQueueRow {
-    grid-template-columns: 22px minmax(0, 1fr) 28px auto 28px 28px;
+    grid-template-columns: 22px minmax(0, 1fr) auto 28px 28px;
     gap: 2px;
     padding-inline: 8px 5px;
   }
 
   .promptQueueRow.appOwned {
-    grid-template-columns: 22px minmax(0, 1fr) 28px auto 28px;
+    grid-template-columns: 22px minmax(0, 1fr) auto 28px;
   }
 
   .promptQueueGuide {
@@ -11218,10 +11264,10 @@ body[data-chat-bg="skin"] .sideChatSend {
     margin: 0 auto 8px !important;
   }
 
-  body .main.sideChatOpen > .composer > .attachmentTray {
-    width: min(360px, calc(100% - 20px)) !important;
-    max-width: min(360px, calc(100% - 20px)) !important;
-    margin-inline: auto !important;
+  body .main.sideChatOpen > .composer > .box > .attachmentTray {
+    width: calc(100% - 12px) !important;
+    max-width: calc(100% - 12px) !important;
+    margin: 0 !important;
   }
 
   .main.sideChatOpen > .sideChatPane > .sideChatComposer .sideChatInput {
@@ -11388,4 +11434,281 @@ body[data-theme] .msg.image:not(.inputImage) img {
   object-position: center top;
   border-radius: 12px;
   cursor: zoom-in;
+}
+
+@media (max-width: 820px) {
+  body .composer > .threadGoalBar,
+  .threadGoalBar {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-height: 0;
+    margin: 0 0 14px;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    padding: 0;
+    box-shadow: none;
+  }
+
+  body[data-theme] .composer > .threadGoalBar {
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .threadGoalBar > :is(.threadGoalLead, .threadGoalBody, .threadGoalTime, .threadGoalActions) {
+    display: none;
+  }
+
+  .threadRunMobile {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .threadRunPillsViewport {
+    width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .threadRunPillsViewport::-webkit-scrollbar {
+    display: none;
+  }
+
+  .threadRunPills {
+    display: flex;
+    width: max-content;
+    min-width: min-content;
+    align-items: center;
+    gap: 8px;
+    margin: 0 auto;
+    border: 0;
+    background: transparent;
+    padding: 0 16px;
+    box-shadow: none;
+  }
+
+  body .threadRunPill,
+  body .threadRunPill:hover,
+  body .threadRunPill:active,
+  body .threadRunPill:focus {
+    display: inline-flex;
+    min-width: 0;
+    height: 36px;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    scroll-snap-align: center;
+    border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    border-radius: 999px;
+    background: transparent;
+    box-shadow: none;
+    color: var(--text-muted);
+    padding: 0 12px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  body .threadRunPill:hover {
+    color: var(--text);
+  }
+
+  body .threadRunPill.isSelected,
+  body .threadRunPill.isSelected:hover,
+  body .threadRunPill.isSelected:active,
+  body .threadRunPill.isSelected:focus {
+    border-color: var(--text);
+    background: var(--text);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+    color: var(--canvas);
+  }
+
+  body .threadRunPill:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+  }
+
+  .threadRunPill > :is(svg, .lucide) {
+    width: 17px;
+    height: 17px;
+    flex: 0 0 17px;
+    stroke-width: 1.9;
+  }
+
+  .threadRunPillLabel,
+  .threadRunGoalTime {
+    color: currentColor;
+    font: inherit;
+    white-space: nowrap;
+  }
+
+  .threadRunGoalPill {
+    gap: 8px;
+  }
+
+  .threadRunGoalTime {
+    margin-left: 1px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .threadRunPlanProgress {
+    position: relative;
+    width: 17px;
+    height: 17px;
+    flex: 0 0 17px;
+    border-radius: 50%;
+    background: conic-gradient(currentColor var(--thread-run-progress, 0%), color-mix(in srgb, currentColor 18%, transparent) 0);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 0);
+    mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 0);
+  }
+
+  .threadRunDetail {
+    width: min(680px, calc(100% - 20px));
+    max-width: min(680px, calc(100% - 20px));
+    box-sizing: border-box;
+    margin: 0 auto;
+    border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+    border-radius: 20px;
+    background: color-mix(in srgb, var(--surface) 97%, transparent);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.12);
+    color: var(--text);
+  }
+
+  .threadRunGoalDetail {
+    display: grid;
+    min-height: 86px;
+    grid-template-rows: minmax(34px, auto) auto;
+    gap: 5px;
+    padding: 13px 12px 8px 16px;
+  }
+
+  .threadRunGoalObjective {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1.45;
+  }
+
+  .threadRunGoalActions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
+  }
+
+  body .threadRunGoalAction,
+  body .threadRunGoalAction:hover,
+  body .threadRunGoalAction:active,
+  body .threadRunGoalAction:focus {
+    width: 38px;
+    min-width: 38px;
+    height: 38px;
+    background: transparent;
+    color: var(--text-muted);
+  }
+
+  body .threadRunGoalAction:hover {
+    color: var(--text);
+  }
+
+  body .threadRunGoalAction.isDanger:hover {
+    color: var(--danger);
+  }
+
+  .threadRunGoalAction > :is(svg, .lucide) {
+    width: 20px;
+    height: 20px;
+    stroke-width: 1.8;
+  }
+
+  .threadRunPlanDetail {
+    display: grid;
+    max-height: min(36vh, 240px);
+    gap: 3px;
+    overflow: hidden auto;
+    padding: 11px 14px;
+  }
+
+  .threadRunPlanStep {
+    display: grid;
+    min-height: 34px;
+    grid-template-columns: 22px 25px minmax(0, 1fr);
+    align-items: start;
+    gap: 4px;
+    padding: 3px 0;
+    color: var(--text);
+  }
+
+  .threadRunPlanMarker {
+    position: relative;
+    display: grid;
+    width: 18px;
+    height: 18px;
+    place-items: center;
+    margin-top: 1px;
+    border: 2px solid color-mix(in srgb, var(--text-muted) 54%, transparent);
+    border-radius: 50%;
+    color: var(--text-muted);
+  }
+
+  .threadRunPlanStep[data-status="in_progress"] .threadRunPlanMarker {
+    border-color: color-mix(in srgb, var(--text-muted) 30%, transparent);
+    border-top-color: var(--text-muted);
+    animation: threadRunPlanSpin 900ms linear infinite;
+  }
+
+  .threadRunPlanStep[data-status="completed"] .threadRunPlanMarker {
+    border-color: var(--text-muted);
+    background: var(--text-muted);
+    color: var(--surface);
+  }
+
+  .threadRunPlanMarker > :is(svg, .lucide) {
+    width: 11px;
+    height: 11px;
+    stroke-width: 2.4;
+  }
+
+  .threadRunPlanNumber {
+    color: var(--text-subtle);
+    font-size: 13px;
+    line-height: 1.55;
+    text-align: right;
+  }
+
+  .threadRunPlanText {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 13.5px;
+    font-weight: 500;
+    line-height: 1.48;
+  }
+
+  body .composer > .editedFilesResult.live {
+    display: none;
+  }
+
+  @keyframes threadRunPlanSpin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .threadRunPlanStep[data-status="in_progress"] .threadRunPlanMarker {
+      animation: none;
+    }
+  }
 }
