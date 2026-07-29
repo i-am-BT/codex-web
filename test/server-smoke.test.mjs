@@ -1669,7 +1669,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=subquota-reset-progress-20260728a"/);
+    assert.match(page, /href="\/ui\.css\?v=goal-status-bar-20260729a"/);
     assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260728a"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
