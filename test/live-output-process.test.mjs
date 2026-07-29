@@ -65,7 +65,9 @@ test('steering stays chronological and input image helpers avoid duplicate uploa
   assert.match(inlineScript, /function cleanSteeringMessageDuplicates\(element\)/);
   assert.match(inlineScript, /if\(role==='user'&&!steering&&turnProcessHeader/);
   assert.match(inlineScript, /appendConversationElement\(el,role,\{steering:steeringUser\}\)/);
-  assert.match(inlineScript, /if\(completedSteeringTimeline\)completedSteeringTimeline\.appendChild\(el\);\s*else activateTurnProcessElement\(el\)/);
+  assert.match(inlineScript, /if\(browserCommentUser\)\{[\s\S]*?else if\(completedSteeringTimeline\)\{[\s\S]*?completedSteeringTimeline\.appendChild\(el\);[\s\S]*?else\{[\s\S]*?activateTurnProcessElement\(el\)/);
+  assert.match(inlineScript, /Browser comments are the user's visible inputs/);
+  assert.match(inlineScript, /if\(item\.classList\?\.contains\('browserCommentSteering'\)\)/);
   assert.doesNotMatch(inlineScript, /pinSteeringMessageToBottom|pinOpenSteeringMessages|ensureSteeringPinObserver/);
   assert.match(inlineScript, /Rebind either direction instead of creating a second copy/);
   assert.match(inlineScript, /item\.classList\?\.contains\('steeringUser'\)[\s\S]*?processElements\.push\(item\)/);
@@ -502,7 +504,7 @@ test('the compact pill matches the reference sizing and closed tools stay hidden
   assert.equal((inlineScript.match(/fileChanges:msg\.fileChanges/g) || []).length, 2);
 });
 
-test('the prompt queue stays out of Web while retaining its backing actions', () => {
+test('the prompt queue shows in Web while retaining its backing actions', () => {
   const ruleBody = (selector) => {
     const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const body = uiStyles.match(new RegExp(`(?:^|\\n)\\s*${escapedSelector}\\s*\\{([^}]*)\\}`, 'm'))?.[1];
@@ -538,27 +540,28 @@ test('the prompt queue stays out of Web while retaining its backing actions', ()
   assert.match(ruleBody('.promptQueueHead'), /display:\s*none(?:;|$)/);
   assert.match(
     uiStyles,
-    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px 28px;[^}]*gap:\s*2px[^}]*\}\s*\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px/s,
+    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 28px auto 28px 28px;[^}]*gap:\s*2px[^}]*\}\s*\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 28px auto 28px/s,
   );
 
   const queueStart = inlineScript.indexOf('function renderPromptQueue(){');
   const queueEnd = inlineScript.indexOf('function enqueuePrompt', queueStart);
   assert.ok(queueStart >= 0 && queueEnd > queueStart, 'missing prompt queue renderer source');
   const queueRenderer = inlineScript.slice(queueStart, queueEnd);
-  assert.match(queueRenderer, /const showInWeb=false/);
-  assert.match(queueRenderer, /classList\.toggle\('hidden',!showInWeb\|\|!threadId\|\|!items\.length\)/);
-  assert.match(queueRenderer, /if\(!showInWeb\|\|!threadId\|\|!items\.length\)/);
-  assert.doesNotMatch(queueRenderer, /queueActionButton\('pencil'/);
+  assert.doesNotMatch(queueRenderer, /const showInWeb=false/);
+  assert.match(queueRenderer, /classList\.toggle\('hidden',!threadId\|\|!items\.length\)/);
+  assert.match(queueRenderer, /if\(!threadId\|\|!items\.length\)/);
+  assert.match(queueRenderer, /queueActionButton\('pencil','编辑'/);
   assert.match(queueRenderer, /queueActionButton\('ellipsis','队列操作'/);
-  assert.match(queueRenderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
-  assert.match(queueRenderer, /body\.disabled=busy/);
+  assert.doesNotMatch(queueRenderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
+  assert.doesNotMatch(queueRenderer, /body\.disabled=busy/);
+  assert.match(queueRenderer, /edit\.disabled=busy/);
   assert.match(queueRenderer, /const retryable=queueFailures\.has\(item\.id\)&&!appOwned/);
   assert.match(queueRenderer, /guide\.disabled=busy\|\|\(!webRunActive&&!retryable\)/);
   assert.match(queueRenderer, /remove\.disabled=busy/);
   assert.match(queueRenderer, /more\.disabled=busy/);
   assert.deepEqual(
-    [...queueRenderer.matchAll(/row\.appendChild\((guide|remove|more)\)/g)].map((match) => match[1]),
-    ['guide', 'remove', 'more'],
+    [...queueRenderer.matchAll(/row\.appendChild\((edit|guide|remove|more)\)/g)].map((match) => match[1]),
+    ['edit', 'guide', 'remove', 'more'],
   );
 });
 
@@ -916,9 +919,11 @@ test('Codex App queue entries keep direct actions but are never dispatched or mo
   assert.match(renderer, /const appOwned=isAppOwnedQueuedPrompt\(item\)/);
   assert.match(renderer, /if\(!appOwned\)bindPromptQueueDrag\(row,threadId,item\.id\)/);
   assert.match(renderer, /meta\.textContent='Codex App'/);
-  assert.match(renderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
+  assert.doesNotMatch(renderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
+  assert.match(renderer, /queueActionButton\('pencil','编辑'/);
+  assert.match(renderer, /edit\.disabled=busy/);
   assert.match(renderer, /const busy=dispatching\|\|guiding\|\|steerSubmitting\|\|appQueueEditSaving/);
-  assert.match(renderer, /row\.appendChild\(guide\);\s*row\.appendChild\(remove\);\s*if\(!appOwned\)\{/);
+  assert.match(renderer, /row\.appendChild\(edit\);\s*row\.appendChild\(guide\);\s*row\.appendChild\(remove\);\s*if\(!appOwned\)\{/);
   assert.doesNotMatch(renderer, /if\(appOwned\)\{\s*promptQueueList\.appendChild\(row\);\s*return;/);
   assert.match(applyQueue, /if\(appQueueEditDraft\?\.threadId===threadId&&!appQueueEditSaving&&!clean\.some\(\(item\)=>item\.id===appQueueEditDraft\.itemId\)\)\{/);
   assert.match(applyQueue, /appQueueEditDraft=null;[\s\S]*?input\.value='';[\s\S]*?clearPendingAttachments\(\);[\s\S]*?该队列消息已在 Codex App 处理/);
@@ -943,7 +948,7 @@ test('Codex App queue entries keep direct actions but are never dispatched or mo
   assert.match(dispatch, /!item\|\|isAppOwnedQueuedPrompt\(item\)\|\|queueDispatchingThreads/);
   assert.match(loadConversation, /if\(conversationChanged&&appQueueEditSaving\)\{statusEl\.textContent='正在保存队列修改，请稍后切换会话';return false\}/);
   assert.match(loadConversation, /if\(conversationChanged&&appQueueEditDraft\)\{appQueueEditDraft=null;input\.value='';input\.style\.height='auto';clearPendingAttachments\(\)\}/);
-  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto (?:30|28)px/s);
+  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) (?:30|28)px auto (?:30|28)px/s);
   assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueBody:disabled/);
 });
 
@@ -1021,6 +1026,8 @@ test('live process timeline keeps note then tools order while streaming', () => 
 });
 
 test('task_complete keeps progress commentary and steering in chronological order', () => {
+  assert.match(inlineScript, /function finalizeTurnProcessCollection\(options=\{\}\)\{/);
+  assert.match(inlineScript, /function findTurnFinalAssistantElement\(turnId=''\)\{/);
   assert.match(inlineScript, /Keep assistant progress commentary in the completion timeline instead of dropping it\./);
   assert.match(inlineScript, /Interleave note -> tools -> note -> tools in chronological artifact order/);
   assert.match(inlineScript, /const flushPendingTools=\(\)=>\{/);
@@ -1030,12 +1037,24 @@ test('task_complete keeps progress commentary and steering in chronological orde
   assert.match(inlineScript, /function appendTurnProcessTimelineElement/);
   assert.match(inlineScript, /appendTurnProcessTimelineElement\(element,\{beforeTools:false\}\)/);
   assert.doesNotMatch(inlineScript, /for\(const item of artifacts\)\{if\(isProgressArtifact\(item\)&&item\.parentNode\)item\.remove\(\)\}/);
-  assert.match(inlineScript, /const completion=createCompletionMessage\(text,processElements,options\.turnId,elapsedSeconds,options\.tokenUsage\)/);
+  assert.match(inlineScript, /const completion=createCompletionMessage\(text,processElements,turnId,elapsedSeconds,options\.tokenUsage\|\|null\)/);
+  assert.match(inlineScript, /return finalizeTurnProcessCollection\(\{[\s\S]*?preferExistingFinal:true/);
   assert.match(inlineScript, /if\(collapsible\)el\.open=false/);
   assert.doesNotMatch(inlineScript, /if\(processElements\.some\([\s\S]*?\)\)completion\.open=true/);
   assert.doesNotMatch(inlineScript, /if\(processKeep\.length\)completion\.open=true/);
   const completedSteeringSource=sourceBetween('function completionTimelineForTurn', 'function consumeNativeOptimisticSteering');
   assert.doesNotMatch(completedSteeringSource, /completion\.open=true/);
+});
+
+test('hydration finalizes completed turns without task_complete and keeps only the active live panel', () => {
+  const loadSource=sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  assert.match(loadSource, /const hydrateShouldStartTurn=\(msg\)=>\{/);
+  assert.match(loadSource, /finalizeTurnProcessCollection\(\{[\s\S]*?preferExistingFinal:true/);
+  assert.match(loadSource, /msg\.role==='assistant'&&msg\.kind==='final_answer'/);
+  assert.match(loadSource, /const hasCompleteLater=messages\.slice\(index\+1\)\.some/);
+  assert.match(inlineScript, /If a previous turn never received task_complete, fold it into completion\+final first\./);
+  assert.match(inlineScript, /beginTurnProcessCollection\(startedAt='',showElapsed=false,turnId=''\)\{[\s\S]*?finalizeTurnProcessCollection\(\{[\s\S]*?preferExistingFinal:true/);
+  assert.doesNotMatch(inlineScript, /If a previous turn never received task_complete, keep its assistant progress instead of deleting it\./);
 });
 
 test('composerCollapsed defaults to a capsule input', () => {
@@ -1052,6 +1071,17 @@ test('composerCollapsed defaults to a capsule input', () => {
   assert.match(uiStyles, /border-radius:\s*999px !important/);
   assert.match(uiStyles, /body \.box\.composerCollapsed\.runActive > \.cancelButton/);
   assert.match(uiStyles, /body \.box\.composerExpanded > \.composerMicBtn/);
+});
+
+test('mobile collapsed capsule is more compact', () => {
+  const mobileStart = uiStyles.indexOf('@media (max-width: 820px)');
+  assert.ok(mobileStart >= 0);
+  const mobileCss = uiStyles.slice(mobileStart, mobileStart + 22000);
+  assert.match(mobileCss, /body \.box\.composerCollapsed\s*\{[^}]*grid-template-rows:\s*44px !important/s);
+  assert.match(mobileCss, /body \.box\.composerCollapsed\s*\{[^}]*min-height:\s*44px/s);
+  assert.match(mobileCss, /@media \(max-width: 460px\)[\s\S]*body \.box\.composerCollapsed\s*\{[^}]*grid-template-rows:\s*42px !important/s);
+  assert.match(mobileCss, /@media \(max-width: 460px\)[\s\S]*body \.box\.composerCollapsed\s*\{[^}]*min-height:\s*42px/s);
+  assert.match(mobileCss, /body \.box\.composerCollapsed > \.attachBtn,[\s\S]*?height:\s*32px !important/);
 });
 
 test('blue capsule reasoning slider matches reference chrome', () => {
@@ -1081,7 +1111,7 @@ test('reset while a native turn is still running reloads the conversation instea
     /if\(conversation\.reset\)\{\s*if\(webRunActive\|\|nativeLiveItems\.size\)\{[\s\S]*?if\(conversation\.status!=='running'\)/,
   );
   assert.match(inlineScript, /\['','message','commentary','final_answer'\]\.includes\(kind\)/);
-  assert.match(inlineScript, /const syncDelay=webRunActive&&currentConversationSource==='codex'\?80:260/);
+  assert.match(inlineScript, /const syncDelay=webRunActive&&currentConversationSource==='codex'\?40:90/);
   assert.match(inlineScript, /dataset\.nativeMessageSeq/);
 });
 

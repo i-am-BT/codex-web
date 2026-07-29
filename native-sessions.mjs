@@ -22,7 +22,7 @@ const DEFAULT_TURN_START_SCAN_BYTES = 32 * 1024 * 1024;
 const TURN_START_RECORD_LIMIT_BYTES = 256 * 1024;
 const DEFAULT_MAX_MESSAGES = 700;
 const DEFAULT_MAX_SESSIONS = 100;
-const DEFAULT_POLL_INTERVAL_MS = 3000;
+const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_RUNNING_WINDOW_MS = 6 * 60 * 60 * 1000;
 const MESSAGE_TEXT_LIMIT = 80000;
 const DETAIL_TEXT_LIMIT = 8000;
@@ -42,6 +42,7 @@ export class NativeSessionStore extends EventEmitter {
       options.sideChatStateFile || path.join(this.codexHome, 'codex-web-side-chat.json'),
     );
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
+    this.goalsDbFile = path.resolve(options.goalsDbFile || path.join(this.codexHome, 'goals_1.sqlite'));
     this.maxReadBytes = positiveNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
     this.turnStartScanBytes = positiveNumber(
       options.turnStartScanBytes,
@@ -57,6 +58,8 @@ export class NativeSessionStore extends EventEmitter {
     this.subagentThreads = new Map();
     this.titles = new Map();
     this.details = new Map();
+    this.threadGoals = new Map();
+    this.goalsStamp = '';
     this.sessionMetadataCache = new Map();
     this.indexStamp = '';
     this.workspaceStateAvailable = false;
@@ -92,6 +95,9 @@ export class NativeSessionStore extends EventEmitter {
             && relative !== 'state_5.sqlite'
             && relative !== 'state_5.sqlite-wal'
             && relative !== 'state_5.sqlite-shm'
+            && relative !== 'goals_1.sqlite'
+            && relative !== 'goals_1.sqlite-wal'
+            && relative !== 'goals_1.sqlite-shm'
             && !relative.startsWith('sessions/')
           ) return;
           this.scheduleRefresh();
@@ -124,12 +130,13 @@ export class NativeSessionStore extends EventEmitter {
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null;
       this.refresh();
-    }, 140);
+    }, 40);
     this.refreshTimer.unref?.();
   }
 
   refresh() {
     this.refreshTitles();
+    const goalChangedIds = this.refreshThreadGoals();
     const pinnedChangedIds = this.refreshWorkspaceState();
     this.refreshAppThreads();
     const nextEntries = scanSessionFiles(
@@ -145,6 +152,7 @@ export class NativeSessionStore extends EventEmitter {
         ...changedSessionIds(this.entries, nextEntries),
         ...changedSessionIds(this.subagentEntries, nextSubagentEntries),
         ...pinnedChangedIds,
+        ...goalChangedIds,
       ]),
     ];
     this.entries = nextEntries;
@@ -533,6 +541,61 @@ export class NativeSessionStore extends EventEmitter {
     this.stateSubagentThreadQuery = null;
   }
 
+  refreshThreadGoals() {
+    let stamp = '';
+    try {
+      const stat = statSync(this.goalsDbFile);
+      stamp = `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      stamp = '';
+    }
+    for (const suffix of ['-wal', '-shm']) {
+      try {
+        const stat = statSync(this.goalsDbFile + suffix);
+        stamp += `|${suffix}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+      } catch {}
+    }
+    if (stamp && stamp === this.goalsStamp) return [];
+
+    const previous = this.threadGoals;
+    const next = new Map();
+    try {
+      if (existsSync(this.goalsDbFile)) {
+        const db = new DatabaseSync(this.goalsDbFile, { readOnly: true, timeout: 500 });
+        try {
+          const rows = db.prepare(`
+            SELECT thread_id, goal_id, objective, status, token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms
+            FROM thread_goals
+          `).all();
+          for (const row of rows) {
+            const goal = normalizeThreadGoal(row, row.thread_id);
+            if (goal) next.set(goal.threadId, goal);
+          }
+        } finally {
+          try { db.close(); } catch {}
+        }
+      }
+      this.goalsStamp = stamp || 'empty';
+    } catch {
+      if (previous.size) return [];
+      this.goalsStamp = stamp || this.goalsStamp || 'error';
+      return [];
+    }
+
+    this.threadGoals = next;
+    const changed = [];
+    const ids = new Set([...previous.keys(), ...next.keys()]);
+    for (const id of ids) {
+      if (!sameThreadGoal(previous.get(id), next.get(id))) changed.push(id);
+    }
+    for (const id of changed) {
+      const cache = this.details.get(id);
+      if (!cache) continue;
+      attachThreadGoal(cache, next.get(id) || null);
+    }
+    return changed;
+  }
+
   refreshTitles() {
     let stamp = '';
     try {
@@ -671,6 +734,7 @@ export class NativeSessionStore extends EventEmitter {
       );
       cache.turnStartScanComplete = true;
     }
+    attachThreadGoal(cache, this.threadGoals.get(String(entry.id || '').trim().toLowerCase()) || null);
     return buildConversation(entry, cache, options, this.runningWindowMs);
   }
 
@@ -960,6 +1024,7 @@ function createDetailCache(entry, options) {
     messagesTruncated: startOffset > 0,
     calls: new Map(),
     metadata: { workspaceKind: entry.workspaceKind || '' },
+    goal: null,
     currentTurnId: '',
     previousTurnId: '',
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
@@ -1298,10 +1363,60 @@ function applyEventRecord(cache, record, payload, maxMessages) {
   switch (payload.type) {
     case 'thread_settings_applied': {
       const settings = payload.thread_settings;
-      if (!settings || typeof settings !== 'object' || !Object.hasOwn(settings, 'service_tier')) break;
-      const serviceTier = normalizeServiceTier(settings.service_tier);
-      if (serviceTier === undefined) break;
-      cache.metadata = { ...cache.metadata, serviceTier };
+      if (!settings || typeof settings !== 'object') break;
+      const next = { ...cache.metadata };
+      let changed = false;
+      if (Object.hasOwn(settings, 'service_tier')) {
+        const serviceTier = normalizeServiceTier(settings.service_tier);
+        if (serviceTier !== undefined) {
+          next.serviceTier = serviceTier;
+          changed = true;
+        }
+      }
+      if (Object.hasOwn(settings, 'model')) {
+        const model = String(settings.model || '').trim();
+        if (model) {
+          next.model = model;
+          changed = true;
+        }
+      }
+      if (Object.hasOwn(settings, 'model_provider_id') || Object.hasOwn(settings, 'model_provider')) {
+        const modelProvider = String(settings.model_provider_id || settings.model_provider || '').trim();
+        if (modelProvider) {
+          next.modelProvider = modelProvider;
+          changed = true;
+        }
+      }
+      if (Object.hasOwn(settings, 'effort') || Object.hasOwn(settings, 'reasoning_effort')) {
+        const reasoningEffort = String(settings.effort || settings.reasoning_effort || '').trim();
+        if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(reasoningEffort)) {
+          next.reasoningEffort = reasoningEffort;
+          changed = true;
+        }
+      }
+      if (Object.hasOwn(settings, 'approval_policy')) {
+        const approvalPolicy = String(settings.approval_policy || '').trim();
+        if (approvalPolicy) {
+          next.approvalPolicy = approvalPolicy;
+          changed = true;
+        }
+      }
+      if (Object.hasOwn(settings, 'approvals_reviewer')) {
+        const approvalsReviewer = String(settings.approvals_reviewer || '').trim();
+        if (approvalsReviewer) {
+          next.approvalsReviewer = approvalsReviewer;
+          changed = true;
+        }
+      }
+      if (Object.hasOwn(settings, 'sandbox_policy')) {
+        const sandboxPolicy = normalizeSandboxPolicy(settings.sandbox_policy);
+        if (sandboxPolicy) {
+          next.sandboxPolicy = sandboxPolicy;
+          changed = true;
+        }
+      }
+      if (!changed) break;
+      cache.metadata = next;
       break;
     }
     case 'task_started':
@@ -1343,6 +1458,14 @@ function applyEventRecord(cache, record, payload, maxMessages) {
         appendNativeMessage(cache, 'process', '上下文已自动压缩', record, maxMessages, payload.type);
       }
       break;
+    case 'thread_goal_updated': {
+      const goal = normalizeThreadGoal(payload.goal || payload, cache.id || payload.threadId || payload.thread_id);
+      if (goal) {
+        cache.goal = goal;
+        cache.contentMutated = true;
+      }
+      break;
+    }
     default:
       break;
   }
@@ -1405,27 +1528,41 @@ function isHandoffSummaryText(text) {
   if (
     plain === 'handoff'
     || plain === 'handoff summary'
+    || plain === 'compacted handoff summary'
     || plain === 'context checkpoint'
     || plain === 'current task'
     || plain === 'current progress'
     || plain.startsWith('handoff:')
     || plain.startsWith('handoff summary:')
+    || plain.startsWith('compacted handoff')
     || plain.startsWith('context checkpoint:')
     || plain.startsWith('current task:')
     || plain.startsWith('current progress:')
     || plain.startsWith('交接摘要')
     || /^\*\*handoff(?:\s+summary)?\*\*/i.test(firstLine)
+    || /^\*\*compacted handoff(?:\s+summary)?\*\*/i.test(firstLine)
     || /^\*\*current task\*\*/i.test(firstLine)
     || /^\*\*current progress\*\*/i.test(firstLine)
   ) return true;
   // Collab handoffs may omit a clean title but still ship the standard sections.
-  const head = normalized.slice(0, 1200).toLowerCase();
-  const hasGoal = head.includes('## goal') || head.includes('## 目标');
+  const head = normalized.slice(0, 2800).toLowerCase();
+  const hasGoal = head.includes('## goal') || head.includes('## 目标') || head.startsWith('goal\n') || head.startsWith('目标\n');
   const hasOps = head.includes('service / ops')
     || head.includes('immediate next steps')
     || head.includes('already done')
     || head.includes('key files')
-    || head.includes('constraints');
+    || head.includes('key decisions')
+    || head.includes('what remains')
+    || head.includes('critical references')
+    || head.includes('next immediate')
+    || head.includes('constraints')
+    || head.includes('current status')
+    || head.includes('key findings')
+    || head.includes('important constraints')
+    || head.includes('useful references')
+    || head.includes('open decisions')
+    || head.includes('likely design')
+    || head.includes('investigation started');
   return hasGoal && hasOps;
 }
 
@@ -1461,8 +1598,10 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
         cache.retryFallbackAssistant = null;
       }
     }
-    if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
-      messageKind = browserComments ? 'steering_browser_comment' : 'steering_user';
+    if (browserComments) {
+      messageKind = 'steering_browser_comment';
+    } else if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
+      messageKind = 'steering_user';
     }
     cache.displayUserMessagesInTurn += 1;
   }
@@ -1555,10 +1694,7 @@ function restoreRolledBackRetryAssistant(cache, maxMessages) {
     previousTurnId: cache.previousTurnId || undefined,
     retrySourceTurnId: fallback.retrySourceTurnId || fallback.turnId || undefined,
   });
-  if (cache.messages.length > maxMessages) {
-    cache.messages.splice(0, cache.messages.length - maxMessages);
-    cache.messagesTruncated = true;
-  }
+  trimNativeMessages(cache, maxMessages);
 }
 
 function isBrowserCommentsMessage(text) {
@@ -1788,17 +1924,48 @@ function normalizeUserDisplayText(text) {
   const commentsBlock = requestIndex === -1 ? normalized : normalized.slice(0, requestIndex);
   const requestBlock = requestIndex === -1 ? '' : normalized.slice(requestIndex + requestMarker.length);
   const parts = [];
-  const commentPattern = /^Comment:\s*\n([\s\S]*?)(?=\n(?:<in-app-browser-context\b|## Comment \d+\b)|$)/gm;
-  let match;
+  const pushPart = (value) => {
+    const clean = String(value || '').trim();
+    if (clean && !parts.includes(clean)) parts.push(clean);
+  };
 
-  while ((match = commentPattern.exec(commentsBlock))) {
-    const comment = match[1].trim();
-    if (comment && !parts.includes(comment)) parts.push(comment);
+  const commentPattern = /^Comment:\s*\n([\s\S]*?)(?=\n(?:<in-app-browser-context\b|## (?:User )?Comment \d+\b|## Requested annotation \d+\b)|$)/gm;
+  let match;
+  while ((match = commentPattern.exec(commentsBlock))) pushPart(match[1]);
+
+  const sectionPattern = /^## (?:User Comment|Comment|Requested annotation) \d+\s*$([\s\S]*?)(?=^## (?:User Comment|Comment|Requested annotation) \d+\s*$|^## My request for Codex:|<in-app-browser-context\b|\Z)/gm;
+  while ((match = sectionPattern.exec(commentsBlock))) {
+    const section = String(match[1] || '');
+    const explicit = section.match(/^Comment:\s*\n([\s\S]*)$/m)?.[1]
+      || section.match(/^Comment:\s*(.+)$/m)?.[1]
+      || '';
+    if (explicit.trim()) {
+      pushPart(explicit);
+      continue;
+    }
+    const cleanedSection = cleanUserRequest(section
+      .replace(/^File:\s*[^\n]*$/gm, '')
+      .replace(/^Node position:[^\n]*$/gm, '')
+      .replace(/^Untrusted page evidence[^\n]*$/gm, '')
+      .replace(/^Page URL:[^\n]*$/gm, '')
+      .replace(/^Frame:[^\n]*$/gm, '')
+      .replace(/^Target:[^\n]*$/gm, '')
+      .replace(/^Target selector:[^\n]*$/gm, '')
+      .replace(/^Target path:[^\n]*$/gm, '')
+      .replace(/^Nearby text:[^\n]*$/gm, '')
+      .replace(/^Area rectangle:[^\n]*$/gm, '')
+      .replace(/^Saved marker screenshot:[^\n]*$/gm, '')
+      .replace(/^Annotated screenshot:[^\n]*$/gm, '')
+      .replace(/^Attached image:[^\n]*$/gm, '')
+      .replace(/^Browser annotation:[\s\S]*?(?=^Comment:|\Z)/gm, ''));
+    pushPart(cleanedSection);
   }
 
   const request = cleanUserRequest(requestBlock);
-  if (request && !parts.includes(request)) parts.push(request);
-
+  if (request) {
+    // Prefer the explicit user request when browser-comment scaffolding surrounds it.
+    return request;
+  }
   return parts.length ? parts.join('\n\n') : cleanUserRequest(normalized);
 }
 
@@ -1841,10 +2008,89 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind, me
     previousTurnId: cache.previousTurnId || undefined,
     ...(metadata && typeof metadata === 'object' ? metadata : {}),
   });
-  if (cache.messages.length > maxMessages) {
-    cache.messages.splice(0, cache.messages.length - maxMessages);
+  trimNativeMessages(cache, maxMessages);
+}
+
+function isProtectedNativeMessage(message) {
+  const role = message?.role;
+  if (role === 'user' || role === 'assistant' || role === 'image') return true;
+  if (role === 'context' && ['handoff_summary', 'turn_aborted'].includes(String(message?.kind || ''))) return true;
+  return false;
+}
+
+function isDroppableNativeMessage(message) {
+  const role = message?.role;
+  return role === 'tool' || role === 'process' || role === 'thinking';
+}
+
+function trimNativeMessages(cache, maxMessages) {
+  const limit = Number(maxMessages);
+  if (!Number.isInteger(limit) || limit <= 0) return;
+  if (!Array.isArray(cache.messages) || cache.messages.length <= limit) return;
+
+  let messages = cache.messages;
+  const overflow = messages.length - limit;
+  const dropIndexes = [];
+  for (let index = 0; index < messages.length && dropIndexes.length < overflow; index += 1) {
+    if (isDroppableNativeMessage(messages[index])) dropIndexes.push(index);
+  }
+  if (dropIndexes.length) {
+    const dropSet = new Set(dropIndexes);
+    messages = messages.filter((_, index) => !dropSet.has(index));
     cache.messagesTruncated = true;
   }
+
+  if (messages.length > limit) {
+    const protectedMessages = messages.filter((message) => isProtectedNativeMessage(message));
+    if (protectedMessages.length <= limit) {
+      const room = limit - protectedMessages.length;
+      const droppable = messages.filter((message) => !isProtectedNativeMessage(message));
+      const keepDroppable = new Set(droppable.slice(-room));
+      messages = messages.filter((message) => (
+        isProtectedNativeMessage(message) || keepDroppable.has(message)
+      ));
+    } else {
+      const keepProtected = new Set(protectedMessages.slice(-limit));
+      messages = messages.filter((message) => keepProtected.has(message));
+    }
+    cache.messagesTruncated = true;
+  }
+
+  cache.messages = messages;
+}
+
+function selectRecentNativeMessages(visibleMessages, limit) {
+  if (!limit || !Array.isArray(visibleMessages) || visibleMessages.length <= limit) {
+    return visibleMessages;
+  }
+
+  const tail = visibleMessages.slice(-limit);
+  const tailProtected = tail.filter((message) => isProtectedNativeMessage(message));
+  const tailUsers = tailProtected.filter((message) => message.role === 'user').length;
+  const tailAssistants = tailProtected.filter((message) => message.role === 'assistant').length;
+  const tailDroppable = tail.length - tailProtected.length;
+  const toolHeavy = tailDroppable >= Math.ceil(limit * 0.75);
+  // Keep chronological tails for normal chats. Only rebalance when the window is
+  // almost pure tool/process noise and would hide the actual conversation body.
+  if ((tailUsers > 0 || tailAssistants > 0) && !toolHeavy) return tail;
+  if (tailUsers > 0 && tailAssistants > 0) return tail;
+
+  const keep = new Set(tail);
+  const newestProtected = [];
+  for (let index = visibleMessages.length - 1; index >= 0; index -= 1) {
+    const message = visibleMessages[index];
+    if (!isProtectedNativeMessage(message)) continue;
+    newestProtected.push(message);
+    if (newestProtected.length >= Math.min(limit, Math.max(6, Math.floor(limit / 2)))) break;
+  }
+  for (const message of newestProtected) {
+    if (keep.has(message)) continue;
+    const dropCandidate = [...keep].find((item) => isDroppableNativeMessage(item));
+    if (!dropCandidate) break;
+    keep.delete(dropCandidate);
+    keep.add(message);
+  }
+  return visibleMessages.filter((message) => keep.has(message));
 }
 
 function tryMergeAssistantMessage(cache, role, clean, record, kind, metadata = null) {
@@ -2225,6 +2471,70 @@ function normalizeServiceTier(value) {
   return undefined;
 }
 
+const THREAD_GOAL_STATUSES = new Set([
+  'active',
+  'paused',
+  'blocked',
+  'usage_limited',
+  'budget_limited',
+  'complete',
+]);
+
+function normalizeThreadGoal(raw, fallbackThreadId = '') {
+  if (!raw || typeof raw !== 'object') return null;
+  const threadId = String(raw.threadId || raw.thread_id || fallbackThreadId || '').trim().toLowerCase();
+  const objective = String(raw.objective || '').trim();
+  const status = String(raw.status || '').trim().toLowerCase();
+  if (!threadId || !objective || !THREAD_GOAL_STATUSES.has(status)) return null;
+  const createdAtRaw = raw.createdAtMs ?? raw.created_at_ms ?? raw.createdAt ?? raw.created_at;
+  const updatedAtRaw = raw.updatedAtMs ?? raw.updated_at_ms ?? raw.updatedAt ?? raw.updated_at;
+  const toMs = (value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return 0;
+    return number < 1e12 ? Math.floor(number * 1000) : Math.floor(number);
+  };
+  const createdAtMs = toMs(createdAtRaw);
+  const updatedAtMs = toMs(updatedAtRaw);
+  const tokenBudgetRaw = raw.tokenBudget ?? raw.token_budget;
+  const tokenBudgetNumber = tokenBudgetRaw == null || tokenBudgetRaw === ''
+    ? null
+    : Math.max(0, Math.floor(Number(tokenBudgetRaw) || 0));
+  return {
+    threadId,
+    goalId: String(raw.goalId || raw.goal_id || '').trim() || null,
+    objective,
+    status,
+    tokenBudget: Number.isFinite(tokenBudgetNumber) ? tokenBudgetNumber : null,
+    tokensUsed: Math.max(0, Math.floor(Number(raw.tokensUsed ?? raw.tokens_used) || 0)),
+    timeUsedSeconds: Math.max(0, Math.floor(Number(raw.timeUsedSeconds ?? raw.time_used_seconds) || 0)),
+    createdAtMs: createdAtMs || 0,
+    updatedAtMs: updatedAtMs || createdAtMs || 0,
+  };
+}
+
+function sameThreadGoal(left, right) {
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+  return left.threadId === right.threadId
+    && left.goalId === right.goalId
+    && left.objective === right.objective
+    && left.status === right.status
+    && left.tokenBudget === right.tokenBudget
+    && left.tokensUsed === right.tokensUsed
+    && left.timeUsedSeconds === right.timeUsedSeconds
+    && left.createdAtMs === right.createdAtMs
+    && left.updatedAtMs === right.updatedAtMs;
+}
+
+function attachThreadGoal(cache, goal) {
+  if (!cache) return false;
+  const next = goal ? { ...goal } : null;
+  if (sameThreadGoal(cache.goal, next)) return false;
+  cache.goal = next;
+  cache.contentMutated = true;
+  return true;
+}
+
 function buildConversation(entry, cache, options, runningWindowMs) {
   const after = Number(options.after);
   const requestedGeneration = Number(options.generation);
@@ -2240,7 +2550,9 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     ? cache.messages.filter((message) => message.seq > after)
     : cache.messages;
   const visibleMessages = availableMessages.filter((message) => !shouldHideHandoffMessage(message));
-  const messages = limit && (!hasAfter || reset) ? visibleMessages.slice(-limit) : visibleMessages;
+  const messages = limit && (!hasAfter || reset)
+    ? selectRecentNativeMessages(visibleMessages, limit)
+    : visibleMessages;
 
   return {
     id: entry.id,
@@ -2259,6 +2571,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     reset,
     revision: `${entry.ino}:${entry.size}:${entry.mtimeMs}`,
     metadata: { ...cache.metadata, workspaceKind: entry.workspaceKind || '' },
+    goal: cache.goal ? { ...cache.goal } : null,
     messages: messages.map((message) => ({ ...message })),
   };
 }

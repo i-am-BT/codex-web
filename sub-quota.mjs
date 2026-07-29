@@ -92,7 +92,126 @@ export class SubQuotaService {
 
   async fetchSource(source, fetchedAt) {
     if (source.provider === 'cpa-codex') return this.fetchCpaCodexSource(source, fetchedAt);
+    if (source.provider === 'grok2api') return this.fetchGrok2ApiSource(source, fetchedAt);
     return this.fetchSub2ApiSource(source, fetchedAt);
+  }
+
+  async fetchGrok2ApiSource(source, fetchedAt) {
+    const base = { id: source.id, name: source.name, provider: 'grok2api', fetchedAt };
+    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+
+    try {
+      const summary = await this.fetchGrok2ApiSummary(source);
+      return [{ ...base, ...normalizeGrok2ApiSummary(summary) }];
+    } catch (error) {
+      return [fetchErrorQuota(base, error, { sourceWide: true })];
+    }
+  }
+
+  async fetchGrok2ApiSummary(source) {
+    const data = await this.requestGrok2ApiJson(source, '/api/admin/v1/accounts/summary');
+    const summary = unwrapGrok2ApiData(data);
+    if (!isRecord(summary)) throw new Error('Grok2API 账号汇总响应无效');
+    return summary;
+  }
+
+  async resetGrok2ApiQuota(source, options = {}) {
+    if (!source || source.provider !== 'grok2api') throw new Error('未配置 Grok2API 额度来源');
+    if (!source.apiKey) throw new Error(`缺少环境变量 ${source.apiKeyEnv || 'GROK2API_ADMIN_PASSWORD'}`);
+    const ids = Array.isArray(options.ids)
+      ? options.ids.map((id) => cleanText(id, 64)).filter(Boolean)
+      : [];
+    const provider = cleanText(options.accountProvider, 40);
+    let data;
+    if (ids.length) {
+      data = await this.requestGrok2ApiJson(source, '/api/admin/v1/accounts/batch/reset-quota', {
+        method: 'POST',
+        body: {
+          ids,
+          ...(provider ? { provider } : {}),
+        },
+      });
+    } else {
+      data = await this.requestGrok2ApiJson(source, '/api/admin/v1/accounts/reset-quota', {
+        method: 'POST',
+        body: {},
+      });
+    }
+    this.cache = null;
+    const payload = unwrapGrok2ApiData(data);
+    return {
+      ok: true,
+      reset: nonNegativeInteger(payload?.reset ?? data?.reset ?? ids.length) ?? (ids.length || null),
+      raw: isRecord(payload) ? payload : (isRecord(data) ? data : {}),
+    };
+  }
+
+  async requestGrok2ApiJson(source, path, options = {}) {
+    const { username, password } = parseGrok2ApiCredentials(source.apiKey);
+    if (!password) throw new Error('Grok2API 管理员密码不能为空');
+    const token = await this.loginGrok2Api(source, username, password);
+    const headers = {
+      Accept: 'application/json',
+      Authorization: `Bearer ${token}`,
+      ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+      ...(options.headers || {}),
+    };
+    const request = {
+      method: options.method || 'GET',
+      headers,
+    };
+    if (options.body !== undefined) request.body = JSON.stringify(options.body);
+    try {
+      return await this.requestJson(`${source.baseUrl}${path}`, request);
+    } catch (error) {
+      if (Number(error?.statusCode || 0) !== 401) throw error;
+      const retryToken = await this.loginGrok2Api(source, username, password, { force: true });
+      return this.requestJson(`${source.baseUrl}${path}`, {
+        ...request,
+        headers: {
+          ...headers,
+          Authorization: `Bearer ${retryToken}`,
+        },
+      });
+    }
+  }
+
+  async loginGrok2Api(source, username, password, { force = false } = {}) {
+    if (!this.grok2ApiTokens) this.grok2ApiTokens = new Map();
+    const cacheKey = `${source.baseUrl}::${username}`;
+    const cached = this.grok2ApiTokens.get(cacheKey);
+    const now = this.now();
+    if (!force && cached?.token && cached.expiresAt > now + 5000) return cached.token;
+
+    const data = await this.requestJson(`${source.baseUrl}/api/admin/v1/auth/login`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ username, password }),
+    });
+    const payload = unwrapGrok2ApiData(data);
+    const token = cleanText(
+      payload?.tokens?.accessToken
+      || payload?.accessToken
+      || data?.tokens?.accessToken
+      || data?.accessToken,
+      4096,
+    );
+    if (!token) throw new Error('Grok2API 登录未返回 accessToken');
+    const expiresAtText = cleanDate(
+      payload?.tokens?.accessTokenExpiresAt
+      || payload?.accessTokenExpiresAt
+      || data?.tokens?.accessTokenExpiresAt
+      || data?.accessTokenExpiresAt,
+    );
+    const expiresAt = expiresAtText ? Date.parse(expiresAtText) : now + 10 * 60 * 1000;
+    this.grok2ApiTokens.set(cacheKey, {
+      token,
+      expiresAt: Number.isFinite(expiresAt) ? expiresAt : now + 10 * 60 * 1000,
+    });
+    return token;
   }
 
   async fetchSourceWithFallback(source, fetchedAt) {
@@ -313,7 +432,7 @@ export function parseSubQuotaSources(value, env = process.env) {
       apiKeyEnv,
       apiKey: String(env[apiKeyEnv] || '').trim(),
       baseUrl,
-      usageUrl: provider === 'cpa-codex' ? '' : `${baseUrl}/v1/usage`,
+      usageUrl: provider === 'sub2api' ? `${baseUrl}/v1/usage` : '',
     };
   });
 }
@@ -405,37 +524,179 @@ export function normalizeCpaCodexQuota(data, file = {}) {
 }
 
 
+export function normalizeGrok2ApiSummary(data) {
+  if (!isRecord(data)) throw new Error('Grok2API 账号汇总响应无效');
+  const recovering = nonNegativeInteger(data.recovering) ?? 0;
+  const attention = nonNegativeInteger(data.attention) ?? 0;
+  const risk = nonNegativeInteger(data.risk) ?? 0;
+  const issues = isRecord(data.issues) ? data.issues : {};
+  const recovery = isRecord(data.recovery) ? data.recovery : {};
+  const disabled = nonNegativeInteger(issues.disabled) ?? 0;
+  const reauthRequired = nonNegativeInteger(issues.reauthRequired) ?? 0;
+  const waitingReset = nonNegativeInteger(recovery.waitingReset) ?? 0;
+  const probing = nonNegativeInteger(recovery.probing) ?? 0;
+  const cooldown = nonNegativeInteger(recovery.cooldown) ?? 0;
+
+  const providers = {};
+  if (isRecord(data.providers)) {
+    for (const [key, value] of Object.entries(data.providers)) {
+      if (!isRecord(value)) continue;
+      const providerTotal = nonNegativeInteger(value.total) ?? 0;
+      const providerAvailable = nonNegativeInteger(value.available) ?? 0;
+      providers[cleanText(key, 40) || key] = {
+        total: providerTotal,
+        available: providerAvailable,
+        abnormal: Math.max(0, providerTotal - providerAvailable),
+      };
+    }
+  }
+
+  // Callable quota is intentionally scoped to the grok_build pool only.
+  const buildPool = providers.grok_build || providers.grokBuild || {
+    total: 0,
+    available: 0,
+    abnormal: 0,
+  };
+  const total = nonNegativeInteger(buildPool.total) ?? 0;
+  const available = nonNegativeInteger(buildPool.available) ?? 0;
+  const abnormal = Math.max(0, total - available);
+  const used = Math.max(0, total - available);
+  const usagePercent = total > 0 ? Math.min(100, Math.max(0, (used / total) * 100)) : 0;
+
+  return {
+    valid: true,
+    mode: 'grok2api_accounts',
+    status: available > 0 ? 'active' : (total > 0 ? 'quota_exhausted' : 'no_access'),
+    planName: 'Grok2API Build',
+    unit: 'accounts',
+    remaining: available,
+    balance: available,
+    quota: {
+      ...quotaWindow(used, total, available),
+      unit: 'accounts',
+    },
+    subscription: null,
+    rateLimits: total > 0 ? [{
+      id: 'grok-build-accounts',
+      window: '30d',
+      used,
+      limit: total,
+      remaining: available,
+      resetAt: '',
+    }] : [],
+    expiresAt: '',
+    daysUntilExpiry: null,
+    today: null,
+    total: null,
+    supportsReset: true,
+    accountStats: {
+      pool: 'grok_build',
+      total,
+      available,
+      abnormal,
+      recovering,
+      attention,
+      risk,
+      disabled,
+      reauthRequired,
+      waitingReset,
+      probing,
+      cooldown,
+      usagePercent,
+      providers,
+    },
+  };
+}
+
 export async function detectSubQuotaProvider(baseUrl, apiKey, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = positiveNumber(options.timeoutMs, DEFAULT_TIMEOUT_MS);
   const key = String(apiKey || '').trim();
   if (!key) throw new Error('API Key 不能为空');
+  const preferred = normalizeProvider(options.provider);
 
-  const cpaBase = normalizeSubQuotaBaseUrl(baseUrl, { provider: 'cpa-codex' });
-  const subBase = normalizeSubQuotaBaseUrl(baseUrl, { provider: 'sub2api' });
-
-  const tryRequest = async (url, headers) => {
+  const tryRequest = async (url, init = {}) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetchImpl(url, {
-        method: 'GET',
-        headers,
+        method: init.method || 'GET',
+        headers: init.headers,
+        body: init.body,
         redirect: 'error',
         signal: controller.signal,
       });
-      const text = await response.text().catch(() => '');
+      const textBody = await response.text().catch(() => '');
       let data = null;
-      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-      return { ok: response.ok, status: response.status, data, text };
+      try { data = textBody ? JSON.parse(textBody) : null; } catch { data = textBody; }
+      return { ok: response.ok, status: response.status, data, text: textBody };
     } finally {
       clearTimeout(timeout);
     }
   };
 
-  // Prefer CPA management probe first when the host exposes /v0/management.
+  const probeGrok = async () => {
+    const grokBase = normalizeSubQuotaBaseUrl(baseUrl, { provider: 'grok2api' });
+    const { username, password } = parseGrok2ApiCredentials(key);
+    const login = await tryRequest(`${grokBase}/api/admin/v1/auth/login`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ username, password }),
+    });
+    if (login.status === 401 || login.status === 403) {
+      throw new Error('Grok2API 管理员账号或密码无效');
+    }
+    if (!login.ok) return null;
+    const payload = unwrapGrok2ApiData(login.data);
+    const token = cleanText(
+      payload?.tokens?.accessToken
+      || payload?.accessToken
+      || login.data?.tokens?.accessToken
+      || login.data?.accessToken,
+      4096,
+    );
+    if (!token) return null;
+    const summary = await tryRequest(`${grokBase}/api/admin/v1/accounts/summary`, {
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    if (summary.ok) {
+      return {
+        provider: 'grok2api',
+        baseUrl: grokBase,
+        label: 'Grok2API',
+        detail: '已识别为 Grok2API 管理接口',
+      };
+    }
+    if (summary.status === 401 || summary.status === 403) {
+      throw new Error('Grok2API 管理员登录成功但汇总接口无权限');
+    }
+    return {
+      provider: 'grok2api',
+      baseUrl: grokBase,
+      label: 'Grok2API',
+      detail: '已识别为 Grok2API 管理登录',
+    };
+  };
+
+  if (preferred === 'grok2api') {
+    const grok = await probeGrok();
+    if (grok) return grok;
+    throw new Error('无法识别为 Grok2API，请确认 URL 与管理员密码');
+  }
+
+  const cpaBase = normalizeSubQuotaBaseUrl(baseUrl, { provider: 'cpa-codex' });
+  const subBase = normalizeSubQuotaBaseUrl(baseUrl, { provider: 'sub2api' });
+
   try {
-    const cpa = await tryRequest(`${cpaBase}/v0/management/auth-files`, managementHeaders(key));
+    const cpa = await tryRequest(`${cpaBase}/v0/management/auth-files`, {
+      headers: managementHeaders(key),
+    });
     if (cpa.ok) {
       return {
         provider: 'cpa-codex',
@@ -445,23 +706,23 @@ export async function detectSubQuotaProvider(baseUrl, apiKey, options = {}) {
       };
     }
   } catch {
-    // fall through to Sub2API probe
+    // fall through
+  }
+
+  try {
+    const grok = await probeGrok();
+    if (grok) return grok;
+  } catch {
+    // fall through to Sub2API
   }
 
   try {
     const sub = await tryRequest(`${subBase}/v1/usage`, {
-      Accept: 'application/json',
-      Authorization: `Bearer ${key}`,
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${key}`,
+      },
     });
-    if (sub.ok && isRecord(sub.data)) {
-      return {
-        provider: 'sub2api',
-        baseUrl: subBase,
-        label: 'Sub2API',
-        detail: '已识别为 Sub2API /v1/usage',
-      };
-    }
-    // Some Sub2API forks return non-object but still 200 with usage body; accept JSON text.
     if (sub.ok) {
       return {
         provider: 'sub2api',
@@ -474,9 +735,10 @@ export async function detectSubQuotaProvider(baseUrl, apiKey, options = {}) {
     // fall through
   }
 
-  // Last resort: if CPA returned auth error (reachable management), treat as CPA.
   try {
-    const cpa = await tryRequest(`${cpaBase}/v0/management/auth-files`, managementHeaders(key));
+    const cpa = await tryRequest(`${cpaBase}/v0/management/auth-files`, {
+      headers: managementHeaders(key),
+    });
     if (cpa.status === 401 || cpa.status === 403) {
       throw new Error('CPA Management Key 无效或无权限');
     }
@@ -484,12 +746,23 @@ export async function detectSubQuotaProvider(baseUrl, apiKey, options = {}) {
     if (String(error?.message || '').includes('Management Key')) throw error;
   }
 
-  throw new Error('无法识别上游服务，请确认 URL/Key 对应 CPA Management 或 Sub2API');
+  try {
+    const grok = await probeGrok();
+    if (grok) return grok;
+  } catch (error) {
+    if (String(error?.message || '').includes('Grok2API')) throw error;
+  }
+
+  throw new Error('无法识别上游服务，请确认 URL/Key 对应 CPA Management、Grok2API 或 Sub2API');
 }
 
 export function normalizeSubQuotaBaseUrl(value, options = {}) {
   const provider = normalizeProvider(options.provider);
-  const label = provider === 'cpa-codex' ? 'CPA Management URL' : 'API URL';
+  const label = provider === 'cpa-codex'
+    ? 'CPA Management URL'
+    : provider === 'grok2api'
+      ? 'Grok2API URL'
+      : 'API URL';
   const text = String(value || '').trim();
   if (!text) throw new Error(`${label} 不能为空`);
   if (text.length > MAX_BASE_URL_LENGTH || /[\r\n\0]/.test(text)) {
@@ -511,6 +784,12 @@ export function normalizeSubQuotaBaseUrl(value, options = {}) {
     pathname = pathname
       .replace(/\/v0\/management(?:\/.*)?$/i, '')
       .replace(/\/v0$/i, '')
+      .replace(/\/v1\/usage$/i, '')
+      .replace(/\/v1$/i, '');
+  } else if (provider === 'grok2api') {
+    pathname = pathname
+      .replace(/\/api\/admin(?:\/.*)?$/i, '')
+      .replace(/\/admin(?:\/.*)?$/i, '')
       .replace(/\/v1\/usage$/i, '')
       .replace(/\/v1$/i, '');
   } else {
@@ -601,7 +880,37 @@ function normalizeProvider(value) {
   const text = cleanText(value, 40).toLowerCase();
   if (!text || text === 'sub2api' || text === 'sub') return 'sub2api';
   if (text === 'cpa' || text === 'cpa-codex' || text === 'codex' || text === 'cliproxyapi') return 'cpa-codex';
+  if (text === 'grok2api' || text === 'grok' || text === 'grok-api' || text === 'grok_api') return 'grok2api';
   return 'sub2api';
+}
+
+function parseGrok2ApiCredentials(apiKey) {
+  const raw = String(apiKey || '').trim();
+  if (!raw) return { username: 'admin', password: '' };
+  const newline = String.fromCharCode(10);
+  const separators = [newline, '|', '::'];
+  for (const separator of separators) {
+    if (!raw.includes(separator)) continue;
+    const [username, ...rest] = raw.split(separator);
+    const password = rest.join(separator).trim();
+    if (username.trim() && password) {
+      return { username: username.trim().slice(0, 80), password: password.slice(0, 4096) };
+    }
+  }
+  if (raw.includes(':')) {
+    const index = raw.indexOf(':');
+    const username = raw.slice(0, index).trim();
+    const password = raw.slice(index + 1).trim();
+    if (username && password && username.length <= 64 && !/\s/.test(username) && !username.includes('.')) {
+      return { username: username.slice(0, 80), password: password.slice(0, 4096) };
+    }
+  }
+  return { username: 'admin', password: raw.slice(0, 4096) };
+}
+
+function unwrapGrok2ApiData(data) {
+  if (isRecord(data) && isRecord(data.data)) return data.data;
+  return data;
 }
 
 function managementHeaders(apiKey) {

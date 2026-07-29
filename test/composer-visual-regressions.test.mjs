@@ -190,6 +190,10 @@ test('Fast mode is an accessible model capability beside the reasoning slider', 
 
   assert.match(serverSource, /composerFastToggle\.className='composerFastToggle(?: hidden)?'/);
   assert.match(serverSource, /setIconLabel\(composerFastToggle,'zap','Fast',true\)/);
+  assert.match(serverSource, /function syncNativeComposerServiceTier/);
+  assert.match(serverSource, /thread\/settings\/update/);
+  assert.match(serverSource, /syncNative=true/);
+  assert.match(serverSource, /body:JSON\.stringify\(\{serviceTier:requested\}\)/);
   assert.match(
     uiStyles,
     /\.composerReasoningInline\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\) auto/s,
@@ -214,7 +218,7 @@ test('permission picker mirrors native approval profiles and preserves custom co
     permissionMode: 'ask', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'user',
   });
   assert.deepEqual(permissionSettings({ permissionMode: 'auto' }), {
-    permissionMode: 'auto', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'guardian_subagent',
+    permissionMode: 'auto', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'auto_review',
   });
   assert.deepEqual(permissionSettings({ permissionMode: 'full' }), {
     permissionMode: 'full', sandbox: 'danger-full-access', approval: 'never', approvalsReviewer: 'user',
@@ -232,7 +236,7 @@ test('permission picker mirrors native approval profiles and preserves custom co
   );
   assert.match(
     serverSource,
-    /requestedMode === 'auto'[\s\S]*permissionMode: 'auto', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'guardian_subagent'/,
+    /requestedMode === 'auto'[\s\S]*permissionMode: 'auto', sandbox: 'workspace-write', approval: 'on-request', approvalsReviewer: 'auto_review'/,
   );
   assert.match(
     serverSource,
@@ -243,6 +247,9 @@ test('permission picker mirrors native approval profiles and preserves custom co
     /requestedMode === 'custom'[\s\S]*permissionMode: 'custom', sandbox: undefined, approval: undefined, approvalsReviewer: undefined/,
   );
   assert.match(serverSource, /useAppServerPermissionDefault: turn\.permissionMode === 'custom' \? true : undefined/);
+  assert.match(serverSource, /function isAutoApprovalsReviewer\(value\)/);
+  assert.match(serverSource, /isAutoApprovalsReviewer\(metadata\.approvalsReviewer\)/);
+  assert.match(serverSource, /\['auto_review', 'guardian_subagent'\]/);
   assert.match(serverSource, /options\.setAttribute\('role','radiogroup'\)/);
   assert.match(serverSource, /option\.setAttribute\('role','radio'\)/);
   assert.match(serverSource, /option\.setAttribute\('aria-checked',String\(selected\)\)/);
