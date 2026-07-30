@@ -155,6 +155,125 @@ index 5fc1614..2ec9586 100644
    return (
      <>
        <Header />
+diff --git a/src/components/AgentWorkspace.tsx b/src/components/AgentWorkspace.tsx
+index 2c51e32..ea1dbab 100644
+--- a/src/components/AgentWorkspace.tsx
++++ b/src/components/AgentWorkspace.tsx
+@@ -780,6 +780,15 @@ export default function AgentWorkspace() {
+                 const hasRoundFavoriteTasks = favoriteTasksForRound.length > 0
+                 const allRoundTasksFavorited = hasRoundFavoriteTasks && favoriteTasksForRound.every((task) => task.isFavorite)
+                 const assistantBlocks = isAssistant ? getAgentAssistantBlocks(round ?? null, taskSlotsForRound, tasks, Boolean(message.content.trim())) : []
++                const suppressCompletedImageTimeout = isAssistant
++                  && round?.status === 'error'
++                  && taskSlotsForRound.length > 0
++                  && taskSlotsForRound.every((slot) => slot.task?.status === 'done' && slot.task.outputImages.length > 0)
++                  && /failed to stream request:\s*stream first event timeout/i.test(round.error ?? message.content)
++                const visibleAssistantBlocks = suppressCompletedImageTimeout
++                  ? assistantBlocks.filter((block) => block.type !== 'text')
++                  : assistantBlocks
++                const visibleAssistantText = suppressCompletedImageTimeout ? '' : message.content
+                 const inputImagesForRound = (round?.inputImageIds || []).map(id => ({ id, dataUrl: '' }))
+                 const parts = getPromptMentionParts(message.content, inputImagesForRound)
+                 return (
+@@ -817,41 +826,57 @@ export default function AgentWorkspace() {
+                       </div>
+                     )}
+
+-                    {round?.status === 'error' && isAssistant && message.content.startsWith('请求失败：') ? (
+-                      <div
+-                        data-selectable-text
+-                        className="-m-2 flex cursor-copy select-text flex-col rounded-xl p-2 transition-colors hover:bg-red-50/60 dark:hover:bg-red-500/5"
+-                        title="点击复制完整报错"
+-                        onPointerDown={handleErrorCopyPointerDown}
+-                        onClick={(e) => handleErrorCopyClick(e, message.content)}
+-                      >
+-                        {(() => {
+-                          const content = message.content.replace(/^请求失败：/, '');
+-                          const [mainErr, ...hints] = content.split('\n提示：');
+-                          return (
+-                            <>
+-                              <div className="flex items-start gap-2 text-red-500 dark:text-red-400">
+-                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-[18px] h-[18px] mt-[1.5px] flex-shrink-0">
+-                                  <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-8-5a.75.75 0 01.75.75v4.5a.75.75 0 01-1.5 0v-4.5A.75.75 0 0110 5zm0 10a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+-                                </svg>
+-                                <div className="whitespace-pre-wrap text-[14px] leading-relaxed break-words font-medium">
+-                                  {mainErr}
+-                                </div>
+-                              </div>
+-                              {hints.length > 0 && (
+-                                <div className="pl-[26px] mt-1.5 whitespace-pre-wrap text-[13px] leading-relaxed text-gray-500 dark:text-gray-400 break-words opacity-90">
+-                                  <span className="font-medium">提示：</span>{hints.join('\n提示：')}
++                    {round?.status === 'error' && isAssistant && message.content.startsWith('请求失败：') && !suppressCompletedImageTimeout ? (
++                      <>
++                        <div
++                          data-selectable-text
++                          className="-m-2 flex cursor-copy select-text flex-col rounded-xl p-2 transition-colors hover:bg-red-50/60 dark:hover:bg-red-500/5"
++                          title="点击复制完整报错"
++                          onPointerDown={handleErrorCopyPointerDown}
++                          onClick={(e) => handleErrorCopyClick(e, message.content)}
++                        >
++                          {(() => {
++                            const content = message.content.replace(/^请求失败：/, '');
++                            const [mainErr, ...hints] = content.split('\n提示：');
++                            return (
++                              <>
++                                <div className="flex items-start gap-2 text-red-500 dark:text-red-400">
++                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-[18px] h-[18px] mt-[1.5px] flex-shrink-0">
++                                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-8-5a.75.75 0 01.75.75v4.5a.75.75 0 01-1.5 0v-4.5A.75.75 0 0110 5zm0 10a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
++                                  </svg>
++                                  <div className="whitespace-pre-wrap text-[14px] leading-relaxed break-words font-medium">
++                                    {mainErr}
++                                  </div>
+                                 </div>
+-                              )}
+-                            </>
+-                          );
+-                        })()}
+-                      </div>
++                                {hints.length > 0 && (
++                                  <div className="pl-[26px] mt-1.5 whitespace-pre-wrap text-[13px] leading-relaxed text-gray-500 dark:text-gray-400 break-words opacity-90">
++                                    <span className="font-medium">提示：</span>{hints.join('\n提示：')}
++                                  </div>
++                                )}
++                              </>
++                            );
++                          })()}
++                        </div>
++                        {assistantBlocks
++                          .filter((block) => block.type === 'image-task' && block.task.outputImages.length > 0)
++                          .map((block) => block.type === 'image-task' && (
++                            <div key={block.key} className="mt-4 max-w-sm" onClick={e => e.stopPropagation()}>
++                              <TaskCard
++                                task={block.task}
++                                disableSwipe={true}
++                                onClick={() => setDetailTaskId(block.task.id)}
++                                onReuse={() => handleReuse(block.task)}
++                                onEditOutputs={() => editOutputs(block.task)}
++                                onDelete={() => setConfirmDialog({ title: '删除任务', message: '确定要删除这个任务吗？', action: () => removeTask(block.task) })}
++                              />
++                            </div>
++                          ))}
++                      </>
+                     ) : (
+                       <div data-selectable-text className={`text-[15px] leading-relaxed text-gray-800 dark:text-gray-100 ${!isAssistant ? 'select-text' : ''}`}>
+                         {isAssistant ? (
+                           <>
+-                            {assistantBlocks.length > 0 ? assistantBlocks.map((block, index) => {
++                            {visibleAssistantBlocks.length > 0 ? visibleAssistantBlocks.map((block, index) => {
+                               if (block.type === 'web-search') return <AgentWebSearchStatusLines key={block.key} statuses={[block.status]} />
+                               if (block.type === 'text') return <div key={block.key} className={index > 0 ? 'mt-3' : undefined}><MarkdownRenderer content={block.content ?? message.content} streaming={isStreamingAssistant} /></div>
+                               if (block.type === 'batch-params') {
+@@ -932,8 +957,8 @@ export default function AgentWorkspace() {
+                         )}
+                         {isAssistant ? (
+                           <>
+-                            <AgentActionButton tooltip="复制输出文本" className={`p-1.5 rounded-md transition-colors ${message.content.trim() ? 'text-gray-400 hover:text-gray-700 hover:bg-gray-100 dark:hover:text-gray-200 dark:hover:bg-white/[0.06]' : 'text-gray-300 dark:text-gray-600 opacity-50 cursor-not-allowed'}`} disabled={!message.content.trim()} onClick={() => {
+-                              void handleCopyMessage(getAgentAssistantCopyContent(message.content, assistantBlocks), '输出文本已复制', '复制输出文本失败');
++                            <AgentActionButton tooltip="复制输出文本" className={`p-1.5 rounded-md transition-colors ${visibleAssistantText.trim() ? 'text-gray-400 hover:text-gray-700 hover:bg-gray-100 dark:hover:text-gray-200 dark:hover:bg-white/[0.06]' : 'text-gray-300 dark:text-gray-600 opacity-50 cursor-not-allowed'}`} disabled={!visibleAssistantText.trim()} onClick={() => {
++                              void handleCopyMessage(getAgentAssistantCopyContent(visibleAssistantText, visibleAssistantBlocks), '输出文本已复制', '复制输出文本失败');
+                             }}>
+                               <CopyIcon className="w-4 h-4" />
+                             </AgentActionButton>
 diff --git a/src/components/InputBar.tsx b/src/components/InputBar.tsx
 index 37375ba..203fc6e 100644
 --- a/src/components/InputBar.tsx
@@ -460,7 +579,7 @@ index ede2298..b9bc384 100644
 
    const apiPath = normalizedBaseUrl.endsWith('/v1')
 diff --git a/src/store.test.ts b/src/store.test.ts
-index 98afeac..730a724 100644
+index 98afeac..0ab3a76 100644
 --- a/src/store.test.ts
 +++ b/src/store.test.ts
 @@ -134,7 +134,7 @@ import { callImageApi } from './lib/api'
@@ -472,7 +591,7 @@ index 98afeac..730a724 100644
 
  const commitTaskDeletionImplementation = vi.mocked(commitTaskDeletion).getMockImplementation()!
  const deleteDbImageImplementation = vi.mocked(deleteDbImage).getMockImplementation()!
-@@ -154,6 +154,108 @@ describe('error toast messages', () => {
+@@ -154,6 +154,112 @@ describe('error toast messages', () => {
    })
  })
 
@@ -558,6 +677,10 @@ index 98afeac..730a724 100644
 +    })
 +    expect(state.agentConversations[0].messages.find((message) => message.role === 'assistant')?.content).toBe('图像已生成。')
 +    expect(state.showToast).toHaveBeenCalledWith('Agent 规划服务暂时不可用，已切换为直接生图', 'info')
++    await vi.waitFor(async () => {
++      expect((await getAllTasks())[0]).toMatchObject({ status: 'done', outputImages: expect.arrayContaining([expect.any(String)]) })
++      expect((await getAllAgentConversations())[0]?.rounds[0]).toMatchObject({ status: 'done', outputTaskIds: expect.arrayContaining([state.tasks[0].id]) })
++    })
 +  })
 +
 +  it('keeps text-only Agent failures as errors instead of generating an image', async () => {
@@ -581,11 +704,122 @@ index 98afeac..730a724 100644
  function agentConversation(overrides: Partial<AgentConversation> = {}): AgentConversation {
    return {
      id: 'conversation-a',
+@@ -3759,6 +3865,61 @@ describe('agent built-in image tool failure', () => {
+     })
+   })
+
++  it('accepts a successful Agent image when a later response continuation times out', async () => {
++    const imageProfile = createDefaultOpenAIProfile({ id: 'image-profile', apiKey: 'image-key', apiMode: 'images' })
++    useStore.setState({
++      settings: normalizeSettings({
++        ...useStore.getState().settings,
++        profiles: [responsesProfile, imageProfile],
++        activeProfileId: responsesProfile.id,
++        agentApiConfigMode: 'hybrid',
++        agentTextProfileId: responsesProfile.id,
++        agentImageProfileId: imageProfile.id,
++        agentMaxToolRounds: 3,
++      }),
++    })
++    vi.mocked(callAgentResponsesApi)
++      .mockResolvedValueOnce({
++        text: '',
++        images: [],
++        outputItems: [{
++          type: 'function_call',
++          name: 'generate_image',
++          call_id: 'hybrid-success-before-timeout',
++          arguments: JSON.stringify({ id: 'motorcycle', prompt: '生成一台概念摩托车' }),
++        }],
++        responseId: 'response-image-call',
++      })
++      .mockRejectedValueOnce(new Error('failed to stream request: stream first event timeout'))
++    vi.mocked(callImageApi).mockResolvedValueOnce({
++      images: ['data:image/png;base64,persisted-agent-image'],
++      actualParams: { size: '1024x1024', output_format: 'png' },
++      actualParamsList: [{ size: '1024x1024', output_format: 'png' }],
++      revisedPrompts: ['生成一台概念摩托车'],
++    })
++
++    await submitAgentMessage()
++    await vi.waitFor(() => {
++      expect(useStore.getState().agentConversations[0]?.rounds[0]).toMatchObject({
++        status: 'done',
++        error: null,
++      })
++    })
++
++    const task = useStore.getState().tasks.find((item) => item.agentToolCallId === 'hybrid-success-before-timeout')
++    if (!task) throw new Error('Expected persisted Agent image task')
++    expect(task).toMatchObject({ status: 'done', outputImages: expect.arrayContaining([expect.any(String)]) })
++    expect(useStore.getState().agentConversations[0]?.messages.find((message) => message.role === 'assistant')).toMatchObject({
++      content: '图像已生成。',
++      outputTaskIds: [task.id],
++    })
++    expect(useStore.getState().showToast).toHaveBeenCalledWith('Agent 已生成图片', 'success')
++    await vi.waitFor(async () => {
++      expect((await getAllTasks()).find((item) => item.id === task.id)).toMatchObject({ status: 'done', outputImages: task.outputImages })
++      expect((await getAllAgentConversations())[0]?.rounds[0]).toMatchObject({ status: 'done', error: null, outputTaskIds: [task.id] })
++    })
++  })
++
+   it('does not commit or report a deleted Hybrid single-image result', async () => {
+     const imageProfile = createDefaultOpenAIProfile({ id: 'image-profile', apiKey: 'image-key', apiMode: 'images' })
+     const request = deferred<Awaited<ReturnType<typeof callImageApi>>>()
 diff --git a/src/store.ts b/src/store.ts
-index f9cb8cd..db3d9c9 100644
+index f9cb8cd..dea8531 100644
 --- a/src/store.ts
 +++ b/src/store.ts
-@@ -2365,6 +2365,16 @@ export async function submitAgentMessage() {
+@@ -80,6 +80,7 @@ let agentConversationPersistenceReady = false
+ let agentConversationMigrationPending = false
+ const AGENT_STOPPED_MESSAGE = '已停止生成。'
+ const AGENT_RECOVERY_PAUSE_ERROR = 'AgentRecoveryPauseError'
++const AGENT_POST_IMAGE_STREAM_TIMEOUT = /failed to stream request:\s*stream first event timeout/i
+ const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
+ const ERROR_TOAST_MAX_LENGTH = 80
+ type ToastType = 'info' | 'success' | 'error'
+@@ -951,24 +952,29 @@ export const useStore = create<AppState>()(
+ let lastStoredAgentConversations = useStore.getState().agentConversations
+ let agentConversationPersistRunning = false
+ let agentConversationPersistQueued = false
++let agentConversationPersistPromise: Promise<void> | null = null
+
+ async function flushAgentConversationsToIndexedDB() {
+   if (agentConversationPersistRunning) {
+     agentConversationPersistQueued = true
+-    return
++    return agentConversationPersistPromise ?? Promise.resolve()
+   }
+
+   agentConversationPersistRunning = true
+-  try {
+-    do {
+-      agentConversationPersistQueued = false
+-      const conversations = useStore.getState().agentConversations
+-      await replaceStoredAgentConversations(conversations)
+-      lastStoredAgentConversations = conversations
+-    } while (agentConversationPersistQueued || useStore.getState().agentConversations !== lastStoredAgentConversations)
+-  } finally {
+-    agentConversationPersistRunning = false
+-  }
++  agentConversationPersistPromise = (async () => {
++    try {
++      do {
++        agentConversationPersistQueued = false
++        const conversations = useStore.getState().agentConversations
++        await replaceStoredAgentConversations(conversations)
++        lastStoredAgentConversations = conversations
++      } while (agentConversationPersistQueued || useStore.getState().agentConversations !== lastStoredAgentConversations)
++    } finally {
++      agentConversationPersistRunning = false
++      agentConversationPersistPromise = null
++    }
++  })()
++  return agentConversationPersistPromise
+ }
+
+ useStore.subscribe((state) => {
+@@ -2365,6 +2371,16 @@ export async function submitAgentMessage() {
    void executeAgentRound(conversation.id, roundId, normalizedParams, requestSettings, activeProfile, imageProfile)
  }
 
@@ -602,7 +836,16 @@ index f9cb8cd..db3d9c9 100644
  export async function regenerateAgentAssistantMessage(conversationId: string, roundId: string) {
    const state = useStore.getState()
    const { settings, params, showToast } = state
-@@ -3025,7 +3035,9 @@ async function executeAgentRound(
+@@ -2613,7 +2629,7 @@ async function executeAgentRound(
+         return { taskId, committed: false }
+       }
+       const actualParams = deriveAgentImageActualParams(image.actualParams, stored)
+-      updateTaskInStore(taskId, {
++      await updateTaskInStore(taskId, {
+         prompt: image.revisedPrompt ?? latestBeforeUpdate.prompt,
+         outputImages: [stored.id],
+         actualParams,
+@@ -3025,7 +3041,9 @@ async function executeAgentRound(
        if (reachedToolLimit) break
        const textBeforeResponse = accumulatedText
        let currentResponseOutputItems: ResponsesOutputItem[] = []
@@ -613,7 +856,7 @@ index f9cb8cd..db3d9c9 100644
          settings: requestSettings,
          profile: activeProfile,
          params,
-@@ -3085,7 +3097,71 @@ async function executeAgentRound(
+@@ -3085,7 +3103,71 @@ async function executeAgentRound(
                failAgentImageTask(toolCallId, error)
              }
            : undefined,
@@ -686,7 +929,99 @@ index f9cb8cd..db3d9c9 100644
        if (controller.signal.aborted) throw createAgentAbortError()
 
        lastResponseId = result.responseId ?? lastResponseId
-@@ -4450,4 +4526,3 @@ export async function addImageFromUrl(src: string): Promise<void> {
+@@ -3350,6 +3432,7 @@ async function executeAgentRound(
+         ? current.messages.map((message) => message.id === assistantMessageId ? assistantMessage : message)
+         : [...current.messages, assistantMessage],
+     }))
++    await flushAgentConversationsToIndexedDB()
+
+     useStore.getState().showToast(outputIds.length > 0 ? 'Agent 已生成图片' : 'Agent 已回复', 'success')
+     showTaskCompletionNotification(
+@@ -3373,8 +3456,66 @@ async function executeAgentRound(
+       message += `\n${networkErrorHint}`
+     }
+
++    const roundImageTasks = useStore.getState().tasks.filter((task) =>
++      task.agentConversationId === conversationId &&
++      task.agentRoundId === roundId,
++    )
++    const completeWithSuccessfulImages = AGENT_POST_IMAGE_STREAM_TIMEOUT.test(message)
++      && roundImageTasks.length > 0
++      && roundImageTasks.every((task) => task.status === 'done' && task.outputImages.length > 0)
++
+     markAgentRoundTasksFailed(conversationId, roundId, message, getRawErrorPayload(err).rawResponsePayload)
+
++    if (completeWithSuccessfulImages) {
++      const successfulTaskIds = roundImageTasks.map((task) => task.id)
++      const successfulImageCount = roundImageTasks.reduce((count, task) => count + task.outputImages.length, 0)
++      updateAgentConversation(conversationId, (current) => {
++        const completedRound = current.rounds.find((round) => round.id === roundId)
++        if (!completedRound) return current
++        const existingAssistantMessage = completedRound.assistantMessageId
++          ? current.messages.find((item) => item.id === completedRound.assistantMessageId)
++          : current.messages.find((item) => item.roundId === roundId && item.role === 'assistant')
++        const outputTaskIds = uniqueIds([...completedRound.outputTaskIds, ...successfulTaskIds])
++        const existingContent = existingAssistantMessage?.content.trim() ?? ''
++        const successContent = existingContent && !existingContent.startsWith('请求失败：')
++          ? existingContent
++          : '图像已生成。'
++        const assistantMessage: AgentMessage = {
++          id: existingAssistantMessage?.id ?? genId(),
++          role: 'assistant',
++          content: successContent,
++          roundId,
++          outputTaskIds,
++          createdAt: existingAssistantMessage?.createdAt ?? Date.now(),
++        }
++
++        return {
++          ...current,
++          updatedAt: Date.now(),
++          rounds: current.rounds.map((round) => round.id === roundId
++            ? {
++                ...round,
++                assistantMessageId: assistantMessage.id,
++                outputTaskIds,
++                status: 'done',
++                error: null,
++                finishedAt: Date.now(),
++              }
++            : round),
++          messages: existingAssistantMessage
++            ? current.messages.map((item) => item.id === existingAssistantMessage.id ? assistantMessage : item)
++            : [...current.messages, assistantMessage],
++        }
++      })
++      await flushAgentConversationsToIndexedDB()
++      useStore.getState().showToast('Agent 已生成图片', 'success')
++      showTaskCompletionNotification(
++        'Agent 已生成图片',
++        `Agent 回复已结束，共生成 ${successfulImageCount} 张图片。`,
++      )
++      return
++    }
++
+     updateAgentConversation(conversationId, (current) => {
+       const failedRound = current.rounds.find((round) => round.id === roundId)
+       const existingAssistantMessage = failedRound?.assistantMessageId
+@@ -3411,6 +3552,7 @@ async function executeAgentRound(
+             ],
+       }
+     })
++    await flushAgentConversationsToIndexedDB()
+     useStore.getState().showToast(`Agent 请求失败：${message}`, 'error')
+   } finally {
+     if (agentRoundControllers.get(controllerKey) === controller) {
+@@ -3642,7 +3784,7 @@ export function updateTaskInStore(taskId: string, patch: Partial<TaskRecord>) {
+   const task = updated.find((t) => t.id === taskId)
+   setTasks(updated)
+   maybeOpenSupportPrompt(tasks, updated, taskId)
+-  if (task) putTask(task)
++  return task ? putTask(task) : Promise.resolve(undefined)
+ }
+
+ export function createFavoriteCollection(name: string) {
+@@ -4450,4 +4592,3 @@ export async function addImageFromUrl(src: string): Promise<void> {
    cacheImage(id, dataUrl)
    useStore.getState().addInputImage({ id, dataUrl })
  }

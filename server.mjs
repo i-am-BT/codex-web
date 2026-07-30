@@ -95,7 +95,7 @@ const FORCE_FULL_ACCESS = parseBoolean(process.env.FORCE_FULL_ACCESS, false);
 const NATIVE_SESSION_MAX_READ_MB = Number(process.env.NATIVE_SESSION_MAX_READ_MB || 32);
 const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAGES || 700);
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
-const NATIVE_SESSION_POLL_MS = Number(process.env.NATIVE_SESSION_POLL_MS || 1000);
+const NATIVE_SESSION_POLL_MS = Number(process.env.NATIVE_SESSION_POLL_MS || 3000);
 const APP_SERVER_REQUEST_TIMEOUT_MS = Number(process.env.APP_SERVER_REQUEST_TIMEOUT_MS || 30000);
 const NATIVE_MODEL_CAPABILITIES_CACHE_MS = 5 * 60 * 1000;
 const NATIVE_MODEL_CAPABILITIES_TIMEOUT_MS = Math.min(APP_SERVER_REQUEST_TIMEOUT_MS, 8000);
@@ -1008,29 +1008,6 @@ app.get('/api/local-image', requireAuth, (req, res) => {
   }
 });
 
-
-app.post('/api/open-local-path', requireAuth, async (req, res) => {
-  res.setHeader('Cache-Control', 'private, no-store');
-  try {
-    const rawPath = String(req.body?.path || req.body?.filePath || req.query?.path || '').trim();
-    const reveal = req.body?.reveal === true || req.query?.reveal === '1';
-    const target = resolveOpenLocalPath(rawPath, req.body?.cwd || req.query?.cwd || '');
-    await openLocalPathWithSystem(target.path, { reveal });
-    res.json({
-      ok: true,
-      path: target.path,
-      name: target.name,
-      type: target.type,
-      revealed: Boolean(reveal),
-    });
-  } catch (err) {
-    const status = Number(err?.statusCode || 0);
-    res.status(status >= 400 && status < 600 ? status : 500).json({
-      error: err.message || '打开本地文件失败',
-    });
-  }
-});
-
 app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
@@ -1367,6 +1344,53 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
   } catch (err) {
     const action = hasServiceTier && !hasTitle ? 'Fast 模式' : hasTitle && !hasServiceTier ? '会话标题' : '会话设置';
     res.status(nativeAppErrorStatus(err)).json({ error: `修改 Codex App ${action}失败: ${err.message}` });
+  }
+});
+
+app.patch('/api/native-sessions/:id/goal', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  const hasObjective = Object.hasOwn(req.body || {}, 'objective');
+  const hasStatus = Object.hasOwn(req.body || {}, 'status');
+  if (!hasObjective && !hasStatus) {
+    return res.status(400).json({ error: '请提供要更新的目标内容或状态' });
+  }
+
+  const params = { threadId };
+  if (hasObjective) {
+    const objective = String(req.body?.objective || '').replace(/\s+/g, ' ').trim();
+    if (!objective) return res.status(400).json({ error: '目标内容不能为空' });
+    if (objective.length > 4000) return res.status(400).json({ error: '目标内容不能超过 4000 个字符' });
+    params.objective = objective;
+  }
+  if (hasStatus) {
+    const status = nativeThreadGoalStatus(req.body?.status);
+    if (!status) return res.status(400).json({ error: '目标状态无效' });
+    params.status = status;
+  }
+
+  try {
+    const result = await appServerClient.request('thread/goal/set', params);
+    nativeSessions.applyThreadGoal?.(result?.goal, threadId);
+    nativeSessions.scheduleRefresh();
+    res.json({ ok: true, id: threadId, goal: result?.goal || null });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `更新 Codex App 目标失败: ${err.message}` });
+  }
+});
+
+app.delete('/api/native-sessions/:id/goal', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  try {
+    const result = await appServerClient.request('thread/goal/clear', { threadId });
+    nativeSessions.clearThreadGoal?.(threadId);
+    nativeSessions.scheduleRefresh();
+    res.json({ ok: true, id: threadId, cleared: result?.cleared !== false });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `清除 Codex App 目标失败: ${err.message}` });
   }
 });
 
@@ -2848,7 +2872,11 @@ function handleAppServerNotification(event) {
   const params = event.params || {};
   const threadId = cleanNativeThreadId(params.threadId || params.thread?.id);
 
-  if (method === 'item/agentMessage/delta' && threadId) {
+  if (method === 'thread/goal/updated' && threadId) {
+    nativeSessions.applyThreadGoal?.(params.goal, threadId);
+  } else if (method === 'thread/goal/cleared' && threadId) {
+    nativeSessions.clearThreadGoal?.(threadId);
+  } else if (method === 'item/agentMessage/delta' && threadId) {
     broadcastNativeRuntime({
       type: 'delta',
       role: 'assistant',
@@ -2913,6 +2941,19 @@ function handleAppServerNotification(event) {
   ) {
     nativeSessions.scheduleRefresh();
   }
+}
+
+function nativeThreadGoalStatus(value) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
+  const statuses = {
+    active: 'active',
+    paused: 'paused',
+    blocked: 'blocked',
+    usagelimited: 'usageLimited',
+    budgetlimited: 'budgetLimited',
+    complete: 'complete',
+  };
+  return statuses[normalized] || '';
 }
 
 function handleAppServerRequest(request) {
@@ -3332,103 +3373,6 @@ function isPathWithinRoot(targetPath, rootPath) {
   const relative = path.relative(rootPath, targetPath);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
-
-
-function stripLocalPathLineColumn(filePath) {
-  return String(filePath || '').trim().replace(/:\d+(?::\d+)?$/, '');
-}
-
-function isOpenLocalPathAllowed(resolvedPath) {
-  const target = String(resolvedPath || '');
-  if (!target || !path.isAbsolute(target)) return false;
-  const roots = [];
-  for (const candidate of [homedir(), tmpdir(), '/Volumes', DEFAULT_CWD, ROOT]) {
-    const raw = String(candidate || '').trim();
-    if (!raw) continue;
-    try {
-      roots.push(realpathSync(raw));
-    } catch {
-      try { roots.push(path.resolve(raw)); } catch {}
-    }
-  }
-  return roots.some((root) => isPathWithinRoot(target, root));
-}
-
-function resolveOpenLocalPath(rawPath, cwd = '') {
-  let clean = String(rawPath || '').trim();
-  if (!clean) {
-    const error = new Error('文件路径无效');
-    error.statusCode = 400;
-    throw error;
-  }
-  if (clean.includes('\0')) {
-    const error = new Error('文件路径无效');
-    error.statusCode = 400;
-    throw error;
-  }
-  if (/^[a-z][a-z0-9+.-]*:/i.test(clean) && !/^file:/i.test(clean)) {
-    const error = new Error('仅支持本地文件路径');
-    error.statusCode = 400;
-    throw error;
-  }
-  if (/^file:/i.test(clean)) {
-    try {
-      clean = decodeURIComponent(new URL(clean).pathname || '');
-    } catch {
-      const error = new Error('file URL 无效');
-      error.statusCode = 400;
-      throw error;
-    }
-  }
-  clean = stripLocalPathLineColumn(clean);
-  try { clean = decodeURIComponent(clean); } catch {}
-  clean = expandHome(clean);
-  const base = normalizeCwd(cwd) || DEFAULT_CWD;
-  const absolute = path.isAbsolute(clean) ? path.normalize(clean) : path.resolve(base, clean);
-  let resolved = absolute;
-  try {
-    resolved = realpathSync(absolute);
-  } catch {
-    if (!existsSync(absolute)) {
-      const error = new Error('文件不存在');
-      error.statusCode = 404;
-      throw error;
-    }
-    resolved = absolute;
-  }
-  if (!isOpenLocalPathAllowed(resolved)) {
-    const error = new Error('该路径不在可打开范围内');
-    error.statusCode = 403;
-    throw error;
-  }
-  const stats = statSync(resolved);
-  if (!stats.isFile() && !stats.isDirectory()) {
-    const error = new Error('不支持的文件类型');
-    error.statusCode = 400;
-    throw error;
-  }
-  return {
-    path: resolved,
-    type: stats.isDirectory() ? 'directory' : 'file',
-    name: path.basename(resolved),
-  };
-}
-
-function openLocalPathWithSystem(targetPath, { reveal = false } = {}) {
-  return new Promise((resolve, reject) => {
-    const args = reveal ? ['-R', targetPath] : [targetPath];
-    const child = spawn('open', args, {
-      stdio: 'ignore',
-      detached: true,
-    });
-    child.once('error', reject);
-    child.once('spawn', () => {
-      child.unref();
-      resolve();
-    });
-  });
-}
-
 
 // `/api/local-image` accepts a client-supplied absolute path (used to preview images
 // referenced in markdown/tool output). Without this check any authenticated user could
@@ -6501,12 +6445,12 @@ body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=goal-status-bar-20260729a">
+<link rel="stylesheet" href="/ui.css?v=goal-indicator-20260729e">
   <link rel="stylesheet" href="/image-prompt.css?v=image-prompt-main-20260728a">
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button><button id="automationToggle" class="automationToggle" type="button">自动化安排</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="automationView" class="automationView hidden" aria-labelledby="automationViewTitle"><div class="automationViewInner"><header class="automationViewHeader"><div><h1 id="automationViewTitle">已安排的任务</h1><p>让 Codex 安排任务、设置提醒或监测更新</p></div><button id="automationCreate" class="automationCreate" type="button"><i data-lucide="plus" aria-hidden="true"></i><span>新建自动化</span></button></header><div class="automationToolbar"><label class="automationSearch"><span class="srOnly">搜索已安排任务</span><i data-lucide="search" aria-hidden="true"></i><input id="automationSearch" type="search" placeholder="搜索已安排任务" autocomplete="off"></label><label class="automationFilter"><span class="srOnly">状态</span><select id="automationFilter"><option value="">全部状态</option><option value="ACTIVE">运行中</option><option value="PAUSED">已暂停</option></select></label><button id="automationRefresh" class="automationRefresh" type="button"><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button></div><div id="automationStatus" class="automationStatus" role="status" aria-live="polite"></div><div id="automationList" class="automationList"></div></div><div id="automationEditor" class="automationEditor hidden" role="presentation"><form id="automationForm" class="automationForm" aria-label="新建自动化安排"><div class="automationFormBody"><label class="automationTitleField"><span class="srOnly">已安排任务标题</span><input id="automationName" maxlength="120" required placeholder="已安排任务标题" autocomplete="off"></label><label class="automationPromptField"><span class="srOnly">任务说明</span><textarea id="automationPrompt" rows="3" maxlength="12000" required placeholder="描述 ChatGPT 应该做什么"></textarea></label><section class="automationFormSection" aria-labelledby="automationDetailsTitle"><h3 id="automationDetailsTitle">详情</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>运行于</span><select id="automationRunAt" aria-label="运行于"><option value="new-task">新任务</option></select></label><label class="automationSettingRow"><span>项目</span><select id="automationCwd" aria-label="项目"><option value="">无</option></select></label><label class="automationSettingRow"><span>模型</span><select id="automationModel" aria-label="模型"><option value="">默认模型</option></select></label><label class="automationSettingRow"><span>推理</span><select id="automationReasoning" aria-label="推理"><option value="">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option><option value="ultra">极高+</option></select></label></div></section><section class="automationFormSection" aria-labelledby="automationFrequencyTitle"><h3 id="automationFrequencyTitle">频率</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>重复</span><select id="automationFrequency" aria-label="重复"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option><option value="hourly">每隔数小时</option></select></label><label id="automationDayField" class="automationSettingRow hidden"><span>星期</span><select id="automationDay" aria-label="星期"><option value="MO">周一</option><option value="TU">周二</option><option value="WE">周三</option><option value="TH">周四</option><option value="FR">周五</option><option value="SA">周六</option><option value="SU">周日</option></select></label><label id="automationIntervalField" class="automationSettingRow hidden"><span>间隔</span><select id="automationInterval" aria-label="间隔小时"><option value="1">每小时</option><option value="2">每 2 小时</option><option value="3" selected>每 3 小时</option><option value="4">每 4 小时</option><option value="6">每 6 小时</option><option value="8">每 8 小时</option><option value="12">每 12 小时</option><option value="24">每 24 小时</option></select></label><label id="automationTimeField" class="automationSettingRow"><span>时间</span><span class="automationTimeControl"><span id="automationTimeDisplay">9:00</span><i data-lucide="chevron-down" aria-hidden="true"></i><input id="automationTime" type="time" value="09:00" required aria-label="时间"></span></label><label class="automationSettingRow"><span>通知</span><select id="automationNotification" aria-label="通知"><option value="always">所有运行</option><option value="failed_runs_only">仅失败时</option></select></label></div></section><input id="automationStartPaused" type="checkbox" class="hidden" aria-hidden="true" tabindex="-1"><div class="automationFormActions"><div id="automationFormMessage" class="automationFormMessage" role="alert"></div><button id="automationFormClose" class="automationEditorBack" type="button">取消</button><button id="automationFormSubmit" class="automationEditorSave" type="submit"><i data-lucide="calendar-plus" aria-hidden="true"></i><span>创建自动化</span></button></div></div></form></div></section><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>直接输入任务；项目路径可选。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box composerExpanded" data-composer-state="expanded"><textarea id="input" rows="1" placeholder="向 Codex 提问"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button><button id="automationToggle" class="automationToggle" type="button">自动化安排</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><div class="smallrow"><button type="button" id="fetchNewModels" class="miniSecondary">获取模型</button><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div></div><button class="miniPrimary">保存并设为默认</button><div id="providerMsg" class="errorText"></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="automationView" class="automationView hidden" aria-labelledby="automationViewTitle"><div class="automationViewInner"><header class="automationViewHeader"><div><h1 id="automationViewTitle">已安排的任务</h1><p>让 Codex 安排任务、设置提醒或监测更新</p></div><button id="automationCreate" class="automationCreate" type="button"><i data-lucide="plus" aria-hidden="true"></i><span>新建自动化</span></button></header><div class="automationToolbar"><label class="automationSearch"><span class="srOnly">搜索已安排任务</span><i data-lucide="search" aria-hidden="true"></i><input id="automationSearch" type="search" placeholder="搜索已安排任务" autocomplete="off"></label><label class="automationFilter"><span class="srOnly">状态</span><select id="automationFilter"><option value="">全部状态</option><option value="ACTIVE">运行中</option><option value="PAUSED">已暂停</option></select></label><button id="automationRefresh" class="automationRefresh" type="button"><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button></div><div id="automationStatus" class="automationStatus" role="status" aria-live="polite"></div><div id="automationList" class="automationList"></div></div><div id="automationEditor" class="automationEditor hidden" role="presentation"><form id="automationForm" class="automationForm" aria-label="新建自动化安排"><div class="automationFormBody"><label class="automationTitleField"><span class="srOnly">已安排任务标题</span><input id="automationName" maxlength="120" required placeholder="已安排任务标题" autocomplete="off"></label><label class="automationPromptField"><span class="srOnly">任务说明</span><textarea id="automationPrompt" rows="3" maxlength="12000" required placeholder="描述 ChatGPT 应该做什么"></textarea></label><section class="automationFormSection" aria-labelledby="automationDetailsTitle"><h3 id="automationDetailsTitle">详情</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>运行于</span><select id="automationRunAt" aria-label="运行于"><option value="new-task">新任务</option></select></label><label class="automationSettingRow"><span>项目</span><select id="automationCwd" aria-label="项目"><option value="">无</option></select></label><label class="automationSettingRow"><span>模型</span><select id="automationModel" aria-label="模型"><option value="">默认模型</option></select></label><label class="automationSettingRow"><span>推理</span><select id="automationReasoning" aria-label="推理"><option value="">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option><option value="ultra">极高</option></select></label></div></section><section class="automationFormSection" aria-labelledby="automationFrequencyTitle"><h3 id="automationFrequencyTitle">频率</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>重复</span><select id="automationFrequency" aria-label="重复"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option><option value="hourly">每隔数小时</option></select></label><label id="automationDayField" class="automationSettingRow hidden"><span>星期</span><select id="automationDay" aria-label="星期"><option value="MO">周一</option><option value="TU">周二</option><option value="WE">周三</option><option value="TH">周四</option><option value="FR">周五</option><option value="SA">周六</option><option value="SU">周日</option></select></label><label id="automationIntervalField" class="automationSettingRow hidden"><span>间隔</span><select id="automationInterval" aria-label="间隔小时"><option value="1">每小时</option><option value="2">每 2 小时</option><option value="3" selected>每 3 小时</option><option value="4">每 4 小时</option><option value="6">每 6 小时</option><option value="8">每 8 小时</option><option value="12">每 12 小时</option><option value="24">每 24 小时</option></select></label><label id="automationTimeField" class="automationSettingRow"><span>时间</span><span class="automationTimeControl"><span id="automationTimeDisplay">9:00</span><i data-lucide="chevron-down" aria-hidden="true"></i><input id="automationTime" type="time" value="09:00" required aria-label="时间"></span></label><label class="automationSettingRow"><span>通知</span><select id="automationNotification" aria-label="通知"><option value="always">所有运行</option><option value="failed_runs_only">仅失败时</option></select></label></div></section><input id="automationStartPaused" type="checkbox" class="hidden" aria-hidden="true" tabindex="-1"><div class="automationFormActions"><div id="automationFormMessage" class="automationFormMessage" role="alert"></div><button id="automationFormClose" class="automationEditorBack" type="button">取消</button><button id="automationFormSubmit" class="automationEditorSave" type="submit"><i data-lucide="calendar-plus" aria-hidden="true"></i><span>创建自动化</span></button></div></div></form></div></section><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>直接输入任务；项目路径可选。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box composerExpanded" data-composer-state="expanded"><textarea id="input" rows="1" placeholder="向 Codex 提问"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
 <div id="nativeRequestModal" class="requestOverlay hidden" role="presentation"><div class="requestPanel" role="dialog" aria-modal="true" aria-labelledby="nativeRequestTitle"><div class="requestHead"><div><div id="nativeRequestTitle" class="requestTitle">Codex 请求确认</div><div id="nativeRequestMeta" class="requestMeta"></div></div></div><pre id="nativeRequestDetail" class="requestDetail"></pre><form id="nativeRequestForm"><div id="nativeRequestFields" class="requestFields"></div><div id="nativeRequestActions" class="requestActions"></div></form></div></div>
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
@@ -6548,9 +6492,6 @@ let nativeCursor = 0;
 let nativeGeneration = 0;
 let sessionEvents = null;
 let nativeSyncTimer = null;
-let nativeConversationPollTimer = null;
-const NATIVE_ACTIVE_POLL_MS=700;
-const NATIVE_IDLE_POLL_MS=1200;
 let nativeCompletionSync = null;
 let nativeCompletionTimer = null;
 let webRunActive = false;
@@ -6595,6 +6536,16 @@ let appQueueEditSaving = false;
 let historyFilter = null;
 let historyItems = [];
 let composerPermissionToggle = null;
+let composerGoalIndicator = null;
+let composerContextToggle = null;
+let composerContextPanel = null;
+let composerContextRing = null;
+let composerContextPercent = null;
+let composerContextDetails = null;
+let composerContextPinned = false;
+let composerContextHoverTimer = 0;
+let currentContextUsedTokens = null;
+let currentContextWindowTokens = null;
 let composerModelToggle = null;
 let composerMicBtn = null;
 let composerSpeechRecognition = null;
@@ -6654,6 +6605,12 @@ let composerAtLoadedAt = 0;
 let nativeComposerOverride = null;
 let promptQueuePanel = null;
 let promptQueueList = null;
+let threadGoalBar = null;
+let currentThreadGoal = null;
+let threadGoalTimer = null;
+let threadGoalSaving = false;
+let threadRunMobilePanel = '';
+let threadRunMobileScrollLeft = 0;
 let promptQueues = readPromptQueues();
 let queueDispatchingThreads = new Set();
 let queueGuidingItems = new Set();
@@ -6680,29 +6637,6 @@ let sideChatView = 'side';
 let sideChatOpenTabs = [];
 let sideChatActiveTurnId = '';
 const syncCurrentNativeConversation = createTrailingSingleFlight(syncCurrentNativeConversationOnce);
-function stopNativeConversationPoll(){
-  if(nativeConversationPollTimer){
-    clearInterval(nativeConversationPollTimer);
-    nativeConversationPollTimer=null;
-  }
-}
-function nativeConversationPollIntervalMs(){
-  if(document.visibilityState==='hidden')return 0;
-  if(currentConversationSource!=='codex'||!currentConversationId)return 0;
-  return (webRunActive||statusEl?.classList?.contains('running'))?NATIVE_ACTIVE_POLL_MS:NATIVE_IDLE_POLL_MS;
-}
-function ensureNativeConversationPoll(){
-  stopNativeConversationPoll();
-  const interval=nativeConversationPollIntervalMs();
-  if(!interval)return;
-  nativeConversationPollTimer=setInterval(()=>{
-    if(document.visibilityState==='hidden')return;
-    if(currentConversationSource!=='codex'||!currentConversationId){stopNativeConversationPoll();return}
-    void syncCurrentNativeConversation();
-  },interval);
-  nativeConversationPollTimer.unref?.();
-}
-
 let settingsOverlay = null;
 let settingsDialog = null;
 let settingsClose = null;
@@ -6803,7 +6737,52 @@ function composerModelLabel(value){
   const clean=String(value||'默认模型').replace(/^gpt-/i,'').replace(/[-_]+/g,' ').trim();
   return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
 }
-function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'极高+'})[String(value||'')]||String(value||'默认')}
+function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'极高'})[String(value||'')]||String(value||'默认')}
+function formatComposerContextTokens(value){
+  const tokens=Math.max(0,Math.round(Number(value)||0));
+  if(tokens>=1000000)return(tokens/1000000).toFixed(tokens>=10000000?0:1).replace(/\\.0$/,'')+'m';
+  if(tokens>=1000)return Math.round(tokens/1000)+'k';
+  return tokens.toLocaleString('zh-CN');
+}
+function syncComposerContextWindow(contextWindow){
+  const used=Number(contextWindow?.usedTokens);
+  const maximum=Number(contextWindow?.maxTokens);
+  const available=currentConversationSource==='codex'&&Number.isFinite(used)&&used>=0&&Number.isFinite(maximum)&&maximum>0;
+  currentContextUsedTokens=available?Math.round(used):null;
+  currentContextWindowTokens=available?Math.round(maximum):null;
+  composerContextToggle?.classList.toggle('hidden',!available);
+  if(!available){
+    composerContextPinned=false;
+    composerContextPanel?.classList.add('hidden');
+    composerContextToggle?.setAttribute('aria-expanded','false');
+    return;
+  }
+  const ratio=Math.min(1,Math.max(0,currentContextUsedTokens/currentContextWindowTokens));
+  const percent=Math.round(ratio*100);
+  const details='已用 '+formatComposerContextTokens(currentContextUsedTokens)+' 标记，共 '+formatComposerContextTokens(currentContextWindowTokens);
+  composerContextRing?.style.setProperty('--context-progress',(ratio*100).toFixed(2)+'%');
+  if(composerContextPercent)composerContextPercent.textContent=percent+'% 已用';
+  if(composerContextDetails)composerContextDetails.textContent=details;
+  const label='上下文窗口：'+percent+'% 已用 · '+details;
+  composerContextToggle.title=label;
+  composerContextToggle.setAttribute('aria-label',label);
+}
+function showComposerContextDetails({pinned=false}={}){
+  if(!composerContextToggle||!composerContextPanel||composerContextToggle.classList.contains('hidden'))return;
+  if(composerContextHoverTimer)clearTimeout(composerContextHoverTimer);
+  if(pinned)composerContextPinned=true;
+  composerContextPanel.classList.remove('hidden');
+  composerContextToggle.setAttribute('aria-expanded','true');
+}
+function scheduleComposerContextHide(){
+  if(composerContextHoverTimer)clearTimeout(composerContextHoverTimer);
+  composerContextHoverTimer=setTimeout(()=>{
+    composerContextHoverTimer=0;
+    if(composerContextPinned||composerContextToggle?.matches(':hover')||composerContextPanel?.matches(':hover'))return;
+    composerContextPanel?.classList.add('hidden');
+    composerContextToggle?.setAttribute('aria-expanded','false');
+  },120);
+}
 function normalizeComposerServiceTier(value){return String(value||'').trim().toLowerCase()==='priority'?'priority':null}
 function composerModelCapabilityKeys(value=model.value){
   const clean=String(value||'').trim().toLowerCase();
@@ -8180,13 +8159,460 @@ function queueActionButton(icon,label,handler,showLabel=false){
   button.addEventListener('click',handler);
   return button;
 }
+
+function ensureThreadGoalBar(composer, anchor){
+  if(!composer)return threadGoalBar;
+  if(!threadGoalBar){
+    threadGoalBar=document.createElement('section');
+    threadGoalBar.id='threadGoalBar';
+    threadGoalBar.className='threadGoalBar hidden';
+    threadGoalBar.setAttribute('role','status');
+    threadGoalBar.setAttribute('aria-live','polite');
+  }
+  const target=anchor||promptQueuePanel||dropZone;
+  if(target && target.parentNode===composer)composer.insertBefore(threadGoalBar, target);
+  else if(threadGoalBar.parentNode!==composer)composer.insertBefore(threadGoalBar, dropZone||null);
+  return threadGoalBar;
+}
+function setThreadGoal(goal){
+  const next=normalizeThreadGoalClient(goal);
+  const same=sameThreadGoalClient(currentThreadGoal, next);
+  currentThreadGoal=next;
+  renderComposerGoalIndicator();
+  if(!same)renderThreadGoalBar();
+  else refreshThreadGoalElapsed();
+  renderThreadGoalCompletionHint();
+}
+function normalizeThreadGoalClient(goal){
+  if(!goal||typeof goal!=='object')return null;
+  const objective=String(goal.objective||'').trim();
+  const rawStatus=String(goal.status||'').trim().toLowerCase().replace(/[\\s_-]+/g,'');
+  const status=({active:'active',paused:'paused',blocked:'blocked',usagelimited:'usage_limited',budgetlimited:'budget_limited',complete:'complete'})[rawStatus]||'';
+  if(!objective||!status)return null;
+  const toMs=(value)=>{
+    const number=Number(value)||0;
+    return number>0&&number<1e12?Math.floor(number*1000):Math.floor(number);
+  };
+  return {
+    threadId:String(goal.threadId||'').trim().toLowerCase(),
+    goalId:goal.goalId?String(goal.goalId):null,
+    objective,
+    status,
+    tokenBudget:goal.tokenBudget==null?null:Number(goal.tokenBudget),
+    tokensUsed:Math.max(0, Math.floor(Number(goal.tokensUsed)||0)),
+    timeUsedSeconds:Math.max(0, Math.floor(Number(goal.timeUsedSeconds)||0)),
+    createdAtMs:toMs(goal.createdAtMs??goal.createdAt),
+    updatedAtMs:toMs(goal.updatedAtMs??goal.updatedAt),
+  };
+}
+function sameThreadGoalClient(left,right){
+  if(!left&&!right)return true;
+  if(!left||!right)return false;
+  return left.threadId===right.threadId
+    && left.goalId===right.goalId
+    && left.objective===right.objective
+    && left.status===right.status
+    && left.tokenBudget===right.tokenBudget
+    && left.tokensUsed===right.tokensUsed
+    && left.timeUsedSeconds===right.timeUsedSeconds
+    && left.createdAtMs===right.createdAtMs
+    && left.updatedAtMs===right.updatedAtMs;
+}
+function threadGoalStatusLabel(status){
+  switch(String(status||'').toLowerCase()){
+    case 'active': return '目标进行中';
+    case 'paused': return '目标已暂停';
+    case 'blocked': return '目标受阻';
+    case 'usage_limited': return '目标额度受限';
+    case 'budget_limited': return '目标预算受限';
+    case 'complete': return '目标已完成';
+    default: return '目标';
+  }
+}
+function renderComposerGoalIndicator(){
+  if(!composerGoalIndicator)return;
+  const native=currentConversationSource==='codex'&&Boolean(currentConversationId);
+  const goal=native?currentThreadGoal:null;
+  const show=Boolean(goal&&goal.status&&goal.status!=='complete');
+  composerGoalIndicator.classList.toggle('hidden',!show);
+  composerGoalIndicator.classList.toggle('isActive',goal?.status==='active');
+  composerGoalIndicator.classList.toggle('isPaused',goal?.status==='paused');
+  composerGoalIndicator.classList.toggle('isBlocked',['blocked','usage_limited','budget_limited'].includes(String(goal?.status||'')));
+  composerGoalIndicator.setAttribute('aria-hidden',String(!show));
+  if(!show){
+    composerGoalIndicator.removeAttribute('aria-label');
+    composerGoalIndicator.removeAttribute('title');
+    return;
+  }
+  const label=threadGoalStatusLabel(goal.status)+'：'+goal.objective;
+  composerGoalIndicator.setAttribute('aria-label',label);
+  composerGoalIndicator.title=label;
+}
+function formatThreadGoalElapsed(seconds){
+  const total=Math.max(0, Math.floor(Number(seconds)||0));
+  const h=Math.floor(total/3600);
+  const m=Math.floor((total%3600)/60);
+  const s=total%60;
+  if(h>0)return h+' 小时 '+m+' 分钟';
+  if(m>0)return m+' 分钟 '+s+' 秒';
+  return s+' 秒';
+}
+function formatThreadGoalCompletionElapsed(seconds){
+  const total=Math.max(0, Math.floor(Number(seconds)||0));
+  const h=Math.floor(total/3600);
+  const m=Math.floor((total%3600)/60);
+  const s=total%60;
+  const parts=[];
+  if(h>0)parts.push(h+'h');
+  if(h>0||m>0)parts.push(m+'m');
+  parts.push(s+'s');
+  return parts.join(' ');
+}
+function threadGoalCompletionTarget(goal=currentThreadGoal){
+  const finals=[...chat.querySelectorAll('.msg.assistant[data-message-kind="final_answer"]')]
+    .filter((item)=>item.parentNode===chat);
+  if(!finals.length)return null;
+  const completedAt=Number(goal?.updatedAtMs)||0;
+  if(completedAt>0){
+    const maxDelayMs=10*60*1000;
+    const timed=finals.map((element)=>({
+      element,
+      at:Date.parse(String(element.dataset.messageAt||'')),
+    })).filter((item)=>Number.isFinite(item.at));
+    const after=timed.filter((item)=>item.at>=completedAt&&item.at-completedAt<=maxDelayMs)
+      .sort((left,right)=>left.at-right.at);
+    return after[0]?.element||null;
+  }
+  if(webRunActive)return null;
+  return finals.at(-1)||null;
+}
+function renderThreadGoalCompletionHint(goal=currentThreadGoal){
+  for(const hint of chat?.querySelectorAll('.threadGoalCompletionHint')||[])hint.remove();
+  const native=currentConversationSource==='codex'&&currentConversationId;
+  if(!native||goal?.status!=='complete')return;
+  const target=threadGoalCompletionTarget(goal);
+  const body=target?._messageBody||target?.querySelector(':scope > .msgBody');
+  if(!body)return;
+  const hint=document.createElement('div');
+  hint.className='threadGoalCompletionHint';
+  hint.setAttribute('role','status');
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','circle-check');
+  icon.setAttribute('aria-hidden','true');
+  const label=document.createElement('span');
+  label.textContent='已在 '+formatThreadGoalCompletionElapsed(goal.timeUsedSeconds)+' 内达成目标';
+  hint.append(icon,label);
+  body.appendChild(hint);
+  refreshIcons(hint);
+}
+function currentThreadGoalElapsedSeconds(goal=currentThreadGoal){
+  if(!goal)return 0;
+  let seconds=Math.max(0, Math.floor(Number(goal.timeUsedSeconds)||0));
+  if(goal.status==='active' && goal.updatedAtMs){
+    const extra=Math.max(0, Math.floor((Date.now()-Number(goal.updatedAtMs))/1000));
+    seconds += extra;
+  }
+  return seconds;
+}
+function stopThreadGoalTimer(){
+  if(threadGoalTimer){
+    clearInterval(threadGoalTimer);
+    threadGoalTimer=null;
+  }
+}
+function refreshThreadGoalElapsed(){
+  if(!threadGoalBar||!currentThreadGoal)return;
+  const elapsed=formatThreadGoalElapsed(currentThreadGoalElapsedSeconds());
+  for(const time of threadGoalBar.querySelectorAll('.threadGoalTime'))time.textContent=elapsed;
+}
+async function updateCurrentThreadGoal(changes,successMessage){
+  if(threadGoalSaving||currentConversationSource!=='codex'||!currentConversationId||!currentThreadGoal)return false;
+  const threadId=currentConversationId;
+  const previous=currentThreadGoal;
+  threadGoalSaving=true;
+  renderThreadGoalBar();
+  statusEl.textContent='正在更新目标...';
+  try{
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(threadId)+'/goal',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)});
+    const data=await res.json();
+    if(!res.ok)throw new Error(data.error||'更新目标失败');
+    if(currentConversationSource==='codex'&&currentConversationId===threadId){
+      const fallback={...previous,...changes,timeUsedSeconds:currentThreadGoalElapsedSeconds(previous),updatedAtMs:Date.now()};
+      setThreadGoal(data.goal||fallback);
+      await syncCurrentNativeConversation();
+      statusEl.textContent=successMessage;
+    }
+    return true;
+  }catch(error){
+    statusEl.textContent=error.message||'更新目标失败';
+    return false;
+  }finally{
+    threadGoalSaving=false;
+    if(currentConversationSource==='codex'&&currentConversationId===threadId)renderThreadGoalBar();
+  }
+}
+function editCurrentThreadGoal(){
+  const goal=currentThreadGoal;
+  if(!goal||threadGoalSaving)return;
+  const value=prompt('编辑目标',goal.objective);
+  if(value===null)return;
+  const objective=String(value||'').replace(/\s+/g,' ').trim();
+  if(!objective){statusEl.textContent='目标内容不能为空';return}
+  if(objective===goal.objective)return;
+  void updateCurrentThreadGoal(
+    {objective,status:'active'},
+    goal.status==='active'?'目标已更新':'目标已更新并恢复',
+  );
+}
+function toggleCurrentThreadGoal(){
+  const goal=currentThreadGoal;
+  if(!goal||threadGoalSaving)return;
+  const status=goal.status==='active'?'paused':'active';
+  void updateCurrentThreadGoal({status},status==='paused'?'目标已暂停':'目标已恢复');
+}
+async function clearCurrentThreadGoal(){
+  const goal=currentThreadGoal;
+  if(!goal||threadGoalSaving||currentConversationSource!=='codex'||!currentConversationId)return;
+  if(!confirm('清除当前目标？\\n\\n'+goal.objective))return;
+  const threadId=currentConversationId;
+  threadGoalSaving=true;
+  renderThreadGoalBar();
+  statusEl.textContent='正在清除目标...';
+  try{
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(threadId)+'/goal',{method:'DELETE'});
+    const data=await res.json();
+    if(!res.ok)throw new Error(data.error||'清除目标失败');
+    if(currentConversationSource==='codex'&&currentConversationId===threadId){
+      setThreadGoal(null);
+      await syncCurrentNativeConversation();
+      statusEl.textContent='目标已清除';
+    }
+  }catch(error){
+    statusEl.textContent=error.message||'清除目标失败';
+  }finally{
+    threadGoalSaving=false;
+    if(currentConversationSource==='codex'&&currentConversationId===threadId)renderThreadGoalBar();
+  }
+}
+function threadGoalActionButton(icon,label,handler,className=''){
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='threadGoalAction'+(className?' '+className:'');
+  button.title=label;
+  button.setAttribute('aria-label',label);
+  button.disabled=threadGoalSaving;
+  setIconLabel(button,icon,label,false);
+  button.addEventListener('click',handler);
+  return button;
+}
+function threadRunAgentItems(){
+  const items=[];
+  const seen=new Set();
+  for(const group of turnProcessElements){
+    if(!group?.classList?.contains('agentActivityGroup'))continue;
+    const agents=Array.isArray(group._agentActivityItems)?group._agentActivityItems:[...group.querySelectorAll('.agentActivityItem')];
+    for(const agent of agents){
+      const key=String(agent?.dataset?.subagentThreadId||agent?.dataset?.agentKey||'').trim();
+      if(key&&seen.has(key))continue;
+      if(key)seen.add(key);
+      items.push(agent);
+    }
+  }
+  return items;
+}
+function mobileThreadGoalStatusLabel(status){
+  switch(String(status||'').toLowerCase()){
+    case 'active': return '正在推进目标';
+    case 'paused': return '目标已暂停';
+    case 'blocked': return '目标受阻';
+    case 'usage_limited': return '目标额度受限';
+    case 'budget_limited': return '目标预算受限';
+    default: return '目标';
+  }
+}
+function toggleThreadRunMobilePanel(panel){
+  const next=String(panel||'');
+  threadRunMobilePanel=threadRunMobilePanel===next?'':next;
+  renderThreadGoalBar();
+}
+function threadRunMobilePill(icon,label,className,{selected=false,expanded=false,handler=null}={}){
+  const pill=document.createElement(handler?'button':'span');
+  if(handler)pill.type='button';
+  pill.className='threadRunPill '+className+(selected?' isSelected':'');
+  pill.setAttribute('aria-label',label);
+  if(handler){
+    pill.setAttribute('aria-expanded',String(expanded));
+    pill.addEventListener('click',(event)=>{event.preventDefault();event.stopPropagation();handler()});
+  }else pill.setAttribute('role','status');
+  const iconNode=document.createElement('i');
+  iconNode.setAttribute('data-lucide',icon);
+  iconNode.setAttribute('aria-hidden','true');
+  const text=document.createElement('span');
+  text.className='threadRunPillLabel';
+  text.textContent=label;
+  pill.append(iconNode,text);
+  return pill;
+}
+function createThreadRunGoalDetail(goal){
+  const detail=document.createElement('section');
+  detail.id='threadRunGoalDetail';
+  detail.className='threadRunDetail threadRunGoalDetail';
+  detail.setAttribute('aria-label','目标详情');
+  const objective=document.createElement('div');
+  objective.className='threadRunGoalObjective';
+  objective.textContent=goal.objective;
+  const actions=document.createElement('div');
+  actions.className='threadRunGoalActions';
+  const edit=threadGoalActionButton('pencil','编辑目标',editCurrentThreadGoal,'threadRunGoalAction');
+  const active=goal.status==='active';
+  const toggle=threadGoalActionButton(active?'pause':'play',active?'暂停目标':'恢复目标',toggleCurrentThreadGoal,'threadRunGoalAction');
+  const clear=threadGoalActionButton('trash-2','清除目标',()=>void clearCurrentThreadGoal(),'threadRunGoalAction isDanger');
+  actions.append(edit,toggle,clear);
+  detail.append(objective,actions);
+  return detail;
+}
+function createThreadRunPlanDetail(progress){
+  const detail=document.createElement('section');
+  detail.id='threadRunPlanDetail';
+  detail.className='threadRunDetail threadRunPlanDetail';
+  detail.setAttribute('aria-label','任务步骤');
+  progress.items.forEach((item,index)=>{
+    const row=document.createElement('div');
+    row.className='threadRunPlanStep';
+    row.dataset.status=item.status;
+    const marker=document.createElement('span');
+    marker.className='threadRunPlanMarker';
+    marker.setAttribute('aria-hidden','true');
+    if(item.status==='completed'){
+      const check=document.createElement('i');
+      check.setAttribute('data-lucide','check');
+      check.setAttribute('aria-hidden','true');
+      marker.appendChild(check);
+    }
+    const number=document.createElement('span');
+    number.className='threadRunPlanNumber';
+    number.textContent=(index+1)+'.';
+    const text=document.createElement('span');
+    text.className='threadRunPlanText';
+    text.textContent=item.step;
+    row.append(marker,number,text);
+    detail.appendChild(row);
+  });
+  return detail;
+}
+function createThreadRunMobile(goal){
+  const mobile=document.createElement('div');
+  mobile.className='threadRunMobile';
+  const progress=turnPlanProgress(webRunActive?liveTurnPlan:[]);
+  const agentCount=webRunActive?threadRunAgentItems().length:0;
+  if(threadRunMobilePanel==='plan'&&!progress.total&&!webRunActive)threadRunMobilePanel='';
+  if(threadRunMobilePanel==='goal')mobile.appendChild(createThreadRunGoalDetail(goal));
+  else if(threadRunMobilePanel==='plan')mobile.appendChild(createThreadRunPlanDetail(progress));
+  const viewport=document.createElement('div');
+  viewport.className='threadRunPillsViewport';
+  viewport.setAttribute('aria-label','运行状态');
+  viewport.addEventListener('scroll',()=>{threadRunMobileScrollLeft=viewport.scrollLeft},{passive:true});
+  const pills=document.createElement('div');
+  pills.className='threadRunPills';
+  const goalSelected=threadRunMobilePanel==='goal';
+  const goalPill=threadRunMobilePill('target',mobileThreadGoalStatusLabel(goal.status),'threadRunGoalPill',{selected:goalSelected,expanded:goalSelected,handler:()=>toggleThreadRunMobilePanel('goal')});
+  goalPill.setAttribute('aria-controls','threadRunGoalDetail');
+  const elapsed=document.createElement('span');
+  elapsed.className='threadGoalTime threadRunGoalTime';
+  elapsed.textContent=formatThreadGoalElapsed(currentThreadGoalElapsedSeconds(goal));
+  goalPill.appendChild(elapsed);
+  pills.appendChild(goalPill);
+  if(progress.total){
+    const planSelected=threadRunMobilePanel==='plan';
+    const planPill=threadRunMobilePill('circle',progress.current+'/'+progress.total,'threadRunPlanPill',{selected:planSelected,expanded:planSelected,handler:()=>toggleThreadRunMobilePanel('plan')});
+    planPill.setAttribute('aria-controls','threadRunPlanDetail');
+    const progressRing=document.createElement('span');
+    progressRing.className='threadRunPlanProgress';
+    progressRing.setAttribute('aria-hidden','true');
+    planPill.replaceChild(progressRing,planPill.firstChild);
+    planPill.style.setProperty('--thread-run-progress',progress.percent+'%');
+    pills.appendChild(planPill);
+  }
+  if(agentCount){
+    const agentPill=threadRunMobilePill('bot',agentCount+' 个智能体','threadRunAgentPill');
+    pills.appendChild(agentPill);
+  }
+  viewport.appendChild(pills);
+  mobile.appendChild(viewport);
+  requestAnimationFrame(()=>{if(viewport.isConnected)viewport.scrollLeft=threadRunMobileScrollLeft});
+  return mobile;
+}
+function renderThreadGoalBar(){
+  const composer=dropZone?.parentElement||document.querySelector('.composer');
+  if(!composer)return;
+  ensureThreadGoalBar(composer, promptQueuePanel||dropZone);
+  if(!threadGoalBar)return;
+  const previousMobileViewport=threadGoalBar.querySelector('.threadRunPillsViewport');
+  if(previousMobileViewport)threadRunMobileScrollLeft=previousMobileViewport.scrollLeft;
+  const native=currentConversationSource==='codex' && currentConversationId;
+  const goal=native?currentThreadGoal:null;
+  const show=Boolean(goal && goal.status && goal.status!=='complete');
+  threadGoalBar.classList.toggle('hidden', !show);
+  threadGoalBar.classList.toggle('isActive', goal?.status==='active');
+  threadGoalBar.classList.toggle('isPaused', goal?.status==='paused');
+  threadGoalBar.classList.toggle('isBlocked', ['blocked','usage_limited','budget_limited'].includes(String(goal?.status||'')));
+  if(!show){
+    threadRunMobilePanel='';
+    threadRunMobileScrollLeft=0;
+    stopThreadGoalTimer();
+    threadGoalBar.replaceChildren();
+    updateComposerOverlayInset({scroll:true});
+    return;
+  }
+  threadGoalBar.replaceChildren();
+  const statusLabel=threadGoalStatusLabel(goal.status);
+  threadGoalBar.toggleAttribute('aria-busy',threadGoalSaving);
+  threadGoalBar.setAttribute('aria-label',statusLabel+'：'+goal.objective);
+  const lead=document.createElement('i');
+  lead.className='threadGoalLead';
+  lead.setAttribute('data-lucide','target');
+  lead.setAttribute('aria-hidden','true');
+  const body=document.createElement('div');
+  body.className='threadGoalBody';
+  const title=document.createElement('div');
+  title.className='threadGoalTitle';
+  const status=document.createElement('span');
+  status.className='threadGoalStatus';
+  status.textContent=statusLabel;
+  const summary=document.createElement('span');
+  summary.className='threadGoalSummary';
+  summary.textContent=goal.objective;
+  summary.title=goal.objective;
+  title.append(status,summary);
+  body.appendChild(title);
+  const time=document.createElement('span');
+  time.className='threadGoalTime';
+  time.textContent=formatThreadGoalElapsed(currentThreadGoalElapsedSeconds(goal));
+  const actions=document.createElement('div');
+  actions.className='threadGoalActions';
+  const edit=threadGoalActionButton('pencil','编辑目标',editCurrentThreadGoal);
+  const toggling=goal.status==='active';
+  const toggle=threadGoalActionButton(toggling?'pause':'play',toggling?'暂停目标':'恢复目标',toggleCurrentThreadGoal);
+  const clear=threadGoalActionButton('trash-2','清除目标',()=>void clearCurrentThreadGoal(),'isDanger');
+  actions.append(edit,toggle,clear);
+  const mobile=createThreadRunMobile(goal);
+  threadGoalBar.append(lead,body,time,actions,mobile);
+  refreshIcons(threadGoalBar);
+  stopThreadGoalTimer();
+  if(goal.status==='active'){
+    threadGoalTimer=setInterval(refreshThreadGoalElapsed, 1000);
+    threadGoalTimer.unref?.();
+  }
+  updateComposerOverlayInset({scroll:true});
+}
 function renderPromptQueue(){
   if(!promptQueuePanel||!promptQueueList)return;
   const threadId=currentConversationSource==='codex'?currentConversationId:'';
   const items=threadId?promptQueueFor(threadId):[];
-  promptQueuePanel.classList.toggle('hidden',!threadId||!items.length);
+  const showInWeb=Boolean(threadId&&items.length);
+  promptQueuePanel.classList.toggle('hidden',!showInWeb);
   promptQueueList.replaceChildren();
-  if(!threadId||!items.length){
+  if(!showInWeb){
     updateComposerOverlayInset({scroll:true});
     return;
   }
@@ -8206,8 +8632,10 @@ function renderPromptQueue(){
     lead.setAttribute('data-lucide',appOwned?'monitor-smartphone':dispatching||guiding?'loader-circle':'grip-vertical');
     lead.setAttribute('aria-hidden','true');
     lead.title=appOwned?'由 Codex App 管理并发送':dispatching||guiding?'发送中':'拖动调整顺序';
-    const body=document.createElement('div');
+    const body=document.createElement('button');
+    body.type='button';
     body.className='promptQueueBody';
+    body.title='编辑队列消息';
     const label=document.createElement('span');
     label.className='promptQueueText';
     label.textContent=queuedPromptLabel(item);
@@ -8224,19 +8652,18 @@ function renderPromptQueue(){
       meta.textContent='Codex App';
       body.appendChild(meta);
     }
+    body.addEventListener('click',()=>restoreQueuedPrompt(threadId,item.id));
     const busy=dispatching||guiding||steerSubmitting||appQueueEditSaving;
+    body.disabled=busy;
     row.appendChild(lead);
     row.appendChild(body);
     const retryable=queueFailures.has(item.id)&&!appOwned;
-    const edit=queueActionButton('pencil','编辑',()=>restoreQueuedPrompt(threadId,item.id));
-    edit.disabled=busy;
     const guide=queueActionButton(retryable?'rotate-cw':'corner-down-left',retryable?'重试':'引导',()=>{
       if(retryable)dispatchNextQueuedPrompt(threadId,{force:true});else steerQueuedPrompt(threadId,item.id);
     },true);
     guide.disabled=busy||(!webRunActive&&!retryable);
     const remove=queueActionButton('trash-2','删除',()=>deleteQueuedPrompt(threadId,item.id));
     remove.disabled=busy;
-    row.appendChild(edit);
     row.appendChild(guide);
     row.appendChild(remove);
     if(!appOwned){
@@ -8742,7 +9169,10 @@ async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
   }
 }
 function closeComposerPopovers(){
-  for(const [panel,button] of [[composerProjectPanel,composerProjectToggle],[composerPermissionPanel,composerPermissionToggle],[composerModelPanel,composerModelToggle]]){
+  composerContextPinned=false;
+  if(composerContextHoverTimer)clearTimeout(composerContextHoverTimer);
+  composerContextHoverTimer=0;
+  for(const [panel,button] of [[composerProjectPanel,composerProjectToggle],[composerPermissionPanel,composerPermissionToggle],[composerModelPanel,composerModelToggle],[composerContextPanel,composerContextToggle]]){
     panel?.classList.add('hidden');
     button?.setAttribute('aria-expanded','false');
   }
@@ -8922,7 +9352,7 @@ function syncComposerChrome(){
   renderComposerPermissionState();
 }
 function composerPopoverOpen(){
-  return [composerProjectPanel,composerPermissionPanel,composerModelPanel,composerSlashPanel,composerAtPanel].some((panel)=>panel&&!panel.classList.contains('hidden'));
+  return [composerProjectPanel,composerPermissionPanel,composerModelPanel,composerContextPanel,composerSlashPanel,composerAtPanel].some((panel)=>panel&&!panel.classList.contains('hidden'));
 }
 function composerChromeContains(node){
   if(!node||node.nodeType!==1)return false;
@@ -8931,6 +9361,7 @@ function composerChromeContains(node){
     || composerProjectPicker?.contains(node)
     || composerPermissionPanel?.contains(node)
     || composerModelPanel?.contains(node)
+    || composerContextPanel?.contains(node)
     || composerSlashPanel?.contains(node)
     || composerAtPanel?.contains(node)
   );
@@ -8993,6 +9424,10 @@ function keepComposerAboveKeyboard({force=false}={}){
   const next=active?Math.max(0,inset):0;
   document.body.style.setProperty('--keyboard-inset', next+'px');
   document.body.classList.toggle('keyboardOpen', next>0);
+  if(window.__composerOverlayInsetKeyboardRaf)cancelAnimationFrame(window.__composerOverlayInsetKeyboardRaf);
+  window.__composerOverlayInsetKeyboardRaf=requestAnimationFrame(()=>updateComposerOverlayInset({scroll:true}));
+  window.clearTimeout(window.__composerOverlayInsetSettleTimer);
+  window.__composerOverlayInsetSettleTimer=window.setTimeout(()=>updateComposerOverlayInset({scroll:true}),160);
   if(next>0&&dropZone){
     // Ensure the floating capsule stays inside the visual viewport on iOS/Android.
     try{dropZone.scrollIntoView({block:'end',inline:'nearest',behavior:'instant'})}catch{dropZone.scrollIntoView(false)}
@@ -9008,11 +9443,13 @@ function enhanceComposerOverlayInset(){
   window.addEventListener('resize', schedule, {passive:true});
   window.visualViewport?.addEventListener('resize', schedule, {passive:true});
   window.visualViewport?.addEventListener('scroll', schedule, {passive:true});
+  const composer=dropZone?.parentElement||document.querySelector('.composer');
+  composer?.addEventListener('transitionend',(event)=>{if(event.propertyName==='bottom')schedule()});
   if(typeof ResizeObserver==='function'){
     const ro=new ResizeObserver(schedule);
-    const composer=dropZone?.parentElement||document.querySelector('.composer');
     if(composer)ro.observe(composer);
     if(promptQueuePanel)ro.observe(promptQueuePanel);
+    if(threadGoalBar)ro.observe(threadGoalBar);
     if(dropZone)ro.observe(dropZone);
     window.__composerOverlayInsetRO=ro;
   }
@@ -9862,7 +10299,7 @@ function enhanceComposer(){
   composerProjectPicker.appendChild(composerProjectToggle);
   composerProjectPicker.appendChild(composerProjectPanel);
   composer.insertBefore(composerProjectPicker,composer.firstChild);
-  if(attachmentTray&&composer&&attachmentTray.parentElement===composer)composer.insertBefore(attachmentTray,dropZone);
+  if(attachmentTray&&dropZone&&attachmentTray.parentElement!==dropZone)dropZone.insertBefore(attachmentTray,input);
   promptQueuePanel=document.createElement('section');
   promptQueuePanel.className='promptQueue hidden';
   promptQueuePanel.setAttribute('aria-label','待发送消息');
@@ -9879,9 +10316,10 @@ function enhanceComposer(){
   promptQueueList.className='promptQueueList';
   promptQueuePanel.appendChild(queueHead);
   promptQueuePanel.appendChild(promptQueueList);
-  // Queue sits above the input capsule (composer sibling), not inside .box.
-  const queueAnchor=(attachmentTray&&attachmentTray.parentNode===composer)?attachmentTray:dropZone;
+  // Queue sits above the input capsule; attachments live inside the capsule.
+  const queueAnchor=dropZone;
   composer.insertBefore(promptQueuePanel,queueAnchor);
+  ensureThreadGoalBar(composer, queueAnchor);
   setIconLabel(attachFile,'plus','上传附件',false);
   setIconLabel(sendBtn,'arrow-up','发送',false);
   setIconLabel(cancelBtn,'square','停止',false);
@@ -9893,6 +10331,16 @@ function enhanceComposer(){
   composerPermissionToggle.setAttribute('aria-controls','composerPermissionPanel');
   composerPermissionToggle.setAttribute('aria-haspopup','dialog');
   attachFile.after(composerPermissionToggle);
+  composerGoalIndicator=document.createElement('span');
+  composerGoalIndicator.className='composerGoalIndicator hidden';
+  composerGoalIndicator.setAttribute('role','status');
+  composerGoalIndicator.setAttribute('aria-hidden','true');
+  const composerGoalIcon=document.createElement('i');
+  composerGoalIcon.setAttribute('data-lucide','target');
+  composerGoalIcon.setAttribute('aria-hidden','true');
+  composerGoalIndicator.appendChild(composerGoalIcon);
+  composerPermissionToggle.after(composerGoalIndicator);
+  renderComposerGoalIndicator();
   composerModelToggle=document.createElement('button');
   composerModelToggle.type='button';
   composerModelToggle.className='composerModelToggle';
@@ -9913,6 +10361,17 @@ function enhanceComposer(){
   composerModelToggle.appendChild(composerEffortName);
   composerModelToggle.appendChild(modelChevron);
   dropZone.insertBefore(composerModelToggle,sendBtn);
+  composerContextToggle=document.createElement('button');
+  composerContextToggle.type='button';
+  composerContextToggle.className='composerContextToggle hidden';
+  composerContextToggle.setAttribute('aria-expanded','false');
+  composerContextToggle.setAttribute('aria-controls','composerContextPanel');
+  composerContextToggle.setAttribute('aria-haspopup','dialog');
+  composerContextRing=document.createElement('span');
+  composerContextRing.className='composerContextRing';
+  composerContextRing.setAttribute('aria-hidden','true');
+  composerContextToggle.appendChild(composerContextRing);
+  dropZone.insertBefore(composerContextToggle,composerModelToggle);
   composerPermissionPanel=document.querySelector('.composerControls');
   if(composerPermissionPanel){
     composerPermissionPanel.id='composerPermissionPanel';
@@ -10003,9 +10462,37 @@ function enhanceComposer(){
   composerModelSubmenu.append(submenuHead,composerModelSubmenuOptions);
   composerModelPanel.append(composerModelMainMenu,composerModelSubmenu);
   dropZone.appendChild(composerModelPanel);
+  composerContextPanel=document.createElement('div');
+  composerContextPanel.id='composerContextPanel';
+  composerContextPanel.className='composerPopover composerContextPanel hidden';
+  composerContextPanel.setAttribute('role','dialog');
+  composerContextPanel.setAttribute('aria-labelledby','composerContextTitle');
+  const contextTitle=document.createElement('div');
+  contextTitle.id='composerContextTitle';
+  contextTitle.className='composerContextTitle';
+  contextTitle.textContent='上下文窗口';
+  composerContextPercent=document.createElement('strong');
+  composerContextPercent.className='composerContextPercent';
+  composerContextDetails=document.createElement('div');
+  composerContextDetails.className='composerContextDetails';
+  composerContextPanel.append(contextTitle,composerContextPercent,composerContextDetails);
+  dropZone.appendChild(composerContextPanel);
   composerProjectToggle.addEventListener('click',(event)=>{event.preventDefault();expandComposer();toggleComposerPopover(composerProjectPanel,composerProjectToggle)});
   composerPermissionToggle.addEventListener('click',(event)=>{event.preventDefault();expandComposer();toggleComposerPopover(composerPermissionPanel,composerPermissionToggle)});
   composerModelToggle.addEventListener('click',(event)=>{event.preventDefault();expandComposer();toggleComposerPopover(composerModelPanel,composerModelToggle)});
+  composerContextToggle.addEventListener('click',(event)=>{
+    event.preventDefault();
+    expandComposer();
+    const closeOnly=composerContextPinned&&!composerContextPanel.classList.contains('hidden');
+    closeComposerPopovers();
+    if(!closeOnly)showComposerContextDetails({pinned:true});
+  });
+  composerContextToggle.addEventListener('mouseenter',()=>{if(composerContextPanel.classList.contains('hidden'))closeComposerPopovers();showComposerContextDetails()});
+  composerContextToggle.addEventListener('mouseleave',scheduleComposerContextHide);
+  composerContextToggle.addEventListener('focus',()=>showComposerContextDetails());
+  composerContextToggle.addEventListener('blur',scheduleComposerContextHide);
+  composerContextPanel.addEventListener('mouseenter',()=>{if(composerContextHoverTimer)clearTimeout(composerContextHoverTimer)});
+  composerContextPanel.addEventListener('mouseleave',scheduleComposerContextHide);
   composerProviderSelect.addEventListener('change',async()=>{provider.value=composerProviderSelect.value;rememberNativeComposerOverride();await loadModels(provider.value);rememberNativeComposerOverride();syncComposerChrome()});
   composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;reconcileComposerFastSupport();rememberNativeComposerOverride();syncComposerChrome()});
   composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;rememberNativeComposerOverride();syncComposerChrome()});
@@ -11232,7 +11719,6 @@ dropZone?.addEventListener('dragover',(e)=>{if(hasFileDrag(e)){e.preventDefault(
 dropZone?.addEventListener('dragleave',()=>dropZone.classList.remove('drag'));
 dropZone?.addEventListener('drop',(e)=>{dropZone.classList.remove('drag');const files=[...(e.dataTransfer?.files||[])];if(!files.length)return;e.preventDefault();handleAttachmentFiles(files)});
 dropZone?.addEventListener('paste',handleAttachmentPaste);
-input?.addEventListener('paste',handleAttachmentPaste);
 cancelBtn?.addEventListener('click', cancelRun);
 nativeRequestForm?.addEventListener('submit',(e)=>e.preventDefault());
 document.addEventListener('visibilitychange',syncNativeAfterPageResume);
@@ -12855,7 +13341,7 @@ function applyConversationMode(){
   nativeNotice.classList.toggle('hidden',!native);
   setIconLabel(modeLabel,native?'app-window':'globe-2',native?'Codex App':'Web');
   statusEl.classList.toggle('running',webRunActive);
-  input.placeholder=queueStarting?'正在发送队列消息...':steerSubmitting?'正在发送引导...':'向 Codex 提问';
+  input.placeholder=queueStarting?'正在发送队列消息...':steerSubmitting?'正在发送引导...':webRunActive&&native?'跟进':'向 Codex 提问';
   sendBtn.setAttribute('aria-label',webRunActive&&native?'加入队列':'发送');
   sendBtn.title=webRunActive&&native?'加入队列':'发送';
   cancelBtn.classList.toggle('hidden',!webRunActive||!native);
@@ -12865,6 +13351,7 @@ function applyConversationMode(){
   if(dropZone)setComposerExpanded(composerShouldStayExpanded());
   syncComposerChrome();
   renderPromptQueue();
+  renderThreadGoalBar();
   if(activeMainView==='archive'){
     statusEl.classList.remove('running');
     statusEl.textContent=archiveNotice||'Codex App · '+archivedItems.length+' 个已归档任务';
@@ -12889,7 +13376,7 @@ function setNativeComposerOverride(threadId,selectedProvider,selectedModel,selec
   nativeComposerOverride={threadId,provider:String(selectedProvider||''),model:String(selectedModel||''),reasoningEffort:String(selectedReasoningEffort||''),serviceTier:normalizeComposerServiceTier(selectedServiceTier),permissionMode:String(selectedPermissionMode||'legacy'),sandbox:String(selectedSandbox||''),approval:String(selectedApproval||'')};
 }
 function nativeComposerOverrideApplies(threadId){return Boolean(nativeComposerOverride?.threadId&&nativeComposerOverride.threadId===threadId)}
-function newChat(){stopNativeConversationPoll();showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeComposerOverride();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeComposerOverride();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -12970,6 +13457,7 @@ async function loadConversation(id,source='web',options={}){
   currentConversationSource=source==='codex'?'codex':'web';
   nativeCursor=0;
   nativeGeneration=0;
+  syncComposerContextWindow(null);
   applyConversationMode();
   updateActiveHistory();
   statusEl.textContent='Loading...';
@@ -12990,6 +13478,7 @@ async function loadConversation(id,source='web',options={}){
   nativeGeneration=Number(conversation.generation||0);
   activeNativeTurnId=String(conversation.activeTurnId||'');
   webRunActive=currentConversationSource==='codex'&&conversation.status==='running';
+  syncComposerContextWindow(conversation.contextWindow||null);
   if(currentConversationSource==='codex')applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(conversation.id)});
   applyConversationMode();
   updateActiveHistory();
@@ -12997,67 +13486,18 @@ async function loadConversation(id,source='web',options={}){
   const messages=conversation.messages||[];
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
   const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
-  let hydratedTurnId='';
-  const hydrateIsActiveTurn=(turnId)=>Boolean(webRunActive&&activeNativeTurnId&&String(turnId||'')===activeNativeTurnId);
-  const hydrateShouldStartTurn=(msg)=>{
-    const turnId=String(msg.turnId||'');
-    if(!turnId)return false;
-    if(msg.role==='user'&&!['steering_user','steering_browser_comment'].includes(String(msg.kind||'')))return true;
-    if(msg.role==='process'&&msg.kind==='task_started')return true;
-    return false;
-  };
+  beginTurnProcessCollection();
   messages.forEach((msg,index)=>{
-    const turnId=currentConversationSource==='codex'?String(msg.turnId||''):'';
-    const activeTurn=hydrateIsActiveTurn(turnId);
-    // Close prior completed turns on boundaries so only the active turn stays live.
-    if(turnId&&hydratedTurnId&&turnId!==hydratedTurnId&&collectingTurnProcess&&!turnProcessElapsedMatches(turnId)){
-      finalizeTurnProcessCollection({
-        turnId:hydratedTurnId,
-        text:'任务完成',
-        preferExistingFinal:true,
-        autoScroll:false,
-      });
-    }
-    if(turnId&&hydrateShouldStartTurn(msg)&&(!collectingTurnProcess||(turnId&&!turnProcessElapsedMatches(turnId)))){
-      if(activeTurn)beginTurnProcessCollection(activeStartedAt||msg.at,true,turnId);
-      else beginTurnProcessCollection(msg.at,false,turnId);
-    }else if(activeTurn&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))){
-      beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
-    }else if(!collectingTurnProcess&&(msg.role==='process'||msg.role==='tool'||(msg.role==='assistant'&&['commentary','live_progress'].includes(String(msg.kind||''))))){
-      beginTurnProcessCollection(msg.at,false,turnId);
-    }
-    if(turnId)hydratedTurnId=turnId;
+    if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
     addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
-    // A historical final without task_complete still needs a completion card before the next turn.
-    if(currentConversationSource==='codex'&&msg.role==='assistant'&&msg.kind==='final_answer'&&turnId&&!activeTurn&&collectingTurnProcess&&turnProcessElapsedMatches(turnId)){
-      const hasCompleteLater=messages.slice(index+1).some((item)=>String(item.turnId||'')===turnId&&item.role==='process'&&item.kind==='task_complete');
-      if(!hasCompleteLater)finalizeTurnProcessCollection({
-        turnId,
-        text:'任务完成',
-        at:msg.at,
-        preferExistingFinal:true,
-        autoScroll:false,
-      });
-    }
   });
-  if(webRunActive&&activeNativeTurnId){
-    if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);
-    else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId);
-  }else if(collectingTurnProcess){
-    finalizeTurnProcessCollection({
-      turnId:hydratedTurnId||turnProcessElapsedTurnId||'',
-      text:'任务完成',
-      preferExistingFinal:true,
-      autoScroll:false,
-    });
-  }
+  if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(!messages.length&&!webRunActive)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   updateConversationStatus(conversation);
+  setThreadGoal(currentConversationSource==='codex' ? (conversation.goal || null) : null);
   if(currentConversationSource==='codex')await pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
   else renderPromptQueue();
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
-  if(currentConversationSource==='codex')ensureNativeConversationPoll();
-  else stopNativeConversationPoll();
   closeMenu();
   persistActiveConversation(currentConversationId,currentConversationSource);
   scrollChatToLatest({force:true});
@@ -13168,7 +13608,7 @@ function connectSessionEvents(){
     try{changedIds=JSON.parse(event.data||'{}').changedIds||[]}catch(e){}
     refreshOpenSubagentTraces(changedIds);
     if(nativeSyncTimer)clearTimeout(nativeSyncTimer);
-    const syncDelay=webRunActive&&currentConversationSource==='codex'?40:90;
+    const syncDelay=webRunActive&&currentConversationSource==='codex'?80:260;
     nativeSyncTimer=setTimeout(async()=>{
       nativeSyncTimer=null;
       await refreshHistory();
@@ -13233,6 +13673,70 @@ function connectSessionEvents(){
     applyRemotePromptQueueEvent(payload);
   });
 }
+function nativeMessageElementBySequence(sequence){
+  const target=Number(sequence);
+  if(!Number.isInteger(target)||target<1)return null;
+  return [...chat.querySelectorAll('[data-native-message-seq]')]
+    .find((item)=>Number(item.dataset.nativeMessageSeq)===target)||null;
+}
+function refreshNativeResetImage(message){
+  const source=String(message?.content||'');
+  if(!source)return false;
+  const direct=nativeMessageElementBySequence(message.seq)?.querySelector('img')||null;
+  const identity=inputImageIdentity(source);
+  const attachment=[...chat.querySelectorAll('.userAttachmentStack img')]
+    .find((image)=>identity&&inputImageIdentity(image.getAttribute('src')||'')===identity)||null;
+  const image=direct||attachment;
+  if(!image)return false;
+  if(image.getAttribute('src')!==source)image.setAttribute('src',source);
+  return true;
+}
+function reconcileNativeResetMessage(message){
+  if(message?.role==='image')return refreshNativeResetImage(message);
+  const existing=nativeMessageElementBySequence(message?.seq);
+  if(!existing)return false;
+  const text=String(message.content||'');
+  const before=normalizeAssistantDedupeText(existing.dataset.messageText||'');
+  const after=normalizeAssistantDedupeText(text);
+  existing.dataset.messageText=text;
+  existing.dataset.messageKind=String(message.kind||'');
+  existing.dataset.turnId=String(message.turnId||'');
+  if(message.at)existing.dataset.messageAt=String(message.at);
+  if(existing._messageBody&&before!==after){
+    if(message.role==='assistant')renderAssistantMarkdown(existing._messageBody,text);
+    else if(message.role==='user')renderMessageMarkdown(existing._messageBody,automationInstructionDisplayText(text));
+  }
+  if(message.role==='assistant'&&message.kind==='final_answer'){
+    existing.classList.remove('progressCommentary');
+    latestFinalAssistantElement=existing;
+  }
+  return true;
+}
+function nativeResetMessagesForIncrementalSync(conversation){
+  const messages=Array.isArray(conversation?.messages)?conversation.messages:[];
+  const previousCursor=nativeCursor;
+  const sequences=new Set(messages.map((message)=>Number(message.seq)).filter(Number.isInteger));
+  const firstSequence=sequences.size?Math.min(...sequences):previousCursor+1;
+  const staleVisible=[...chat.querySelectorAll('[data-native-message-seq]')].some((item)=>{
+    const sequence=Number(item.dataset.nativeMessageSeq);
+    return Number.isInteger(sequence)&&sequence>=firstSequence&&sequence<=previousCursor&&!sequences.has(sequence);
+  });
+  if(staleVisible)return null;
+  for(const [key,live] of nativeLiveItems){
+    if(live?.source!=='snapshot')continue;
+    if(live.renderTimer)clearTimeout(live.renderTimer);
+    nativeLiveItems.delete(key);
+  }
+  nativeRenderedMessageKeys.clear();
+  const pending=[];
+  for(const message of messages){
+    const sequence=Number(message.seq);
+    if(Number.isInteger(sequence)&&sequence>previousCursor){pending.push(message);continue}
+    if(reconcileNativeResetMessage(message))continue;
+    if(['assistant','user'].includes(message.role))pending.push(message);
+  }
+  return pending;
+}
 async function syncCurrentNativeConversationOnce(){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
   const id=currentConversationId;
@@ -13243,35 +13747,25 @@ async function syncCurrentNativeConversationOnce(){
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
   const data=await res.json();
   const conversation=data.conversation;
-  applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id),preservePermissions:false});
+  applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
+  syncComposerContextWindow(conversation.contextWindow||null);
   syncComposerChrome();
+  let syncMessages=conversation.messages||[];
   if(conversation.reset){
-    // generation invalidates the incremental cursor. Never advance the cursor and drop
-    // later fields while a turn is still running — that forced users to hard-refresh.
-    if(conversation.status==='running'){
-      await loadConversation(id,'codex');
-      return;
-    }
-    if(webRunActive||nativeLiveItems.size){
-      nativeCursor=Number(conversation.cursor||nativeCursor);
-      nativeGeneration=Number(conversation.generation||nativeGeneration);
-      const resetTurnId=nativeCompletionSync?.turnId||activeNativeTurnId;
-      freezeTurnProcessElapsed(conversation.updatedAt,resetTurnId);
-      scheduleNativeCompletionSync(id,resetTurnId,120);
-      return;
-    }
-    await loadConversation(id,'codex');return;
+    syncMessages=nativeResetMessagesForIncrementalSync(conversation);
+    if(!syncMessages){await loadConversation(id,'codex');return}
+    nativeGeneration=Number(conversation.generation||nativeGeneration);
   }
   const wasRunning=webRunActive;
   const completingTurnId=activeNativeTurnId;
   const incomingActiveTurnId=String(conversation.activeTurnId||activeNativeTurnId||'');
   const nearBottom=captureNativeLiveFollowBottom();
   if(conversation.status==='running'&&incomingActiveTurnId&&incomingActiveTurnId!==activeNativeTurnId){activeNativeTurnId=incomingActiveTurnId;webRunActive=true}
-  if((conversation.messages||[]).length){
+  if(syncMessages.length){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
   }
-  for(const msg of conversation.messages||[]){
+  for(const msg of syncMessages){
     const role=msg.role==='log'?'log':msg.role;
     // Skip only while a live runtime stream bubble is still pumping for this turn.
     if(nativeRuntimeStreamTurnIds.has(String(msg.turnId||''))&&['assistant','thinking'].includes(role)){
@@ -13285,9 +13779,6 @@ async function syncCurrentNativeConversationOnce(){
     if(role==='assistant'&&adoptRuntimeLiveForSnapshotMessage(msg)){
       continue;
     }
-    if(role!=='assistant'&&Number.isInteger(msg.seq)&&[...chat.querySelectorAll('.msg')].some((item)=>Number(item.dataset.nativeMessageSeq)===Number(msg.seq))){
-      continue;
-    }
     addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage})
   }
   nativeCursor=Number(conversation.cursor||nativeCursor);
@@ -13299,18 +13790,13 @@ async function syncCurrentNativeConversationOnce(){
     freezeTurnProcessElapsed(conversation.updatedAt,completingTurnId);
     activeNativeTurnId='';
     finishAllNativeLiveItems();
-    if(nativeTerminalPersisted(conversation,completingTurnId)&&nativeLiveItems.size){
-      clearNativeCompletionSync();
-      await loadConversation(id,'codex');
-      return;
-    }
     scheduleNativeCompletionSync(id,completingTurnId,120);
   }
   updateConversationStatus(conversation);
+  setThreadGoal(conversation.goal || null);
   applyConversationMode();
   if(!webRunActive)schedulePromptQueueDispatch(id,180);
-  if(nearBottom&&(conversation.messages||[]).length)scheduleNativeLiveScroll();
-  ensureNativeConversationPoll();
+  if(nearBottom&&syncMessages.length)scheduleNativeLiveScroll();
 }
 function nativeTerminalPersisted(conversation,turnId){
   const id=String(turnId||'');
@@ -13348,7 +13834,7 @@ async function reconcileNativeCompletion(){
       if(nativeCompletionSync!==pending)return;
       if(nativeTerminalPersisted(data.conversation,pending.turnId)){
         nativeCompletionSync=null;
-        await loadConversation(pending.threadId,'codex');
+        await syncCurrentNativeConversation();
         return;
       }
     }
@@ -13358,7 +13844,7 @@ async function reconcileNativeCompletion(){
   if(pending.attempt>=60){nativeCompletionSync=null;statusEl.textContent='任务已结束，历史记录仍在同步';return}
   scheduleNativeCompletionSync(pending.threadId,pending.turnId,Math.min(1500,180+pending.attempt*90));
 }
-function syncNativeAfterPageResume(){ensureNativeConversationPoll();
+function syncNativeAfterPageResume(){
   if(document.visibilityState==='hidden'||currentConversationSource!=='codex'||!currentConversationId)return;
   if(nativeCompletionSync){scheduleNativeCompletionSync(nativeCompletionSync.threadId,nativeCompletionSync.turnId,0);return}
   syncCurrentNativeConversation();
@@ -13759,65 +14245,13 @@ function markdownLocalFileIcon(href){
   if(['png','jpg','jpeg','webp','gif','svg','avif'].includes(extension))return'image';
   return extension?'file-code-2':'file';
 }
-function normalizeMarkdownLocalPath(value){
-  let clean=String(value||'').trim();
-  if(!clean)return '';
-  if(/^(https?:|mailto:|javascript:|data:|blob:)/i.test(clean))return '';
-  if(/^file:/i.test(clean)){
-    try{clean=decodeURIComponent(new URL(clean).pathname||'')}catch(e){return ''}
-  }
-  // Same-origin absolute links created from markdown like href="/Volumes/..." stay path-only.
-  try{
-    if(clean.startsWith(location.origin+'/')) clean=clean.slice(location.origin.length);
-  }catch(e){}
-  clean=clean.split(/[?#]/,1)[0];
-  try{clean=decodeURIComponent(clean)}catch(e){}
-  clean=clean.replace(/:\\d+(?::\\d+)?$/,'');
-  if(!/^\\/(?:Users|Volumes|workspace|opt|var|tmp|home|root)\\//.test(clean) && clean.indexOf('~/')!==0 && clean!=='~') return '';
-  return clean;
-}
-async function openMarkdownLocalPath(filePath,{reveal=false}={}){
-  const localPath=normalizeMarkdownLocalPath(filePath);
-  if(!localPath) throw new Error('不是可打开的本地路径');
-  const response=await fetch('/api/open-local-path',{
-    method:'POST',
-    headers:{'Content-Type':'application/json',Accept:'application/json'},
-    body:JSON.stringify({
-      path:localPath,
-      reveal:Boolean(reveal),
-      cwd:(typeof currentConversationCwd==='string'&&currentConversationCwd)||window.__currentConversationCwd||'',
-    }),
-  });
-  const data=await response.json().catch(()=>({}));
-  if(!response.ok) throw new Error(data.error||'打开本地文件失败');
-  return data;
-}
 function decorateMarkdownLink(link,href){
   if(!link||!href)return link;
   link.classList.add('markdownLink');
-  const localPath=normalizeMarkdownLocalPath(href)||normalizeMarkdownLocalPath(link.getAttribute('href')||'');
-  if(localPath){
-    link.classList.add('markdownFileLink');
-    link.href=localPath;
-    link.target='_self';
-    link.rel='noopener';
-    link.dataset.linkUrl=localPath;
-    link.dataset.localPath=localPath;
-    link.title=localPath+'（点击在本地打开）';
-    if(!link.querySelector(':scope > .markdownFileLinkIcon')){
-      const icon=document.createElement('i');
-      icon.className='markdownFileLinkIcon';
-      icon.setAttribute('data-lucide',markdownLocalFileIcon(localPath)||'file');
-      icon.setAttribute('aria-hidden','true');
-      link.prepend(icon);
-    }
-    return link;
-  }
   link.target='_blank';
   link.rel='noopener noreferrer';
   if(!link.title)link.title=href;
   link.dataset.linkUrl=href;
-  delete link.dataset.localPath;
   const fileIcon=markdownLocalFileIcon(href);
   if(fileIcon&&!link.querySelector(':scope > .markdownFileLinkIcon')){
     link.classList.add('markdownFileLink');
@@ -13899,8 +14333,7 @@ function ensureChatLinkMenu(){
   const actions=[
     {id:'add',label:'添加到聊天'},
     {id:'copy',label:'拷贝'},
-    {id:'open',label:'打开'},
-    {id:'reveal',label:'在 Finder 中显示'},
+    {id:'open',label:'打开链接'},
   ];
   for(const action of actions){
     const button=document.createElement('button');
@@ -13979,48 +14412,13 @@ async function handleChatLinkMenuAction(action){
     statusEl.textContent='已复制链接';
     return;
   }
-  if(action==='open' || action==='reveal'){
-    const localPath=normalizeMarkdownLocalPath(url);
-    if(localPath){
-      try{
-        statusEl.textContent=action==='reveal'?'正在 Finder 中显示…':'正在打开本地文件…';
-        const result=await openMarkdownLocalPath(localPath,{reveal:action==='reveal'});
-        statusEl.textContent=action==='reveal'
-          ? ('已在 Finder 中显示 '+(result.name||localPath))
-          : ('已在本地打开 '+(result.name||localPath));
-      }catch(error){
-        statusEl.textContent=String(error?.message||'打开本地文件失败');
-      }
-      return;
-    }
-    if(action==='reveal'){
-      statusEl.textContent='当前链接不是本地文件';
-      return;
-    }
+  if(action==='open'){
     window.open(url,'_blank','noopener,noreferrer');
   }
 }
 function bindChatLinkContextMenu(){
   if(!chat||chat.dataset.linkMenuBound==='1')return;
   chat.dataset.linkMenuBound='1';
-  chat.addEventListener('click',(event)=>{
-    const link=event.target?.closest?.('a.markdownLink, a.markdownFileLink, .markdownBody a[href]');
-    if(!link||!chat.contains(link))return;
-    const href=String(link.dataset.localPath||link.dataset.linkUrl||link.getAttribute('href')||'').trim();
-    const localPath=normalizeMarkdownLocalPath(href);
-    if(!localPath)return;
-    event.preventDefault();
-    event.stopPropagation();
-    if(event.metaKey||event.ctrlKey){
-      void openMarkdownLocalPath(localPath,{reveal:true})
-        .then((result)=>{statusEl.textContent='已在 Finder 中显示 '+(result.name||localPath)})
-        .catch((error)=>{statusEl.textContent=String(error?.message||'打开本地文件失败')});
-      return;
-    }
-    void openMarkdownLocalPath(localPath)
-      .then((result)=>{statusEl.textContent='已在本地打开 '+(result.name||localPath)})
-      .catch((error)=>{statusEl.textContent=String(error?.message||'打开本地文件失败')});
-  });
   chat.addEventListener('contextmenu',(event)=>{
     const link=event.target?.closest?.('a.markdownLink, .markdownBody a[href]');
     if(link&&chat.contains(link)){
@@ -14821,6 +15219,7 @@ function appendAgentActivityBatch(group,batch){
   }
   group.insertBefore(batch,group._agentActivityStatus);
   updateAgentActivityGroupStatus(group);
+  if(typeof renderThreadGoalBar==='function')renderThreadGoalBar();
 }
 function settleAgentActivityGroup(group){
   for(const batch of group?._agentActivityBatches||[])settleTurnTool(batch);
@@ -15249,6 +15648,7 @@ function upsertLiveTurnPlan(plan){
   const normalized=normalizeTurnPlanItems(plan);
   ensureTurnProcessHeader();
   liveTurnPlan=normalized;
+  if(typeof renderThreadGoalBar==='function')renderThreadGoalBar();
   const next=refreshLiveEditedFilesResult();
   moveLiveEditedFilesResultToEnd();
   return next;
@@ -15323,7 +15723,7 @@ function turnTokenUsageLabel(tokenUsage){
   const total=Number(tokenUsage?.totalTokens);
   if(!Number.isFinite(total)||total<0)return'';
   const rounded=Math.round(total);
-  return String(rounded).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')+' tokens';
+  return '本轮累计 '+String(rounded).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')+' tokens';
 }
 function liveProcessElapsedTitle(startedAt,now=Date.now()){
   const start=Number(startedAt);
@@ -15429,6 +15829,7 @@ function clearLiveTurnProgress(){
   liveTurnPlan=[];
   if(liveEditedFilesResult?.parentNode)liveEditedFilesResult.remove();
   liveEditedFilesResult=null;
+  if(typeof renderThreadGoalBar==='function')renderThreadGoalBar();
 }
 function clearTurnProcessHeader(){
   clearTurnReasoningStatus();
@@ -15462,141 +15863,38 @@ function resetTurnProcessCollection(){
   pendingAgentActivityBatches=[];
   pendingActivityReasoning=[];
   collectingTurnProcess=false;
-}
-function findTurnFinalAssistantElement(turnId=''){
-  const id=String(turnId||'');
-  const turnAssistants=[...chat.querySelectorAll('.msg.assistant')].filter((item)=>{
-    if(!item)return false;
-    if(id&&item.dataset.turnId&&item.dataset.turnId!==id)return false;
-    const messageKind=item.dataset.messageKind||'';
-    return !messageKind||['','message','commentary','live_progress','final_answer'].includes(messageKind);
-  });
-  // Prefer explicit final_answer; otherwise promote the last non-progress-style assistant bubble.
-  let turnFinal=turnAssistants.find((item)=>(item.dataset.messageKind||'')==='final_answer')||null;
-  if(!turnFinal){
-    turnFinal=[...turnAssistants].reverse().find((item)=>{
-      const messageKind=item.dataset.messageKind||'';
-      if(['commentary','live_progress'].includes(messageKind))return false;
-      return !isProgressStyleAssistantText(item.dataset.messageText||item.textContent||'');
-    })||turnAssistants.at(-1)||null;
-  }
-  return turnFinal||null;
-}
-function finalizeTurnProcessCollection(options={}){
-  if(!collectingTurnProcess&&!(turnProcessElements||[]).length&&!turnProcessHeader)return null;
-  const turnId=String(options.turnId||turnProcessElapsedTurnId||'');
-  const text=String(options.text||'任务完成');
-  const completedAt=turnProcessStartTimestamp(options.at);
-  const elapsedSeconds=Number.isFinite(options.elapsedSeconds)
-    ?Number(options.elapsedSeconds)
-    :(turnProcessStartedAt>0?Math.max(0,(completedAt-turnProcessStartedAt)/1000):NaN);
-  // Prefer explicit final_answer; otherwise promote the last non-progress-style assistant bubble.
-  let turnFinal=findTurnFinalAssistantElement(turnId);
-  if(turnFinal){
-    turnFinal.classList.remove('progressCommentary');
-    if((turnFinal.dataset.messageKind||'')!=='final_answer')turnFinal.dataset.messageKind='final_answer';
-    // Ensure the final reply sits in the main chat stream, not the live process panel.
-    if(turnFinal.parentNode!==chat)chat.appendChild(turnFinal);
-    latestFinalAssistantElement=turnFinal;
-  }
-  const anchor=(latestFinalAssistantElement?.parentNode===chat&&(!turnId||!latestFinalAssistantElement.dataset.turnId||latestFinalAssistantElement.dataset.turnId===turnId)?latestFinalAssistantElement:null)||turnFinal;
-  const artifacts=collectTurnArtifactsFromDom(anchor,takeTurnProcessElements());
-  const isProgressArtifact=(item)=>{
-    if(!item||item===anchor)return false;
-    if(item.classList?.contains('progressCommentary'))return true;
-    if(item.classList?.contains('assistant')){
-      const messageKind=item.dataset?.messageKind||'';
-      if(messageKind==='final_answer')return false;
-      if(['commentary','live_progress'].includes(messageKind))return true;
-      if(['','message'].includes(messageKind))return isProgressStyleAssistantText(item.dataset?.messageText||item.textContent||'');
-    }
-    return ['commentary','live_progress'].includes(item?.dataset?.messageKind||'');
-  };
-  const isToolArtifact=(item)=>{
-    if(!item||item===anchor||isProgressArtifact(item))return false;
-    if(item.classList?.contains('tool')||item.classList?.contains('activityBatch')||item.classList?.contains('activityCluster')||item.classList?.contains('agentActivityGroup'))return true;
-    if(item.classList?.contains('process')&&!item.classList?.contains('completionSummary')&&!item.classList?.contains('liveProcessHeader')&&!item.classList?.contains('reasoningStatus'))return true;
-    return ['tool_activity','agent_activity','agent_activity_group','activity_cluster','context_compacted','image_view_activity'].includes(item.dataset?.messageKind||'');
-  };
-  const visibleActivities=artifacts.filter((item)=>item.dataset?.messageKind==='image_view_activity');
-  // Keep assistant progress commentary in the completion timeline instead of dropping it.
-  // Interleave note -> tools -> note -> tools in chronological artifact order (App-style).
-  const processElements=[];
-  const pendingTools=[];
-  const flushPendingTools=()=>{
-    if(!pendingTools.length)return;
-    const chunk=pendingTools.splice(0,pendingTools.length);
-    const kept=[];
-    const loose=[];
-    for(const item of chunk){
-      if(item?.classList?.contains('activityCluster')||item?.classList?.contains('agentActivityGroup'))kept.push(item);
-      else loose.push(item);
-    }
-    processElements.push(...kept, ...regroupTurnToolArtifacts(loose));
-  };
-  for(const item of artifacts){
-    if(item===anchor)continue;
-    if(item.classList?.contains('steeringUser')){
-      // Plain steers stay chronological inside the completion timeline.
-      // Browser-comment cards stay visible as main-stream user inputs.
-      if(item.classList?.contains('browserCommentSteering')){
-        if(item.parentNode&&item.parentNode!==chat){
-          if(anchor?.parentNode===chat)chat.insertBefore(item, anchor);
-          else chat.appendChild(item);
-        }
-        continue;
-      }
-      flushPendingTools();
-      processElements.push(item);
-      continue;
-    }
-    if(isProgressArtifact(item)){
-      const progressText=String(item.dataset?.messageText||item.textContent||'').trim();
-      if(!progressText){
-        if(item.parentNode)item.remove();
-        continue;
-      }
-      flushPendingTools();
-      item.classList.remove('streaming');
-      processElements.push(item);
-      continue;
-    }
-    if(isToolArtifact(item)&&item.dataset?.messageKind!=='image_view_activity')pendingTools.push(item);
-  }
-  flushPendingTools();
-  if(!processElements.length&&!anchor&&!visibleActivities.length){
-    latestToolElement=null;
-    return null;
-  }
-  const resultArtifacts=createTurnResultArtifacts(artifacts.filter((item)=>!isProgressArtifact(item)),turnId);
-  for(const item of visibleActivities)settleTurnTool(item);
-  const completion=createCompletionMessage(text,processElements,turnId,elapsedSeconds,options.tokenUsage||null);
-  if(anchor){
-    chat.insertBefore(completion,anchor);
-    for(const item of visibleActivities)chat.insertBefore(item,anchor);
-    if(resultArtifacts)chat.insertBefore(resultArtifacts,anchor.nextSibling);
-  }else{
-    chat.appendChild(completion);
-    for(const item of visibleActivities)chat.appendChild(item);
-    if(resultArtifacts)chat.appendChild(resultArtifacts);
-  }
-  latestToolElement=null;
-  refreshIcons(chat);
-  if(options.autoScroll!==false){
-    requestAnimationFrame(()=>{scrollChatToLatest({force:false});});
-    scrollChatToLatest();
-  }
-  return completion;
+  if(typeof renderThreadGoalBar==='function')renderThreadGoalBar();
 }
 function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
-  // If a previous turn never received task_complete, fold it into completion+final first.
-  if(collectingTurnProcess)finalizeTurnProcessCollection({
-    turnId:turnProcessElapsedTurnId||'',
-    text:'任务完成',
-    preferExistingFinal:true,
-    autoScroll:false,
-  });
-  resetTurnProcessCollection();
+  // If a previous turn never received task_complete, keep its assistant progress instead of deleting it.
+  if(collectingTurnProcess&&turnProcessElements.length){
+    const orphaned=turnProcessElements.filter((item)=>item?.isConnected);
+    if(orphaned.length){
+      const orphanFinal=[...orphaned].reverse().find((item)=>item.classList?.contains('assistant')&&!item.classList.contains('progressCommentary'))
+        ||[...orphaned].reverse().find((item)=>item.classList?.contains('assistant'))
+        ||null;
+      if(orphanFinal){
+        orphanFinal.classList.remove('progressCommentary');
+        if((orphanFinal.dataset.messageKind||'')!=='final_answer')orphanFinal.dataset.messageKind='final_answer';
+        if(orphanFinal.parentNode!==chat)chat.appendChild(orphanFinal);
+        latestFinalAssistantElement=orphanFinal;
+      }
+      const processKeep=orphaned.filter((item)=>item!==orphanFinal&&(item.classList?.contains('progressCommentary')||item.classList?.contains('steeringUser')));
+      const completion=createCompletionMessage('任务完成',processKeep,turnProcessElapsedTurnId||'',NaN,null);
+      if(orphanFinal?.parentNode===chat)chat.insertBefore(completion,orphanFinal);
+      else chat.appendChild(completion);
+    }
+  }
+  for(const element of turnProcessElements){
+    if(!element?.parentNode)continue;
+    if(element.parentNode===chat&&!element.classList.contains('assistant'))element.remove();
+  }
+  clearTurnProcessHeader();
+  turnProcessElements=[];
+  currentActivityCluster=null;
+  currentAgentActivityGroup=null;
+  pendingAgentActivityBatches=[];
+  pendingActivityReasoning=[];
   collectingTurnProcess=true;
   if(showElapsed)startTurnProcessElapsed(startedAt,Date.now(),turnId);
 }
@@ -15710,11 +16008,15 @@ function isHandoffSummaryText(text){
   if(!normalized)return false;
   const firstLine=normalized.split('\\n',1)[0].trim();
   const plain=firstLine.replace(/^#{1,6}\\s+/,'').replace(/^\\*{1,2}|\\*{1,2}$/g,'').replace(/^_+|_+$/g,'').trim().toLowerCase();
-  if(plain==='handoff'||plain==='handoff summary'||plain==='context checkpoint'||plain==='current task'||plain==='current progress'||plain.startsWith('handoff:')||plain.startsWith('handoff summary:')||plain.startsWith('context checkpoint:')||plain.startsWith('current task:')||plain.startsWith('current progress:')||plain.startsWith('交接摘要')||/^\\*\\*handoff(?:\\s+summary)?\\*\\*/i.test(firstLine)||/^\\*\\*current task\\*\\*/i.test(firstLine)||/^\\*\\*current progress\\*\\*/i.test(firstLine))return true;
-  const head=normalized.slice(0,2800).toLowerCase();
+  if(plain==='handoff'||plain==='handoff summary'||plain==='compacted handoff summary'||plain==='context checkpoint'||plain==='current task'||plain==='current progress'||plain.startsWith('handoff:')||plain.startsWith('handoff summary:')||plain.startsWith('compacted handoff')||plain.startsWith('context checkpoint:')||plain.startsWith('current task:')||plain.startsWith('current progress:')||plain.startsWith('交接摘要')||/^\\*\\*handoff(?:\\s+summary)?\\*\\*/i.test(firstLine)||/^\\*\\*compacted handoff(?:\\s+summary)?\\*\\*/i.test(firstLine)||/^\\*\\*current task\\*\\*/i.test(firstLine)||/^\\*\\*current progress\\*\\*/i.test(firstLine))return true;
+  const head=normalized.slice(0,6000).toLowerCase();
+  const structuredChineseHandoff=plain==='当前状态'&&['最新需求：','当前源码仍是','上一轮已完成并需保留','## 下一步','工作树有大量','禁止清理或回滚'].every((signal)=>head.includes(signal));
+  if(structuredChineseHandoff)return true;
   const hasGoal=head.includes('## goal')||head.includes('## 目标')||head.startsWith('goal\\n')||head.startsWith('目标\\n');
   const hasOps=head.includes('service / ops')||head.includes('immediate next steps')||head.includes('already done')||head.includes('key files')||head.includes('key decisions')||head.includes('what remains')||head.includes('critical references')||head.includes('next immediate')||head.includes('constraints')||head.includes('current status')||head.includes('key findings')||head.includes('important constraints')||head.includes('useful references')||head.includes('open decisions')||head.includes('likely design')||head.includes('investigation started');
-  return hasGoal&&hasOps;
+  const structuredHandoffSections=['## current state','## findings','## browser state','## agents','## next steps','## 当前状态','## 发现','## 浏览器状态','## 代理','## 后续步骤'].filter((section)=>head.includes(section)).length;
+  const hasActiveGoalMarker=head.includes('active goal:');
+  return hasGoal&&(hasOps||structuredHandoffSections>=3||(hasActiveGoalMarker&&structuredHandoffSections>=2));
 }
 function isProgressStyleAssistantText(text){
   const source=String(text||'').replace(/\\r\\n/g,'\\n').trim();
@@ -15821,8 +16123,8 @@ function regroupTurnToolArtifacts(elements=[]){
   return [...grouped,...standalone];
 }
 function createCompletionMessage(text,processElements=[],turnId='',elapsedSeconds=NaN,tokenUsage=null){
-  // Preserve mid-turn steering at its chronological point between response/tool items.
-  const items=settleTurnProcessHistory(processElements).filter((item)=>Boolean(item)&&(!item.classList?.contains('user')||item.classList?.contains('steeringUser')));
+  // User/steer bubbles stay in the main chat stream; completion cards only hold process/tool history.
+  const items=settleTurnProcessHistory(processElements).filter((item)=>Boolean(item)&&!item.classList?.contains('user')&&!item.classList?.contains('steeringUser'));
   const collapsible=items.length>0;
   const el=document.createElement(collapsible?'details':'div');
   el.className='msg process completionSummary'+(collapsible?' collapsible':'');
@@ -16168,22 +16470,15 @@ function appendInputImageToUser(userElement,source,at){
   if(!userElement?.isConnected||!userElement._messageBody)return null;
   const normalized=inputImageIdentity(source);
   if(!normalized&&!String(source||'').trim())return null;
+  const singleImageInput=userElement.classList.contains('steeringUser')
+    ||userElement.classList.contains('browserCommentSteering');
   let stack=userElement.querySelector('.userAttachmentStack');
   if(!stack){
     stack=document.createElement('div');
     stack.className='userAttachmentStack';
     const toolContent=userElement.querySelector(':scope > .toolContent');
-    const browserCard=userElement.querySelector(':scope > .browserCommentCard');
-    if(toolContent){
-      toolContent.insertBefore(stack,toolContent.firstChild);
-    }else if(browserCard){
-      // Keep screenshot media inside the comment card surface.
-      browserCard.insertBefore(stack,browserCard.firstChild);
-    }else if(userElement._messageBody?.parentNode===userElement){
-      userElement.insertBefore(stack,userElement._messageBody);
-    }else{
-      userElement.insertBefore(stack,userElement.firstChild);
-    }
+    if(toolContent)toolContent.insertBefore(stack,toolContent.firstChild);
+    else userElement.insertBefore(stack,userElement._messageBody);
   }
   const sameImage=(image)=>{
     const src=image.getAttribute('src')||'';
@@ -16193,7 +16488,14 @@ function appendInputImageToUser(userElement,source,at){
   if(existing){
     // Prefer the fresher server URL when rebinding the same visual.
     if(source&&existing.getAttribute('src')!==source&&isServerSessionImageSrc(source))existing.setAttribute('src',source);
-    return existing.closest('button');
+    const button=existing.closest('button');
+    while(singleImageInput&&stack.children.length>1){
+      const extra=stack.lastElementChild===button?stack.firstElementChild:stack.lastElementChild;
+      if(!extra||extra===button)break;
+      extra.remove();
+    }
+    stack.classList.toggle('single',stack.children.length===1);
+    return button;
   }
   // Optimistic /assets/images/upload-* often later becomes /api/native-sessions/.../images/{seq}.
   // Rebind either direction instead of creating a second copy.
@@ -16216,7 +16518,7 @@ function appendInputImageToUser(userElement,source,at){
         button.addEventListener('click',()=>openImagePreview(counterpart.getAttribute('src')||source,counterpart.alt||'用户上传的图片',button));
       }
       // Keep at most one thumb on steers.
-      while(userElement.classList.contains('steeringUser')&&stack.children.length>1)stack.lastElementChild.remove();
+      while(singleImageInput&&stack.children.length>1)stack.lastElementChild.remove();
       stack.classList.toggle('single',stack.children.length===1);
       userElement.classList.add('hasInputImage');
       return button||counterpart;
@@ -16229,8 +16531,8 @@ function appendInputImageToUser(userElement,source,at){
     if(wrap)wrap.remove();
     else image.remove();
   }
-  // Mid-turn steers: never show two thumbs for the same attachment payload.
-  if(userElement.classList.contains('steeringUser')&&stack.children.length>=1){
+  // Mid-turn steers and browser comments intentionally render one representative screenshot.
+  if(singleImageInput&&stack.children.length>=1){
     const button=stack.querySelector('.userAttachment')||stack.firstElementChild;
     const img=button?.querySelector?.('img')||stack.querySelector('img');
     if(img&&source)img.setAttribute('src',source);
@@ -16281,46 +16583,46 @@ function completionTimelineForTurn(turnId){
   }
   return timeline;
 }
-function browserCommentEyebrowText(options={}){
-  return options.optimisticQueueId?'待发送消息':'浏览器注释';
-}
-function syncBrowserCommentCardChrome(element,options={}){
-  if(!element?.classList?.contains('browserCommentSteering'))return element;
-  if(options.kind)element.dataset.messageKind=String(options.kind);
-  if(options.browserTarget!=null)element.dataset.browserTarget=String(options.browserTarget||'');
-  if(options.annotationCount!=null){
-    const annotationCount=Math.max(1,Number(options.annotationCount)||1);
-    element.dataset.annotationCount=String(annotationCount);
-    const badge=element.querySelector('.browserCommentBadge');
-    if(badge)badge.textContent=options.optimisticQueueId?'待发送消息':(annotationCount===1?'1 条注释':annotationCount+' 条注释');
-  }
-  // Title row removed; badge alone carries the compact label.
-  if(Number.isInteger(options.nativeMessageSeq))element.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
-  if(options.at)element.dataset.messageAt=String(options.at);
+function reconcileNativeSteeringElement(element,options={}){
+  if(!element)return null;
+  const queueId=String(element.dataset.optimisticQueueId||'');
+  if(queueId)nativeOptimisticSteering.delete(queueId);
+  element.classList.remove('optimistic');
+  delete element.dataset.optimisticQueueId;
+  element.dataset.messageKind='steering_user';
+  element.dataset.messageAt=String(options.at||element.dataset.messageAt||'');
   if(options.turnId)element.dataset.turnId=String(options.turnId);
-  if(!options.optimisticQueueId){
-    element.classList.remove('optimistic');
-    delete element.dataset.optimisticQueueId;
-  }
+  if(Number.isInteger(options.nativeMessageSeq))element.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+  latestUserElement=element;
   return element;
 }
-function consumeNativeOptimisticSteering(text,at,turnId,options={}){
+function consumeNativeOptimisticSteering(text,options={}){
   const expected=String(text||'').trim();
-  const expectedTurnId=String(turnId||'');
+  const expectedTurnId=String(options.turnId||'');
   for(const [id,element] of nativeOptimisticSteering){
     if(!element?.isConnected){nativeOptimisticSteering.delete(id);continue}
     if(String(element.dataset.messageText||'').trim()!==expected)continue;
     if(expectedTurnId&&element.dataset.turnId&&element.dataset.turnId!==expectedTurnId)continue;
     nativeOptimisticSteering.delete(id);
-    element.classList.remove('optimistic');
-    delete element.dataset.optimisticQueueId;
-    element.dataset.messageAt=String(at||element.dataset.messageAt||'');
-    if(expectedTurnId)element.dataset.turnId=expectedTurnId;
-    syncBrowserCommentCardChrome(element,{...options,at,turnId:expectedTurnId||options.turnId,optimisticQueueId:''});
-    latestUserElement=element;
-    return element;
+    return reconcileNativeSteeringElement(element,options);
   }
   return null;
+}
+function findExistingNativeSteering(text,options={}){
+  const sequence=Number(options.nativeMessageSeq);
+  if(Number.isInteger(sequence)){
+    const bySequence=nativeMessageElementBySequence(sequence);
+    if(bySequence?.classList?.contains('steeringUser'))return bySequence;
+  }
+  const expected=String(text||'').trim();
+  const expectedAt=String(options.at||'');
+  const expectedTurnId=String(options.turnId||'');
+  if(!expected||!expectedAt)return null;
+  return [...chat.querySelectorAll('.msg.user.steeringUser')].reverse().find((element)=>(
+    String(element.dataset.messageText||'').trim()===expected
+    && (!expectedTurnId||!element.dataset.turnId||element.dataset.turnId===expectedTurnId)
+    && String(element.dataset.messageAt||'')===expectedAt
+  ))||null;
 }
 function cleanSteeringMessageDuplicates(element){
   if(!element||!chat)return element;
@@ -16357,9 +16659,10 @@ function cleanSteeringMessageDuplicates(element){
 }
 function appendConversationElement(element,role,options={}){
   const steering=Boolean(options.steering)||element?.classList?.contains('steeringUser');
-  // Normal user questions stay above the live process panel. A mid-turn steer is
-  // adopted into the live timeline by activateTurnProcessElement at its send point.
-  if(role==='user'&&!steering&&turnProcessHeader?.parentNode===chat)chat.insertBefore(element,turnProcessHeader);
+  // Input context and normal user questions stay above the live process panel.
+  // A mid-turn steer is adopted into the live timeline at its send point.
+  const beforeLiveProcess=role==='context'||(role==='user'&&!steering);
+  if(beforeLiveProcess&&turnProcessHeader?.parentNode===chat)chat.insertBefore(element,turnProcessHeader);
   else chat.appendChild(element);
   return element;
 }
@@ -16426,40 +16729,11 @@ function addMsg(role,text,options={}){
   if(role==='assistant'&&isHandoffSummaryText(text))return null;
   if(role==='context'&&kind==='handoff_summary')return null;
   const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
-  const steeringUser=role==='user'&&['steering_user','steering_browser_comment'].includes(kind);
+  const midTurnUser=role==='user'&&['steering_user','steering_browser_comment'].includes(kind);
+  const steeringUser=role==='user'&&kind==='steering_user';
   const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage(text);
-  const completedSteeringTimeline=steeringUser?completionTimelineForTurn(options.turnId):null;
+  const completedSteeringTimeline=midTurnUser?completionTimelineForTurn(options.turnId):null;
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
-  // Incremental native sync can re-deliver the same seq when a prior render throws.
-  // Reuse the existing DOM node instead of cloning user/browser-comment bubbles.
-  if(Number.isInteger(options.nativeMessageSeq)&&!options.streaming&&!options.optimisticQueueId&&!inputImage){
-    const existingNative=[...chat.querySelectorAll('.msg')].find((item)=>Number(item.dataset.nativeMessageSeq)===Number(options.nativeMessageSeq));
-    if(existingNative){
-      if(options.kind)existingNative.dataset.messageKind=String(options.kind);
-      if(options.turnId)existingNative.dataset.turnId=String(options.turnId);
-      if(options.at)existingNative.dataset.messageAt=String(options.at);
-      if(role==='assistant'){
-        const targetText=String(text||'');
-        const existingText=String(existingNative.dataset.messageText||'');
-        if(targetText&&normalizeAssistantDedupeText(existingText)!==normalizeAssistantDedupeText(targetText)){
-          existingNative.dataset.messageText=targetText;
-          if(existingNative._messageBody)renderAssistantMarkdown(existingNative._messageBody,targetText);
-        }
-        latestAssistantElement=existingNative;
-        if(kind==='final_answer'){
-          existingNative.classList.remove('progressCommentary');
-          latestFinalAssistantElement=existingNative;
-        }
-      }else if(role==='user'){
-        if(String(options.kind||'')==='steering_browser_comment'||existingNative.classList.contains('browserCommentSteering')){
-          syncBrowserCommentCardChrome(existingNative,options);
-        }
-        latestUserElement=existingNative;
-      }
-      if(options.autoScroll!==false)scrollChatToLatest();
-      return existingNative;
-    }
-  }
   if(role!=='user'&&!inputImage)latestUserElement=null;
   if(role==='thinking')return null;
   const terminalProcess=role==='process'&&['task_complete','task_error','turn_aborted','error'].includes(kind);
@@ -16512,7 +16786,7 @@ function addMsg(role,text,options={}){
     return activity;
   }
   if(role==='user'){
-    if(steeringUser){
+    if(midTurnUser){
       if(!completedSteeringTimeline&&!collectingTurnProcess)beginTurnProcessCollection(options.at);
     }else{
       if(!collectingTurnProcess)beginTurnProcessCollection(options.at);
@@ -16524,26 +16798,116 @@ function addMsg(role,text,options={}){
   const empty=chat.querySelector('.empty');
   if(empty)empty.remove();
   if(steeringUser&&!options.optimisticQueueId){
-    const optimistic=consumeNativeOptimisticSteering(text,options.at,options.turnId,options);
-    if(optimistic){
+    const existingSteering=consumeNativeOptimisticSteering(text,options)||findExistingNativeSteering(text,options);
+    if(existingSteering){
+      reconcileNativeSteeringElement(existingSteering,options);
       if(options.autoScroll!==false)scrollChatToLatest();
-      return optimistic;
+      return existingSteering;
     }
   }
   if(role==='process'&&kind==='task_complete'){
-    freezeTurnProcessElapsed(options.at,options.turnId);
-    clearLiveTurnProgress();
-    settleTurnTool(latestToolElement);
-    collapseCurrentActivityCluster();
-    // Prefer existing final_answer for that turnId; fold process into completionSummary before it.
-    return finalizeTurnProcessCollection({
-      turnId:options.turnId||'',
-      text,
-      at:options.at,
-      tokenUsage:options.tokenUsage,
-      preferExistingFinal:true,
-      autoScroll:options.autoScroll,
+    const completedAt=turnProcessStartTimestamp(options.at);
+    const elapsedSeconds=turnProcessStartedAt>0?Math.max(0,(completedAt-turnProcessStartedAt)/1000):NaN;
+    const turnId=String(options.turnId||'');
+    const turnAssistants=[...chat.querySelectorAll('.msg.assistant')].filter((item)=>{
+      if(!item)return false;
+      if(turnId&&item.dataset.turnId&&item.dataset.turnId!==turnId)return false;
+      const messageKind=item.dataset.messageKind||'';
+      return !messageKind||['','message','commentary','live_progress','final_answer'].includes(messageKind);
     });
+    // Prefer explicit final_answer; otherwise promote the last non-progress-style assistant bubble.
+    let turnFinal=turnAssistants.find((item)=>(item.dataset.messageKind||'')==='final_answer')||null;
+    if(!turnFinal){
+      turnFinal=[...turnAssistants].reverse().find((item)=>{
+        const messageKind=item.dataset.messageKind||'';
+        if(['commentary','live_progress'].includes(messageKind))return false;
+        return !isProgressStyleAssistantText(item.dataset.messageText||item.textContent||'');
+      })||turnAssistants.at(-1)||null;
+    }
+    if(turnFinal){
+      turnFinal.classList.remove('progressCommentary');
+      if((turnFinal.dataset.messageKind||'')!=='final_answer')turnFinal.dataset.messageKind='final_answer';
+      // Ensure the final reply sits in the main chat stream, not the live process panel.
+      if(turnFinal.parentNode!==chat)chat.appendChild(turnFinal);
+      latestFinalAssistantElement=turnFinal;
+    }
+    const anchor=(latestFinalAssistantElement?.parentNode===chat?latestFinalAssistantElement:null)||turnFinal;
+    const artifacts=collectTurnArtifactsFromDom(anchor,takeTurnProcessElements());
+    const isProgressArtifact=(item)=>{
+      if(!item||item===anchor)return false;
+      if(item.classList?.contains('progressCommentary'))return true;
+      if(item.classList?.contains('assistant')){
+        const messageKind=item.dataset?.messageKind||'';
+        if(messageKind==='final_answer')return false;
+        if(['commentary','live_progress'].includes(messageKind))return true;
+        if(['','message'].includes(messageKind))return isProgressStyleAssistantText(item.dataset?.messageText||item.textContent||'');
+      }
+      return ['commentary','live_progress'].includes(item?.dataset?.messageKind||'');
+    };
+    const isToolArtifact=(item)=>{
+      if(!item||item===anchor||isProgressArtifact(item))return false;
+      if(item.classList?.contains('tool')||item.classList?.contains('activityBatch')||item.classList?.contains('activityCluster')||item.classList?.contains('agentActivityGroup'))return true;
+      if(item.classList?.contains('process')&&!item.classList?.contains('completionSummary')&&!item.classList?.contains('liveProcessHeader')&&!item.classList?.contains('reasoningStatus'))return true;
+      return ['tool_activity','agent_activity','agent_activity_group','activity_cluster','context_compacted','image_view_activity'].includes(item.dataset?.messageKind||'');
+    };
+    const visibleActivities=artifacts.filter((item)=>item.dataset?.messageKind==='image_view_activity');
+    // Keep assistant progress commentary in the completion timeline instead of dropping it.
+    // Interleave note -> tools -> note -> tools in chronological artifact order (App-style).
+    const processElements=[];
+    const pendingTools=[];
+    const flushPendingTools=()=>{
+      if(!pendingTools.length)return;
+      const chunk=pendingTools.splice(0,pendingTools.length);
+      const kept=[];
+      const loose=[];
+      for(const item of chunk){
+        if(item?.classList?.contains('activityCluster')||item?.classList?.contains('agentActivityGroup'))kept.push(item);
+        else loose.push(item);
+      }
+      processElements.push(...kept, ...regroupTurnToolArtifacts(loose));
+    };
+    for(const item of artifacts){
+      if(item===anchor)continue;
+      if(item.classList?.contains('steeringUser')){
+        // Keep historical user/steer bubbles in the main chat stream.
+        // Folding them into the default-collapsed completion card hides input history.
+        flushPendingTools();
+        continue;
+      }
+      if(isProgressArtifact(item)){
+        const progressText=String(item.dataset?.messageText||item.textContent||'').trim();
+        if(!progressText){
+          if(item.parentNode)item.remove();
+          continue;
+        }
+        flushPendingTools();
+        item.classList.remove('streaming');
+        processElements.push(item);
+        continue;
+      }
+      if(isToolArtifact(item)&&item.dataset?.messageKind!=='image_view_activity')pendingTools.push(item);
+    }
+    flushPendingTools();
+    const resultArtifacts=createTurnResultArtifacts(artifacts.filter((item)=>!isProgressArtifact(item)),options.turnId);
+    for(const item of visibleActivities)settleTurnTool(item);
+    const completion=createCompletionMessage(text,processElements,options.turnId,elapsedSeconds,options.tokenUsage);
+    const steerItems=artifacts.filter((item)=>item&&item!==anchor&&item.classList?.contains('steeringUser'));
+    if(anchor){
+      chat.insertBefore(completion,anchor);
+      for(const item of visibleActivities)chat.insertBefore(item,anchor);
+      for(const item of steerItems)chat.insertBefore(item,completion);
+      if(resultArtifacts)chat.insertBefore(resultArtifacts,anchor.nextSibling);
+    }else{
+      chat.appendChild(completion);
+      for(const item of visibleActivities)chat.appendChild(item);
+      for(const item of steerItems)chat.insertBefore(item,completion);
+      if(resultArtifacts)chat.appendChild(resultArtifacts);
+    }
+    latestToolElement=null;
+    refreshIcons(chat);
+    requestAnimationFrame(()=>{if(options.autoScroll!==false)scrollChatToLatest({force:false});});
+    if(options.autoScroll!==false)scrollChatToLatest();
+    return completion;
   }
   if(collectingTurnProcess&&role==='tool'){
     const activity=appendTurnTool(text,options);
@@ -16615,7 +16979,7 @@ function addMsg(role,text,options={}){
   el.dataset.messageAt=String(options.at||'');
   el.dataset.turnId=String(options.turnId||'');
   if(Number.isInteger(options.nativeMessageSeq))el.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
-  if(browserCommentUser){el.classList.add('browserCommentSteering');el.dataset.browserTarget=String(options.browserTarget||'');const annotationCount=Math.max(1,Number(options.annotationCount)||0);el.dataset.annotationCount=String(annotationCount)}
+  if(browserCommentUser){el.classList.add('browserCommentSteering');el.dataset.browserTarget=String(options.browserTarget||'')}
   if(steeringUser){
     el.classList.add('steeringUser');
     if(options.optimisticQueueId){
@@ -16657,7 +17021,7 @@ function addMsg(role,text,options={}){
     const body=document.createElement('div');
     body.className='msgBody';
     if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text);
-    else if(role==='user')renderMessageMarkdown(body,automationInstructionDisplayText(browserCommentUser?String(text||'').replace(/\s+$/,''):text));
+    else if(role==='user')renderMessageMarkdown(body,automationInstructionDisplayText(text));
     else body.textContent=text;
     const actions=document.createElement('div');
     actions.className='msgActions';
@@ -16741,41 +17105,9 @@ function addMsg(role,text,options={}){
       el.appendChild(summary);
       el.appendChild(content);
       el._messageLabel=label;
-    }else if(browserCommentUser){
-      const card=document.createElement('div');
-      card.className='browserCommentCard';
-      body.classList.add('browserCommentSource');
-      body.classList.add('browserCommentText');
-      // Drop trailing empty markdown nodes that create a blank band in the float.
-      while(body.lastChild && ((body.lastChild.nodeType===Node.TEXT_NODE && !String(body.lastChild.textContent||'').trim()) || (body.lastChild.nodeType===1 && !String(body.lastChild.textContent||'').trim() && !body.lastChild.querySelector('img,svg,video,canvas')))){
-        body.removeChild(body.lastChild);
-      }
-      for(const node of body.querySelectorAll('p,div,br')){
-        if(node.tagName==='BR' && !node.nextSibling){node.remove();continue}
-        if(['P','DIV'].includes(node.tagName) && !String(node.textContent||'').trim() && !node.querySelector('img,svg,video,canvas'))node.remove();
-      }
-      const meta=document.createElement('div');
-      meta.className='browserCommentMeta';
-      const annotationCount=Math.max(1,Number(options.annotationCount)||1);
-      const badge=document.createElement('div');
-      badge.className='browserCommentBadge';
-      badge.textContent=options.optimisticQueueId?'待发送消息':(annotationCount===1?'1 条注释':annotationCount+' 条注释');
-      meta.appendChild(badge);
-      meta.appendChild(body);
-      card.appendChild(meta);
-      card.tabIndex=0;
-      card.setAttribute('role','group');
-      card.setAttribute('aria-label','注释，悬停或聚焦查看正文');
-      // Touch devices have no hover: tap empty card chrome to expand/collapse text.
-      card.addEventListener('click',(event)=>{
-        if(event.target.closest('button,a,input,textarea,select,.userAttachment'))return;
-        if(window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches)return;
-        card.classList.toggle('is-comment-expanded');
-      });
-      el.appendChild(card);
-      el.appendChild(actions);
     }else{
       el.appendChild(body);
+      if(browserCommentUser)body.classList.add('browserCommentSource');
       el.appendChild(actions);
       if(longUser)bindLongUserMessage(el,body);
     }
@@ -16783,24 +17115,11 @@ function addMsg(role,text,options={}){
   }
   if(role==='tool'&&latestToolElement?.parentNode)latestToolElement.remove();
   appendConversationElement(el,role,{steering:steeringUser});
+  if(steeringUser||browserCommentUser)cleanSteeringMessageDuplicates(el);
   if(steeringUser){
-    cleanSteeringMessageDuplicates(el);
-    // Browser comments are the user's visible inputs; keep them in the main stream.
-    // Only plain mid-turn steers fold into the process/completion timeline.
-    if(browserCommentUser){
-      if(completedSteeringTimeline){
-        const completion=completedSteeringTimeline.closest('.completionSummary');
-        if(completion?.parentNode===chat){
-          const anchor=completion.nextSibling;
-          if(anchor)chat.insertBefore(el,anchor);
-          else chat.appendChild(el);
-        }
-      }
-    }else if(completedSteeringTimeline){
-      completedSteeringTimeline.appendChild(el);
-    }else{
-      activateTurnProcessElement(el);
-    }
+    // Historical steers should remain visible as input bubbles.
+    // Only live mid-turn steers join the active process timeline.
+    if(!completedSteeringTimeline)activateTurnProcessElement(el);
   }else if(isTurnProcessMessage(role,kind,text)){
     activateTurnProcessElement(el);
   }

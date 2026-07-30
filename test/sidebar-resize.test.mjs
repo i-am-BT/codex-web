@@ -204,3 +204,10 @@ test('the separator contract exposes a desktop hit area without changing mobile 
   assert.match(uiStyles, /\.app\.sidebarResizing\s*\{[\s\S]*?transition:\s*none;/);
   assert.match(uiStyles, /\.app\.sideCollapsed \.sidebarResizeHandle\s*\{\s*display:\s*none;/);
 });
+
+test('sidebar scroll containers hide their scrollbars without disabling overflow', () => {
+  assert.match(uiStyles, /body \.side,\s*body \.history\s*\{[^}]*-ms-overflow-style:\s*none;[^}]*scrollbar-width:\s*none;/s);
+  assert.match(uiStyles, /body \.side::\-webkit-scrollbar,\s*body \.history::\-webkit-scrollbar\s*\{[^}]*display:\s*none;/s);
+  assert.match(serverSource, /\.side\{[^}]*overflow:auto/);
+  assert.match(serverSource, /\.history\{[^}]*overflow:auto/);
+});

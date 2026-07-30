@@ -55,7 +55,7 @@ test('native session store lists, parses, and incrementally follows Codex JSONL'
       {
         timestamp: '2026-07-11T04:52:32.000Z',
         type: 'event_msg',
-        payload: { type: 'task_started', turn_id: 'turn-1' },
+        payload: { type: 'task_started', turn_id: 'turn-1', model_context_window: 258400 },
       },
       {
         timestamp: '2026-07-11T04:52:32.001Z',
@@ -279,6 +279,24 @@ This block is automatically supplied ambient UI state, not part of the user's re
         payload: { replacement_history: [] },
       },
       {
+        timestamp: '2026-07-11T04:52:32.004Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            // Codex can repeat the same cumulative snapshot. It must not be counted twice.
+            last_token_usage: {
+              input_tokens: 1200,
+              cached_input_tokens: 700,
+              output_tokens: 300,
+              reasoning_output_tokens: 80,
+              total_tokens: 1500,
+            },
+            total_token_usage: { total_tokens: 9999 },
+          },
+        },
+      },
+      {
         timestamp: '2026-07-11T04:52:32.005Z',
         type: 'response_item',
         payload: {
@@ -416,6 +434,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
     assert.equal(conversation.status, 'done');
     assert.equal(conversation.latestTurnId, 'turn-2');
     assert.equal(conversation.latestTurnStartedAt, '2026-07-11T04:52:33.000Z');
+    assert.deepEqual(conversation.contextWindow, { usedTokens: 50, maxTokens: 258400 });
     assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '用户消息'));
     assert.ok(conversation.messages.some((message) => (
       message.role === 'user'
@@ -555,16 +574,36 @@ This block is automatically supplied ambient UI state, not part of the user's re
 
     store.start();
     const changed = once(store, 'change');
-    await appendFile(sessionFile, jsonl([{
-      timestamp: '2026-07-11T04:53:00.000Z',
-      type: 'response_item',
-      payload: {
-        type: 'message',
-        role: 'assistant',
-        phase: 'final_answer',
-        content: [{ type: 'output_text', text: '新增回复' }],
+    await appendFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-11T04:52:59.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: {
+              input_tokens: 215308,
+              cached_input_tokens: 0,
+              output_tokens: 775,
+              reasoning_output_tokens: 392,
+              total_tokens: 216083,
+            },
+            total_token_usage: { total_tokens: 35835711 },
+            model_context_window: 258400,
+          },
+        },
       },
-    }]));
+      {
+        timestamp: '2026-07-11T04:53:00.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '新增回复' }],
+        },
+      },
+    ]));
     store.refresh();
     const [change] = await changed;
     assert.deepEqual(change.changedIds, [id]);
@@ -575,6 +614,7 @@ This block is automatically supplied ambient UI state, not part of the user's re
     });
     assert.equal(incremental.reset, false);
     assert.deepEqual(incremental.messages.map((message) => message.content), ['新增回复']);
+    assert.deepEqual(incremental.contextWindow, { usedTokens: 215308, maxTokens: 258400 });
     assert.ok(incremental.cursor > conversation.cursor);
 
     const compactedChange = once(store, 'change');
@@ -624,6 +664,43 @@ This block is automatically supplied ambient UI state, not part of the user's re
     )), false);
     assert.equal(afterCompaction.messages.filter((message) => message.kind === 'context_compacted').length, 2);
 
+    const immediateCompactionChange = once(store, 'change');
+    await appendFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-07-11T04:55:30.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            'Repository snapshot and continuation notes',
+            '- Keep the existing working tree unchanged.',
+            '- Resume from the latest browser state.',
+          ].join('\n') }],
+        },
+      },
+      {
+        timestamp: '2026-07-11T04:55:30.010Z',
+        type: 'compacted',
+        payload: {
+          message: [
+            'Another language model started to solve this problem.',
+            'Repository snapshot and continuation notes',
+            '- Keep the existing working tree unchanged.',
+            '- Resume from the latest browser state.',
+          ].join('\n'),
+          replacement_history: [],
+        },
+      },
+    ]));
+    store.refresh();
+    await immediateCompactionChange;
+    const afterImmediateCompaction = store.get(id);
+    assert.equal(afterImmediateCompaction.messages.some((message) => (
+      String(message.content || '').includes('Repository snapshot and continuation notes')
+    )), false);
+
     const delayedCompactionChange = once(store, 'change');
     await appendFile(sessionFile, jsonl([
       {
@@ -639,7 +716,10 @@ This block is automatically supplied ambient UI state, not part of the user's re
       {
         timestamp: '2026-07-11T04:56:10.000Z',
         type: 'compacted',
-        payload: { replacement_history: [] },
+        payload: {
+          message: 'Another language model started to solve this problem.\n正常最终回复',
+          replacement_history: [],
+        },
       },
     ]));
     store.refresh();
@@ -1678,6 +1758,68 @@ test('hides hash-title handoff agent summaries from web history', async () => {
         },
       },
       {
+        timestamp: '2026-07-23T10:00:02.875Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            '## Goal',
+            '',
+            'Active goal: remove the visible scrollbar from the Codex Web sidebar while preserving scrolling.',
+            '',
+            '## Current State',
+            '- Repo: /workspace/codex-web',
+            '',
+            '## Findings',
+            '- The internal handoff was rendered as a normal assistant bubble.',
+            '',
+            '## Next Steps',
+            '1. Filter the internal summary.',
+          ].join('\n') }],
+        },
+      },
+      {
+        timestamp: '2026-07-23T10:00:02.900Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            '## 当前状态',
+            '',
+            '最新需求：目标状态条保留目标正文。',
+            '当前源码仍是上一轮的极简版本。',
+            '上一轮已完成并需保留：真实页面验证。',
+            '',
+            '## 下一步',
+            '1. 补齐内部交接过滤。',
+            '',
+            '工作树有大量用户已有修改和备份文件，禁止清理或回滚。相关位置主要是 server.mjs。',
+          ].join('\n') }],
+        },
+      },
+      {
+        timestamp: '2026-07-23T10:00:02.950Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            '## 当前状态',
+            '',
+            '最新需求：目标状态条已经修复，服务健康。',
+            '',
+            '## 下一步',
+            '',
+            '工作树有大量用户已有修改，因此没有清理或回滚；等待用户验收。',
+          ].join('\n') }],
+        },
+      },
+      {
         timestamp: '2026-07-23T10:00:03.000Z',
         type: 'response_item',
         payload: {
@@ -1697,7 +1839,14 @@ test('hides hash-title handoff agent summaries from web history', async () => {
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Context checkpoint')), false);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('fix/internal-summary')), false);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Send the final response')), false);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('remove the visible scrollbar')), false);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('internal handoff was rendered')), false);
+    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('当前源码仍是上一轮')), false);
     assert.equal(conversation.messages.some((message) => message.kind === 'handoff_summary'), false);
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'assistant'
+      && message.content.includes('没有清理或回滚；等待用户验收')
+    )));
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content.includes('已隐藏交接摘要')));
   } finally {
     store?.stop();
@@ -2079,3 +2228,434 @@ test('native session store prefers user/assistant history over trailing tool spa
 function jsonl(records) {
   return records.map((record) => JSON.stringify(record)).join('\n') + '\n';
 }
+
+test('exposes active thread goals from goals_1.sqlite and thread_goal_updated events', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-thread-goal-'));
+  const sessionsDir = path.join(temporary, 'sessions', '2026', '07', '29');
+  await mkdir(sessionsDir, { recursive: true });
+  const id = '019fa98b-8d3b-72c3-908c-d4909779da26';
+  const goalsDb = path.join(temporary, 'goals_1.sqlite');
+  const db = new DatabaseSync(goalsDb);
+  db.exec(`
+    CREATE TABLE thread_goals (
+      thread_id TEXT PRIMARY KEY NOT NULL,
+      goal_id TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      status TEXT NOT NULL,
+      token_budget INTEGER,
+      tokens_used INTEGER NOT NULL DEFAULT 0,
+      time_used_seconds INTEGER NOT NULL DEFAULT 0,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+  `);
+  db.prepare(`
+    INSERT INTO thread_goals (
+      thread_id, goal_id, objective, status, token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    'goal-1',
+    '完整的测试所有功能有效,审查正常后进行pr提交,注意不要破坏前端ui',
+    'active',
+    null,
+    12,
+    34,
+    1785255923409,
+    1785255947606,
+  );
+  db.close();
+
+  const file = path.join(sessionsDir, `rollout-2026-07-29T00-25-23-${id}.jsonl`);
+  await writeFile(file, [
+    JSON.stringify({ timestamp: '2026-07-29T00:25:23.003Z', type: 'session_meta', payload: { id, cwd: temporary } }),
+    JSON.stringify({
+      timestamp: '2026-07-29T00:25:23.100Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_goal_updated',
+        threadId: id,
+        goal: {
+          threadId: id,
+          objective: '完整的测试所有功能有效,审查正常后进行pr提交,注意不要破坏前端ui',
+          status: 'active',
+          tokensUsed: 12,
+          timeUsedSeconds: 34,
+          createdAt: 1785255923,
+          updatedAt: 1785255947,
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-29T00:25:23.200Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: '继续' }],
+      },
+    }),
+    '',
+  ].join('\n'), 'utf8');
+
+  const store = new NativeSessionStore(temporary, {
+    goalsDbFile: goalsDb,
+    watchChanges: false,
+    maxSessions: 20,
+  });
+  try {
+    const conversation = store.get(id);
+    assert.ok(conversation?.goal);
+    assert.equal(conversation.goal.status, 'active');
+    assert.equal(conversation.goal.objective, '完整的测试所有功能有效,审查正常后进行pr提交,注意不要破坏前端ui');
+    assert.equal(conversation.goal.tokensUsed, 12);
+    assert.equal(conversation.goal.timeUsedSeconds, 34);
+  } finally {
+    store.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+
+test('rollout event goal remains available when goals db has no row', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-thread-goal-event-'));
+  const sessionsDir = path.join(temporary, 'sessions', '2026', '07', '29');
+  await mkdir(sessionsDir, { recursive: true });
+  const id = '019fa8b3-09e8-75a0-abd8-5ece634e5144';
+  const goalsDb = path.join(temporary, 'goals_1.sqlite');
+  const db = new DatabaseSync(goalsDb);
+  db.exec(`
+    CREATE TABLE thread_goals (
+      thread_id TEXT PRIMARY KEY NOT NULL,
+      goal_id TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      status TEXT NOT NULL,
+      token_budget INTEGER,
+      tokens_used INTEGER NOT NULL DEFAULT 0,
+      time_used_seconds INTEGER NOT NULL DEFAULT 0,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+  `);
+  db.close();
+
+  const file = path.join(sessionsDir, `rollout-2026-07-29T01-00-00-${id}.jsonl`);
+  await writeFile(file, [
+    JSON.stringify({ timestamp: '2026-07-29T01:00:00.003Z', type: 'session_meta', payload: { id, cwd: temporary } }),
+    JSON.stringify({
+      timestamp: '2026-07-29T01:00:01.100Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_goal_updated',
+        threadId: id,
+        goal: {
+          threadId: id,
+          objective: '将项目搭建成docker compose部署的项目,并提交pr和docker镜像',
+          status: 'active',
+          tokensUsed: 0,
+          timeUsedSeconds: 12,
+          createdAt: 1785256413,
+          updatedAt: 1785256413,
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-29T01:00:02.200Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: '继续' }],
+      },
+    }),
+    '',
+  ].join('\n'), 'utf8');
+
+  const store = new NativeSessionStore(temporary, {
+    goalsDbFile: goalsDb,
+    watchChanges: false,
+    maxSessions: 20,
+  });
+  try {
+    const conversation = store.get(id);
+    assert.ok(conversation?.goal);
+    assert.equal(conversation.goal.status, 'active');
+    assert.equal(conversation.goal.objective, '将项目搭建成docker compose部署的项目,并提交pr和docker镜像');
+    assert.equal(conversation.goal.timeUsedSeconds, 12);
+  } finally {
+    store.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('marks goal complete from update_goal tool call without thread_goal_updated', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-thread-goal-complete-'));
+  const sessionsDir = path.join(temporary, 'sessions', '2026', '07', '29');
+  await mkdir(sessionsDir, { recursive: true });
+  const id = '019fa8b3-09e8-75a0-abd8-5ece634e5144';
+  const goalsDb = path.join(temporary, 'goals_1.sqlite');
+  const db = new DatabaseSync(goalsDb);
+  db.exec(`
+    CREATE TABLE thread_goals (
+      thread_id TEXT PRIMARY KEY NOT NULL,
+      goal_id TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      status TEXT NOT NULL,
+      token_budget INTEGER,
+      tokens_used INTEGER NOT NULL DEFAULT 0,
+      time_used_seconds INTEGER NOT NULL DEFAULT 0,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+  `);
+  db.close();
+
+  const file = path.join(sessionsDir, `rollout-2026-07-29T01-10-00-${id}.jsonl`);
+  await writeFile(file, [
+    JSON.stringify({ timestamp: '2026-07-29T01:10:00.003Z', type: 'session_meta', payload: { id, cwd: temporary } }),
+    JSON.stringify({
+      timestamp: '2026-07-29T01:10:01.100Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_goal_updated',
+        threadId: id,
+        goal: {
+          threadId: id,
+          goalId: 'goal-complete-fixture',
+          objective: '将项目搭建成docker compose部署的项目,并提交pr和docker镜像',
+          status: 'active',
+          tokenBudget: 12000000,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 1785291647,
+          updatedAt: 1785291647,
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-29T01:10:02.200Z',
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call',
+        name: 'exec',
+        call_id: 'call-goal-complete',
+        input: 'await tools.update_goal({status:"complete"});',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-29T01:10:02.309Z',
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call_output',
+        call_id: 'call-goal-complete',
+        output: [
+          { type: 'input_text', text: 'Script completed\nWall time 0.0 seconds\nOutput:\n' },
+          {
+            type: 'input_text',
+            text: JSON.stringify({
+              goal: {
+                threadId: id,
+                objective: '将项目搭建成docker compose部署的项目,并提交pr和docker镜像',
+                status: 'complete',
+                tokensUsed: 9664242,
+                timeUsedSeconds: 7291,
+                createdAt: 1785291647,
+                updatedAt: 1785299386,
+              },
+              remainingTokens: null,
+            }),
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-29T01:10:03.200Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'Docker 部署已完成。' }],
+      },
+    }),
+    '',
+  ].join('\n'), 'utf8');
+
+  const store = new NativeSessionStore(temporary, {
+    goalsDbFile: goalsDb,
+    watchChanges: false,
+    maxSessions: 20,
+  });
+  try {
+    const conversation = store.get(id);
+    assert.ok(conversation?.goal);
+    assert.equal(conversation.goal.status, 'complete');
+    assert.equal(conversation.goal.objective, '将项目搭建成docker compose部署的项目,并提交pr和docker镜像');
+    assert.equal(conversation.goal.goalId, 'goal-complete-fixture');
+    assert.equal(conversation.goal.tokenBudget, 12000000);
+    assert.equal(conversation.goal.tokensUsed, 9664242);
+    assert.equal(conversation.goal.timeUsedSeconds, 7291);
+    assert.equal(conversation.goal.createdAtMs, 1785291647000);
+    assert.equal(conversation.goal.updatedAtMs, 1785299386000);
+  } finally {
+    store.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('prefers newer complete goal from goals db over stale active event', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-thread-goal-db-complete-'));
+  const sessionsDir = path.join(temporary, 'sessions', '2026', '07', '29');
+  await mkdir(sessionsDir, { recursive: true });
+  const id = '019fa98b-8d3b-72c3-908c-d4909779da27';
+  const goalsDb = path.join(temporary, 'goals_1.sqlite');
+  const db = new DatabaseSync(goalsDb);
+  db.exec(`
+    CREATE TABLE thread_goals (
+      thread_id TEXT PRIMARY KEY NOT NULL,
+      goal_id TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      status TEXT NOT NULL,
+      token_budget INTEGER,
+      tokens_used INTEGER NOT NULL DEFAULT 0,
+      time_used_seconds INTEGER NOT NULL DEFAULT 0,
+      created_at_ms INTEGER NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
+  `);
+  db.prepare(`
+    INSERT INTO thread_goals (
+      thread_id, goal_id, objective, status, token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    'goal-2',
+    '将项目搭建成docker compose部署的项目,并提交pr和docker镜像',
+    'complete',
+    null,
+    100,
+    200,
+    1785256413000,
+    1785257000000,
+  );
+  db.close();
+
+  const file = path.join(sessionsDir, `rollout-2026-07-29T01-20-00-${id}.jsonl`);
+  await writeFile(file, [
+    JSON.stringify({ timestamp: '2026-07-29T01:20:00.003Z', type: 'session_meta', payload: { id, cwd: temporary } }),
+    JSON.stringify({
+      timestamp: '2026-07-29T01:20:01.100Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_goal_updated',
+        threadId: id,
+        goal: {
+          threadId: id,
+          objective: '将项目搭建成docker compose部署的项目,并提交pr和docker镜像',
+          status: 'active',
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 1785256413,
+          updatedAt: 1785256413,
+        },
+      },
+    }),
+    '',
+  ].join('\n'), 'utf8');
+
+  const store = new NativeSessionStore(temporary, {
+    goalsDbFile: goalsDb,
+    watchChanges: false,
+    maxSessions: 20,
+  });
+  try {
+    const conversation = store.get(id);
+    assert.ok(conversation?.goal);
+    assert.equal(conversation.goal.status, 'complete');
+    assert.equal(conversation.goal.tokensUsed, 100);
+    assert.equal(conversation.goal.timeUsedSeconds, 200);
+  } finally {
+    store.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('applies and clears app-server goals without reviving stale rollout state', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-thread-goal-cache-'));
+  const sessionsDir = path.join(temporary, 'sessions', '2026', '07', '29');
+  await mkdir(sessionsDir, { recursive: true });
+  const id = '019fac39-7e6e-7ec3-8acc-7d1b5b9b6c9c';
+  const file = path.join(sessionsDir, `rollout-2026-07-29T12-54-36-${id}.jsonl`);
+  await writeFile(file, jsonl([
+    { timestamp: '2026-07-29T12:54:36.003Z', type: 'session_meta', payload: { id, cwd: temporary } },
+    {
+      timestamp: '2026-07-29T12:54:37.100Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_goal_updated',
+        threadId: id,
+        goal: {
+          threadId: id,
+          objective: '旧目标',
+          status: 'active',
+          tokensUsed: 4,
+          timeUsedSeconds: 8,
+          createdAt: 1785300876,
+          updatedAt: 1785300877,
+        },
+      },
+    },
+  ]), 'utf8');
+
+  const store = new NativeSessionStore(temporary, {
+    watchChanges: false,
+    maxSessions: 20,
+  });
+  try {
+    assert.equal(store.get(id)?.goal?.objective, '旧目标');
+    const changes = [];
+    store.on('change', (event) => changes.push(event));
+    const initialVersion = store.version;
+
+    assert.equal(store.applyThreadGoal({
+      threadId: id,
+      objective: '应用服务器目标',
+      status: 'usageLimited',
+      tokenBudget: 100,
+      tokensUsed: 25,
+      timeUsedSeconds: 40,
+      createdAt: 1785300876,
+      updatedAt: 1785300880,
+    }), true);
+    assert.equal(store.threadGoals.get(id)?.status, 'usage_limited');
+    assert.equal(store.get(id)?.goal?.objective, '应用服务器目标');
+    assert.equal(store.get(id)?.goal?.status, 'usage_limited');
+    assert.equal(store.version, initialVersion + 1);
+    assert.deepEqual(changes.at(-1)?.changedIds, [id]);
+
+    assert.equal(store.applyThreadGoal({
+      threadId: id,
+      objective: '应用服务器目标',
+      status: 'budgetLimited',
+      tokenBudget: 100,
+      tokensUsed: 25,
+      timeUsedSeconds: 40,
+      createdAt: 1785300876,
+      updatedAt: 1785300881,
+    }), true);
+    assert.equal(store.get(id)?.goal?.status, 'budget_limited');
+
+    assert.equal(store.clearThreadGoal(id), true);
+    assert.equal(store.threadGoals.has(id), false);
+    assert.equal(store.get(id)?.goal, null);
+    assert.deepEqual(changes.at(-1)?.changedIds, [id]);
+
+    // Rebuilding the detail cache replays the stale rollout event; the explicit
+    // clear tombstone must still keep that old goal out of subsequent reads.
+    store.details.delete(id);
+    assert.equal(store.get(id)?.goal, null);
+    assert.equal(store.clearThreadGoal(id), false);
+  } finally {
+    store.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
