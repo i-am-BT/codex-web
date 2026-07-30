@@ -495,9 +495,9 @@ body .settingsToggle[aria-expanded="true"] {
   right: 0;
   display: grid;
   width: min(320px, 100%);
-  max-height: min(480px, calc(100dvh - 140px));
+  max-height: none;
   gap: 12px;
-  overflow: auto;
+  overflow: visible;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface);
@@ -616,6 +616,29 @@ body .subQuotaClose:hover {
   white-space: nowrap;
 }
 
+.subQuotaExpiry {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.subQuotaExpiry > :first-child {
+  flex: 0 0 auto;
+}
+
+.subQuotaExpiry > :last-child {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .subQuotaWindow {
   display: grid;
   min-width: 0;
@@ -653,6 +676,25 @@ body .subQuotaClose:hover {
   border-radius: inherit;
   background: var(--primary);
   transition: width 180ms var(--ease);
+}
+
+.subQuotaProgressBar[data-level="normal"] {
+  background: #22c55e;
+}
+
+.subQuotaProgressBar[data-level="warning"] {
+  background: #f97316;
+}
+
+.subQuotaProgressBar[data-level="exhausted"] {
+  background: var(--danger);
+}
+
+.subQuotaWindowReset {
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
 }
 
 .subQuotaMeta {
@@ -7605,6 +7647,11 @@ body .composerContextPanel {
   font-weight: 500;
 }
 
+.composerEffortName.maximum {
+  color: var(--primary);
+  font-weight: 600;
+}
+
 .composerModelToggle .lucide {
   width: 15px;
   height: 15px;
@@ -7864,7 +7911,7 @@ body[data-theme="dark"] .threadGoalBar {
 .promptQueueRow {
   display: grid;
   min-height: 40px;
-  grid-template-columns: 22px minmax(0, 1fr) auto 30px 30px;
+  grid-template-columns: 22px minmax(0, 1fr) 30px auto 30px 30px;
   align-items: center;
   gap: 4px;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 28%, transparent);
@@ -7891,7 +7938,7 @@ body[data-theme="dark"] .threadGoalBar {
 }
 
 .promptQueueRow.appOwned {
-  grid-template-columns: 22px minmax(0, 1fr) auto 30px;
+  grid-template-columns: 22px minmax(0, 1fr) 30px auto 30px;
 }
 
 body[data-theme="dark"] .promptQueue {
@@ -9577,11 +9624,6 @@ body .composer > .box:focus-within {
     flex-basis: 14px;
   }
 
-  body .composer:has(> .composerProjectPicker.hidden) .composerEffortName {
-    color: var(--thinking);
-    font-weight: 600;
-  }
-
   body[data-theme="light"] .composer:has(> .composerProjectPicker.hidden) > .box {
     border-color: #e1e3e6;
     background: #ffffff;
@@ -10279,13 +10321,13 @@ body .composer > .box:focus-within {
   }
 
   .promptQueueRow {
-    grid-template-columns: 22px minmax(0, 1fr) auto 28px 28px;
+    grid-template-columns: 22px minmax(0, 1fr) 28px auto 28px 28px;
     gap: 2px;
     padding-inline: 8px 5px;
   }
 
   .promptQueueRow.appOwned {
-    grid-template-columns: 22px minmax(0, 1fr) auto 28px;
+    grid-template-columns: 22px minmax(0, 1fr) 28px auto 28px;
   }
 
   .promptQueueGuide {

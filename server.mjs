@@ -36,6 +36,7 @@ import {
 import { normalizeSubQuotaBaseUrl, SubQuotaService } from './sub-quota.mjs';
 import { listCodexSkills } from './skills-catalog.mjs';
 import { listCodexPlugins } from './plugins-catalog.mjs';
+import { PlaygroundUpdater } from './playground-updater.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -68,6 +69,9 @@ const IMAGE_DIR = path.join(RUNTIME_DIR, 'images');
 const FILE_DIR = path.join(RUNTIME_DIR, 'files');
 const BACKGROUND_DIR = path.join(RUNTIME_DIR, 'backgrounds');
 const IMAGE_PROMPT_CACHE_DIR = path.join(RUNTIME_DIR, 'image-prompts');
+const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
+const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
+const PLAYGROUND_PREVIOUS_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'previous');
 const CODEX_HOME = resolveLocalPath(process.env.CODEX_HOME || path.join(homedir(), '.codex'), homedir());
 const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path.join(CODEX_HOME, 'config.toml'), CODEX_HOME);
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
@@ -111,6 +115,7 @@ const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
 const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
 const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
 const IMAGE_PROMPT_AUTO_SYNC = parseBoolean(process.env.IMAGE_PROMPT_AUTO_SYNC, true);
+const PLAYGROUND_UPDATE_ENABLED = parseBoolean(process.env.PLAYGROUND_UPDATE_ENABLED, true);
 const imagePromptSyncIntervalMinutes = Number(process.env.IMAGE_PROMPT_SYNC_INTERVAL_MINUTES || 360);
 const IMAGE_PROMPT_SYNC_INTERVAL_MS = (
   Number.isFinite(imagePromptSyncIntervalMinutes) && imagePromptSyncIntervalMinutes > 0
@@ -186,6 +191,12 @@ const imagePromptLibrary = new ImagePromptLibrary({
   intervalMs: IMAGE_PROMPT_SYNC_INTERVAL_MS,
   requestTimeoutMs: IMAGE_PROMPT_SYNC_TIMEOUT_MS,
 });
+const playgroundUpdater = new PlaygroundUpdater({
+  runtimeDir: PLAYGROUND_UPDATE_DIR,
+  vendorDir: GPT_IMAGE_PLAYGROUND_DIR,
+  patchDir: path.join(ROOT, 'vendor', 'gpt-image-playground', 'patches'),
+  enabled: PLAYGROUND_UPDATE_ENABLED,
+});
 
 const app = express();
 const sessions = loadSessions();
@@ -199,9 +210,11 @@ const nativeSessions = new NativeSessionStore(CODEX_HOME, {
   sideChatStateFile: path.join(RUNTIME_DIR, 'side-chat-threads.json'),
 });
 const automationStore = new AutomationStore(CODEX_HOME);
+const SUB2API_ADMIN_API_KEY = String(process.env.SUB2API_ADMIN_API_KEY || '').trim();
 let subQuotaConfigs = readStartupSubQuotaConfigs(process.env);
 delete process.env.CPA_QUOTA_API_KEY;
 delete process.env.SUB2API_API_KEY;
+delete process.env.SUB2API_ADMIN_API_KEY;
 let subQuotaService = createSubQuotaService(subQuotaConfigs);
 const codexProcessEnvironment = buildCodexProcessEnvironment();
 const appServerClient = new CodexAppServerClient({
@@ -397,6 +410,26 @@ app.get('/api/session', (req, res) => {
   res.json({ authenticated: Boolean(validateSession(req)) });
 });
 
+app.get('/api/playground-update/status', requireAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    const status = await playgroundUpdater.getStatus({ refresh: req.query.refresh === '1' });
+    res.json(status);
+  } catch (err) {
+    res.status(err.statusCode || 502).json({ error: err.message });
+  }
+});
+
+app.post('/api/playground-update', requireAuth, async (_req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    const status = await playgroundUpdater.startUpdate();
+    res.status(status.status === 'updating' ? 202 : 200).json(status);
+  } catch (err) {
+    res.status(err.statusCode || 502).json({ error: err.message });
+  }
+});
+
 app.use('/assets/images', requireAuth, express.static(IMAGE_DIR, {
   fallthrough: false,
   setHeaders: (res) => {
@@ -414,8 +447,8 @@ app.use('/assets/files', requireAuth, express.static(FILE_DIR, {
 }));
 app.use('/assets/backgrounds', requireAuth, express.static(BACKGROUND_DIR, { fallthrough: false }));
 app.use('/assets/dream-skin', requireAuth, express.static(DREAM_SKIN_DIR, { fallthrough: false }));
-app.use('/playground', requireAuth, express.static(GPT_IMAGE_PLAYGROUND_DIR, {
-  fallthrough: false,
+const playgroundStaticOptions = {
+  fallthrough: true,
   setHeaders: (res, filePath) => {
     const immutable = filePath.includes(`${path.sep}assets${path.sep}`)
       && !filePath.endsWith('.css')
@@ -424,7 +457,14 @@ app.use('/playground', requireAuth, express.static(GPT_IMAGE_PLAYGROUND_DIR, {
       ? 'private, max-age=31536000, immutable'
       : 'private, no-store');
   },
-}));
+};
+app.use(
+  '/playground',
+  requireAuth,
+  express.static(PLAYGROUND_CURRENT_DIR, playgroundStaticOptions),
+  express.static(PLAYGROUND_PREVIOUS_DIR, playgroundStaticOptions),
+  express.static(GPT_IMAGE_PLAYGROUND_DIR, { ...playgroundStaticOptions, fallthrough: false }),
+);
 
 app.all('/api-proxy/*', requireAuth, proxyPlaygroundRequest);
 
@@ -1344,6 +1384,53 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
   } catch (err) {
     const action = hasServiceTier && !hasTitle ? 'Fast 模式' : hasTitle && !hasServiceTier ? '会话标题' : '会话设置';
     res.status(nativeAppErrorStatus(err)).json({ error: `修改 Codex App ${action}失败: ${err.message}` });
+  }
+});
+
+app.patch('/api/native-sessions/:id/goal', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  const hasObjective = Object.hasOwn(req.body || {}, 'objective');
+  const hasStatus = Object.hasOwn(req.body || {}, 'status');
+  if (!hasObjective && !hasStatus) {
+    return res.status(400).json({ error: '请提供要更新的目标内容或状态' });
+  }
+
+  const params = { threadId };
+  if (hasObjective) {
+    const objective = String(req.body?.objective || '').replace(/\s+/g, ' ').trim();
+    if (!objective) return res.status(400).json({ error: '目标内容不能为空' });
+    if (objective.length > 4000) return res.status(400).json({ error: '目标内容不能超过 4000 个字符' });
+    params.objective = objective;
+  }
+  if (hasStatus) {
+    const status = nativeThreadGoalStatus(req.body?.status);
+    if (!status) return res.status(400).json({ error: '目标状态无效' });
+    params.status = status;
+  }
+
+  try {
+    const result = await appServerClient.request('thread/goal/set', params);
+    nativeSessions.applyThreadGoal?.(result?.goal, threadId);
+    nativeSessions.scheduleRefresh();
+    res.json({ ok: true, id: threadId, goal: result?.goal || null });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `更新 Codex App 目标失败: ${err.message}` });
+  }
+});
+
+app.delete('/api/native-sessions/:id/goal', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  try {
+    const result = await appServerClient.request('thread/goal/clear', { threadId });
+    nativeSessions.clearThreadGoal?.(threadId);
+    nativeSessions.scheduleRefresh();
+    res.json({ ok: true, id: threadId, cleared: result?.cleared !== false });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `清除 Codex App 目标失败: ${err.message}` });
   }
 });
 
@@ -4094,6 +4181,7 @@ function createSubQuotaService(configs = {}) {
   const env = {
     CPA_QUOTA_API_KEY: String(configs['cpa-codex']?.apiKey || ''),
     SUB2API_API_KEY: String(configs.sub2api?.apiKey || ''),
+    SUB2API_ADMIN_API_KEY,
     GROK2API_ADMIN_PASSWORD: String(configs.grok2api?.apiKey || ''),
     SUB_QUOTA_TIMEOUT_MS: process.env.SUB_QUOTA_TIMEOUT_MS,
     SUB_QUOTA_CACHE_SECONDS: process.env.SUB_QUOTA_CACHE_SECONDS,
@@ -4108,6 +4196,7 @@ function createSubQuotaService(configs = {}) {
           : config.provider === 'grok2api'
             ? 'GROK2API_ADMIN_PASSWORD'
             : 'CPA_QUOTA_API_KEY',
+        ...(config.provider === 'sub2api' ? { adminApiKeyEnv: 'SUB2API_ADMIN_API_KEY' } : {}),
       })))
       : '',
   };
@@ -6644,6 +6733,7 @@ let settingsReturnFocus = null;
 let passwordForm = null;
 let passwordStatus = null;
 let subQuotaHoverTimer = null;
+let subQuotaCountdownTimer = null;
 let suppressSubQuotaFocusPreview = false;
 let dreamSkinPanel = null;
 let dreamSkinIdea = null;
@@ -6738,6 +6828,9 @@ function composerModelLabel(value){
   return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
 }
 function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'极高'})[String(value||'')]||String(value||'默认')}
+function composerMaximumEffortValue(select=reasoningEffort){
+  return[...(select?.options||[])].filter((option)=>!option.disabled&&option.value).at(-1)?.value||'';
+}
 function formatComposerContextTokens(value){
   const tokens=Math.max(0,Math.round(Number(value)||0));
   if(tokens>=1000000)return(tokens/1000000).toFixed(tokens>=10000000?0:1).replace(/\\.0$/,'')+'m';
@@ -8657,6 +8750,9 @@ function renderPromptQueue(){
     body.disabled=busy;
     row.appendChild(lead);
     row.appendChild(body);
+    const edit=queueActionButton('pencil','编辑队列消息',()=>restoreQueuedPrompt(threadId,item.id));
+    edit.disabled=busy;
+    row.appendChild(edit);
     const retryable=queueFailures.has(item.id)&&!appOwned;
     const guide=queueActionButton(retryable?'rotate-cw':'corner-down-left',retryable?'重试':'引导',()=>{
       if(retryable)dispatchNextQueuedPrompt(threadId,{force:true});else steerQueuedPrompt(threadId,item.id);
@@ -9311,7 +9407,10 @@ function syncComposerChrome(){
   syncComposerSelect(reasoningEffort,composerReasoningSelect);
   reconcileComposerFastSupport();
   if(composerModelName)composerModelName.textContent=composerModelLabel(model.value);
-  if(composerEffortName)composerEffortName.textContent=composerEffortLabel(reasoningEffort.value);
+  if(composerEffortName){
+    composerEffortName.textContent=composerEffortLabel(reasoningEffort.value);
+    composerEffortName.classList.toggle('maximum',Boolean(reasoningEffort.value)&&reasoningEffort.value===composerMaximumEffortValue(reasoningEffort));
+  }
   const projectPath=normalizeProjectPath(cwd.value);
   const projectName=projectPath?historyProjectName(projectPath):'选择项目（可选）';
   const hasConversation=Boolean(currentConversationId);
@@ -11299,11 +11398,13 @@ function showSubQuotaPreview(){
   subQuotaPopover.classList.remove('hidden');
   subQuotaToggle.setAttribute('aria-expanded','true');
   subQuotaToggle.dataset.previewOpen='1';
+  startSubQuotaCountdowns();
   if(wasHidden)void loadSubQuota();
 }
 function hideSubQuotaPreview(){
   if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
   subQuotaPopover.classList.add('hidden');
+  stopSubQuotaCountdowns();
   if(subQuotaSettingsOverlay?.classList.contains('hidden')!==false){
     subQuotaToggle?.setAttribute('aria-expanded','false');
   }
@@ -11427,6 +11528,13 @@ function renderSubQuota(data){
     plan.appendChild(planName);
     plan.appendChild(sourceName);
     source.appendChild(plan);
+    const isSub2Api=quota.provider==='sub2api';
+    const isSub2ApiSubscription=isSub2Api&&Boolean(quota.subscription);
+    const sub2ApiWindowOptions=isSub2Api
+      ? {displayUsed:true,showReset:true,fixedCurrency:true}
+      : undefined;
+    const expiresAt=quota.expiresAt||quota.subscription?.expiresAt;
+    if(isSub2ApiSubscription&&expiresAt)appendSubQuotaExpiry(source,expiresAt);
     if(quota.provider==='grok2api' && quota.accountStats){
       const stats=quota.accountStats;
       const unit='accounts';
@@ -11467,16 +11575,26 @@ function renderSubQuota(data){
     }
     const unit=quota.unit||quota.quota?.unit||(quota.mode==='cpa_codex'?'%':'USD');
     let detailCount=0;
+    const rateLimits=Array.isArray(quota.rateLimits)?quota.rateLimits:[];
+    for(const rateLimit of rateLimits){
+      if(String(rateLimit?.window||'').toLowerCase()!=='5h')continue;
+      const label=isSub2Api?'5小时':subQuotaRateLimitLabel(rateLimit.window);
+      detailCount+=appendSubQuotaWindow(source,label,rateLimit,rateLimit.unit||unit,sub2ApiWindowOptions)?1:0;
+    }
     if(quota.subscription){
-      detailCount+=appendSubQuotaWindow(source,'每日',quota.subscription.daily,unit)?1:0;
-      detailCount+=appendSubQuotaWindow(source,'每周',quota.subscription.weekly,unit)?1:0;
+      const resetAnchor=quota.subscription.weeklyWindowStart;
+      const daily=withSubQuotaPeriodicReset(quota.subscription.daily,resetAnchor,24*60*60*1000);
+      const weekly=withSubQuotaPeriodicReset(quota.subscription.weekly,resetAnchor,7*24*60*60*1000);
+      detailCount+=appendSubQuotaWindow(source,'每日',daily,unit,sub2ApiWindowOptions)?1:0;
+      detailCount+=appendSubQuotaWindow(source,'每周',weekly,unit,sub2ApiWindowOptions)?1:0;
       if(finiteSubQuotaNumber(quota.subscription.monthly?.limit)>0){
-        detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit)?1:0;
+        detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit,sub2ApiWindowOptions)?1:0;
       }
     }
     if(quota.quota)detailCount+=appendSubQuotaWindow(source,'总额度',quota.quota,unit)?1:0;
-    for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
-      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,unit)?1:0;
+    for(const rateLimit of rateLimits){
+      if(String(rateLimit?.window||'').toLowerCase()==='5h')continue;
+      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,rateLimit.unit||unit,sub2ApiWindowOptions)?1:0;
     }
     const walletBalance=finiteSubQuotaNumber(quota.balance??quota.remaining);
     if(!detailCount&&walletBalance!==null){
@@ -11485,13 +11603,12 @@ function renderSubQuota(data){
     const meta=document.createElement('div');
     meta.className='subQuotaMeta';
     const todayCost=quota.today?.actualCost??quota.today?.cost;
-    if(Number.isFinite(Number(todayCost)))appendSubQuotaMeta(meta,'今日 '+formatSubQuotaAmount(todayCost,unit==='%'?'USD':unit));
-    if(Number.isFinite(Number(quota.today?.requests)))appendSubQuotaMeta(meta,'请求 '+Number(quota.today.requests).toLocaleString('zh-CN')+' 次');
-    const expiresAt=quota.expiresAt||quota.subscription?.expiresAt;
-    if(expiresAt)appendSubQuotaMeta(meta,'到期 '+formatSubQuotaDate(expiresAt));
+    if(!isSub2ApiSubscription&&Number.isFinite(Number(todayCost)))appendSubQuotaMeta(meta,'今日 '+formatSubQuotaAmount(todayCost,unit==='%'?'USD':unit));
+    if(!isSub2ApiSubscription&&Number.isFinite(Number(quota.today?.requests)))appendSubQuotaMeta(meta,'请求 '+Number(quota.today.requests).toLocaleString('zh-CN')+' 次');
+    if(!isSub2ApiSubscription&&expiresAt)appendSubQuotaMeta(meta,'到期 '+formatSubQuotaDate(expiresAt));
     if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
     if(Number.isFinite(Number(quota.rateLimitResetCredits)))appendSubQuotaMeta(meta,'主动重置 '+Number(quota.rateLimitResetCredits).toLocaleString('zh-CN')+' 次');
-    for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
+    for(const rateLimit of isSub2Api?[]:(Array.isArray(quota.rateLimits)?quota.rateLimits:[])){
       if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit.window)+'重置 '+formatSubQuotaDateTime(rateLimit.resetAt));
     }
     if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
@@ -11503,6 +11620,7 @@ function renderSubQuota(data){
   if(!rendered){renderSubQuotaError('未返回可显示的额度数据');return}
   delete subQuotaStatus.dataset.state;
   subQuotaStatus.textContent=subQuotaFetchedStatusText(data.fetchedAt,hasStale);
+  refreshSubQuotaCountdowns();
 }
 function subQuotaProgressPercent(used,limit,remaining,unit){
   const progressAmount=remaining!==null?remaining:used;
@@ -11511,12 +11629,15 @@ function subQuotaProgressPercent(used,limit,remaining,unit){
   if(limit===null||limit<=0)return null;
   return Math.min(100,Math.max(0,(progressAmount/limit)*100));
 }
-function appendSubQuotaWindow(parent,label,windowData,unit){
+function appendSubQuotaWindow(parent,label,windowData,unit,options={}){
   if(!windowData)return false;
   const used=finiteSubQuotaNumber(windowData.used);
   const limit=finiteSubQuotaNumber(windowData.limit);
   const remaining=finiteSubQuotaNumber(windowData.remaining);
-  if(used===null&&limit===null&&remaining===null)return false;
+  const available=windowData.availability==='available';
+  const displayUsed=options.displayUsed===true||windowData.display==='used';
+  const fixedCurrency=options.fixedCurrency===true;
+  if(used===null&&limit===null&&remaining===null&&!available)return false;
   const row=document.createElement('div');
   row.className='subQuotaWindow';
   const head=document.createElement('div');
@@ -11524,7 +11645,11 @@ function appendSubQuotaWindow(parent,label,windowData,unit){
   const title=document.createElement('span');
   title.textContent=label;
   const value=document.createElement('span');
-  if(unit==='%'&&(used!==null||remaining!==null)){
+  if(displayUsed&&used!==null&&limit!==null&&limit>0){
+    value.textContent=formatSubQuotaAmount(used,unit,fixedCurrency)+' / '+formatSubQuotaAmount(limit,unit,fixedCurrency);
+  }else if(available&&used===null&&remaining===null){
+    value.textContent='当前可用';
+  }else if(unit==='%'&&(used!==null||remaining!==null)){
     if(remaining!==null)value.textContent='剩余 '+formatSubQuotaAmount(remaining,'%');
     else value.textContent='已用 '+formatSubQuotaAmount(used,'%');
   }else if(limit!==null&&limit>0){
@@ -11539,26 +11664,84 @@ function appendSubQuotaWindow(parent,label,windowData,unit){
   head.appendChild(title);
   head.appendChild(value);
   row.appendChild(head);
-  const percent=subQuotaProgressPercent(used,limit,remaining,unit);
+  const percent=subQuotaProgressPercent(used,limit,displayUsed?null:remaining,unit);
   if(percent!==null){
     const progress=document.createElement('div');
     progress.className='subQuotaProgress';
     const bar=document.createElement('span');
     bar.className='subQuotaProgressBar';
     bar.style.setProperty('--sub-quota-percent',percent.toFixed(2)+'%');
+    if(displayUsed)bar.dataset.level=percent>=100?'exhausted':percent>=80?'warning':'normal';
     progress.appendChild(bar);
     row.appendChild(progress);
   }
+  if(options.showReset===true&&windowData.resetAt){
+    const reset=document.createElement('span');
+    reset.className='subQuotaWindowReset';
+    reset.dataset.resetAt=windowData.resetAt;
+    reset.textContent=formatSubQuotaResetCountdown(windowData.resetAt);
+    if(reset.textContent)row.appendChild(reset);
+  }
   parent.appendChild(row);
   return true;
+}
+function appendSubQuotaExpiry(parent,value){
+  const date=new Date(value);
+  if(!Number.isFinite(date.getTime()))return;
+  const row=document.createElement('div');
+  row.className='subQuotaExpiry';
+  const label=document.createElement('span');
+  label.textContent='到期时间';
+  const detail=document.createElement('span');
+  detail.textContent='剩余 '+Math.max(0,Math.ceil((date.getTime()-Date.now())/(24*60*60*1000)))+' 天 ('+formatSubQuotaDateTimeFull(value)+')';
+  row.appendChild(label);
+  row.appendChild(detail);
+  parent.appendChild(row);
+}
+function withSubQuotaPeriodicReset(windowData,anchorValue,intervalMs){
+  if(!windowData||windowData.resetAt)return windowData;
+  const anchor=new Date(anchorValue).getTime();
+  if(!Number.isFinite(anchor)||!Number.isFinite(intervalMs)||intervalMs<=0)return windowData;
+  const elapsed=Math.max(0,Date.now()-anchor);
+  const resetAt=new Date(anchor+(Math.floor(elapsed/intervalMs)+1)*intervalMs).toISOString();
+  return {...windowData,resetAt};
+}
+function formatSubQuotaResetCountdown(value){
+  const resetAt=new Date(value).getTime();
+  if(!Number.isFinite(resetAt))return '';
+  const totalMinutes=Math.max(0,Math.floor((resetAt-Date.now())/60000));
+  if(totalMinutes<=0)return '即将重置';
+  const days=Math.floor(totalMinutes/(24*60));
+  const hours=Math.floor((totalMinutes%(24*60))/60);
+  const minutes=totalMinutes%60;
+  if(days>0)return days+'d '+hours+'h 后重置';
+  if(hours>0)return hours+'h '+minutes+'m 后重置';
+  return minutes+'m 后重置';
+}
+function refreshSubQuotaCountdowns(){
+  if(!subQuotaPopover)return;
+  for(const item of subQuotaPopover.querySelectorAll('.subQuotaWindowReset[data-reset-at]')){
+    item.textContent=formatSubQuotaResetCountdown(item.dataset.resetAt);
+  }
+}
+function startSubQuotaCountdowns(){
+  stopSubQuotaCountdowns();
+  refreshSubQuotaCountdowns();
+  subQuotaCountdownTimer=setInterval(refreshSubQuotaCountdowns,30000);
+}
+function stopSubQuotaCountdowns(){
+  if(!subQuotaCountdownTimer)return;
+  clearInterval(subQuotaCountdownTimer);
+  subQuotaCountdownTimer=null;
 }
 function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item)}
 function finiteSubQuotaNumber(value){if(value===null||value===undefined||value==='')return null;const number=Number(value);return Number.isFinite(number)&&number>=0?number:null}
 function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[String(value||'').toLowerCase()]||String(value||'限速')}
 function formatSubQuotaStatus(value){return({active:'正常',quota_exhausted:'额度耗尽',expired:'已过期',no_access:'无访问权限',blocked:'已限制'})[String(value||'').toLowerCase()]||String(value||'')}
-function formatSubQuotaAmount(value,unit){const number=finiteSubQuotaNumber(value)||0;if(unit==='%')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+'%';if(unit==='accounts')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+' 个';const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:0,maximumFractionDigits:2});return unit==='USD'?'$'+formatted:formatted+(unit?' '+unit:'')}
+function formatSubQuotaAmount(value,unit,fixedCurrency=false){const number=finiteSubQuotaNumber(value)||0;if(unit==='%')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+'%';if(unit==='accounts')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+' 个';const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:unit==='USD'&&fixedCurrency?2:0,maximumFractionDigits:2});return unit==='USD'?'$'+formatted:formatted+(unit?' '+unit:'')}
 function formatSubQuotaDate(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'}):String(value||'')}
 function formatSubQuotaDateTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}):''}
+function formatSubQuotaDateTimeFull(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}):''}
 function formatSubQuotaTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
 function subQuotaStaleMetaText(quota){
   const staleTime=formatSubQuotaTime(quota?.fetchedAt);

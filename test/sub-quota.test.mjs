@@ -5,6 +5,8 @@ import {
   normalizeCpaCodexQuota,
   normalizeGrok2ApiSummary,
   normalizeSubQuota,
+  normalizeSub2ApiCodexAccounts,
+  normalizeSub2ApiRateLimitProbe,
   normalizeSubQuotaBaseUrl,
   parseSubQuotaSources,
   SubQuotaService,
@@ -109,6 +111,17 @@ test('parses server-side Sub quota sources without embedding credentials', () =>
     apiKeyEnv: 'SUB_MAIN_API_KEY',
   }]), { SUB_MAIN_API_KEY: 'secret-key' });
   assert.equal(fullUsageUrl[0].usageUrl, 'https://sub.example.test/v1/usage');
+  const adminEnriched = parseSubQuotaSources(JSON.stringify([{
+    id: 'admin-enriched',
+    baseUrl: 'https://sub.example.test',
+    apiKeyEnv: 'SUB_MAIN_API_KEY',
+    adminApiKeyEnv: 'SUB_ADMIN_API_KEY',
+  }]), {
+    SUB_MAIN_API_KEY: 'usage-secret',
+    SUB_ADMIN_API_KEY: 'admin-secret',
+  });
+  assert.equal(adminEnriched[0].adminApiKeyEnv, 'SUB_ADMIN_API_KEY');
+  assert.equal(adminEnriched[0].adminApiKey, 'admin-secret');
   assert.throws(() => parseSubQuotaSources('[{"baseUrl":"file:///tmp/key"}]'), /apiKeyEnv/);
 });
 
@@ -161,8 +174,9 @@ test('normalizes Sub2API subscription and quota-limited responses', () => {
 
   const limited = normalizeSubQuota({
     mode: 'quota_limited',
-    status: 'active',
+    status: 'quota_exhausted',
     quota: { limit: 100, used: 25, remaining: 75, unit: 'USD' },
+    api_key: { rate_limit_5h: 999, usage_5h: 999 },
     rate_limits: [
       {
         window: '5h',
@@ -223,6 +237,175 @@ test('normalizes Sub2API subscription and quota-limited responses', () => {
   assert.equal(limited.expiresAt, '2026-08-02T00:00:00Z');
   assert.equal(limited.daysUntilExpiry, 14);
   assert.equal(limited.remaining, null);
+  assert.equal(limited.status, 'quota_exhausted');
+});
+
+test('normalizes Sub2API API key DTO five-hour fields without replacing subscription windows', () => {
+  const quota = normalizeSubQuota({
+    mode: 'unrestricted',
+    unit: 'USD',
+    subscription: {
+      weekly_usage_usd: 30,
+      weekly_limit_usd: 100,
+    },
+    api_key: {
+      rate_limit_5h: '50',
+      usage_5h: '12.5',
+      window_5h_start: '2026-07-30T00:00:00Z',
+      reset_5h_at: 1785387600,
+      rate_limit_1d: 0,
+      usage_1d: 0,
+    },
+  });
+
+  assert.deepEqual(quota.subscription.weekly, { used: 30, limit: 100, remaining: 70 });
+  assert.deepEqual(quota.rateLimits, [{
+    window: '5h',
+    used: 12.5,
+    limit: 50,
+    remaining: 37.5,
+    windowStart: '2026-07-30T00:00:00Z',
+    resetAt: '2026-07-30T05:00:00.000Z',
+    unit: 'USD',
+  }]);
+});
+
+test('normalizes Sub2API subscription five-hour USD usage with an optional reset window', () => {
+  const quota = normalizeSubQuota({
+    mode: 'unrestricted',
+    subscription: {
+      usage_5h_usd: '18.72',
+      limit_5h_usd: 60,
+      window_5h_start: '2026-07-30T06:00:00Z',
+      daily_usage_usd: 78.9,
+      daily_limit_usd: 100,
+    },
+  });
+
+  assert.deepEqual(quota.rateLimits, [{
+    window: '5h',
+    used: 18.72,
+    limit: 60,
+    remaining: 41.28,
+    windowStart: '2026-07-30T06:00:00Z',
+    resetAt: '2026-07-30T11:00:00.000Z',
+    unit: 'USD',
+    display: 'used',
+  }]);
+});
+
+test('normalizes Sub2API five-hour utilization as percent and leaves absent windows absent', () => {
+  const quota = normalizeSubQuota({
+    mode: 'unrestricted',
+    unit: 'USD',
+    subscription: { monthly_usage_usd: 10, monthly_limit_usd: 200 },
+    usage_info: {
+      five_hour: {
+        utilization: '72.5',
+        resets_at: '2026-07-30T05:00:00Z',
+      },
+    },
+  });
+  assert.deepEqual(quota.rateLimits, [{
+    window: '5h',
+    used: 72.5,
+    limit: 100,
+    remaining: 27.5,
+    windowStart: '',
+    resetAt: '2026-07-30T05:00:00Z',
+    unit: '%',
+  }]);
+
+  const absent = normalizeSubQuota({
+    mode: 'unrestricted',
+    api_key: { rate_limit_5h: 0, usage_5h: 0 },
+  });
+  assert.deepEqual(absent.rateLimits, []);
+});
+
+test('normalizes cached Sub2API Codex account five-hour percentages and reset timestamps', () => {
+  const quotas = normalizeSub2ApiCodexAccounts({
+    data: {
+      items: [{
+        id: 42,
+        name: 'Codex Plus',
+        status: 'active',
+        extra: {
+          plan_type: 'plus',
+          codex_usage_updated_at: '2026-07-30T01:00:00Z',
+          codex_5h_used_percent: '72.5',
+          codex_5h_reset_after_seconds: 7200,
+          codex_5h_window_minutes: 300,
+          codex_7d_used_percent: 100,
+          codex_7d_reset_at: '2026-08-02T03:00:00Z',
+          codex_7d_window_minutes: 10080,
+        },
+      }],
+    },
+  });
+
+  assert.equal(quotas.length, 1);
+  assert.equal(quotas[0].accountId, '42');
+  assert.equal(quotas[0].status, 'quota_exhausted');
+  assert.equal(quotas[0].unit, '%');
+  assert.deepEqual(quotas[0].rateLimits, [{
+    window: '5h',
+    used: 72.5,
+    limit: 100,
+    remaining: 27.5,
+    windowStart: '2026-07-29T22:00:00.000Z',
+    resetAt: '2026-07-30T03:00:00.000Z',
+    unit: '%',
+  }, {
+    window: '7d',
+    used: 100,
+    limit: 100,
+    remaining: 0,
+    windowStart: '2026-07-26T03:00:00.000Z',
+    resetAt: '2026-08-02T03:00:00Z',
+    unit: '%',
+  }]);
+});
+
+test('normalizes legacy Sub2API Codex windows by duration and ignores accounts without usage', () => {
+  const quotas = normalizeSub2ApiCodexAccounts({
+    items: [{
+      id: 'legacy',
+      email: 'legacy@example.test',
+      updated_at: '2026-07-30T00:00:00Z',
+      extra: {
+        codex_primary_used_percent: 20,
+        codex_primary_reset_after_seconds: 1800,
+        codex_primary_window_minutes: 300,
+        codex_secondary_used_percent: 45,
+        codex_secondary_reset_after_seconds: 3600,
+        codex_secondary_window_minutes: 10080,
+      },
+    }, {
+      id: 'absent',
+      name: 'No cached usage',
+      extra: { plan_type: 'plus' },
+    }],
+  });
+
+  assert.equal(quotas.length, 1);
+  assert.equal(quotas[0].name, 'legacy@example.test');
+  assert.deepEqual(quotas[0].rateLimits.map((item) => ({
+    window: item.window,
+    used: item.used,
+    remaining: item.remaining,
+    resetAt: item.resetAt,
+  })), [{
+    window: '5h',
+    used: 20,
+    remaining: 80,
+    resetAt: '2026-07-30T00:30:00.000Z',
+  }, {
+    window: '7d',
+    used: 45,
+    remaining: 55,
+    resetAt: '2026-07-30T01:00:00.000Z',
+  }]);
 });
 
 test('normalizes wallet balances and rejects invalid negative quota values', () => {
@@ -336,7 +519,16 @@ test('fetches all sources, isolates errors, and caches the result', async () => 
     fetchImpl: async (_url, options) => {
       requests += 1;
       assert.equal(options.headers.Authorization, 'Bearer key');
-      return new Response(JSON.stringify({ isValid: true, remaining: 12, unit: 'USD' }), {
+      return new Response(JSON.stringify({
+        isValid: true,
+        remaining: 12,
+        unit: 'USD',
+        apiKey: {
+          rateLimit5h: 20,
+          usage5h: 5,
+          reset5hAt: '2026-07-19T05:00:00Z',
+        },
+      }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
@@ -349,7 +541,225 @@ test('fetches all sources, isolates errors, and caches the result', async () => 
   assert.equal(requests, 1);
   assert.equal(first.availableCount, 1);
   assert.equal(first.quotas[0].remaining, 12);
+  assert.deepEqual(first.quotas[0].rateLimits, [{
+    window: '5h',
+    used: 5,
+    limit: 20,
+    remaining: 15,
+    windowStart: '',
+    resetAt: '2026-07-19T05:00:00Z',
+    unit: 'USD',
+  }]);
   assert.match(first.quotas[1].error, /MISSING_KEY/);
+});
+
+test('enriches Sub2API usage without skipping the five-hour probe', async () => {
+  const calls = [];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'sub',
+      name: 'Sub2API',
+      provider: 'sub2api',
+      baseUrl: 'https://sub.test',
+      usageUrl: 'https://sub.test/v1/usage',
+      apiKeyEnv: 'SUB2API_API_KEY',
+      apiKey: 'usage-secret',
+      adminApiKeyEnv: 'SUB2API_ADMIN_API_KEY',
+      adminApiKey: 'admin-secret',
+    }],
+    now: () => Date.parse('2026-07-30T01:00:00Z'),
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), headers: init.headers });
+      if (String(url).endsWith('/v1/usage')) {
+        return new Response(JSON.stringify({
+          mode: 'unrestricted',
+          subscription: { weekly_usage_usd: 10, weekly_limit_usd: 100 },
+        }), { status: 200 });
+      }
+      if (String(url).endsWith('/v1/models')) {
+        return new Response(JSON.stringify({
+          error: { code: 'FIVE_HOUR_LIMIT_EXCEEDED' },
+        }), {
+          status: 429,
+          headers: {
+            'x-codex-primary-used-percent': '100',
+            'x-codex-primary-window-minutes': '300',
+            'x-codex-primary-reset-at': '1785390371',
+          },
+        });
+      }
+      return new Response(JSON.stringify({
+        data: {
+          items: [{
+            id: 7,
+            name: 'Provider Codex',
+            extra: {
+              codex_usage_updated_at: '2026-07-30T01:00:00Z',
+              codex_5h_used_percent: 80,
+              codex_5h_reset_after_seconds: 3600,
+            },
+          }],
+        },
+      }), { status: 200 });
+    },
+  });
+
+  const result = await service.list();
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].url, 'https://sub.test/v1/usage');
+  assert.equal(calls[0].headers.Authorization, 'Bearer usage-secret');
+  assert.equal(calls[0].headers['x-api-key'], undefined);
+  assert.equal(calls[1].url, 'https://sub.test/v1/models');
+  assert.equal(calls[1].headers.Authorization, 'Bearer usage-secret');
+  assert.equal(calls[2].url, 'https://sub.test/api/v1/admin/accounts?platform=openai&type=oauth&page=1&page_size=1000');
+  assert.equal(calls[2].headers['x-api-key'], 'admin-secret');
+  assert.equal(calls[2].headers.Authorization, undefined);
+  assert.equal(result.availableCount, 2);
+  assert.deepEqual(result.quotas[0].subscription.weekly, { used: 10, limit: 100, remaining: 90 });
+  assert.equal(result.quotas[0].rateLimits[0].window, '5h');
+  assert.equal(result.quotas[0].rateLimits[0].remaining, 0);
+  assert.equal(result.quotas[1].rateLimits[0].window, '5h');
+  assert.equal(result.quotas[1].rateLimits[0].remaining, 20);
+  assert.equal(JSON.stringify(result).includes('usage-secret'), false);
+  assert.equal(JSON.stringify(result).includes('admin-secret'), false);
+});
+
+test('probes Sub2API five-hour limits without requesting admin accounts', async () => {
+  let requests = 0;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'sub',
+      name: 'Sub2API',
+      provider: 'sub2api',
+      baseUrl: 'https://sub.test',
+      usageUrl: 'https://sub.test/v1/usage',
+      apiKeyEnv: 'SUB2API_API_KEY',
+      apiKey: 'usage-secret',
+    }],
+    now: () => Date.parse('2026-07-30T04:00:00Z'),
+    fetchImpl: async (url, init) => {
+      requests += 1;
+      assert.equal(init.headers.Authorization, 'Bearer usage-secret');
+      if (String(url).endsWith('/v1/usage')) {
+        return new Response(JSON.stringify({ mode: 'unrestricted', remaining: 9 }), { status: 200 });
+      }
+      assert.equal(String(url), 'https://sub.test/v1/models');
+      return new Response(JSON.stringify({
+        error: { type: 'usage_limit_reached', code: 'FIVE_HOUR_LIMIT_EXCEEDED' },
+      }), {
+        status: 429,
+        headers: {
+          'retry-after': '3600',
+          'x-codex-primary-used-percent': '100',
+          'x-codex-primary-window-minutes': '300',
+        },
+      });
+    },
+  });
+
+  const result = await service.list();
+  assert.equal(requests, 2);
+  assert.equal(result.count, 1);
+  assert.equal(result.quotas[0].remaining, 9);
+  assert.equal(result.quotas[0].status, 'quota_exhausted');
+  assert.deepEqual(result.quotas[0].rateLimits, [{
+    window: '5h',
+    used: 100,
+    limit: 100,
+    remaining: 0,
+    windowStart: '2026-07-30T00:00:00.000Z',
+    resetAt: '2026-07-30T05:00:00.000Z',
+    unit: '%',
+  }]);
+});
+
+test('normalizes live Sub2API five-hour probe headers and ignores unrelated responses', () => {
+  const liveHeaders = new Headers({
+    'retry-after': '4575',
+    'x-codex-primary-reset-at': '1785390371',
+    'x-codex-primary-used-percent': '100',
+    'x-codex-primary-window-minutes': '300',
+  });
+  assert.deepEqual(normalizeSub2ApiRateLimitProbe(
+    liveHeaders,
+    JSON.stringify({ error: { code: 'FIVE_HOUR_LIMIT_EXCEEDED' } }),
+    Date.parse('2026-07-30T04:00:00Z'),
+  ), [{
+    window: '5h',
+    used: 100,
+    limit: 100,
+    remaining: 0,
+    windowStart: '2026-07-30T00:46:11.000Z',
+    resetAt: '2026-07-30T05:46:11.000Z',
+    unit: '%',
+  }]);
+  assert.deepEqual(normalizeSub2ApiRateLimitProbe(new Headers(), '{"object":"list"}'), []);
+});
+
+test('keeps the Sub2API five-hour window visible when the successful probe omits usage headers', async () => {
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'sub',
+      name: 'Sub2API',
+      provider: 'sub2api',
+      baseUrl: 'https://sub.test',
+      usageUrl: 'https://sub.test/v1/usage',
+      apiKeyEnv: 'SUB2API_API_KEY',
+      apiKey: 'usage-secret',
+    }],
+    fetchImpl: async (url) => String(url).endsWith('/v1/usage')
+      ? new Response(JSON.stringify({ mode: 'unrestricted', remaining: 9 }), { status: 200 })
+      : new Response(JSON.stringify({ object: 'list', data: [] }), { status: 200 }),
+  });
+
+  const result = await service.list();
+  assert.deepEqual(result.quotas[0].rateLimits, [{
+    window: '5h',
+    used: null,
+    limit: null,
+    remaining: null,
+    windowStart: '',
+    resetAt: '',
+    unit: '%',
+    availability: 'available',
+  }]);
+});
+
+test('keeps Sub2API subscription and last-known-good accounts on transient admin failure', async () => {
+  let round = 1;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'sub',
+      name: 'Sub2API',
+      provider: 'sub2api',
+      baseUrl: 'https://sub.test',
+      usageUrl: 'https://sub.test/v1/usage',
+      apiKeyEnv: 'SUB2API_API_KEY',
+      apiKey: 'usage-secret',
+      adminApiKeyEnv: 'SUB2API_ADMIN_API_KEY',
+      adminApiKey: 'admin-secret',
+    }],
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/v1/usage')) {
+        return new Response(JSON.stringify({ mode: 'unrestricted', remaining: round === 1 ? 30 : 25 }), { status: 200 });
+      }
+      if (round === 2) throw new DOMException('aborted', 'AbortError');
+      return new Response(JSON.stringify({ items: [{
+        id: 'codex',
+        extra: { codex_5h_used_percent: 10, codex_5h_reset_at: '2026-07-30T05:00:00Z' },
+      }] }), { status: 200 });
+    },
+  });
+
+  const ready = await service.list();
+  round = 2;
+  const degraded = await service.list({ refresh: true });
+  assert.equal(degraded.quotas.find((item) => item.id === 'sub').remaining, 25);
+  const staleAccount = degraded.quotas.find((item) => item.id === 'sub-codex-codex');
+  assert.equal(staleAccount.rateLimits[0].remaining, 90);
+  assert.equal(staleAccount.stale, true);
+  assert.equal(staleAccount.warning, '请求超时');
+  assert.equal(staleAccount.fetchedAt, ready.quotas.find((item) => item.id === 'sub-codex-codex').fetchedAt);
 });
 
 test('uses recent source success after a timeout and replaces it after recovery', async () => {

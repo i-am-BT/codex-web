@@ -143,11 +143,13 @@ cp .env.example .env
 | `CPA_QUOTA_API_KEY` | CPA Management Key，仅保存在服务端本地 `.env` |
 | `SUB2API_BASE_URL` | Sub2API 地址；旧的单 CPA 配置仍可通过 `SUB_QUOTA_PROVIDER=cpa-codex` 兼容读取 |
 | `SUB2API_API_KEY` | Sub2API API Key；旧的单 CPA Management Key 仍兼容读取 |
+| `SUB2API_ADMIN_API_KEY` | 可选的 Sub2API 管理 API Key；仅在服务端用于补充 Codex 账号 5 小时/7 天额度 |
 | `SUB_QUOTA_TIMEOUT_MS` | CPA/Sub2API 额度请求超时，默认 10000 毫秒 |
 | `SUB_QUOTA_CACHE_SECONDS` | CPA/Sub2API 额度结果缓存时间，默认 30 秒 |
 | `IMAGE_PROMPT_AUTO_SYNC` | 启动时及定时检查 `awesome-gpt-image-2` 更新，默认开启 |
 | `IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` | 提示词库自动检查间隔，默认 360 分钟 |
 | `IMAGE_PROMPT_SYNC_TIMEOUT_MS` | 单次 GitHub 请求超时，默认 20000 毫秒 |
+| `PLAYGROUND_UPDATE_ENABLED` | 是否显示并启用生图工作台一键更新，默认开启 |
 | `IMAGE_PROMPT_GITHUB_TOKEN` | 可选 GitHub Token，仅用于提高 API 速率限制 |
 | `PLAYGROUND_PROXY_TIMEOUT_MS` | 生图工作台同源代理请求超时，默认 690000 毫秒 |
 | `CODEX_WEB_SHUTDOWN_GRACE_MS` | 重启时等待进行中的代理请求完成，默认 120000 毫秒 |
@@ -169,13 +171,14 @@ cp .env.example .env
 
 ### CPA Codex 与 Sub2API 额度
 
-左侧额度入口可同时查询本地 CLIProxyAPI（CPA）中的 Codex 账号额度与 Sub2API 额度。悬停额度图标显示两路只读额度卡，点击图标可分别填写两组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与用量。
+左侧额度入口可同时查询本地 CLIProxyAPI（CPA）中的 Codex 账号额度与 Sub2API 额度。悬停额度图标显示两路只读额度卡，点击图标可分别填写两组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与 API Key 限速窗口。可选设置 `SUB2API_ADMIN_API_KEY` 后，服务端还会读取 `/api/v1/admin/accounts` 中缓存的 Codex 提供商账号 5 小时/7 天使用百分比；管理 Key 不会发送到浏览器。
 
 ```bash
 CPA_QUOTA_BASE_URL=http://127.0.0.1:8327
 CPA_QUOTA_API_KEY=<replace-with-cpa-management-key>
 SUB2API_BASE_URL=https://sub.example.com
 SUB2API_API_KEY=<replace-with-sub2api-key>
+SUB2API_ADMIN_API_KEY=<optional-sub2api-admin-key>
 SUB_QUOTA_PROVIDER=multi
 ```
 
@@ -209,6 +212,12 @@ PLAYGROUND_PROXY_ALLOWED_ORIGINS=https://images.example.com,http://192.168.1.20:
 Image Prompt 的案例和模板保留仓库内置快照作为兜底。自动更新写入 `runtime/image-prompts/`，不会修改已跟踪的 `vendor/` 文件；GitHub 不可用或数据校验失败时继续使用最近一次成功版本。可在 `.env` 中使用 `IMAGE_PROMPT_AUTO_SYNC`、`IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` 和 `IMAGE_PROMPT_SYNC_TIMEOUT_MS` 调整更新行为。
 
 能否实际生成图片仍取决于上游账户是否支持所选 Image 模型。网络代理正常但上游返回 `model_not_found` 时，需要在上游配置对应模型或切换到受支持的 Image API。
+
+### 生图工作台更新
+
+生图工作台标题栏的更新图标会检查上游稳定版。点击后，服务端在隔离的临时目录中拉取源码、应用对应的 Codex Web 集成补丁，并依次执行依赖安装、上游测试、生产构建和资源校验；全部通过后才会切换当前版本。更新期间不会覆盖仓库内置的 `vendor/` 快照。
+
+成功构建的当前版本和上一版本分别保存在 `runtime/playground/current/` 与 `runtime/playground/previous/`。切换失败时会自动恢复旧版本；旧页面引用的 hash 资源也可从上一版本回退读取。Docker 部署已持久化 `/data/runtime`，因此容器重建不会丢失已安装版本。设置 `PLAYGROUND_UPDATE_ENABLED=false` 可禁用按钮和更新接口。
 
 ## 模型与服务商
 

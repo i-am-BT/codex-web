@@ -562,7 +562,7 @@ test('the prompt queue stays visible in Web while retaining its backing actions'
   assert.match(ruleBody('.promptQueueHead'), /display:\s*none(?:;|$)/);
   assert.match(
     uiStyles,
-    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px 28px;[^}]*gap:\s*2px[^}]*\}\s*\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px/s,
+    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 28px auto 28px 28px;[^}]*gap:\s*2px[^}]*\}\s*\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 28px auto 28px/s,
   );
 
   const queueStart = inlineScript.indexOf('function renderPromptQueue(){');
@@ -572,17 +572,18 @@ test('the prompt queue stays visible in Web while retaining its backing actions'
   assert.match(queueRenderer, /const showInWeb=Boolean\(threadId&&items\.length\)/);
   assert.match(queueRenderer, /classList\.toggle\('hidden',!showInWeb\)/);
   assert.match(queueRenderer, /if\(!showInWeb\)/);
-  assert.doesNotMatch(queueRenderer, /queueActionButton\('pencil'/);
+  assert.match(queueRenderer, /queueActionButton\('pencil','编辑队列消息'/);
   assert.match(queueRenderer, /queueActionButton\('ellipsis','队列操作'/);
   assert.match(queueRenderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
   assert.match(queueRenderer, /body\.disabled=busy/);
+  assert.match(queueRenderer, /edit\.disabled=busy/);
   assert.match(queueRenderer, /const retryable=queueFailures\.has\(item\.id\)&&!appOwned/);
   assert.match(queueRenderer, /guide\.disabled=busy\|\|\(!webRunActive&&!retryable\)/);
   assert.match(queueRenderer, /remove\.disabled=busy/);
   assert.match(queueRenderer, /more\.disabled=busy/);
   assert.deepEqual(
-    [...queueRenderer.matchAll(/row\.appendChild\((guide|remove|more)\)/g)].map((match) => match[1]),
-    ['guide', 'remove', 'more'],
+    [...queueRenderer.matchAll(/row\.appendChild\((edit|guide|remove|more)\)/g)].map((match) => match[1]),
+    ['edit', 'guide', 'remove', 'more'],
   );
 });
 
@@ -942,7 +943,7 @@ test('Codex App queue entries keep direct actions but are never dispatched or mo
   assert.match(renderer, /meta\.textContent='Codex App'/);
   assert.match(renderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
   assert.match(renderer, /const busy=dispatching\|\|guiding\|\|steerSubmitting\|\|appQueueEditSaving/);
-  assert.match(renderer, /row\.appendChild\(guide\);\s*row\.appendChild\(remove\);\s*if\(!appOwned\)\{/);
+  assert.match(renderer, /row\.appendChild\(edit\);[\s\S]*?row\.appendChild\(guide\);\s*row\.appendChild\(remove\);\s*if\(!appOwned\)\{/);
   assert.doesNotMatch(renderer, /if\(appOwned\)\{\s*promptQueueList\.appendChild\(row\);\s*return;/);
   assert.match(applyQueue, /if\(appQueueEditDraft\?\.threadId===threadId&&!appQueueEditSaving&&!clean\.some\(\(item\)=>item\.id===appQueueEditDraft\.itemId\)\)\{/);
   assert.match(applyQueue, /appQueueEditDraft=null;[\s\S]*?input\.value='';[\s\S]*?clearPendingAttachments\(\);[\s\S]*?该队列消息已在 Codex App 处理/);
@@ -967,7 +968,7 @@ test('Codex App queue entries keep direct actions but are never dispatched or mo
   assert.match(dispatch, /!item\|\|isAppOwnedQueuedPrompt\(item\)\|\|queueDispatchingThreads/);
   assert.match(loadConversation, /if\(conversationChanged&&appQueueEditSaving\)\{statusEl\.textContent='正在保存队列修改，请稍后切换会话';return false\}/);
   assert.match(loadConversation, /if\(conversationChanged&&appQueueEditDraft\)\{appQueueEditDraft=null;input\.value='';input\.style\.height='auto';clearPendingAttachments\(\)\}/);
-  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto (?:30|28)px/s);
+  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) (?:30|28)px auto (?:30|28)px/s);
   assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueBody:disabled/);
 });
 
