@@ -6692,6 +6692,7 @@ let composerAtLoading = false;
 let composerAtLoadPromise = null;
 let composerAtLoadedAt = 0;
 let nativeComposerOverride = null;
+let nativeForkCreating = false;
 let promptQueuePanel = null;
 let promptQueueList = null;
 let threadGoalBar = null;
@@ -13644,14 +13645,17 @@ async function loadConversation(id,source='web',options={}){
   applyConversationMode();
   updateActiveHistory();
   statusEl.textContent='Loading...';
-  const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
-  const requestUrl=endpoint+encodeURIComponent(id)+(currentConversationSource==='codex'?'?images=external':'');
-  const res=await fetch(requestUrl);
-  if(seq!==conversationLoadSeq)return false;
-  if(!res.ok){statusEl.textContent='加载失败';return false}
-  const data=await res.json();
-  if(seq!==conversationLoadSeq)return false;
-  const conversation=data.conversation;
+  let conversation=options.conversation||null;
+  if(!conversation){
+    const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
+    const requestUrl=endpoint+encodeURIComponent(id)+(currentConversationSource==='codex'?'?images=external':'');
+    const res=await fetch(requestUrl);
+    if(seq!==conversationLoadSeq)return false;
+    if(!res.ok){statusEl.textContent='加载失败';return false}
+    const data=await res.json();
+    if(seq!==conversationLoadSeq)return false;
+    conversation=data.conversation;
+  }
   setCurrentConversationTitle(conversation.title||'Chat','Chat');
   currentConversationId=conversation.id;
   currentConversationSource=conversation.source==='codex'?'codex':'web';
@@ -13678,7 +13682,7 @@ async function loadConversation(id,source='web',options={}){
   if(!messages.length&&!webRunActive)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   updateConversationStatus(conversation);
   setThreadGoal(currentConversationSource==='codex' ? (conversation.goal || null) : null);
-  if(currentConversationSource==='codex')await pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
+  if(currentConversationSource==='codex'&&!options.skipPromptQueueSync)await pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
   else renderPromptQueue();
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
   closeMenu();
@@ -13733,13 +13737,12 @@ function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,p
   updateSafetyHint();
 }
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
-async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
+async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=null}={}){
   if(!currentConversationId||currentConversationSource!=='codex')return;
   if(webRunActive){statusEl.textContent='任务运行中，不能创建历史分支';return}
-  const prompt=continueAfter
-    ?'在新任务中从这条回答之后继续？原任务会保留，已经产生的本地文件修改不会撤销。'
-    :'从这条消息重新开始？原会话会保留，新分支不会撤销已经产生的本地文件修改，原消息中的附件需要重新添加。';
-  if(!confirm(prompt))return;
+  if(nativeForkCreating)return;
+  nativeForkCreating=true;
+  if(trigger){trigger.disabled=true;trigger.setAttribute('aria-busy','true')}
   const sourceThreadId=currentConversationId;
   statusEl.textContent='正在创建历史分支...';
   try{
@@ -13747,7 +13750,7 @@ async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||'创建历史分支失败');
     clearPendingAttachments();
-    const loaded=await loadConversation(data.threadId,'codex');
+    const loaded=await loadConversation(data.threadId,'codex',{conversation:data.conversation,skipPromptQueueSync:true});
     if(!loaded){
       newChat();
       currentConversationId=data.threadId;
@@ -13762,11 +13765,14 @@ async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
     input.value=data.draft||'';
     input.style.height='auto';
     input.style.height=Math.min(input.scrollHeight,180)+'px';
-    await refreshHistory();
     statusEl.textContent=continueAfter?'已在新任务中继续；原任务保持不变':'已创建分支，可修改后发送；原会话保持不变';
     input.focus();
+    refreshHistory().catch(()=>{});
   }catch(e){
     statusEl.textContent=e.message;
+  }finally{
+    nativeForkCreating=false;
+    if(trigger?.isConnected){trigger.disabled=false;trigger.removeAttribute('aria-busy')}
   }
 }
 function isCompletedNativeRuntimeTurn(turnId,frozenTurnId=turnProcessElapsedFrozen?turnProcessElapsedTurnId:'',pendingTurnId=nativeCompletionSync?.turnId||''){
@@ -17231,7 +17237,7 @@ function addMsg(role,text,options={}){
       fork.dataset.tooltip='从这里重新开始';
       fork.setAttribute('aria-label','从这里重新开始');
       setIconLabel(fork,'git-branch','从这里重新开始',false);
-      fork.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq)});
+      fork.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{trigger:fork})});
       actions.appendChild(fork);
     }else if(role==='user'&&Number.isInteger(options.messageIndex)){
       const rollback=document.createElement('button');
@@ -17252,7 +17258,7 @@ function addMsg(role,text,options={}){
       continueTask.dataset.tooltip='在新任务中继续';
       continueTask.setAttribute('aria-label','在新任务中继续');
       setIconLabel(continueTask,'corner-up-right','在新任务中继续',false);
-      continueTask.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true})});
+      continueTask.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true,trigger:continueTask})});
       actions.appendChild(continueTask);
     }
     if(['user','assistant'].includes(role)){

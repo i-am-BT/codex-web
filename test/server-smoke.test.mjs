@@ -2039,7 +2039,10 @@ updated_at = 1784422800000
     assert.match(page, /async function renameConversation\(id,title,source='codex'\)\{[\s\S]*?currentConversationId===id[\s\S]*?setCurrentConversationTitle\(clean\)/);
     assert.match(page, /function newChat\(\)\{[^\n]*setCurrentConversationTitle\('新任务'\)/);
     assert.match(page, /async function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(conversation\.title\|\|'Chat','Chat'\)/);
-    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false\}=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
+    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false,trigger=null\}=\{\}\)\{[\s\S]*?loadConversation\(data\.threadId,'codex',\{conversation:data\.conversation,skipPromptQueueSync:true\}\)[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
+    assert.doesNotMatch(page, /forkNativeConversation[\s\S]{0,500}confirm\(/);
+    assert.match(page, /input\.focus\(\);\s*refreshHistory\(\)\.catch\(\(\)=>\{\}\)/);
+    assert.match(page, /currentConversationSource==='codex'&&!options\.skipPromptQueueSync\)await pullPromptQueueFromServer/);
     assert.match(page, /automationStatus\.textContent=automationNotice\|\|''/);
     assert.match(page, /function openArchivedView/);
     assert.match(page, /ask:\{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'\}/);
