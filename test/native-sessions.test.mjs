@@ -625,15 +625,14 @@ This block is automatically supplied ambient UI state, not part of the user's re
         payload: {
           type: 'message',
           role: 'assistant',
-          phase: 'final_answer',
-          content: [{ type: 'output_text', text: '**Current Task**\nLate handoff summary' }],
+          content: [{ type: 'output_text', text: '## 当前任务\n\n用户指出输入框底部的推理强度文字高亮错误' }],
         },
       },
       {
         timestamp: '2026-07-11T04:55:27.000Z',
         type: 'compacted',
         payload: {
-          message: 'Another language model started to solve this problem.\n**Current Task**\nLate handoff summary',
+          message: 'Another language model started to solve this problem.\n## 当前任务\n\n用户指出输入框底部的推理强度文字高亮错误',
           replacement_history: [],
         },
       },
@@ -657,10 +656,10 @@ This block is automatically supplied ambient UI state, not part of the user's re
     )), false);
     assert.equal(afterCompaction.messages.some((message) => (
       message.role === 'assistant'
-      && message.content.includes('Late handoff summary')
+      && message.content.includes('用户指出输入框底部的推理强度文字高亮错误')
     )), false);
     assert.equal(afterCompaction.messages.some((message) => (
-      String(message.content || '').includes('Late handoff summary')
+      String(message.content || '').includes('用户指出输入框底部的推理强度文字高亮错误')
     )), false);
     assert.equal(afterCompaction.messages.filter((message) => message.kind === 'context_compacted').length, 2);
 
@@ -672,7 +671,6 @@ This block is automatically supplied ambient UI state, not part of the user's re
         payload: {
           type: 'message',
           role: 'assistant',
-          phase: 'final_answer',
           content: [{ type: 'output_text', text: [
             'Repository snapshot and continuation notes',
             '- Keep the existing working tree unchanged.',
