@@ -5,6 +5,41 @@ body .top {
   gap: 12px;
 }
 
+/* Keep Codex / Image Prompt switch visually centered in the full header. */
+body .top:has(> .workspaceNav) {
+  position: relative;
+}
+
+body .top > .workspaceNav {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 2;
+  transform: translate(-50%, -50%);
+  justify-self: center;
+}
+
+body .top:has(> .workspaceNav) > .topConversationContext {
+  position: absolute;
+  left: 68px;
+  right: calc(50% + 110px);
+  overflow: hidden;
+  justify-self: auto;
+  text-align: left;
+}
+
+body .top:has(> .workspaceNav) > .topConversationContext #status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+body .top:has(> .workspaceNav) > #modeLabel {
+  grid-column: 4;
+  width: max-content;
+  justify-self: end;
+}
+
 /* Image Prompt workspace needs a column flex main so the iframe can fill height. */
 body .main.imagePromptMain {
   display: flex;
@@ -1096,19 +1131,8 @@ body[data-theme="light"] .imagePromptToolbar {
     gap: 7px;
   }
 
-  .topConversationContext {
-    display: block;
-    width: 100%;
-    min-width: 0;
-    max-width: 124px;
-    justify-self: end;
-    overflow: hidden;
-    text-align: right;
-  }
-
-  .topConversationContext #status,
-  body #modeLabel,
-  .main.imagePromptMain .topConversationContext {
+  .topConversationContext,
+  body #modeLabel {
     display: none;
   }
 
@@ -1116,7 +1140,11 @@ body[data-theme="light"] .imagePromptToolbar {
     grid-template-columns: 38px minmax(0, 1fr) auto;
   }
 
-  .workspaceNav {
+  body .top > .workspaceNav {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
     justify-self: center;
   }
 

@@ -127,6 +127,43 @@ test('history rename uses an inline editor instead of a browser prompt', () => {
   assert.match(uiStyles, /\.histRenameInput\s*\{[^}]*height:\s*28px;[^}]*font-size:\s*12px/s);
 });
 
+test('native history archiving uses an in-app confirmation card', () => {
+  const archiveSource = sourceBetween('function ensureArchiveConfirmDialog', 'function sidebarCollapsedPreference');
+  const rowSource = sourceBetween('function createHistoryRow', 'function updateActiveHistory');
+  assert.match(archiveSource, /archiveConfirmDialog\.setAttribute\('role','dialog'\)/);
+  assert.match(archiveSource, /archiveConfirmDialog\.setAttribute\('aria-modal','true'\)/);
+  assert.match(archiveSource, /title\.textContent='归档会话'/);
+  assert.match(archiveSource, /description\.textContent='归档后会从最近任务移除，可在“已归档任务”中恢复。'/);
+  assert.match(archiveSource, /archiveConfirmOverlay\.addEventListener\('click',\(event\)=>\{if\(event\.target===archiveConfirmOverlay\)closeArchiveConfirm\(\)\}\)/);
+  assert.match(archiveSource, /trapDialogFocus\(archiveConfirmDialog,event\)/);
+  assert.match(archiveSource, /if\(source==='codex'\)\{openArchiveConfirm\(id,title,trigger\);return\}/);
+  assert.match(archiveSource, /if\(!confirm\('删除会话：'\+title\+'？'\)\)return/);
+  assert.match(archiveSource, /fallbackRow=archiveConfirmReturnKey\?\[\.\.\.history\.querySelectorAll\('\.hist'\)\]\.find\(\(row\)=>row\.dataset\.key===archiveConfirmReturnKey\):null/);
+  assert.match(archiveSource, /fallbackRow\?\.querySelector\('\.histDelete'\)/);
+  assert.match(rowSource, /deleteConversation\(item\.id,item\.title,source,del\)/);
+  assert.match(inlineScript, /if\(archiveConfirmOverlay&&!archiveConfirmOverlay\.classList\.contains\('hidden'\)\)\{closeArchiveConfirm\(\);return\}/);
+  assert.match(uiStyles, /\.archiveConfirmDialog\s*\{[^}]*border-radius:\s*8px/s);
+  assert.match(uiStyles, /\.archiveConfirmOverlay\s*\{[^}]*z-index:\s*90/s);
+  assert.match(uiStyles, /\.archiveConfirmActions button:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--primary\)/s);
+});
+
+test('native history forks retain an in-chat continuation marker', () => {
+  const markerSource = sourceBetween('function readNativeForkMarkers', 'function updateComposerOverlayInset');
+  const forkSource = sourceBetween('async function forkNativeConversation', 'function isCompletedNativeRuntimeTurn');
+  assert.match(inlineScript, /const NATIVE_FORK_MARKERS_STORAGE_KEY='codexWeb\.nativeForkMarkers\.v1'/);
+  assert.match(markerSource, /localStorage\.getItem\(NATIVE_FORK_MARKERS_STORAGE_KEY\)/);
+  assert.match(markerSource, /localStorage\.setItem\(NATIVE_FORK_MARKERS_STORAGE_KEY,JSON\.stringify\(nativeForkMarkers\)\)/);
+  assert.match(markerSource, /divider\.className='nativeForkDivider'/);
+  assert.match(markerSource, /divider\.setAttribute\('role','separator'\)/);
+  assert.match(markerSource, /text\.textContent='从聊天中继续'/);
+  assert.match(markerSource, /chat\.insertBefore\(divider,next\)/);
+  assert.match(forkSource, /setNativeForkMarker\(data\.threadId,\{afterSeq,afterTurnId:data\.forkedThroughTurnId\}\)/);
+  assert.match(inlineScript, /if\(currentConversationSource==='codex'\)renderNativeForkDivider\(messages\)/);
+  assert.match(inlineScript, /if\(nativeForkMarkers\[id\]\)renderNativeForkDivider\(syncMessages\)/);
+  assert.match(uiStyles, /\.nativeForkDivider\s*\{[^}]*grid-template-columns:\s*minmax\(20px, 1fr\) auto minmax\(20px, 1fr\)/s);
+  assert.match(uiStyles, /\.nativeForkDivider::before,[\s\S]*\.nativeForkDivider::after\s*\{[^}]*height:\s*1px/s);
+});
+
 test('the browser sidepanel section renders between pinned and regular tasks', () => {
   const sidebarRenderSource = sourceBetween('function appendBrowserSidebarHistoryTasks', 'function setHistoryTasksExpanded');
   assert.match(sidebarRenderSource, /section\.className='historySidebarTasks'/);

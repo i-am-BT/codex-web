@@ -1570,10 +1570,12 @@ function dropRawHandoffBeforeCompaction(cache, record) {
     const immediateEmbeddedHandoff = embeddedHandoff && followsHandoffQuickly;
     if (
       message?.role === 'assistant'
-      && message.kind === 'final_answer'
-      && (immediateEmbeddedHandoff || isHandoffSummaryText(message.content))
+      && (
+        immediateEmbeddedHandoff
+        || (message.kind === 'final_answer' && isHandoffSummaryText(message.content))
+      )
     ) {
-      // Keep the folded handoff summary context; only drop raw final_answer handoffs.
+      // A compacted handoff may omit phase, so embedded summaries are not always final_answer.
       cache.messages.splice(index, 1);
       return;
     }
@@ -1608,6 +1610,8 @@ function isHandoffSummaryText(text) {
     || plain === 'context checkpoint'
     || plain === 'current task'
     || plain === 'current progress'
+    || plain === '当前任务'
+    || plain === '当前进度'
     || plain.startsWith('handoff:')
     || plain.startsWith('handoff summary:')
     || plain.startsWith('compacted handoff')

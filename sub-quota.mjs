@@ -16,6 +16,7 @@ const CODEX_USAGE_HEADERS = {
 };
 const TRANSIENT_FETCH_ERROR = Symbol('transientFetchError');
 const SOURCE_WIDE_FETCH_ERROR = Symbol('sourceWideFetchError');
+const PARTIAL_SOURCE_FETCH_ERROR = Symbol('partialSourceFetchError');
 
 export class SubQuotaService {
   constructor(options = {}) {
@@ -235,6 +236,7 @@ export class SubQuotaService {
       else this.lastSuccessfulBySource.delete(source);
       return fallback.length ? fallback : quotas;
     }
+    const partialFailure = quotas.find((item) => item[PARTIAL_SOURCE_FETCH_ERROR]);
 
     const next = new Map(previous);
     const returnedKeys = new Set();
@@ -254,8 +256,14 @@ export class SubQuotaService {
       next.delete(key);
       return item;
     });
-    for (const key of next.keys()) {
-      if (!returnedKeys.has(key)) next.delete(key);
+    for (const [key, entry] of previous) {
+      if (returnedKeys.has(key)) continue;
+      if (partialFailure?.[TRANSIENT_FETCH_ERROR] && now - entry.succeededAt <= LAST_GOOD_TTL_MS) {
+        next.set(key, entry);
+        resolved.push(staleQuota(entry.quota, partialFailure.error));
+      } else {
+        next.delete(key);
+      }
     }
     if (next.size) this.lastSuccessfulBySource.set(source, next);
     else this.lastSuccessfulBySource.delete(source);
@@ -273,10 +281,84 @@ export class SubQuotaService {
           Authorization: `Bearer ${source.apiKey}`,
         },
       });
-      return [{ ...base, ...normalizeSubQuota(data) }];
+      const quota = { ...base, ...normalizeSubQuota(data) };
+      if (source.baseUrl && !quota.rateLimits.some((item) => item.window === '5h')) {
+        try {
+          const probedLimits = await this.fetchSub2ApiRateLimitProbe(source);
+          const existingWindows = new Set(quota.rateLimits.map((item) => item.window));
+          quota.rateLimits.push(...probedLimits.filter((item) => !existingWindows.has(item.window)));
+          if (quota.rateLimits.some((item) => item.used !== null && item.limit !== null && item.used >= item.limit)) {
+            quota.status = 'quota_exhausted';
+          }
+        } catch {
+          // The models probe is optional. Keep a valid /v1/usage result intact.
+        }
+      }
+      if (!source.adminApiKey) return [quota];
+      try {
+        const accounts = await this.fetchSub2ApiCodexAccounts(source, fetchedAt);
+        return [quota, ...accounts];
+      } catch (error) {
+        return [quota, fetchErrorQuota({
+          ...base,
+          id: `${source.id}-codex-accounts`,
+          name: `${source.name} Codex`,
+        }, error, { partial: true })];
+      }
     } catch (error) {
       return [fetchErrorQuota(base, error, { sourceWide: true })];
     }
+  }
+
+  async fetchSub2ApiRateLimitProbe(source) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(`${source.baseUrl}/v1/models`, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${source.apiKey}`,
+        },
+        redirect: 'error',
+        signal: controller.signal,
+      });
+      const bodyText = await readLimitedBody(response, MAX_RESPONSE_BYTES);
+      const limits = normalizeSub2ApiRateLimitProbe(response.headers, bodyText, this.now());
+      if (limits.length || !response.ok) return limits;
+      return [{
+        window: '5h',
+        used: null,
+        limit: null,
+        remaining: null,
+        windowStart: '',
+        resetAt: '',
+        unit: '%',
+        availability: 'available',
+      }];
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async fetchSub2ApiCodexAccounts(source, fetchedAt) {
+    const data = await this.requestJson(
+      `${source.baseUrl}/api/v1/admin/accounts?platform=openai&type=oauth&page=1&page_size=1000`,
+      {
+        headers: {
+          Accept: 'application/json',
+          'x-api-key': source.adminApiKey,
+        },
+      },
+    );
+    return normalizeSub2ApiCodexAccounts(data).map((quota, index) => ({
+      id: `${source.id}-codex-${quota.accountId || index + 1}`,
+      name: quota.name,
+      provider: 'sub2api',
+      sourceName: source.name,
+      fetchedAt,
+      ...quota,
+    }));
   }
 
   async fetchCpaCodexSource(source, fetchedAt) {
@@ -418,11 +500,15 @@ export function parseSubQuotaSources(value, env = process.env) {
     const id = String(item?.id || `sub-${index + 1}`).trim();
     const name = String(item?.name || id).trim().slice(0, 80);
     const apiKeyEnv = String(item?.apiKeyEnv || '').trim();
+    const adminApiKeyEnv = String(item?.adminApiKeyEnv || '').trim();
     const provider = normalizeProvider(item?.provider);
     if (!SOURCE_ID_PATTERN.test(id)) throw new Error(`额度来源 ${index + 1} 的 id 无效`);
     if (ids.has(id)) throw new Error(`额度来源 id 重复: ${id}`);
     if (!name) throw new Error(`额度来源 ${id} 缺少名称`);
     if (!ENV_KEY_PATTERN.test(apiKeyEnv)) throw new Error(`额度来源 ${id} 的 apiKeyEnv 无效`);
+    if (adminApiKeyEnv && !ENV_KEY_PATTERN.test(adminApiKeyEnv)) {
+      throw new Error(`额度来源 ${id} 的 adminApiKeyEnv 无效`);
+    }
     ids.add(id);
     const baseUrl = normalizeSubQuotaBaseUrl(item?.baseUrl, { provider });
     return {
@@ -433,12 +519,17 @@ export function parseSubQuotaSources(value, env = process.env) {
       apiKey: String(env[apiKeyEnv] || '').trim(),
       baseUrl,
       usageUrl: provider === 'sub2api' ? `${baseUrl}/v1/usage` : '',
+      ...(provider === 'sub2api' && adminApiKeyEnv ? {
+        adminApiKeyEnv,
+        adminApiKey: String(env[adminApiKeyEnv] || '').trim(),
+      } : {}),
     };
   });
 }
 
 export function normalizeSubQuota(data) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('额度响应格式无效');
+  const subscriptionData = isRecord(data.subscription) ? data.subscription : null;
   const subscription = isRecord(data.subscription)
     ? {
       daily: quotaWindow(data.subscription.daily_usage_usd, data.subscription.daily_limit_usd, undefined, { zeroLimitUnlimited: true }),
@@ -452,22 +543,90 @@ export function normalizeSubQuota(data) {
     ...quotaWindow(data.quota.used, data.quota.limit, data.quota.remaining),
     unit: cleanText(data.quota.unit, 16),
   } : null;
+  const rateLimits = normalizeSubRateLimits(data);
+  if (subscriptionData && !rateLimits.some((item) => item.window === '5h')) {
+    const fiveHour = quotaWindow(
+      subscriptionData.usage_5h_usd,
+      subscriptionData.limit_5h_usd,
+      undefined,
+      { zeroLimitUnlimited: true },
+    );
+    if (fiveHour?.limit > 0) {
+      const windowStart = cleanQuotaTimestamp(
+        subscriptionData.window_5h_start ?? subscriptionData.window5hStart,
+      );
+      const explicitResetAt = cleanQuotaTimestamp(
+        subscriptionData.reset_5h_at ?? subscriptionData.reset5hAt,
+      );
+      rateLimits.unshift({
+        window: '5h',
+        ...fiveHour,
+        windowStart,
+        resetAt: explicitResetAt || (
+          windowStart
+            ? new Date(Date.parse(windowStart) + 5 * 60 * 60 * 1000).toISOString()
+            : ''
+        ),
+        unit: 'USD',
+        display: 'used',
+      });
+    }
+  }
   return {
     valid: data.isValid !== false,
     mode: cleanText(data.mode, 40),
     status: cleanText(data.status, 40),
     planName: cleanText(data.planName, 100),
-    unit: cleanText(data.unit, 16) || quota?.unit || 'USD',
+    unit: cleanText(data.unit, 16) || quota?.unit || inferRateLimitUnit(rateLimits) || 'USD',
     remaining: nonNegativeNumber(data.remaining),
     balance: nonNegativeNumber(data.balance),
     quota,
     subscription,
-    rateLimits: normalizeRateLimits(data.rate_limits),
+    rateLimits,
     expiresAt: cleanDate(data.expires_at),
     daysUntilExpiry: nonNegativeInteger(data.days_until_expiry),
     today: normalizeUsage(data.usage?.today),
     total: normalizeUsage(data.usage?.total),
   };
+}
+
+export function normalizeSub2ApiCodexAccounts(data) {
+  const payload = isRecord(data?.data) ? data.data : data;
+  const accounts = Array.isArray(payload?.items)
+    ? payload.items
+    : Array.isArray(payload?.accounts)
+      ? payload.accounts
+      : Array.isArray(payload)
+        ? payload
+        : [];
+  const quotas = [];
+  for (const account of accounts) {
+    if (!isRecord(account)) continue;
+    const rateLimits = normalizeSub2ApiCodexAccountRateLimits(account);
+    if (!rateLimits.length) continue;
+    const status = cleanText(account.status, 40).toLowerCase();
+    quotas.push({
+      valid: !['disabled', 'inactive', 'error'].includes(status),
+      mode: 'sub2api_codex_account',
+      status: rateLimits.some((item) => item.used !== null && item.used >= 100)
+        ? 'quota_exhausted'
+        : status || 'active',
+      planName: formatCodexPlanName(account.extra?.plan_type ?? account.extra?.planType),
+      unit: '%',
+      remaining: null,
+      balance: null,
+      quota: null,
+      subscription: null,
+      rateLimits,
+      expiresAt: cleanQuotaTimestamp(account.expires_at ?? account.expiresAt),
+      daysUntilExpiry: null,
+      today: null,
+      total: null,
+      name: cleanText(account.name || account.email || `Codex ${account.id || ''}`, 100) || 'Codex',
+      accountId: cleanText(account.id, 80),
+    });
+  }
+  return quotas;
 }
 
 export function normalizeCpaCodexQuota(data, file = {}) {
@@ -937,12 +1096,13 @@ function formatFetchError(error) {
   return message.slice(0, 160);
 }
 
-function fetchErrorQuota(base, error, { sourceWide = false } = {}) {
+function fetchErrorQuota(base, error, { sourceWide = false, partial = false } = {}) {
   const quota = { ...base, error: formatFetchError(error) };
   if (isTransientFetchError(error)) {
     Object.defineProperty(quota, TRANSIENT_FETCH_ERROR, { value: true });
   }
   if (sourceWide) Object.defineProperty(quota, SOURCE_WIDE_FETCH_ERROR, { value: true });
+  if (partial) Object.defineProperty(quota, PARTIAL_SOURCE_FETCH_ERROR, { value: true });
   return quota;
 }
 
@@ -1006,7 +1166,7 @@ function normalizeRateLimits(value) {
   const limits = [];
   for (const item of value) {
     if (!isRecord(item)) continue;
-    const window = cleanText(item.window, 8).toLowerCase();
+    const window = normalizeRateLimitWindow(item.window ?? item.window_name ?? item.windowName);
     if (!RATE_LIMIT_WINDOWS.has(window) || seen.has(window)) continue;
     seen.add(window);
     const quota = quotaWindow(item.used, item.limit, item.remaining) || {
@@ -1017,11 +1177,212 @@ function normalizeRateLimits(value) {
     limits.push({
       window,
       ...quota,
-      windowStart: cleanDate(item.window_start),
-      resetAt: cleanDate(item.reset_at),
+      windowStart: cleanQuotaTimestamp(item.window_start ?? item.windowStart),
+      resetAt: cleanQuotaTimestamp(item.reset_at ?? item.resetAt),
+      ...(cleanText(item.unit, 16) ? { unit: cleanText(item.unit, 16) } : {}),
     });
   }
   return limits;
+}
+
+function normalizeSubRateLimits(data) {
+  const limits = normalizeRateLimits(data.rate_limits ?? data.rateLimits);
+  const seen = new Set(limits.map((item) => item.window));
+  const appendMissing = (items) => {
+    for (const item of items) {
+      if (seen.has(item.window)) continue;
+      seen.add(item.window);
+      limits.push(item);
+    }
+  };
+
+  for (const candidate of [data.api_key, data.apiKey, data.key, data]) {
+    if (isRecord(candidate)) appendMissing(normalizeApiKeyRateLimits(candidate));
+  }
+  for (const candidate of [data.usage_info, data.usageInfo, data.account_usage, data.accountUsage, data]) {
+    if (isRecord(candidate)) appendMissing(normalizeUsageProgressRateLimits(candidate));
+  }
+  return limits;
+}
+
+function normalizeApiKeyRateLimits(value) {
+  const limits = [];
+  for (const definition of [
+    ['5h', '5h'],
+    ['1d', '1d'],
+    ['7d', '7d'],
+  ]) {
+    const [window, suffix] = definition;
+    const camelSuffix = suffix[0].toUpperCase() + suffix.slice(1);
+    const limit = nonNegativeNumber(value[`rate_limit_${suffix}`] ?? value[`rateLimit${camelSuffix}`]);
+    const used = nonNegativeNumber(value[`usage_${suffix}`] ?? value[`usage${camelSuffix}`]);
+    if (limit === 0 || (limit === null && used === null)) continue;
+    const quota = quotaWindow(used, limit, undefined) || { used: null, limit: null, remaining: null };
+    limits.push({
+      window,
+      ...quota,
+      windowStart: cleanQuotaTimestamp(value[`window_${suffix}_start`] ?? value[`window${camelSuffix}Start`]),
+      resetAt: cleanQuotaTimestamp(value[`reset_${suffix}_at`] ?? value[`reset${camelSuffix}At`]),
+      unit: cleanText(value.unit, 16) || 'USD',
+    });
+  }
+  return limits;
+}
+
+function normalizeUsageProgressRateLimits(value) {
+  const limits = [];
+  for (const [window, snakeName, camelName] of [
+    ['5h', 'five_hour', 'fiveHour'],
+    ['7d', 'seven_day', 'sevenDay'],
+  ]) {
+    const progress = value[snakeName] ?? value[camelName];
+    if (!isRecord(progress)) continue;
+    const used = nonNegativeNumber(progress.utilization ?? progress.used_percent ?? progress.usedPercent);
+    if (used === null) continue;
+    limits.push({
+      window,
+      used,
+      limit: 100,
+      remaining: Math.max(0, 100 - used),
+      windowStart: '',
+      resetAt: cleanQuotaTimestamp(progress.resets_at ?? progress.resetsAt ?? progress.reset_at ?? progress.resetAt),
+      unit: '%',
+    });
+  }
+  return limits;
+}
+
+export function normalizeSub2ApiRateLimitProbe(headers, bodyText = '', nowValue = Date.now()) {
+  const getHeader = (name) => cleanText(headers?.get?.(name), 80);
+  const body = parseMaybeJson(bodyText);
+  const errorCode = cleanText(body?.error?.code || body?.code, 80).toUpperCase();
+  const usedPercent = nonNegativeNumber(getHeader('x-codex-primary-used-percent'));
+  const windowMinutes = nonNegativeInteger(getHeader('x-codex-primary-window-minutes'));
+  const resetAtHeader = cleanQuotaTimestamp(getHeader('x-codex-primary-reset-at'));
+  const resetAfterSeconds = nonNegativeInteger(getHeader('x-codex-primary-reset-after-seconds'));
+  const retryAfterSeconds = nonNegativeInteger(getHeader('retry-after'));
+  const isFiveHour = windowMinutes === 300 || errorCode === 'FIVE_HOUR_LIMIT_EXCEEDED';
+  if (!isFiveHour) return [];
+
+  const now = Number(nowValue);
+  const relativeSeconds = resetAfterSeconds ?? retryAfterSeconds;
+  const resetAt = resetAtHeader || (
+    relativeSeconds !== null && Number.isFinite(now)
+      ? new Date(now + relativeSeconds * 1000).toISOString()
+      : ''
+  );
+  const used = usedPercent ?? (errorCode === 'FIVE_HOUR_LIMIT_EXCEEDED' ? 100 : null);
+  return [{
+    window: '5h',
+    used,
+    limit: 100,
+    remaining: used === null ? null : Math.max(0, 100 - used),
+    windowStart: resetAt ? new Date(Date.parse(resetAt) - 5 * 60 * 60 * 1000).toISOString() : '',
+    resetAt,
+    unit: '%',
+  }];
+}
+
+function normalizeSub2ApiCodexAccountRateLimits(account) {
+  const extra = isRecord(account.extra) ? account.extra : {};
+  const limits = [];
+  for (const [window, prefix, seconds] of [
+    ['5h', 'codex_5h', 5 * 60 * 60],
+    ['7d', 'codex_7d', 7 * 24 * 60 * 60],
+  ]) {
+    const used = nonNegativeNumber(extra[`${prefix}_used_percent`]);
+    if (used === null) continue;
+    const resetAt = cleanQuotaTimestamp(extra[`${prefix}_reset_at`])
+      || resetAtFromRelativeSeconds(
+        extra[`${prefix}_reset_after_seconds`],
+        extra.codex_usage_updated_at ?? account.updated_at ?? account.updatedAt,
+      );
+    limits.push({
+      window,
+      used,
+      limit: 100,
+      remaining: Math.max(0, 100 - used),
+      windowStart: resetAt ? new Date(Date.parse(resetAt) - seconds * 1000).toISOString() : '',
+      resetAt,
+      unit: '%',
+    });
+  }
+  if (limits.length) return limits;
+
+  const legacy = [];
+  for (const [usedKey, resetKey, minutesKey] of [
+    ['codex_primary_used_percent', 'codex_primary_reset_after_seconds', 'codex_primary_window_minutes'],
+    ['codex_secondary_used_percent', 'codex_secondary_reset_after_seconds', 'codex_secondary_window_minutes'],
+  ]) {
+    const used = nonNegativeNumber(extra[usedKey]);
+    const minutes = nonNegativeNumber(extra[minutesKey]);
+    if (used === null || minutes === null) continue;
+    const window = minutes >= 240 && minutes <= 360
+      ? '5h'
+      : minutes >= 9360 && minutes <= 10800
+        ? '7d'
+        : '';
+    if (!window || legacy.some((item) => item.window === window)) continue;
+    const resetAt = resetAtFromRelativeSeconds(
+      extra[resetKey],
+      extra.codex_usage_updated_at ?? account.updated_at ?? account.updatedAt,
+    );
+    legacy.push({
+      window,
+      used,
+      limit: 100,
+      remaining: Math.max(0, 100 - used),
+      windowStart: resetAt ? new Date(Date.parse(resetAt) - minutes * 60 * 1000).toISOString() : '',
+      resetAt,
+      unit: '%',
+    });
+  }
+  return legacy;
+}
+
+function resetAtFromRelativeSeconds(value, baseValue) {
+  const seconds = nonNegativeNumber(value);
+  if (seconds === null) return '';
+  const base = cleanQuotaTimestamp(baseValue);
+  const baseMilliseconds = base ? Date.parse(base) : NaN;
+  if (!Number.isFinite(baseMilliseconds)) return '';
+  return new Date(baseMilliseconds + seconds * 1000).toISOString();
+}
+
+function normalizeRateLimitWindow(value) {
+  const window = cleanText(value, 24).toLowerCase().replace(/[\s_-]+/g, '');
+  return ({
+    '5h': '5h',
+    '5hour': '5h',
+    '5hours': '5h',
+    fivehour: '5h',
+    '1d': '1d',
+    '1day': '1d',
+    daily: '1d',
+    '7d': '7d',
+    '7day': '7d',
+    weekly: '7d',
+    '30d': '30d',
+    '30day': '30d',
+    monthly: '30d',
+  })[window] || window;
+}
+
+function inferRateLimitUnit(rateLimits) {
+  if (!rateLimits.length) return '';
+  const units = new Set(rateLimits.map((item) => cleanText(item.unit, 16)).filter(Boolean));
+  return units.size === 1 ? [...units][0] : '';
+}
+
+function cleanQuotaTimestamp(value) {
+  if (typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim()))) {
+    const number = nonNegativeNumber(value);
+    if (number === null) return '';
+    const milliseconds = number >= 1e12 ? number : number * 1000;
+    const parsed = new Date(milliseconds);
+    return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : '';
+  }
+  return cleanDate(value);
 }
 
 function normalizeUsage(value) {

@@ -17,14 +17,42 @@ test('playground refresh preserves browser streaming preferences and completed A
     path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'index.html'),
     'utf8',
   );
+  const playgroundOverrides = await readFile(
+    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'codex-web-overrides.css'),
+    'utf8',
+  );
+  const playgroundIntegration = await readFile(
+    path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'codex-web-integration.js'),
+    'utf8',
+  );
   const playgroundAssetPath = playgroundPage.match(/src="\.\/(assets\/[^"\?]+\.js)/)?.[1];
   assert.ok(playgroundAssetPath);
+  assert.match(playgroundPage, /href="\.\/codex-web-overrides\.css\?v=[^"]+"/);
+  assert.match(playgroundPage, /src="\.\/codex-web-integration\.js\?v=[^"]+"/);
+  assert.match(playgroundOverrides, /\[data-input-bar\]:has\(\[contenteditable="true"\]:focus\)/);
+  assert.match(playgroundOverrides, /font-size:\s*16px/);
+  assert.match(playgroundOverrides, /> \.collapse-section\s*\{[^}]*grid-template-rows:\s*0fr/s);
+  assert.match(playgroundOverrides, /\.codexWebUpdateButton\s*\{/);
+  assert.match(playgroundOverrides, /\.codexWebUpdateButton--desktop\s*\{[^}]*margin-left:\s*28px/s);
+  assert.match(playgroundOverrides, /\.codexWebUpdateButton--mobile\s*\{[^}]*display:\s*none/s);
+  assert.match(
+    playgroundOverrides,
+    /@media \(max-width:\s*639px\)[\s\S]*\.codexWebUpdateButton--mobile\s*\{[^}]*display:\s*inline-flex/s,
+  );
+  assert.match(playgroundIntegration, /\/api\/playground-update\/status/);
+  assert.match(playgroundIntegration, /method:\s*'POST'/);
+  assert.match(playgroundIntegration, /setInterval\(scheduleEnsureButtons, 1500\)/);
+  assert.doesNotMatch(playgroundIntegration, /MutationObserver/);
   const playgroundAssetScript = await readFile(
     path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', playgroundAssetPath),
     'utf8',
   );
   const playgroundPatchSource = await readFile(
     path.join(ROOT, 'vendor', 'gpt-image-playground', 'patches', 'codex-web.patch'),
+    'utf8',
+  );
+  const playgroundV072PatchSource = await readFile(
+    path.join(ROOT, 'vendor', 'gpt-image-playground', 'patches', 'codex-web-v0.7.2.patch'),
     'utf8',
   );
 
@@ -37,6 +65,8 @@ test('playground refresh preserves browser streaming preferences and completed A
   assert.match(playgroundPatchSource, /AGENT_POST_IMAGE_STREAM_TIMEOUT\.test\(message\)/);
   assert.match(playgroundPatchSource, /const completeWithSuccessfulImages =/);
   assert.match(playgroundPatchSource, /status: 'done',\s*\n\+\s*error: null/);
+  assert.match(playgroundV072PatchSource, /imageProfile,\s*\n\+\s*params: imageParams/);
+  assert.match(playgroundV072PatchSource, /normalizeParamsForSettings\(imageParams, imageRequestSettings/);
   assert.match(playgroundAssetScript, /streamImages:typeof\(w==null\?void 0:w\.streamImages\)=="boolean"\?w\.streamImages:I\.streamImages/);
   assert.match(playgroundAssetScript, /streamPartialImages:typeof\(w==null\?void 0:w\.streamPartialImages\)=="number"\?w\.streamPartialImages:I\.streamPartialImages/);
   assert.match(
@@ -1066,7 +1096,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.sideActions\s*\{[^}]*grid-template-columns:\s*minmax\(112px, 1fr\) repeat\(4, 36px\);[^}]*gap:\s*6px/s);
     assert.match(uiStyles, /\.sideActions \.miniPrimary\s*\{[^}]*flex-wrap:\s*nowrap;[^}]*white-space:\s*nowrap/s);
     assert.match(uiStyles, /\.sideActions \.miniPrimary \.buttonLabel\s*\{[^}]*flex:\s*0 0 auto;[^}]*word-break:\s*keep-all/s);
-    assert.match(uiStyles, /\.subQuotaPopover\s*\{/);
+    assert.match(uiStyles, /\.subQuotaPopover\s*\{[^}]*max-height:\s*none;[^}]*overflow:\s*visible/s);
     assert.match(uiStyles, /\.subQuotaSettingsDialog\s*\{/);
     assert.match(uiStyles, /\.subQuotaError\s*\{[^}]*font-size:\s*11px;[^}]*line-height:\s*1\.4/s);
     assert.match(uiStyles, /@container sidebar \(max-width: 280px\)/);
@@ -1149,6 +1179,8 @@ if (args[0] === 'app-server') {
     assert.equal(imagePromptStylesResponse.status, 200);
     const imagePromptStyles = await imagePromptStylesResponse.text();
     assert.match(imagePromptStyles, /\.workspaceNavButton\.active/);
+    assert.match(imagePromptStyles, /\.top:has\(> \.workspaceNav\) > #modeLabel\s*\{[^}]*grid-column:\s*4;[^}]*width:\s*max-content;[^}]*justify-self:\s*end/s);
+    assert.match(imagePromptStyles, /\.top:has\(> \.workspaceNav\) > \.topConversationContext\s*\{[^}]*position:\s*absolute;[^}]*left:\s*68px;[^}]*right:\s*calc\(50% \+ 110px\);[^}]*overflow:\s*hidden/s);
     assert.match(imagePromptStyles, /\.imagePromptGrid/);
     assert.match(imagePromptStyles, /\.imagePromptDetailDialog/);
     assert.match(imagePromptStyles, /\.imagePromptPreviewFrame\.imageLoading img/);
@@ -1157,8 +1189,7 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptStyles, /\.imagePromptSyncStatus\[data-status="error"\]/);
     assert.match(imagePromptStyles, /\.imagePromptSyncButton\.syncing \.lucide/);
     assert.match(imagePromptStyles, /grid-template-columns:\s*38px minmax\(0, 1fr\) minmax\(64px, min\(24vw, 124px\)\)/);
-    assert.match(imagePromptStyles, /\.topConversationContext\s*\{[^}]*display:\s*block;[^}]*max-width:\s*124px;[^}]*text-align:\s*right/s);
-    assert.match(imagePromptStyles, /\.topConversationContext #status,[^}]*\.main\.imagePromptMain \.topConversationContext\s*\{[^}]*display:\s*none/s);
+    assert.match(imagePromptStyles, /\.topConversationContext,\s*body #modeLabel\s*\{[^}]*display:\s*none/s);
 
     const imagePromptScriptResponse = await fetch(`${baseUrl}/image-prompt.js`);
     assert.equal(imagePromptScriptResponse.status, 200);
@@ -1531,6 +1562,8 @@ updated_at = 1784422800000
     assert.match(playgroundResponse.headers.get('cache-control'), /private, no-store/);
     const playgroundPage = await playgroundResponse.text();
     assert.match(playgroundPage, /<title>GPT Image Playground<\/title>/);
+    assert.match(playgroundPage, /codex-web-overrides\.css/);
+    assert.match(playgroundPage, /codex-web-integration\.js/);
     const playgroundAssetPath = playgroundPage.match(/src="\.\/(assets\/[^"\?]+\.js)/)?.[1];
     assert.ok(playgroundAssetPath);
     const playgroundAsset = await fetch(`${baseUrl}/playground/${playgroundAssetPath}`, {
@@ -1568,6 +1601,24 @@ updated_at = 1784422800000
     assert.equal(playgroundServiceWorker.status, 200);
     assert.match(playgroundServiceWorker.headers.get('content-type'), /javascript/);
     assert.match(await playgroundServiceWorker.text(), /registration\.unregister/);
+    const playgroundIntegrationResponse = await fetch(`${baseUrl}/playground/codex-web-integration.js`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundIntegrationResponse.status, 200);
+    assert.match(await playgroundIntegrationResponse.text(), /\/api\/playground-update\/status/);
+
+    const unauthorizedPlaygroundUpdateStatus = await fetch(`${baseUrl}/api/playground-update/status`);
+    assert.equal(unauthorizedPlaygroundUpdateStatus.status, 401);
+    const playgroundUpdateStatus = await fetch(`${baseUrl}/api/playground-update/status`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(playgroundUpdateStatus.status, 200);
+    assert.equal((await playgroundUpdateStatus.json()).enabled, false);
+    const disabledPlaygroundUpdate = await fetch(`${baseUrl}/api/playground-update`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(disabledPlaygroundUpdate.status, 403);
 
     const dreamSkinSkill = await fetch(`${baseUrl}/assets/dream-skin/SKILL.md`, {
       headers: { Cookie: cookie },
@@ -1755,7 +1806,7 @@ updated_at = 1784422800000
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /href="\/ui\.css\?v=goal-indicator-20260729e"/);
-    assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260728a"/);
+    assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-center-20260730a"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
@@ -1988,7 +2039,10 @@ updated_at = 1784422800000
     assert.match(page, /async function renameConversation\(id,title,source='codex'\)\{[\s\S]*?currentConversationId===id[\s\S]*?setCurrentConversationTitle\(clean\)/);
     assert.match(page, /function newChat\(\)\{[^\n]*setCurrentConversationTitle\('新任务'\)/);
     assert.match(page, /async function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(conversation\.title\|\|'Chat','Chat'\)/);
-    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false\}=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
+    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false,trigger=null\}=\{\}\)\{[\s\S]*?loadConversation\(data\.threadId,'codex',\{conversation:data\.conversation,skipPromptQueueSync:true\}\)[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
+    assert.doesNotMatch(page, /forkNativeConversation[\s\S]{0,500}confirm\(/);
+    assert.match(page, /input\.focus\(\);\s*refreshHistory\(\)\.catch\(\(\)=>\{\}\)/);
+    assert.match(page, /currentConversationSource==='codex'&&!options\.skipPromptQueueSync\)await pullPromptQueueFromServer/);
     assert.match(page, /automationStatus\.textContent=automationNotice\|\|''/);
     assert.match(page, /function openArchivedView/);
     assert.match(page, /ask:\{sandbox:'workspace-write',approval:'on-request',label:'请求批准',icon:'hand'\}/);
@@ -2154,6 +2208,35 @@ updated_at = 1784422800000
     assert.equal(subQuotaProgressPercent(74, 100, null, '%'), 74);
     assert.equal(subQuotaProgressPercent(75, 100, 25, 'USD'), 25);
     assert.equal(subQuotaProgressPercent(null, 100, null, 'USD'), null);
+    assert.match(inlineScript, /const displayUsed=options\.displayUsed===true\|\|windowData\.display==='used'/);
+    assert.match(inlineScript, /formatSubQuotaAmount\(used,unit,fixedCurrency\)\+' \/ '\+formatSubQuotaAmount\(limit,unit,fixedCurrency\)/);
+    assert.match(inlineScript, /subQuotaProgressPercent\(used,limit,displayUsed\?null:remaining,unit\)/);
+    assert.match(inlineScript, /\{displayUsed:true,showReset:true,fixedCurrency:true\}/);
+    assert.match(inlineScript, /bar\.dataset\.level=percent>=100\?'exhausted':percent>=80\?'warning':'normal'/);
+    assert.match(inlineScript, /value.textContent='当前可用'/);
+    assert.doesNotMatch(inlineScript, /用量未返回/);
+    const firstFiveHourWindow = inlineScript.indexOf("if(String(rateLimit?.window||'').toLowerCase()!=='5h')continue;");
+    const dailySubscriptionWindow = inlineScript.indexOf("appendSubQuotaWindow(source,'每日',daily,unit,sub2ApiWindowOptions)");
+    assert.ok(firstFiveHourWindow >= 0);
+    assert.ok(dailySubscriptionWindow > firstFiveHourWindow);
+    assert.match(inlineScript, /const label=isSub2Api\?'5小时':subQuotaRateLimitLabel\(rateLimit\.window\)/);
+    assert.match(inlineScript, /if\(isSub2ApiSubscription&&expiresAt\)appendSubQuotaExpiry\(source,expiresAt\)/);
+    assert.match(uiStyles, /\.subQuotaProgressBar\[data-level="normal"\]\s*\{[^}]*background:\s*#22c55e/s);
+    assert.match(uiStyles, /\.subQuotaProgressBar\[data-level="warning"\]\s*\{[^}]*background:\s*#f97316/s);
+    assert.match(uiStyles, /\.subQuotaProgressBar\[data-level="exhausted"\]\s*\{[^}]*background:\s*var\(--danger\)/s);
+    const subQuotaCountdownHelper = inlineScript.match(/(function formatSubQuotaResetCountdown[\s\S]*?)(?=function refreshSubQuotaCountdowns)/)?.[1];
+    assert.ok(subQuotaCountdownHelper);
+    const formatSubQuotaResetCountdown = new Function(
+      subQuotaCountdownHelper + '; return formatSubQuotaResetCountdown;',
+    )();
+    const originalDateNow = Date.now;
+    Date.now = () => Date.parse('2026-07-30T15:18:00+08:00');
+    try {
+      assert.equal(formatSubQuotaResetCountdown('2026-07-30T19:00:00+08:00'), '3h 42m 后重置');
+      assert.equal(formatSubQuotaResetCountdown('2026-08-05T00:00:00+08:00'), '5d 8h 后重置');
+    } finally {
+      Date.now = originalDateNow;
+    }
     const subQuotaDateTimeHelper = inlineScript.match(/(function formatSubQuotaDateTime[\s\S]*?)(?=function formatSubQuotaTime)/)?.[1];
     assert.ok(subQuotaDateTimeHelper);
     const formatSubQuotaDateTime = new Function(
@@ -2183,6 +2266,8 @@ updated_at = 1784422800000
       'subQuotaSettingsOverlay',
       'cancelSubQuotaPreviewHide',
       'loadSubQuota',
+      'startSubQuotaCountdowns',
+      'stopSubQuotaCountdowns',
       subQuotaPreviewHelpers + '; return { showSubQuotaPreview, hideSubQuotaPreview };',
     )(
       previewPopover,
@@ -2190,6 +2275,8 @@ updated_at = 1784422800000
       null,
       () => {},
       async () => { subQuotaLoads += 1; },
+      () => {},
+      () => {},
     );
     subQuotaPreviewApi.showSubQuotaPreview();
     subQuotaPreviewApi.showSubQuotaPreview();
@@ -2243,11 +2330,22 @@ updated_at = 1784422800000
     const composerLabelHelpers = inlineScript.match(/(function composerModelLabel[\s\S]*?)(?=function closeComposerPopovers)/)?.[1];
     assert.ok(composerLabelHelpers);
     const composerLabels = new Function(
-      composerLabelHelpers + '; return { composerModelLabel, composerEffortLabel };',
-    )();
+      'reasoningEffort',
+      composerLabelHelpers + '; return { composerModelLabel, composerEffortLabel, composerMaximumEffortValue };',
+    )(null);
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
     assert.equal(composerLabels.composerEffortLabel('ultra'), '极高');
+    assert.equal(composerLabels.composerMaximumEffortValue({ options: [
+      { value: '' },
+      { value: 'xhigh' },
+      { value: 'ultra' },
+    ] }), 'ultra');
+    assert.equal(composerLabels.composerMaximumEffortValue({ options: [
+      { value: '' },
+      { value: 'xhigh' },
+      { value: 'ultra', disabled: true },
+    ] }), 'xhigh');
     const elapsedTitleHelpers = inlineScript.match(/(function processedMessageTitle[\s\S]*?)(?=function clearTurnReasoningStatus)/)?.[1];
     assert.ok(elapsedTitleHelpers);
     const elapsedTitleApi = new Function(
@@ -5787,6 +5885,7 @@ function startServer({
     PLAYGROUND_PROXY_HEARTBEAT_MS: '20',
     HOMEPAGE_API_TOKEN: '',
     IMAGE_PROMPT_AUTO_SYNC: 'false',
+    PLAYGROUND_UPDATE_ENABLED: 'false',
     DEFAULT_CWD: temporary,
     DEFAULT_SANDBOX: 'read-only',
     DEFAULT_APPROVAL: 'never',
@@ -5803,6 +5902,11 @@ function startServer({
   env.CPA_QUOTA_API_KEY = '';
   delete env.SUB2API_BASE_URL;
   delete env.SUB2API_API_KEY;
+  env.SUB2API_ADMIN_API_KEY = '';
+  env.GROK2API_BASE_URL = '';
+  env.GROK2API_ADMIN_PASSWORD = '';
+  env.GROK2API_API_KEY = '';
+  env.SUB_QUOTA_SOURCES = '';
   env.SUB_QUOTA_PROVIDER = 'cpa-codex';
   if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;
   if (sub2ApiKey !== undefined) env.SUB2API_API_KEY = sub2ApiKey;

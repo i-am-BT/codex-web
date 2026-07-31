@@ -36,6 +36,7 @@ import {
 import { normalizeSubQuotaBaseUrl, SubQuotaService } from './sub-quota.mjs';
 import { listCodexSkills } from './skills-catalog.mjs';
 import { listCodexPlugins } from './plugins-catalog.mjs';
+import { PlaygroundUpdater } from './playground-updater.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -68,6 +69,9 @@ const IMAGE_DIR = path.join(RUNTIME_DIR, 'images');
 const FILE_DIR = path.join(RUNTIME_DIR, 'files');
 const BACKGROUND_DIR = path.join(RUNTIME_DIR, 'backgrounds');
 const IMAGE_PROMPT_CACHE_DIR = path.join(RUNTIME_DIR, 'image-prompts');
+const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
+const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
+const PLAYGROUND_PREVIOUS_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'previous');
 const CODEX_HOME = resolveLocalPath(process.env.CODEX_HOME || path.join(homedir(), '.codex'), homedir());
 const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path.join(CODEX_HOME, 'config.toml'), CODEX_HOME);
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
@@ -111,6 +115,7 @@ const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
 const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
 const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
 const IMAGE_PROMPT_AUTO_SYNC = parseBoolean(process.env.IMAGE_PROMPT_AUTO_SYNC, true);
+const PLAYGROUND_UPDATE_ENABLED = parseBoolean(process.env.PLAYGROUND_UPDATE_ENABLED, true);
 const imagePromptSyncIntervalMinutes = Number(process.env.IMAGE_PROMPT_SYNC_INTERVAL_MINUTES || 360);
 const IMAGE_PROMPT_SYNC_INTERVAL_MS = (
   Number.isFinite(imagePromptSyncIntervalMinutes) && imagePromptSyncIntervalMinutes > 0
@@ -186,6 +191,12 @@ const imagePromptLibrary = new ImagePromptLibrary({
   intervalMs: IMAGE_PROMPT_SYNC_INTERVAL_MS,
   requestTimeoutMs: IMAGE_PROMPT_SYNC_TIMEOUT_MS,
 });
+const playgroundUpdater = new PlaygroundUpdater({
+  runtimeDir: PLAYGROUND_UPDATE_DIR,
+  vendorDir: GPT_IMAGE_PLAYGROUND_DIR,
+  patchDir: path.join(ROOT, 'vendor', 'gpt-image-playground', 'patches'),
+  enabled: PLAYGROUND_UPDATE_ENABLED,
+});
 
 const app = express();
 const sessions = loadSessions();
@@ -199,9 +210,11 @@ const nativeSessions = new NativeSessionStore(CODEX_HOME, {
   sideChatStateFile: path.join(RUNTIME_DIR, 'side-chat-threads.json'),
 });
 const automationStore = new AutomationStore(CODEX_HOME);
+const SUB2API_ADMIN_API_KEY = String(process.env.SUB2API_ADMIN_API_KEY || '').trim();
 let subQuotaConfigs = readStartupSubQuotaConfigs(process.env);
 delete process.env.CPA_QUOTA_API_KEY;
 delete process.env.SUB2API_API_KEY;
+delete process.env.SUB2API_ADMIN_API_KEY;
 let subQuotaService = createSubQuotaService(subQuotaConfigs);
 const codexProcessEnvironment = buildCodexProcessEnvironment();
 const appServerClient = new CodexAppServerClient({
@@ -397,6 +410,26 @@ app.get('/api/session', (req, res) => {
   res.json({ authenticated: Boolean(validateSession(req)) });
 });
 
+app.get('/api/playground-update/status', requireAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    const status = await playgroundUpdater.getStatus({ refresh: req.query.refresh === '1' });
+    res.json(status);
+  } catch (err) {
+    res.status(err.statusCode || 502).json({ error: err.message });
+  }
+});
+
+app.post('/api/playground-update', requireAuth, async (_req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    const status = await playgroundUpdater.startUpdate();
+    res.status(status.status === 'updating' ? 202 : 200).json(status);
+  } catch (err) {
+    res.status(err.statusCode || 502).json({ error: err.message });
+  }
+});
+
 app.use('/assets/images', requireAuth, express.static(IMAGE_DIR, {
   fallthrough: false,
   setHeaders: (res) => {
@@ -414,8 +447,8 @@ app.use('/assets/files', requireAuth, express.static(FILE_DIR, {
 }));
 app.use('/assets/backgrounds', requireAuth, express.static(BACKGROUND_DIR, { fallthrough: false }));
 app.use('/assets/dream-skin', requireAuth, express.static(DREAM_SKIN_DIR, { fallthrough: false }));
-app.use('/playground', requireAuth, express.static(GPT_IMAGE_PLAYGROUND_DIR, {
-  fallthrough: false,
+const playgroundStaticOptions = {
+  fallthrough: true,
   setHeaders: (res, filePath) => {
     const immutable = filePath.includes(`${path.sep}assets${path.sep}`)
       && !filePath.endsWith('.css')
@@ -424,7 +457,14 @@ app.use('/playground', requireAuth, express.static(GPT_IMAGE_PLAYGROUND_DIR, {
       ? 'private, max-age=31536000, immutable'
       : 'private, no-store');
   },
-}));
+};
+app.use(
+  '/playground',
+  requireAuth,
+  express.static(PLAYGROUND_CURRENT_DIR, playgroundStaticOptions),
+  express.static(PLAYGROUND_PREVIOUS_DIR, playgroundStaticOptions),
+  express.static(GPT_IMAGE_PLAYGROUND_DIR, { ...playgroundStaticOptions, fallthrough: false }),
+);
 
 app.all('/api-proxy/*', requireAuth, proxyPlaygroundRequest);
 
@@ -1344,6 +1384,53 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
   } catch (err) {
     const action = hasServiceTier && !hasTitle ? 'Fast 模式' : hasTitle && !hasServiceTier ? '会话标题' : '会话设置';
     res.status(nativeAppErrorStatus(err)).json({ error: `修改 Codex App ${action}失败: ${err.message}` });
+  }
+});
+
+app.patch('/api/native-sessions/:id/goal', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  const hasObjective = Object.hasOwn(req.body || {}, 'objective');
+  const hasStatus = Object.hasOwn(req.body || {}, 'status');
+  if (!hasObjective && !hasStatus) {
+    return res.status(400).json({ error: '请提供要更新的目标内容或状态' });
+  }
+
+  const params = { threadId };
+  if (hasObjective) {
+    const objective = String(req.body?.objective || '').replace(/\s+/g, ' ').trim();
+    if (!objective) return res.status(400).json({ error: '目标内容不能为空' });
+    if (objective.length > 4000) return res.status(400).json({ error: '目标内容不能超过 4000 个字符' });
+    params.objective = objective;
+  }
+  if (hasStatus) {
+    const status = nativeThreadGoalStatus(req.body?.status);
+    if (!status) return res.status(400).json({ error: '目标状态无效' });
+    params.status = status;
+  }
+
+  try {
+    const result = await appServerClient.request('thread/goal/set', params);
+    nativeSessions.applyThreadGoal?.(result?.goal, threadId);
+    nativeSessions.scheduleRefresh();
+    res.json({ ok: true, id: threadId, goal: result?.goal || null });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `更新 Codex App 目标失败: ${err.message}` });
+  }
+});
+
+app.delete('/api/native-sessions/:id/goal', requireAuth, async (req, res) => {
+  const threadId = cleanNativeThreadId(req.params.id);
+  if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+
+  try {
+    const result = await appServerClient.request('thread/goal/clear', { threadId });
+    nativeSessions.clearThreadGoal?.(threadId);
+    nativeSessions.scheduleRefresh();
+    res.json({ ok: true, id: threadId, cleared: result?.cleared !== false });
+  } catch (err) {
+    res.status(nativeAppErrorStatus(err)).json({ error: `清除 Codex App 目标失败: ${err.message}` });
   }
 });
 
@@ -4094,6 +4181,7 @@ function createSubQuotaService(configs = {}) {
   const env = {
     CPA_QUOTA_API_KEY: String(configs['cpa-codex']?.apiKey || ''),
     SUB2API_API_KEY: String(configs.sub2api?.apiKey || ''),
+    SUB2API_ADMIN_API_KEY,
     GROK2API_ADMIN_PASSWORD: String(configs.grok2api?.apiKey || ''),
     SUB_QUOTA_TIMEOUT_MS: process.env.SUB_QUOTA_TIMEOUT_MS,
     SUB_QUOTA_CACHE_SECONDS: process.env.SUB_QUOTA_CACHE_SECONDS,
@@ -4108,6 +4196,7 @@ function createSubQuotaService(configs = {}) {
           : config.provider === 'grok2api'
             ? 'GROK2API_ADMIN_PASSWORD'
             : 'CPA_QUOTA_API_KEY',
+        ...(config.provider === 'sub2api' ? { adminApiKeyEnv: 'SUB2API_ADMIN_API_KEY' } : {}),
       })))
       : '',
   };
@@ -6446,7 +6535,7 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
 <link rel="stylesheet" href="/ui.css?v=goal-indicator-20260729e">
-  <link rel="stylesheet" href="/image-prompt.css?v=image-prompt-main-20260728a">
+  <link rel="stylesheet" href="/image-prompt.css?v=image-prompt-center-20260730a">
 </head>
 <body><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="card"><div class="brand">${appName}</div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form></div></section>
@@ -6466,6 +6555,8 @@ const automationToggle = document.getElementById('automationToggle'), automation
 let subQuotaToggle = null, subQuotaPopover = null, subQuotaStatus = null, subQuotaContent = null;
 let subQuotaSettingsForm = null, subQuotaSettingsInputs = new Map(), subQuotaSettingsStatus = null;
 let subQuotaSettingsOverlay = null, subQuotaSettingsDialog = null, subQuotaSettingsClose = null, subQuotaSettingsReturnFocus = null;
+let archiveConfirmOverlay = null, archiveConfirmDialog = null, archiveConfirmName = null, archiveConfirmCancel = null, archiveConfirmSubmit = null, archiveConfirmStatus = null;
+let archiveConfirmPending = null, archiveConfirmReturnFocus = null, archiveConfirmReturnKey = '', archiveConfirmSubmitting = false;
 const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
 const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
@@ -6603,6 +6694,7 @@ let composerAtLoading = false;
 let composerAtLoadPromise = null;
 let composerAtLoadedAt = 0;
 let nativeComposerOverride = null;
+let nativeForkCreating = false;
 let promptQueuePanel = null;
 let promptQueueList = null;
 let threadGoalBar = null;
@@ -6644,6 +6736,7 @@ let settingsReturnFocus = null;
 let passwordForm = null;
 let passwordStatus = null;
 let subQuotaHoverTimer = null;
+let subQuotaCountdownTimer = null;
 let suppressSubQuotaFocusPreview = false;
 let dreamSkinPanel = null;
 let dreamSkinIdea = null;
@@ -6692,6 +6785,7 @@ let sideChatPreferredWidth=SIDE_CHAT_WIDTH_DEFAULT;
 let sideChatRenderedWidth=SIDE_CHAT_WIDTH_DEFAULT;
 let sideChatResizePointerId=null;
 const ACTIVE_CONVERSATION_STORAGE_KEY='codexWeb.activeConversation.v1';
+const NATIVE_FORK_MARKERS_STORAGE_KEY='codexWeb.nativeForkMarkers.v1';
 const NATIVE_INITIAL_MESSAGE_LIMIT=60;
 const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
@@ -6706,6 +6800,7 @@ let historyRefreshPending=false;
 let historyRenameActive=false;
 let historyProjectPreview=null;
 let historyProjectPreviewAnchor=null;
+let nativeForkMarkers=readNativeForkMarkers();
 function refreshIcons(root=document){if(!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
 function setIconLabel(element,name,label,showLabel=true){if(!element)return;element.replaceChildren();const icon=document.createElement('i');icon.setAttribute('data-lucide',name);icon.setAttribute('aria-hidden','true');element.appendChild(icon);if(showLabel){const text=document.createElement('span');text.className='buttonLabel';text.textContent=label;element.appendChild(text)}if(label&&!element.getAttribute('aria-label'))element.setAttribute('aria-label',label);refreshIcons(element)}
 function createComposerMirrorField(panel,labelText,ariaLabel){
@@ -6738,6 +6833,9 @@ function composerModelLabel(value){
   return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
 }
 function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'极高'})[String(value||'')]||String(value||'默认')}
+function composerMaximumEffortValue(select=reasoningEffort){
+  return[...(select?.options||[])].filter((option)=>!option.disabled&&option.value).at(-1)?.value||'';
+}
 function formatComposerContextTokens(value){
   const tokens=Math.max(0,Math.round(Number(value)||0));
   if(tokens>=1000000)return(tokens/1000000).toFixed(tokens>=10000000?0:1).replace(/\\.0$/,'')+'m';
@@ -8657,6 +8755,9 @@ function renderPromptQueue(){
     body.disabled=busy;
     row.appendChild(lead);
     row.appendChild(body);
+    const edit=queueActionButton('pencil','编辑队列消息',()=>restoreQueuedPrompt(threadId,item.id));
+    edit.disabled=busy;
+    row.appendChild(edit);
     const retryable=queueFailures.has(item.id)&&!appOwned;
     const guide=queueActionButton(retryable?'rotate-cw':'corner-down-left',retryable?'重试':'引导',()=>{
       if(retryable)dispatchNextQueuedPrompt(threadId,{force:true});else steerQueuedPrompt(threadId,item.id);
@@ -9311,7 +9412,10 @@ function syncComposerChrome(){
   syncComposerSelect(reasoningEffort,composerReasoningSelect);
   reconcileComposerFastSupport();
   if(composerModelName)composerModelName.textContent=composerModelLabel(model.value);
-  if(composerEffortName)composerEffortName.textContent=composerEffortLabel(reasoningEffort.value);
+  if(composerEffortName){
+    composerEffortName.textContent=composerEffortLabel(reasoningEffort.value);
+    composerEffortName.classList.toggle('maximum',Boolean(reasoningEffort.value)&&reasoningEffort.value===composerMaximumEffortValue(reasoningEffort));
+  }
   const projectPath=normalizeProjectPath(cwd.value);
   const projectName=projectPath?historyProjectName(projectPath):'选择项目（可选）';
   const hasConversation=Boolean(currentConversationId);
@@ -11105,8 +11209,9 @@ function closeSettings(){
 function syncModalOpenState(){
   const settingsOpen=settingsOverlay&&!settingsOverlay.classList.contains('hidden');
   const subQuotaSettingsOpen=subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden');
+  const archiveConfirmOpen=archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden');
   const previewOpen=imagePreview&&!imagePreview.classList.contains('hidden');
-  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||subQuotaSettingsOpen||previewOpen));
+  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||subQuotaSettingsOpen||archiveConfirmOpen||previewOpen));
 }
 function ensureImagePreview(){
   if(imagePreview)return;
@@ -11299,11 +11404,13 @@ function showSubQuotaPreview(){
   subQuotaPopover.classList.remove('hidden');
   subQuotaToggle.setAttribute('aria-expanded','true');
   subQuotaToggle.dataset.previewOpen='1';
+  startSubQuotaCountdowns();
   if(wasHidden)void loadSubQuota();
 }
 function hideSubQuotaPreview(){
   if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
   subQuotaPopover.classList.add('hidden');
+  stopSubQuotaCountdowns();
   if(subQuotaSettingsOverlay?.classList.contains('hidden')!==false){
     subQuotaToggle?.setAttribute('aria-expanded','false');
   }
@@ -11427,6 +11534,13 @@ function renderSubQuota(data){
     plan.appendChild(planName);
     plan.appendChild(sourceName);
     source.appendChild(plan);
+    const isSub2Api=quota.provider==='sub2api';
+    const isSub2ApiSubscription=isSub2Api&&Boolean(quota.subscription);
+    const sub2ApiWindowOptions=isSub2Api
+      ? {displayUsed:true,showReset:true,fixedCurrency:true}
+      : undefined;
+    const expiresAt=quota.expiresAt||quota.subscription?.expiresAt;
+    if(isSub2ApiSubscription&&expiresAt)appendSubQuotaExpiry(source,expiresAt);
     if(quota.provider==='grok2api' && quota.accountStats){
       const stats=quota.accountStats;
       const unit='accounts';
@@ -11467,16 +11581,26 @@ function renderSubQuota(data){
     }
     const unit=quota.unit||quota.quota?.unit||(quota.mode==='cpa_codex'?'%':'USD');
     let detailCount=0;
+    const rateLimits=Array.isArray(quota.rateLimits)?quota.rateLimits:[];
+    for(const rateLimit of rateLimits){
+      if(String(rateLimit?.window||'').toLowerCase()!=='5h')continue;
+      const label=isSub2Api?'5小时':subQuotaRateLimitLabel(rateLimit.window);
+      detailCount+=appendSubQuotaWindow(source,label,rateLimit,rateLimit.unit||unit,sub2ApiWindowOptions)?1:0;
+    }
     if(quota.subscription){
-      detailCount+=appendSubQuotaWindow(source,'每日',quota.subscription.daily,unit)?1:0;
-      detailCount+=appendSubQuotaWindow(source,'每周',quota.subscription.weekly,unit)?1:0;
+      const resetAnchor=quota.subscription.weeklyWindowStart;
+      const daily=withSubQuotaPeriodicReset(quota.subscription.daily,resetAnchor,24*60*60*1000);
+      const weekly=withSubQuotaPeriodicReset(quota.subscription.weekly,resetAnchor,7*24*60*60*1000);
+      detailCount+=appendSubQuotaWindow(source,'每日',daily,unit,sub2ApiWindowOptions)?1:0;
+      detailCount+=appendSubQuotaWindow(source,'每周',weekly,unit,sub2ApiWindowOptions)?1:0;
       if(finiteSubQuotaNumber(quota.subscription.monthly?.limit)>0){
-        detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit)?1:0;
+        detailCount+=appendSubQuotaWindow(source,'每月',quota.subscription.monthly,unit,sub2ApiWindowOptions)?1:0;
       }
     }
     if(quota.quota)detailCount+=appendSubQuotaWindow(source,'总额度',quota.quota,unit)?1:0;
-    for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
-      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,unit)?1:0;
+    for(const rateLimit of rateLimits){
+      if(String(rateLimit?.window||'').toLowerCase()==='5h')continue;
+      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,rateLimit.unit||unit,sub2ApiWindowOptions)?1:0;
     }
     const walletBalance=finiteSubQuotaNumber(quota.balance??quota.remaining);
     if(!detailCount&&walletBalance!==null){
@@ -11485,13 +11609,12 @@ function renderSubQuota(data){
     const meta=document.createElement('div');
     meta.className='subQuotaMeta';
     const todayCost=quota.today?.actualCost??quota.today?.cost;
-    if(Number.isFinite(Number(todayCost)))appendSubQuotaMeta(meta,'今日 '+formatSubQuotaAmount(todayCost,unit==='%'?'USD':unit));
-    if(Number.isFinite(Number(quota.today?.requests)))appendSubQuotaMeta(meta,'请求 '+Number(quota.today.requests).toLocaleString('zh-CN')+' 次');
-    const expiresAt=quota.expiresAt||quota.subscription?.expiresAt;
-    if(expiresAt)appendSubQuotaMeta(meta,'到期 '+formatSubQuotaDate(expiresAt));
+    if(!isSub2ApiSubscription&&Number.isFinite(Number(todayCost)))appendSubQuotaMeta(meta,'今日 '+formatSubQuotaAmount(todayCost,unit==='%'?'USD':unit));
+    if(!isSub2ApiSubscription&&Number.isFinite(Number(quota.today?.requests)))appendSubQuotaMeta(meta,'请求 '+Number(quota.today.requests).toLocaleString('zh-CN')+' 次');
+    if(!isSub2ApiSubscription&&expiresAt)appendSubQuotaMeta(meta,'到期 '+formatSubQuotaDate(expiresAt));
     if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
     if(Number.isFinite(Number(quota.rateLimitResetCredits)))appendSubQuotaMeta(meta,'主动重置 '+Number(quota.rateLimitResetCredits).toLocaleString('zh-CN')+' 次');
-    for(const rateLimit of Array.isArray(quota.rateLimits)?quota.rateLimits:[]){
+    for(const rateLimit of isSub2Api?[]:(Array.isArray(quota.rateLimits)?quota.rateLimits:[])){
       if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit.window)+'重置 '+formatSubQuotaDateTime(rateLimit.resetAt));
     }
     if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
@@ -11503,6 +11626,7 @@ function renderSubQuota(data){
   if(!rendered){renderSubQuotaError('未返回可显示的额度数据');return}
   delete subQuotaStatus.dataset.state;
   subQuotaStatus.textContent=subQuotaFetchedStatusText(data.fetchedAt,hasStale);
+  refreshSubQuotaCountdowns();
 }
 function subQuotaProgressPercent(used,limit,remaining,unit){
   const progressAmount=remaining!==null?remaining:used;
@@ -11511,12 +11635,15 @@ function subQuotaProgressPercent(used,limit,remaining,unit){
   if(limit===null||limit<=0)return null;
   return Math.min(100,Math.max(0,(progressAmount/limit)*100));
 }
-function appendSubQuotaWindow(parent,label,windowData,unit){
+function appendSubQuotaWindow(parent,label,windowData,unit,options={}){
   if(!windowData)return false;
   const used=finiteSubQuotaNumber(windowData.used);
   const limit=finiteSubQuotaNumber(windowData.limit);
   const remaining=finiteSubQuotaNumber(windowData.remaining);
-  if(used===null&&limit===null&&remaining===null)return false;
+  const available=windowData.availability==='available';
+  const displayUsed=options.displayUsed===true||windowData.display==='used';
+  const fixedCurrency=options.fixedCurrency===true;
+  if(used===null&&limit===null&&remaining===null&&!available)return false;
   const row=document.createElement('div');
   row.className='subQuotaWindow';
   const head=document.createElement('div');
@@ -11524,7 +11651,11 @@ function appendSubQuotaWindow(parent,label,windowData,unit){
   const title=document.createElement('span');
   title.textContent=label;
   const value=document.createElement('span');
-  if(unit==='%'&&(used!==null||remaining!==null)){
+  if(displayUsed&&used!==null&&limit!==null&&limit>0){
+    value.textContent=formatSubQuotaAmount(used,unit,fixedCurrency)+' / '+formatSubQuotaAmount(limit,unit,fixedCurrency);
+  }else if(available&&used===null&&remaining===null){
+    value.textContent='当前可用';
+  }else if(unit==='%'&&(used!==null||remaining!==null)){
     if(remaining!==null)value.textContent='剩余 '+formatSubQuotaAmount(remaining,'%');
     else value.textContent='已用 '+formatSubQuotaAmount(used,'%');
   }else if(limit!==null&&limit>0){
@@ -11539,26 +11670,84 @@ function appendSubQuotaWindow(parent,label,windowData,unit){
   head.appendChild(title);
   head.appendChild(value);
   row.appendChild(head);
-  const percent=subQuotaProgressPercent(used,limit,remaining,unit);
+  const percent=subQuotaProgressPercent(used,limit,displayUsed?null:remaining,unit);
   if(percent!==null){
     const progress=document.createElement('div');
     progress.className='subQuotaProgress';
     const bar=document.createElement('span');
     bar.className='subQuotaProgressBar';
     bar.style.setProperty('--sub-quota-percent',percent.toFixed(2)+'%');
+    if(displayUsed)bar.dataset.level=percent>=100?'exhausted':percent>=80?'warning':'normal';
     progress.appendChild(bar);
     row.appendChild(progress);
   }
+  if(options.showReset===true&&windowData.resetAt){
+    const reset=document.createElement('span');
+    reset.className='subQuotaWindowReset';
+    reset.dataset.resetAt=windowData.resetAt;
+    reset.textContent=formatSubQuotaResetCountdown(windowData.resetAt);
+    if(reset.textContent)row.appendChild(reset);
+  }
   parent.appendChild(row);
   return true;
+}
+function appendSubQuotaExpiry(parent,value){
+  const date=new Date(value);
+  if(!Number.isFinite(date.getTime()))return;
+  const row=document.createElement('div');
+  row.className='subQuotaExpiry';
+  const label=document.createElement('span');
+  label.textContent='到期时间';
+  const detail=document.createElement('span');
+  detail.textContent='剩余 '+Math.max(0,Math.ceil((date.getTime()-Date.now())/(24*60*60*1000)))+' 天 ('+formatSubQuotaDateTimeFull(value)+')';
+  row.appendChild(label);
+  row.appendChild(detail);
+  parent.appendChild(row);
+}
+function withSubQuotaPeriodicReset(windowData,anchorValue,intervalMs){
+  if(!windowData||windowData.resetAt)return windowData;
+  const anchor=new Date(anchorValue).getTime();
+  if(!Number.isFinite(anchor)||!Number.isFinite(intervalMs)||intervalMs<=0)return windowData;
+  const elapsed=Math.max(0,Date.now()-anchor);
+  const resetAt=new Date(anchor+(Math.floor(elapsed/intervalMs)+1)*intervalMs).toISOString();
+  return {...windowData,resetAt};
+}
+function formatSubQuotaResetCountdown(value){
+  const resetAt=new Date(value).getTime();
+  if(!Number.isFinite(resetAt))return '';
+  const totalMinutes=Math.max(0,Math.floor((resetAt-Date.now())/60000));
+  if(totalMinutes<=0)return '即将重置';
+  const days=Math.floor(totalMinutes/(24*60));
+  const hours=Math.floor((totalMinutes%(24*60))/60);
+  const minutes=totalMinutes%60;
+  if(days>0)return days+'d '+hours+'h 后重置';
+  if(hours>0)return hours+'h '+minutes+'m 后重置';
+  return minutes+'m 后重置';
+}
+function refreshSubQuotaCountdowns(){
+  if(!subQuotaPopover)return;
+  for(const item of subQuotaPopover.querySelectorAll('.subQuotaWindowReset[data-reset-at]')){
+    item.textContent=formatSubQuotaResetCountdown(item.dataset.resetAt);
+  }
+}
+function startSubQuotaCountdowns(){
+  stopSubQuotaCountdowns();
+  refreshSubQuotaCountdowns();
+  subQuotaCountdownTimer=setInterval(refreshSubQuotaCountdowns,30000);
+}
+function stopSubQuotaCountdowns(){
+  if(!subQuotaCountdownTimer)return;
+  clearInterval(subQuotaCountdownTimer);
+  subQuotaCountdownTimer=null;
 }
 function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item)}
 function finiteSubQuotaNumber(value){if(value===null||value===undefined||value==='')return null;const number=Number(value);return Number.isFinite(number)&&number>=0?number:null}
 function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[String(value||'').toLowerCase()]||String(value||'限速')}
 function formatSubQuotaStatus(value){return({active:'正常',quota_exhausted:'额度耗尽',expired:'已过期',no_access:'无访问权限',blocked:'已限制'})[String(value||'').toLowerCase()]||String(value||'')}
-function formatSubQuotaAmount(value,unit){const number=finiteSubQuotaNumber(value)||0;if(unit==='%')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+'%';if(unit==='accounts')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+' 个';const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:0,maximumFractionDigits:2});return unit==='USD'?'$'+formatted:formatted+(unit?' '+unit:'')}
+function formatSubQuotaAmount(value,unit,fixedCurrency=false){const number=finiteSubQuotaNumber(value)||0;if(unit==='%')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+'%';if(unit==='accounts')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+' 个';const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:unit==='USD'&&fixedCurrency?2:0,maximumFractionDigits:2});return unit==='USD'?'$'+formatted:formatted+(unit?' '+unit:'')}
 function formatSubQuotaDate(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'}):String(value||'')}
 function formatSubQuotaDateTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}):''}
+function formatSubQuotaDateTimeFull(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}):''}
 function formatSubQuotaTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
 function subQuotaStaleMetaText(quota){
   const staleTime=formatSubQuotaTime(quota?.fetchedAt);
@@ -11700,7 +11889,7 @@ document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();finishSideChatResize();app.classList.remove('menuOpen');renderSidebarWidth();renderSideChatWidth();syncMenuButton()});
 document.addEventListener('pointerdown',(event)=>{if(!promptQueueMenu||promptQueueMenu.classList.contains('hidden'))return;if(promptQueueMenu.contains(event.target)||event.target.closest?.('.promptQueueIconButton[aria-label="队列操作"]'))return;closePromptQueueMenu()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',async()=>{rememberNativeComposerOverride();await loadModels(provider.value);rememberNativeComposerOverride();syncComposerChrome()});
@@ -13198,7 +13387,7 @@ function createHistoryRow(item,projectPath){
     del.title='归档会话';
     del.setAttribute('aria-label','归档会话');
     setIconLabel(del,'archive','归档会话',false);
-    del.addEventListener('click',(e)=>{e.stopPropagation();deleteConversation(item.id,item.title,source)});
+    del.addEventListener('click',(e)=>{e.stopPropagation();deleteConversation(item.id,item.title,source,del)});
     row.appendChild(rename);
     row.appendChild(del);
   }else{
@@ -13215,7 +13404,7 @@ function createHistoryRow(item,projectPath){
     del.title='删除会话';
     del.setAttribute('aria-label','删除会话');
     setIconLabel(del,'trash-2','删除会话',false);
-    del.addEventListener('click',(e)=>{e.stopPropagation();deleteConversation(item.id,item.title,source)});
+    del.addEventListener('click',(e)=>{e.stopPropagation();deleteConversation(item.id,item.title,source,del)});
     row.appendChild(rename);
     row.appendChild(del);
   }
@@ -13288,7 +13477,146 @@ async function renameConversation(id,title,source='codex'){
     return true;
   }catch(error){statusEl.textContent=error.message||'改名失败';return false}
 }
-async function deleteConversation(id,title,source='codex'){const verb=source==='codex'?'归档':'删除';if(!confirm(verb+'会话：'+title+'？'))return;const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});const data=await res.json().catch(()=>({}));if(!res.ok){statusEl.textContent=data.error||verb+'失败';return}if(currentConversationId===id)newChat();await refreshHistory();statusEl.textContent=verb+'完成'}
+function ensureArchiveConfirmDialog(){
+  if(archiveConfirmOverlay)return;
+  archiveConfirmOverlay=document.createElement('div');
+  archiveConfirmOverlay.id='archiveConfirmOverlay';
+  archiveConfirmOverlay.className='archiveConfirmOverlay hidden';
+  archiveConfirmOverlay.setAttribute('role','presentation');
+  archiveConfirmDialog=document.createElement('section');
+  archiveConfirmDialog.id='archiveConfirmDialog';
+  archiveConfirmDialog.className='archiveConfirmDialog';
+  archiveConfirmDialog.setAttribute('role','dialog');
+  archiveConfirmDialog.setAttribute('aria-modal','true');
+  archiveConfirmDialog.setAttribute('aria-labelledby','archiveConfirmTitle');
+  archiveConfirmDialog.setAttribute('aria-describedby','archiveConfirmDescription');
+  const head=document.createElement('header');
+  head.className='archiveConfirmHead';
+  const icon=document.createElement('span');
+  icon.className='archiveConfirmIcon';
+  setIconLabel(icon,'archive','',false);
+  const heading=document.createElement('div');
+  const title=document.createElement('h2');
+  title.id='archiveConfirmTitle';
+  title.textContent='归档会话';
+  const description=document.createElement('p');
+  description.id='archiveConfirmDescription';
+  description.textContent='归档后会从最近任务移除，可在“已归档任务”中恢复。';
+  heading.appendChild(title);
+  heading.appendChild(description);
+  head.appendChild(icon);
+  head.appendChild(heading);
+  const target=document.createElement('div');
+  target.className='archiveConfirmTarget';
+  const targetLabel=document.createElement('span');
+  targetLabel.textContent='将归档';
+  archiveConfirmName=document.createElement('strong');
+  target.appendChild(targetLabel);
+  target.appendChild(archiveConfirmName);
+  archiveConfirmStatus=document.createElement('div');
+  archiveConfirmStatus.className='archiveConfirmStatus';
+  archiveConfirmStatus.setAttribute('role','status');
+  archiveConfirmStatus.setAttribute('aria-live','polite');
+  const actions=document.createElement('footer');
+  actions.className='archiveConfirmActions';
+  archiveConfirmCancel=document.createElement('button');
+  archiveConfirmCancel.type='button';
+  archiveConfirmCancel.className='archiveConfirmCancel';
+  archiveConfirmCancel.textContent='取消';
+  archiveConfirmSubmit=document.createElement('button');
+  archiveConfirmSubmit.type='button';
+  archiveConfirmSubmit.className='archiveConfirmSubmit';
+  setIconLabel(archiveConfirmSubmit,'archive','归档');
+  actions.appendChild(archiveConfirmCancel);
+  actions.appendChild(archiveConfirmSubmit);
+  archiveConfirmDialog.appendChild(head);
+  archiveConfirmDialog.appendChild(target);
+  archiveConfirmDialog.appendChild(archiveConfirmStatus);
+  archiveConfirmDialog.appendChild(actions);
+  archiveConfirmOverlay.appendChild(archiveConfirmDialog);
+  document.body.appendChild(archiveConfirmOverlay);
+  archiveConfirmCancel.addEventListener('click',()=>closeArchiveConfirm());
+  archiveConfirmSubmit.addEventListener('click',confirmArchiveConversation);
+  archiveConfirmOverlay.addEventListener('click',(event)=>{if(event.target===archiveConfirmOverlay)closeArchiveConfirm()});
+  archiveConfirmDialog.addEventListener('keydown',(event)=>trapDialogFocus(archiveConfirmDialog,event));
+  refreshIcons(archiveConfirmDialog);
+}
+function openArchiveConfirm(id,title,trigger=null){
+  ensureArchiveConfirmDialog();
+  if(!archiveConfirmOverlay||archiveConfirmSubmitting)return;
+  closeComposerPopovers();
+  archiveConfirmPending={id:String(id||''),title:String(title||'未命名会话')};
+  archiveConfirmReturnFocus=trigger||document.activeElement;
+  archiveConfirmReturnKey=String(trigger?.closest?.('.hist')?.dataset?.key||'');
+  archiveConfirmName.textContent=archiveConfirmPending.title;
+  archiveConfirmStatus.textContent='';
+  archiveConfirmCancel.disabled=false;
+  archiveConfirmSubmit.disabled=false;
+  archiveConfirmSubmit.removeAttribute('aria-busy');
+  setIconLabel(archiveConfirmSubmit,'archive','归档');
+  archiveConfirmOverlay.classList.remove('hidden');
+  syncModalOpenState();
+  requestAnimationFrame(()=>archiveConfirmCancel?.focus());
+}
+function closeArchiveConfirm({restoreFocus=true}={}){
+  if(!archiveConfirmOverlay||archiveConfirmOverlay.classList.contains('hidden')||archiveConfirmSubmitting)return;
+  archiveConfirmOverlay.classList.add('hidden');
+  archiveConfirmPending=null;
+  archiveConfirmStatus.textContent='';
+  syncModalOpenState();
+  const fallbackRow=archiveConfirmReturnKey?[...history.querySelectorAll('.hist')].find((row)=>row.dataset.key===archiveConfirmReturnKey):null;
+  const returnFocus=archiveConfirmReturnFocus?.isConnected?archiveConfirmReturnFocus:fallbackRow?.querySelector('.histDelete');
+  archiveConfirmReturnFocus=null;
+  archiveConfirmReturnKey='';
+  if(restoreFocus&&returnFocus?.isConnected)returnFocus.focus();
+}
+async function confirmArchiveConversation(){
+  if(!archiveConfirmPending||archiveConfirmSubmitting)return;
+  archiveConfirmSubmitting=true;
+  archiveConfirmCancel.disabled=true;
+  archiveConfirmSubmit.disabled=true;
+  archiveConfirmSubmit.setAttribute('aria-busy','true');
+  setIconLabel(archiveConfirmSubmit,'loader-circle','归档中…');
+  archiveConfirmStatus.textContent='正在归档会话…';
+  const pending=archiveConfirmPending;
+  const archived=await performDeleteConversation(pending.id,'codex');
+  archiveConfirmSubmitting=false;
+  if(archived){
+    archiveConfirmOverlay.classList.add('hidden');
+    archiveConfirmPending=null;
+    archiveConfirmReturnFocus=null;
+    archiveConfirmReturnKey='';
+    syncModalOpenState();
+    return;
+  }
+  archiveConfirmCancel.disabled=false;
+  archiveConfirmSubmit.disabled=false;
+  archiveConfirmSubmit.removeAttribute('aria-busy');
+  setIconLabel(archiveConfirmSubmit,'archive','重试归档');
+  archiveConfirmStatus.textContent=statusEl.textContent||'归档失败';
+  archiveConfirmCancel.focus();
+}
+async function performDeleteConversation(id,source='codex'){
+  const verb=source==='codex'?'归档':'删除';
+  const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';
+  try{
+    const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){statusEl.textContent=data.error||verb+'失败';return false}
+    if(currentConversationId===id)newChat();
+    await refreshHistory();
+    statusEl.textContent=verb+'完成';
+    return true;
+  }catch(error){
+    statusEl.textContent=error?.message||verb+'失败';
+    return false;
+  }
+}
+async function deleteConversation(id,title,source='codex',trigger=null){
+  if(source==='codex'){openArchiveConfirm(id,title,trigger);return}
+  if(!confirm('删除会话：'+title+'？'))return;
+  await performDeleteConversation(id,source);
+}
 function sidebarCollapsedPreference(){try{return localStorage.getItem(SIDEBAR_STORAGE_KEY)==='1'}catch{return false}}
 function storeSidebarCollapsed(collapsed){try{localStorage.setItem(SIDEBAR_STORAGE_KEY,collapsed?'1':'0')}catch{}}
 function sidebarWidthLimit(viewportWidth=window.innerWidth){const width=Number(viewportWidth);const viewport=Number.isFinite(width)?width:window.innerWidth;return Math.max(SIDEBAR_WIDTH_MIN,Math.min(SIDEBAR_WIDTH_MAX,Math.round(viewport-SIDEBAR_MAIN_MIN)))}
@@ -13401,6 +13729,71 @@ function persistActiveConversation(id=currentConversationId,source=currentConver
     }));
   }catch(e){}
 }
+function readNativeForkMarkers(){
+  try{
+    const parsed=JSON.parse(localStorage.getItem(NATIVE_FORK_MARKERS_STORAGE_KEY)||'{}');
+    if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))return{};
+    const clean={};
+    for(const [threadId,value] of Object.entries(parsed)){
+      if(!value||typeof value!=='object'||Array.isArray(value))continue;
+      const afterSeq=Math.max(0,Number(value.afterSeq)||0);
+      const afterTurnId=String(value.afterTurnId||'');
+      clean[String(threadId)]={afterSeq,afterTurnId,createdAt:Number(value.createdAt)||0};
+    }
+    return clean;
+  }catch{return{}}
+}
+function persistNativeForkMarkers(){
+  try{
+    const entries=Object.entries(nativeForkMarkers).sort((left,right)=>(right[1]?.createdAt||0)-(left[1]?.createdAt||0)).slice(0,120);
+    nativeForkMarkers=Object.fromEntries(entries);
+    localStorage.setItem(NATIVE_FORK_MARKERS_STORAGE_KEY,JSON.stringify(nativeForkMarkers));
+  }catch{}
+}
+function setNativeForkMarker(threadId,{afterSeq=0,afterTurnId=''}={}){
+  const id=String(threadId||'');
+  if(!id)return;
+  nativeForkMarkers[id]={afterSeq:Math.max(0,Number(afterSeq)||0),afterTurnId:String(afterTurnId||''),createdAt:Date.now()};
+  persistNativeForkMarkers();
+}
+function createNativeForkDivider(){
+  const divider=document.createElement('div');
+  divider.className='nativeForkDivider';
+  divider.setAttribute('role','separator');
+  divider.setAttribute('aria-label','从聊天中继续');
+  const label=document.createElement('span');
+  label.className='nativeForkDividerLabel';
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','git-branch');
+  icon.setAttribute('aria-hidden','true');
+  const text=document.createElement('span');
+  text.textContent='从聊天中继续';
+  label.appendChild(icon);
+  label.appendChild(text);
+  divider.appendChild(label);
+  refreshIcons(divider);
+  return divider;
+}
+function renderNativeForkDivider(messages=[]){
+  chat.querySelector('.nativeForkDivider')?.remove();
+  if(currentConversationSource!=='codex'||!currentConversationId)return;
+  const marker=nativeForkMarkers[currentConversationId];
+  if(!marker)return;
+  const list=Array.isArray(messages)?messages:[];
+  let boundary=Math.max(0,Number(marker.afterSeq)||0);
+  if(!boundary&&marker.afterTurnId){
+    const matching=list.filter((message)=>String(message.turnId||'')===marker.afterTurnId).map((message)=>Number(message.seq)).filter(Number.isInteger);
+    if(matching.length){boundary=Math.max(...matching);marker.afterSeq=boundary;persistNativeForkMarkers()}
+  }
+  const divider=createNativeForkDivider();
+  const children=[...chat.children].filter((child)=>!child.classList.contains('empty'));
+  const next=children.find((child)=>{
+    const nodes=[child,...child.querySelectorAll('[data-native-message-seq]')];
+    const sequences=nodes.map((node)=>Number(node.dataset?.nativeMessageSeq)).filter(Number.isInteger);
+    return sequences.length&&Math.min(...sequences)>boundary;
+  });
+  if(next)chat.insertBefore(divider,next);else chat.appendChild(divider);
+}
 function updateComposerOverlayInset(options={}){
   if(!document.body)return 0;
   const composer=dropZone?.parentElement||document.querySelector('.composer');
@@ -13461,14 +13854,17 @@ async function loadConversation(id,source='web',options={}){
   applyConversationMode();
   updateActiveHistory();
   statusEl.textContent='Loading...';
-  const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
-  const requestUrl=endpoint+encodeURIComponent(id)+(currentConversationSource==='codex'?'?images=external':'');
-  const res=await fetch(requestUrl);
-  if(seq!==conversationLoadSeq)return false;
-  if(!res.ok){statusEl.textContent='加载失败';return false}
-  const data=await res.json();
-  if(seq!==conversationLoadSeq)return false;
-  const conversation=data.conversation;
+  let conversation=options.conversation||null;
+  if(!conversation){
+    const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
+    const requestUrl=endpoint+encodeURIComponent(id)+(currentConversationSource==='codex'?'?images=external':'');
+    const res=await fetch(requestUrl);
+    if(seq!==conversationLoadSeq)return false;
+    if(!res.ok){statusEl.textContent='加载失败';return false}
+    const data=await res.json();
+    if(seq!==conversationLoadSeq)return false;
+    conversation=data.conversation;
+  }
   setCurrentConversationTitle(conversation.title||'Chat','Chat');
   currentConversationId=conversation.id;
   currentConversationSource=conversation.source==='codex'?'codex':'web';
@@ -13491,11 +13887,12 @@ async function loadConversation(id,source='web',options={}){
     if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
     addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
   });
+  if(currentConversationSource==='codex')renderNativeForkDivider(messages);
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
-  if(!messages.length&&!webRunActive)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
+  if(!messages.length&&!webRunActive&&!nativeForkMarkers[currentConversationId])chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   updateConversationStatus(conversation);
   setThreadGoal(currentConversationSource==='codex' ? (conversation.goal || null) : null);
-  if(currentConversationSource==='codex')await pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
+  if(currentConversationSource==='codex'&&!options.skipPromptQueueSync)await pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
   else renderPromptQueue();
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
   closeMenu();
@@ -13550,21 +13947,23 @@ function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,p
   updateSafetyHint();
 }
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
-async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
+async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=null}={}){
   if(!currentConversationId||currentConversationSource!=='codex')return;
   if(webRunActive){statusEl.textContent='任务运行中，不能创建历史分支';return}
-  const prompt=continueAfter
-    ?'在新任务中从这条回答之后继续？原任务会保留，已经产生的本地文件修改不会撤销。'
-    :'从这条消息重新开始？原会话会保留，新分支不会撤销已经产生的本地文件修改，原消息中的附件需要重新添加。';
-  if(!confirm(prompt))return;
+  if(nativeForkCreating)return;
+  nativeForkCreating=true;
+  if(trigger){trigger.disabled=true;trigger.setAttribute('aria-busy','true')}
   const sourceThreadId=currentConversationId;
   statusEl.textContent='正在创建历史分支...';
   try{
     const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||'创建历史分支失败');
+    const copiedMessages=Array.isArray(data.conversation?.messages)?data.conversation.messages:[];
+    const afterSeq=copiedMessages.reduce((maximum,message)=>Math.max(maximum,Number(message.seq)||0),0);
+    setNativeForkMarker(data.threadId,{afterSeq,afterTurnId:data.forkedThroughTurnId});
     clearPendingAttachments();
-    const loaded=await loadConversation(data.threadId,'codex');
+    const loaded=await loadConversation(data.threadId,'codex',{conversation:data.conversation,skipPromptQueueSync:true});
     if(!loaded){
       newChat();
       currentConversationId=data.threadId;
@@ -13579,11 +13978,14 @@ async function forkNativeConversation(messageSeq,{continueAfter=false}={}){
     input.value=data.draft||'';
     input.style.height='auto';
     input.style.height=Math.min(input.scrollHeight,180)+'px';
-    await refreshHistory();
     statusEl.textContent=continueAfter?'已在新任务中继续；原任务保持不变':'已创建分支，可修改后发送；原会话保持不变';
     input.focus();
+    refreshHistory().catch(()=>{});
   }catch(e){
     statusEl.textContent=e.message;
+  }finally{
+    nativeForkCreating=false;
+    if(trigger?.isConnected){trigger.disabled=false;trigger.removeAttribute('aria-busy')}
   }
 }
 function isCompletedNativeRuntimeTurn(turnId,frozenTurnId=turnProcessElapsedFrozen?turnProcessElapsedTurnId:'',pendingTurnId=nativeCompletionSync?.turnId||''){
@@ -13781,6 +14183,7 @@ async function syncCurrentNativeConversationOnce(){
     }
     addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage})
   }
+  if(nativeForkMarkers[id])renderNativeForkDivider(syncMessages);
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
   activeNativeTurnId=incomingActiveTurnId;
@@ -17048,7 +17451,7 @@ function addMsg(role,text,options={}){
       fork.dataset.tooltip='从这里重新开始';
       fork.setAttribute('aria-label','从这里重新开始');
       setIconLabel(fork,'git-branch','从这里重新开始',false);
-      fork.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq)});
+      fork.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{trigger:fork})});
       actions.appendChild(fork);
     }else if(role==='user'&&Number.isInteger(options.messageIndex)){
       const rollback=document.createElement('button');
@@ -17069,7 +17472,7 @@ function addMsg(role,text,options={}){
       continueTask.dataset.tooltip='在新任务中继续';
       continueTask.setAttribute('aria-label','在新任务中继续');
       setIconLabel(continueTask,'corner-up-right','在新任务中继续',false);
-      continueTask.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true})});
+      continueTask.addEventListener('click',(e)=>{e.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true,trigger:continueTask})});
       actions.appendChild(continueTask);
     }
     if(['user','assistant'].includes(role)){

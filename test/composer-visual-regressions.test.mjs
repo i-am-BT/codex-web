@@ -162,6 +162,14 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
     uiStyles,
     /\.composerReasoningInline \.composerReasoningSlider\s*\{[^}]*gap:\s*0;[^}]*padding:\s*0/s,
   );
+  assert.match(
+    serverSource,
+    /composerEffortName\.classList\.toggle\('maximum',Boolean\(reasoningEffort\.value\)&&reasoningEffort\.value===composerMaximumEffortValue\(reasoningEffort\)\)/,
+  );
+  assert.match(
+    uiStyles,
+    /\.composerEffortName\.maximum\s*\{[^}]*color:\s*var\(--primary\);[^}]*font-weight:\s*600/s,
+  );
 });
 
 test('Fast mode is an accessible model capability beside the reasoning slider', () => {
