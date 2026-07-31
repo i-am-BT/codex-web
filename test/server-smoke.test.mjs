@@ -1179,6 +1179,8 @@ if (args[0] === 'app-server') {
     assert.equal(imagePromptStylesResponse.status, 200);
     const imagePromptStyles = await imagePromptStylesResponse.text();
     assert.match(imagePromptStyles, /\.workspaceNavButton\.active/);
+    assert.match(imagePromptStyles, /\.top:has\(> \.workspaceNav\) > #modeLabel\s*\{[^}]*grid-column:\s*4;[^}]*width:\s*max-content;[^}]*justify-self:\s*end/s);
+    assert.match(imagePromptStyles, /\.top:has\(> \.workspaceNav\) > \.topConversationContext\s*\{[^}]*position:\s*absolute;[^}]*left:\s*68px;[^}]*right:\s*calc\(50% \+ 110px\);[^}]*overflow:\s*hidden/s);
     assert.match(imagePromptStyles, /\.imagePromptGrid/);
     assert.match(imagePromptStyles, /\.imagePromptDetailDialog/);
     assert.match(imagePromptStyles, /\.imagePromptPreviewFrame\.imageLoading img/);
@@ -1187,8 +1189,7 @@ if (args[0] === 'app-server') {
     assert.match(imagePromptStyles, /\.imagePromptSyncStatus\[data-status="error"\]/);
     assert.match(imagePromptStyles, /\.imagePromptSyncButton\.syncing \.lucide/);
     assert.match(imagePromptStyles, /grid-template-columns:\s*38px minmax\(0, 1fr\) minmax\(64px, min\(24vw, 124px\)\)/);
-    assert.match(imagePromptStyles, /\.topConversationContext\s*\{[^}]*display:\s*block;[^}]*max-width:\s*124px;[^}]*text-align:\s*right/s);
-    assert.match(imagePromptStyles, /\.topConversationContext #status,[^}]*\.main\.imagePromptMain \.topConversationContext\s*\{[^}]*display:\s*none/s);
+    assert.match(imagePromptStyles, /\.topConversationContext,\s*body #modeLabel\s*\{[^}]*display:\s*none/s);
 
     const imagePromptScriptResponse = await fetch(`${baseUrl}/image-prompt.js`);
     assert.equal(imagePromptScriptResponse.status, 200);
@@ -1805,7 +1806,7 @@ updated_at = 1784422800000
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /href="\/ui\.css\?v=goal-indicator-20260729e"/);
-    assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-main-20260728a"/);
+    assert.match(page, /href="\/image-prompt\.css\?v=image-prompt-center-20260730a"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
