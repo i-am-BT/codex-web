@@ -6555,6 +6555,8 @@ const automationToggle = document.getElementById('automationToggle'), automation
 let subQuotaToggle = null, subQuotaPopover = null, subQuotaStatus = null, subQuotaContent = null;
 let subQuotaSettingsForm = null, subQuotaSettingsInputs = new Map(), subQuotaSettingsStatus = null;
 let subQuotaSettingsOverlay = null, subQuotaSettingsDialog = null, subQuotaSettingsClose = null, subQuotaSettingsReturnFocus = null;
+let archiveConfirmOverlay = null, archiveConfirmDialog = null, archiveConfirmName = null, archiveConfirmCancel = null, archiveConfirmSubmit = null, archiveConfirmStatus = null;
+let archiveConfirmPending = null, archiveConfirmReturnFocus = null, archiveConfirmReturnKey = '', archiveConfirmSubmitting = false;
 const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
 const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
@@ -6783,6 +6785,7 @@ let sideChatPreferredWidth=SIDE_CHAT_WIDTH_DEFAULT;
 let sideChatRenderedWidth=SIDE_CHAT_WIDTH_DEFAULT;
 let sideChatResizePointerId=null;
 const ACTIVE_CONVERSATION_STORAGE_KEY='codexWeb.activeConversation.v1';
+const NATIVE_FORK_MARKERS_STORAGE_KEY='codexWeb.nativeForkMarkers.v1';
 const NATIVE_INITIAL_MESSAGE_LIMIT=60;
 const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
@@ -6797,6 +6800,7 @@ let historyRefreshPending=false;
 let historyRenameActive=false;
 let historyProjectPreview=null;
 let historyProjectPreviewAnchor=null;
+let nativeForkMarkers=readNativeForkMarkers();
 function refreshIcons(root=document){if(!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
 function setIconLabel(element,name,label,showLabel=true){if(!element)return;element.replaceChildren();const icon=document.createElement('i');icon.setAttribute('data-lucide',name);icon.setAttribute('aria-hidden','true');element.appendChild(icon);if(showLabel){const text=document.createElement('span');text.className='buttonLabel';text.textContent=label;element.appendChild(text)}if(label&&!element.getAttribute('aria-label'))element.setAttribute('aria-label',label);refreshIcons(element)}
 function createComposerMirrorField(panel,labelText,ariaLabel){
@@ -11205,8 +11209,9 @@ function closeSettings(){
 function syncModalOpenState(){
   const settingsOpen=settingsOverlay&&!settingsOverlay.classList.contains('hidden');
   const subQuotaSettingsOpen=subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden');
+  const archiveConfirmOpen=archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden');
   const previewOpen=imagePreview&&!imagePreview.classList.contains('hidden');
-  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||subQuotaSettingsOpen||previewOpen));
+  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||subQuotaSettingsOpen||archiveConfirmOpen||previewOpen));
 }
 function ensureImagePreview(){
   if(imagePreview)return;
@@ -11884,7 +11889,7 @@ document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();finishSideChatResize();app.classList.remove('menuOpen');renderSidebarWidth();renderSideChatWidth();syncMenuButton()});
 document.addEventListener('pointerdown',(event)=>{if(!promptQueueMenu||promptQueueMenu.classList.contains('hidden'))return;if(promptQueueMenu.contains(event.target)||event.target.closest?.('.promptQueueIconButton[aria-label="队列操作"]'))return;closePromptQueueMenu()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',async()=>{rememberNativeComposerOverride();await loadModels(provider.value);rememberNativeComposerOverride();syncComposerChrome()});
@@ -13382,7 +13387,7 @@ function createHistoryRow(item,projectPath){
     del.title='归档会话';
     del.setAttribute('aria-label','归档会话');
     setIconLabel(del,'archive','归档会话',false);
-    del.addEventListener('click',(e)=>{e.stopPropagation();deleteConversation(item.id,item.title,source)});
+    del.addEventListener('click',(e)=>{e.stopPropagation();deleteConversation(item.id,item.title,source,del)});
     row.appendChild(rename);
     row.appendChild(del);
   }else{
@@ -13399,7 +13404,7 @@ function createHistoryRow(item,projectPath){
     del.title='删除会话';
     del.setAttribute('aria-label','删除会话');
     setIconLabel(del,'trash-2','删除会话',false);
-    del.addEventListener('click',(e)=>{e.stopPropagation();deleteConversation(item.id,item.title,source)});
+    del.addEventListener('click',(e)=>{e.stopPropagation();deleteConversation(item.id,item.title,source,del)});
     row.appendChild(rename);
     row.appendChild(del);
   }
@@ -13472,7 +13477,146 @@ async function renameConversation(id,title,source='codex'){
     return true;
   }catch(error){statusEl.textContent=error.message||'改名失败';return false}
 }
-async function deleteConversation(id,title,source='codex'){const verb=source==='codex'?'归档':'删除';if(!confirm(verb+'会话：'+title+'？'))return;const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});const data=await res.json().catch(()=>({}));if(!res.ok){statusEl.textContent=data.error||verb+'失败';return}if(currentConversationId===id)newChat();await refreshHistory();statusEl.textContent=verb+'完成'}
+function ensureArchiveConfirmDialog(){
+  if(archiveConfirmOverlay)return;
+  archiveConfirmOverlay=document.createElement('div');
+  archiveConfirmOverlay.id='archiveConfirmOverlay';
+  archiveConfirmOverlay.className='archiveConfirmOverlay hidden';
+  archiveConfirmOverlay.setAttribute('role','presentation');
+  archiveConfirmDialog=document.createElement('section');
+  archiveConfirmDialog.id='archiveConfirmDialog';
+  archiveConfirmDialog.className='archiveConfirmDialog';
+  archiveConfirmDialog.setAttribute('role','dialog');
+  archiveConfirmDialog.setAttribute('aria-modal','true');
+  archiveConfirmDialog.setAttribute('aria-labelledby','archiveConfirmTitle');
+  archiveConfirmDialog.setAttribute('aria-describedby','archiveConfirmDescription');
+  const head=document.createElement('header');
+  head.className='archiveConfirmHead';
+  const icon=document.createElement('span');
+  icon.className='archiveConfirmIcon';
+  setIconLabel(icon,'archive','',false);
+  const heading=document.createElement('div');
+  const title=document.createElement('h2');
+  title.id='archiveConfirmTitle';
+  title.textContent='归档会话';
+  const description=document.createElement('p');
+  description.id='archiveConfirmDescription';
+  description.textContent='归档后会从最近任务移除，可在“已归档任务”中恢复。';
+  heading.appendChild(title);
+  heading.appendChild(description);
+  head.appendChild(icon);
+  head.appendChild(heading);
+  const target=document.createElement('div');
+  target.className='archiveConfirmTarget';
+  const targetLabel=document.createElement('span');
+  targetLabel.textContent='将归档';
+  archiveConfirmName=document.createElement('strong');
+  target.appendChild(targetLabel);
+  target.appendChild(archiveConfirmName);
+  archiveConfirmStatus=document.createElement('div');
+  archiveConfirmStatus.className='archiveConfirmStatus';
+  archiveConfirmStatus.setAttribute('role','status');
+  archiveConfirmStatus.setAttribute('aria-live','polite');
+  const actions=document.createElement('footer');
+  actions.className='archiveConfirmActions';
+  archiveConfirmCancel=document.createElement('button');
+  archiveConfirmCancel.type='button';
+  archiveConfirmCancel.className='archiveConfirmCancel';
+  archiveConfirmCancel.textContent='取消';
+  archiveConfirmSubmit=document.createElement('button');
+  archiveConfirmSubmit.type='button';
+  archiveConfirmSubmit.className='archiveConfirmSubmit';
+  setIconLabel(archiveConfirmSubmit,'archive','归档');
+  actions.appendChild(archiveConfirmCancel);
+  actions.appendChild(archiveConfirmSubmit);
+  archiveConfirmDialog.appendChild(head);
+  archiveConfirmDialog.appendChild(target);
+  archiveConfirmDialog.appendChild(archiveConfirmStatus);
+  archiveConfirmDialog.appendChild(actions);
+  archiveConfirmOverlay.appendChild(archiveConfirmDialog);
+  document.body.appendChild(archiveConfirmOverlay);
+  archiveConfirmCancel.addEventListener('click',()=>closeArchiveConfirm());
+  archiveConfirmSubmit.addEventListener('click',confirmArchiveConversation);
+  archiveConfirmOverlay.addEventListener('click',(event)=>{if(event.target===archiveConfirmOverlay)closeArchiveConfirm()});
+  archiveConfirmDialog.addEventListener('keydown',(event)=>trapDialogFocus(archiveConfirmDialog,event));
+  refreshIcons(archiveConfirmDialog);
+}
+function openArchiveConfirm(id,title,trigger=null){
+  ensureArchiveConfirmDialog();
+  if(!archiveConfirmOverlay||archiveConfirmSubmitting)return;
+  closeComposerPopovers();
+  archiveConfirmPending={id:String(id||''),title:String(title||'未命名会话')};
+  archiveConfirmReturnFocus=trigger||document.activeElement;
+  archiveConfirmReturnKey=String(trigger?.closest?.('.hist')?.dataset?.key||'');
+  archiveConfirmName.textContent=archiveConfirmPending.title;
+  archiveConfirmStatus.textContent='';
+  archiveConfirmCancel.disabled=false;
+  archiveConfirmSubmit.disabled=false;
+  archiveConfirmSubmit.removeAttribute('aria-busy');
+  setIconLabel(archiveConfirmSubmit,'archive','归档');
+  archiveConfirmOverlay.classList.remove('hidden');
+  syncModalOpenState();
+  requestAnimationFrame(()=>archiveConfirmCancel?.focus());
+}
+function closeArchiveConfirm({restoreFocus=true}={}){
+  if(!archiveConfirmOverlay||archiveConfirmOverlay.classList.contains('hidden')||archiveConfirmSubmitting)return;
+  archiveConfirmOverlay.classList.add('hidden');
+  archiveConfirmPending=null;
+  archiveConfirmStatus.textContent='';
+  syncModalOpenState();
+  const fallbackRow=archiveConfirmReturnKey?[...history.querySelectorAll('.hist')].find((row)=>row.dataset.key===archiveConfirmReturnKey):null;
+  const returnFocus=archiveConfirmReturnFocus?.isConnected?archiveConfirmReturnFocus:fallbackRow?.querySelector('.histDelete');
+  archiveConfirmReturnFocus=null;
+  archiveConfirmReturnKey='';
+  if(restoreFocus&&returnFocus?.isConnected)returnFocus.focus();
+}
+async function confirmArchiveConversation(){
+  if(!archiveConfirmPending||archiveConfirmSubmitting)return;
+  archiveConfirmSubmitting=true;
+  archiveConfirmCancel.disabled=true;
+  archiveConfirmSubmit.disabled=true;
+  archiveConfirmSubmit.setAttribute('aria-busy','true');
+  setIconLabel(archiveConfirmSubmit,'loader-circle','归档中…');
+  archiveConfirmStatus.textContent='正在归档会话…';
+  const pending=archiveConfirmPending;
+  const archived=await performDeleteConversation(pending.id,'codex');
+  archiveConfirmSubmitting=false;
+  if(archived){
+    archiveConfirmOverlay.classList.add('hidden');
+    archiveConfirmPending=null;
+    archiveConfirmReturnFocus=null;
+    archiveConfirmReturnKey='';
+    syncModalOpenState();
+    return;
+  }
+  archiveConfirmCancel.disabled=false;
+  archiveConfirmSubmit.disabled=false;
+  archiveConfirmSubmit.removeAttribute('aria-busy');
+  setIconLabel(archiveConfirmSubmit,'archive','重试归档');
+  archiveConfirmStatus.textContent=statusEl.textContent||'归档失败';
+  archiveConfirmCancel.focus();
+}
+async function performDeleteConversation(id,source='codex'){
+  const verb=source==='codex'?'归档':'删除';
+  const endpoint=source==='codex'?'/api/native-sessions/':'/api/conversations/';
+  try{
+    const res=await fetch(endpoint+encodeURIComponent(id),{method:'DELETE'});
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){statusEl.textContent=data.error||verb+'失败';return false}
+    if(currentConversationId===id)newChat();
+    await refreshHistory();
+    statusEl.textContent=verb+'完成';
+    return true;
+  }catch(error){
+    statusEl.textContent=error?.message||verb+'失败';
+    return false;
+  }
+}
+async function deleteConversation(id,title,source='codex',trigger=null){
+  if(source==='codex'){openArchiveConfirm(id,title,trigger);return}
+  if(!confirm('删除会话：'+title+'？'))return;
+  await performDeleteConversation(id,source);
+}
 function sidebarCollapsedPreference(){try{return localStorage.getItem(SIDEBAR_STORAGE_KEY)==='1'}catch{return false}}
 function storeSidebarCollapsed(collapsed){try{localStorage.setItem(SIDEBAR_STORAGE_KEY,collapsed?'1':'0')}catch{}}
 function sidebarWidthLimit(viewportWidth=window.innerWidth){const width=Number(viewportWidth);const viewport=Number.isFinite(width)?width:window.innerWidth;return Math.max(SIDEBAR_WIDTH_MIN,Math.min(SIDEBAR_WIDTH_MAX,Math.round(viewport-SIDEBAR_MAIN_MIN)))}
@@ -13585,6 +13729,71 @@ function persistActiveConversation(id=currentConversationId,source=currentConver
     }));
   }catch(e){}
 }
+function readNativeForkMarkers(){
+  try{
+    const parsed=JSON.parse(localStorage.getItem(NATIVE_FORK_MARKERS_STORAGE_KEY)||'{}');
+    if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))return{};
+    const clean={};
+    for(const [threadId,value] of Object.entries(parsed)){
+      if(!value||typeof value!=='object'||Array.isArray(value))continue;
+      const afterSeq=Math.max(0,Number(value.afterSeq)||0);
+      const afterTurnId=String(value.afterTurnId||'');
+      clean[String(threadId)]={afterSeq,afterTurnId,createdAt:Number(value.createdAt)||0};
+    }
+    return clean;
+  }catch{return{}}
+}
+function persistNativeForkMarkers(){
+  try{
+    const entries=Object.entries(nativeForkMarkers).sort((left,right)=>(right[1]?.createdAt||0)-(left[1]?.createdAt||0)).slice(0,120);
+    nativeForkMarkers=Object.fromEntries(entries);
+    localStorage.setItem(NATIVE_FORK_MARKERS_STORAGE_KEY,JSON.stringify(nativeForkMarkers));
+  }catch{}
+}
+function setNativeForkMarker(threadId,{afterSeq=0,afterTurnId=''}={}){
+  const id=String(threadId||'');
+  if(!id)return;
+  nativeForkMarkers[id]={afterSeq:Math.max(0,Number(afterSeq)||0),afterTurnId:String(afterTurnId||''),createdAt:Date.now()};
+  persistNativeForkMarkers();
+}
+function createNativeForkDivider(){
+  const divider=document.createElement('div');
+  divider.className='nativeForkDivider';
+  divider.setAttribute('role','separator');
+  divider.setAttribute('aria-label','从聊天中继续');
+  const label=document.createElement('span');
+  label.className='nativeForkDividerLabel';
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','git-branch');
+  icon.setAttribute('aria-hidden','true');
+  const text=document.createElement('span');
+  text.textContent='从聊天中继续';
+  label.appendChild(icon);
+  label.appendChild(text);
+  divider.appendChild(label);
+  refreshIcons(divider);
+  return divider;
+}
+function renderNativeForkDivider(messages=[]){
+  chat.querySelector('.nativeForkDivider')?.remove();
+  if(currentConversationSource!=='codex'||!currentConversationId)return;
+  const marker=nativeForkMarkers[currentConversationId];
+  if(!marker)return;
+  const list=Array.isArray(messages)?messages:[];
+  let boundary=Math.max(0,Number(marker.afterSeq)||0);
+  if(!boundary&&marker.afterTurnId){
+    const matching=list.filter((message)=>String(message.turnId||'')===marker.afterTurnId).map((message)=>Number(message.seq)).filter(Number.isInteger);
+    if(matching.length){boundary=Math.max(...matching);marker.afterSeq=boundary;persistNativeForkMarkers()}
+  }
+  const divider=createNativeForkDivider();
+  const children=[...chat.children].filter((child)=>!child.classList.contains('empty'));
+  const next=children.find((child)=>{
+    const nodes=[child,...child.querySelectorAll('[data-native-message-seq]')];
+    const sequences=nodes.map((node)=>Number(node.dataset?.nativeMessageSeq)).filter(Number.isInteger);
+    return sequences.length&&Math.min(...sequences)>boundary;
+  });
+  if(next)chat.insertBefore(divider,next);else chat.appendChild(divider);
+}
 function updateComposerOverlayInset(options={}){
   if(!document.body)return 0;
   const composer=dropZone?.parentElement||document.querySelector('.composer');
@@ -13678,8 +13887,9 @@ async function loadConversation(id,source='web',options={}){
     if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
     addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
   });
+  if(currentConversationSource==='codex')renderNativeForkDivider(messages);
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
-  if(!messages.length&&!webRunActive)chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
+  if(!messages.length&&!webRunActive&&!nativeForkMarkers[currentConversationId])chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   updateConversationStatus(conversation);
   setThreadGoal(currentConversationSource==='codex' ? (conversation.goal || null) : null);
   if(currentConversationSource==='codex'&&!options.skipPromptQueueSync)await pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
@@ -13749,6 +13959,9 @@ async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=nu
     const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||'创建历史分支失败');
+    const copiedMessages=Array.isArray(data.conversation?.messages)?data.conversation.messages:[];
+    const afterSeq=copiedMessages.reduce((maximum,message)=>Math.max(maximum,Number(message.seq)||0),0);
+    setNativeForkMarker(data.threadId,{afterSeq,afterTurnId:data.forkedThroughTurnId});
     clearPendingAttachments();
     const loaded=await loadConversation(data.threadId,'codex',{conversation:data.conversation,skipPromptQueueSync:true});
     if(!loaded){
@@ -13970,6 +14183,7 @@ async function syncCurrentNativeConversationOnce(){
     }
     addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage})
   }
+  if(nativeForkMarkers[id])renderNativeForkDivider(syncMessages);
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
   activeNativeTurnId=incomingActiveTurnId;

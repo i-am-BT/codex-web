@@ -2273,6 +2273,151 @@ body.modalOpen {
   backdrop-filter: blur(5px);
 }
 
+.archiveConfirmOverlay {
+  position: fixed;
+  z-index: 90;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(20, 24, 31, 0.42);
+  padding: 20px;
+  backdrop-filter: blur(5px);
+}
+
+.archiveConfirmDialog {
+  width: min(440px, calc(100vw - 32px));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 20px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
+}
+
+.archiveConfirmHead {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.archiveConfirmIcon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.archiveConfirmIcon .lucide {
+  width: 17px;
+  height: 17px;
+}
+
+.archiveConfirmHead h2 {
+  margin: 1px 0 4px;
+  font-size: 16px;
+  line-height: 1.35;
+  letter-spacing: 0;
+}
+
+.archiveConfirmHead p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.archiveConfirmTarget {
+  display: grid;
+  gap: 3px;
+  margin: 18px 0 0;
+  border-block: 1px solid var(--border);
+  padding: 11px 0;
+}
+
+.archiveConfirmTarget > span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.archiveConfirmTarget strong {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.archiveConfirmStatus {
+  min-height: 18px;
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.archiveConfirmStatus:empty {
+  display: none;
+}
+
+.archiveConfirmActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.archiveConfirmCancel,
+.archiveConfirmSubmit {
+  display: inline-flex;
+  min-width: 76px;
+  min-height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.archiveConfirmCancel {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.archiveConfirmCancel:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+
+.archiveConfirmSubmit {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: white;
+}
+
+.archiveConfirmSubmit:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.archiveConfirmActions button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.archiveConfirmActions button:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.archiveConfirmSubmit[aria-busy="true"] .lucide {
+  animation: spin 0.9s linear infinite;
+}
+
 .settingsDialog {
   display: flex;
   width: min(720px, calc(100vw - 32px));
@@ -4118,6 +4263,38 @@ body .msg.assistant .continueMsg:focus-visible {
 body .msg.assistant .continueMsg:hover,
 body .msg.assistant .continueMsg:focus-visible {
   background: transparent;
+}
+
+.nativeForkDivider {
+  display: grid;
+  width: min(880px, 100%);
+  align-self: center;
+  grid-template-columns: minmax(20px, 1fr) auto minmax(20px, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin: 2px auto;
+  color: var(--primary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.nativeForkDivider::before,
+.nativeForkDivider::after {
+  height: 1px;
+  content: "";
+  background: var(--border);
+}
+
+.nativeForkDividerLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.nativeForkDividerLabel .lucide {
+  width: 14px;
+  height: 14px;
 }
 
 body .msg.assistant .messageAction .lucide {
@@ -10110,6 +10287,24 @@ body .composer > .box:focus-within {
   .settingsOverlay {
     place-items: end center;
     padding: 8px;
+  }
+
+  .archiveConfirmOverlay {
+    place-items: end center;
+    padding: 8px;
+  }
+
+  .archiveConfirmDialog {
+    width: 100%;
+    padding: 18px 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+  }
+
+  .archiveConfirmActions {
+    margin-top: 14px;
+  }
+
+  .archiveConfirmActions button {
+    flex: 1 1 0;
   }
 
   .subQuotaSettingsOverlay {
