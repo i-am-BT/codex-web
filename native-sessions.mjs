@@ -30,6 +30,7 @@ const IMAGE_URL_LIMIT = 16 * 1024 * 1024;
 const TOOL_FILE_CHANGE_LIMIT = 200;
 const TOOL_FILE_PATH_LIMIT = 2048;
 const APP_THREAD_SOURCES = new Set(['vscode', 'appServer', 'app_server']);
+const TURN_TERMINAL_PROCESS_KINDS = new Set(['task_complete', 'task_error', 'turn_aborted', 'error']);
 
 export class NativeSessionStore extends EventEmitter {
   constructor(codexHome, options = {}) {
@@ -69,6 +70,7 @@ export class NativeSessionStore extends EventEmitter {
     this.sideChatThreadIds = new Set();
     this.sideChatSourceThreads = new Map();
     this.pinnedThreadIds = [];
+    this.threadSettingsOverrides = new Map();
     this.appThreads = null;
     this.stateDb = null;
     this.stateDbIno = 0;
@@ -496,6 +498,11 @@ export class NativeSessionStore extends EventEmitter {
         if (!SESSION_ID_PATTERN.test(`${id}.jsonl`) || !APP_THREAD_SOURCES.has(source)) continue;
         if (Number(row.is_automation) === 1 && !this.pinnedThreadIds.includes(id)) continue;
         if (!rolloutPath) continue;
+        const rawThreadSettings = {};
+        if (Number(row.has_model_provider) === 1) rawThreadSettings.modelProvider = row.model_provider;
+        if (Number(row.has_model) === 1) rawThreadSettings.model = row.model;
+        if (Number(row.has_reasoning_effort) === 1) rawThreadSettings.reasoningEffort = row.reasoning_effort;
+        const threadSettings = normalizeThreadSettings(rawThreadSettings);
         next.set(id, {
           rolloutPath: path.resolve(rolloutPath),
           cwd: String(row.cwd || '').trim(),
@@ -504,6 +511,8 @@ export class NativeSessionStore extends EventEmitter {
           createdAtMs: timestampMs(row.created_at_ms),
           updatedAtMs: timestampMs(row.updated_at_ms),
           recencyAtMs: timestampMs(row.recency_at_ms),
+          threadSettings,
+          settingsUpdatedAtMs: Object.keys(threadSettings).length ? timestampMs(row.updated_at_ms) : 0,
         });
       }
       this.appThreads = next;
@@ -630,6 +639,54 @@ export class NativeSessionStore extends EventEmitter {
     this.version += 1;
     this.emit('change', { version: this.version, changedIds: [threadId] });
     return true;
+  }
+
+  applyThreadSettings(rawSettings, fallbackThreadId = '') {
+    const source = rawSettings && typeof rawSettings === 'object' ? rawSettings : {};
+    const threadId = String(source.threadId || source.thread_id || fallbackThreadId || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return null;
+
+    const settings = normalizeThreadSettings(source.threadSettings || source.thread_settings || source);
+    if (!Object.keys(settings).length) return null;
+
+    const updatedAtMs = Date.now();
+    const previous = this.threadSettingsOverrides.get(threadId) || {};
+    const overlay = { ...previous, ...settings, updatedAtMs };
+    this.threadSettingsOverrides.set(threadId, overlay);
+    const cache = this.details.get(threadId);
+    if (cache) {
+      const merged = mergeThreadSettingsMetadata(cache.metadata, overlay, updatedAtMs);
+      if (merged.changed) cache.metadata = merged.metadata;
+    }
+
+    this.version += 1;
+    this.emit('change', { version: this.version, changedIds: [threadId] });
+    return { ...overlay };
+  }
+
+  applyPersistedThreadSettings(cache, entry) {
+    if (!cache || !entry) return false;
+    const threadId = String(entry.id || '').trim().toLowerCase();
+    const persisted = entry.threadSettings || {};
+    const persistedUpdatedAtMs = Number(entry.settingsUpdatedAtMs) || 0;
+    let overlay = this.threadSettingsOverrides.get(threadId) || null;
+
+    if (overlay) {
+      const overlayUpdatedAtMs = Number(overlay.updatedAtMs) || 0;
+      const persistedMatchesOverlay = threadSettingsMatch(persisted, overlay);
+      const persistedIsNewer = persistedUpdatedAtMs > overlayUpdatedAtMs;
+      if (persistedMatchesOverlay || persistedIsNewer) {
+        this.threadSettingsOverrides.delete(threadId);
+        overlay = null;
+      }
+    }
+
+    const settings = overlay || persisted;
+    if (!Object.keys(settings).length) return false;
+    const updatedAtMs = overlay ? Number(overlay.updatedAtMs) || 0 : persistedUpdatedAtMs;
+    const merged = mergeThreadSettingsMetadata(cache.metadata, settings, updatedAtMs);
+    if (merged.changed) cache.metadata = merged.metadata;
+    return merged.changed;
   }
 
   refreshTitles() {
@@ -760,6 +817,7 @@ export class NativeSessionStore extends EventEmitter {
     }
 
     readSessionUpdates(cache, entry, this.maxMessages);
+    this.applyPersistedThreadSettings(cache, entry);
     if (cache.status === 'running' && cache.latestTurnId && !cache.currentTurnStartedAt && !cache.turnStartScanComplete) {
       cache.currentTurnStartedAt = findTurnStartedAtBeforeOffset(
         entry.filePath,
@@ -809,6 +867,9 @@ function prepareAppThreadQuery(db) {
 
   const recencyColumn = columns.has('recency_at_ms') ? 'recency_at_ms' : 'updated_at_ms';
   const threadSource = columns.has('thread_source') ? "COALESCE(thread_source, '')" : "''";
+  const modelProviderColumn = columns.has('model_provider') ? 'model_provider' : 'NULL';
+  const modelColumn = columns.has('model') ? 'model' : 'NULL';
+  const reasoningEffortColumn = columns.has('reasoning_effort') ? 'reasoning_effort' : 'NULL';
   const automationThread = `(
     ${threadSource} = 'automation'
     OR (
@@ -820,6 +881,12 @@ function prepareAppThreadQuery(db) {
   return db.prepare(`
     SELECT id, rollout_path, source, cwd, title, created_at_ms, updated_at_ms,
       ${recencyColumn} AS recency_at_ms,
+      ${modelProviderColumn} AS model_provider,
+      ${modelColumn} AS model,
+      ${reasoningEffortColumn} AS reasoning_effort,
+      ${columns.has('model_provider') ? 1 : 0} AS has_model_provider,
+      ${columns.has('model') ? 1 : 0} AS has_model,
+      ${columns.has('reasoning_effort') ? 1 : 0} AS has_reasoning_effort,
       CASE WHEN ${automationThread} THEN 1 ELSE 0 END AS is_automation
     FROM threads
     WHERE archived = 0
@@ -964,6 +1031,8 @@ function scanSessionFiles(
           agentPath: appThread?.agentPath || '',
           agentNickname: appThread?.agentNickname || '',
           depth: appThread?.depth || 0,
+          threadSettings: appThread?.threadSettings || {},
+          settingsUpdatedAtMs: appThread?.settingsUpdatedAtMs || 0,
         };
         const previous = entries.get(id);
         if (!previous || entry.recencyMs > previous.recencyMs) entries.set(id, entry);
@@ -1004,7 +1073,7 @@ function changedSessionIds(previous, next) {
 }
 
 function entrySignature(entry) {
-  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.originator || ''}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}`;
+  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.originator || ''}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}:${entry.settingsUpdatedAtMs || 0}:${JSON.stringify(entry.threadSettings || {})}`;
 }
 
 function sessionSummary(entry, status) {
@@ -1426,36 +1495,14 @@ function applyEventRecord(cache, record, payload, maxMessages) {
     case 'thread_settings_applied': {
       const settings = payload.thread_settings;
       if (!settings || typeof settings !== 'object') break;
-      const next = { ...cache.metadata };
-      let changed = false;
-      if (Object.hasOwn(settings, 'service_tier')) {
-        const serviceTier = normalizeServiceTier(settings.service_tier);
-        if (serviceTier !== undefined) {
-          next.serviceTier = serviceTier;
-          changed = true;
-        }
-      }
-      if (Object.hasOwn(settings, 'model')) {
-        const model = String(settings.model || '').trim();
-        if (model) {
-          next.model = model;
-          changed = true;
-        }
-      }
-      if (Object.hasOwn(settings, 'model_provider_id') || Object.hasOwn(settings, 'model_provider')) {
-        const modelProvider = String(settings.model_provider_id || settings.model_provider || '').trim();
-        if (modelProvider) {
-          next.modelProvider = modelProvider;
-          changed = true;
-        }
-      }
-      if (Object.hasOwn(settings, 'effort') || Object.hasOwn(settings, 'reasoning_effort')) {
-        const reasoningEffort = String(settings.effort || settings.reasoning_effort || '').trim();
-        if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(reasoningEffort)) {
-          next.reasoningEffort = reasoningEffort;
-          changed = true;
-        }
-      }
+      const appliedAtMs = Date.parse(String(record.timestamp || ''));
+      const merged = mergeThreadSettingsMetadata(
+        cache.metadata,
+        normalizeThreadSettings(settings),
+        Number.isFinite(appliedAtMs) ? appliedAtMs : 0,
+      );
+      const next = merged.metadata;
+      let changed = merged.changed;
       if (Object.hasOwn(settings, 'approval_policy')) {
         const approvalPolicy = String(settings.approval_policy || '').trim();
         if (approvalPolicy) {
@@ -1567,11 +1614,11 @@ function dropRawHandoffBeforeCompaction(cache, record) {
       if (message?.role === 'tool' || message?.role === 'process') continue;
       break;
     }
-    const immediateEmbeddedHandoff = embeddedHandoff && followsHandoffQuickly;
+    const linkedEmbeddedHandoff = embeddedHandoff && (followsHandoffQuickly || message.kind === 'message');
     if (
       message?.role === 'assistant'
       && (
-        immediateEmbeddedHandoff
+        linkedEmbeddedHandoff
         || (message.kind === 'final_answer' && isHandoffSummaryText(message.content))
       )
     ) {
@@ -1608,21 +1655,13 @@ function isHandoffSummaryText(text) {
     || plain === 'handoff summary'
     || plain === 'compacted handoff summary'
     || plain === 'context checkpoint'
-    || plain === 'current task'
-    || plain === 'current progress'
-    || plain === '当前任务'
-    || plain === '当前进度'
     || plain.startsWith('handoff:')
     || plain.startsWith('handoff summary:')
     || plain.startsWith('compacted handoff')
     || plain.startsWith('context checkpoint:')
-    || plain.startsWith('current task:')
-    || plain.startsWith('current progress:')
     || plain.startsWith('交接摘要')
     || /^\*\*handoff(?:\s+summary)?\*\*/i.test(firstLine)
     || /^\*\*compacted handoff(?:\s+summary)?\*\*/i.test(firstLine)
-    || /^\*\*current task\*\*/i.test(firstLine)
-    || /^\*\*current progress\*\*/i.test(firstLine)
   ) return true;
   // Collab handoffs may omit a clean title but still ship the standard sections.
   const head = normalized.slice(0, 6000).toLowerCase();
@@ -2179,14 +2218,18 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind, me
 
 function isProtectedNativeMessage(message) {
   const role = message?.role;
+  const kind = String(message?.kind || '');
   if (role === 'user' || role === 'assistant' || role === 'image') return true;
-  if (role === 'context' && ['handoff_summary', 'turn_aborted'].includes(String(message?.kind || ''))) return true;
+  // Terminal process records close a rendered turn. Losing one lets a later
+  // user message attach to the previous turn's live panel during hydration.
+  if (role === 'process' && TURN_TERMINAL_PROCESS_KINDS.has(kind)) return true;
+  if (role === 'context' && ['handoff_summary', 'turn_aborted'].includes(kind)) return true;
   return false;
 }
 
 function isDroppableNativeMessage(message) {
   const role = message?.role;
-  return role === 'tool' || role === 'process' || role === 'thinking';
+  return !isProtectedNativeMessage(message) && (role === 'tool' || role === 'process' || role === 'thinking');
 }
 
 function trimNativeMessages(cache, maxMessages) {
@@ -2635,6 +2678,73 @@ function normalizeServiceTier(value) {
   if (!normalized || normalized === 'default') return null;
   if (normalized === 'priority') return 'priority';
   return undefined;
+}
+
+const THREAD_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+
+function threadSettingsValue(source, keys) {
+  for (const key of keys) {
+    if (Object.hasOwn(source, key)) return { present: true, value: source[key] };
+  }
+  return { present: false, value: undefined };
+}
+
+function normalizeThreadSettings(rawSettings) {
+  const source = rawSettings && typeof rawSettings === 'object' && !Array.isArray(rawSettings)
+    ? rawSettings
+    : {};
+  const settings = {};
+  const normalizeText = (value) => {
+    if (value === null || value === undefined) return null;
+    const text = String(value).trim();
+    return text || null;
+  };
+
+  const model = threadSettingsValue(source, ['model']);
+  if (model.present) settings.model = normalizeText(model.value);
+
+  const modelProvider = threadSettingsValue(source, ['modelProvider', 'model_provider_id', 'model_provider']);
+  if (modelProvider.present) settings.modelProvider = normalizeText(modelProvider.value);
+
+  const effort = threadSettingsValue(source, ['effort', 'reasoningEffort', 'reasoning_effort']);
+  if (effort.present) {
+    const normalized = normalizeText(effort.value);
+    if (normalized === null || THREAD_REASONING_EFFORTS.has(normalized)) settings.reasoningEffort = normalized;
+  }
+
+  const serviceTier = threadSettingsValue(source, ['serviceTier', 'service_tier']);
+  if (serviceTier.present) {
+    const normalized = normalizeServiceTier(serviceTier.value);
+    if (normalized !== undefined) settings.serviceTier = normalized;
+  }
+
+  return settings;
+}
+
+function mergeThreadSettingsMetadata(metadata, settings, updatedAtMs = 0) {
+  const next = { ...(metadata || {}) };
+  let changed = false;
+  for (const key of ['modelProvider', 'model', 'reasoningEffort', 'serviceTier']) {
+    if (!Object.hasOwn(settings, key)) continue;
+    if (!Object.hasOwn(next, key) || next[key] !== settings[key]) {
+      next[key] = settings[key];
+      changed = true;
+    }
+  }
+  const timestamp = Number(updatedAtMs) || 0;
+  if (timestamp > 0 && next.settingsUpdatedAtMs !== timestamp) {
+    next.settingsUpdatedAtMs = timestamp;
+    changed = true;
+  }
+  return { metadata: next, changed };
+}
+
+function threadSettingsMatch(persisted, overlay) {
+  const fields = ['modelProvider', 'model', 'reasoningEffort', 'serviceTier']
+    .filter((key) => Object.hasOwn(overlay || {}, key));
+  return fields.length > 0 && fields.every((key) => (
+    Object.hasOwn(persisted || {}, key) && persisted[key] === overlay[key]
+  ));
 }
 
 const THREAD_GOAL_STATUSES = new Set([

@@ -108,7 +108,8 @@ test('the pinned section renders above tasks, collapses independently, and marks
   assert.match(rowSource, /if\(source==='codex'\)\{\s*if\(running\)row\.appendChild\(running\);[\s\S]*row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\)/);
   assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
   assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
-  assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-12px;[^}]*pointer-events:\s*none/s);
+  assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*2;[^}]*left:\s*-7px;[^}]*pointer-events:\s*none/s);
+  assert.match(uiStyles, /\.histCompletionUnread\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-7px;[^}]*background:\s*var\(--info\);[^}]*pointer-events:\s*none/s);
   assert.match(uiStyles, /\.historyPinned,\s*\.historySidebarTasks,\s*\.historyTasks\s*\{[^}]*display:\s*grid/s);
   assert.match(uiStyles, /\.historyPinnedItems\[hidden\],\s*\.historySidebarItems\[hidden\],\s*\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
   assert.match(uiStyles, /\.historyPinnedHead\[aria-expanded="true"\] \.historyPinnedChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);
@@ -140,6 +141,11 @@ test('native history archiving uses an in-app confirmation card', () => {
   assert.match(archiveSource, /if\(!confirm\('删除会话：'\+title\+'？'\)\)return/);
   assert.match(archiveSource, /fallbackRow=archiveConfirmReturnKey\?\[\.\.\.history\.querySelectorAll\('\.hist'\)\]\.find\(\(row\)=>row\.dataset\.key===archiveConfirmReturnKey\):null/);
   assert.match(archiveSource, /fallbackRow\?\.querySelector\('\.histDelete'\)/);
+  assert.match(archiveSource, /const visibleRows=\[\.\.\.history\.querySelectorAll\('\.hist'\)\]\.filter\(\(row\)=>!row\.closest\('\[hidden\]'\)\)/);
+  assert.match(archiveSource, /visibleRows\[triggerRowIndex\+1\]\|\|visibleRows\[triggerRowIndex-1\]/);
+  assert.match(archiveSource, /const adjacentRow=adjacentKey\?\[\.\.\.history\.querySelectorAll\('\.hist'\)\]\.find\(\(row\)=>row\.dataset\.key===adjacentKey\):null/);
+  assert.match(archiveSource, /const nextFocus=adjacentRow\?\.querySelector\('\.histOpen'\)\|\|document\.getElementById\('newChat'\)/);
+  assert.match(archiveSource, /requestAnimationFrame\(\(\)=>nextFocus\?\.focus\(\)\)/);
   assert.match(rowSource, /deleteConversation\(item\.id,item\.title,source,del\)/);
   assert.match(inlineScript, /if\(archiveConfirmOverlay&&!archiveConfirmOverlay\.classList\.contains\('hidden'\)\)\{closeArchiveConfirm\(\);return\}/);
   assert.match(uiStyles, /\.archiveConfirmDialog\s*\{[^}]*border-radius:\s*8px/s);

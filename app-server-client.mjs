@@ -3,6 +3,8 @@ import { spawn } from 'node:child_process';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_INITIALIZE_TIMEOUT_MS = 15000;
+const DEFAULT_INITIALIZE_RETRY_COUNT = 1;
+const DEFAULT_INITIALIZE_RETRY_DELAY_MS = 150;
 
 export class CodexAppServerClient extends EventEmitter {
   constructor(options = {}) {
@@ -21,6 +23,8 @@ export class CodexAppServerClient extends EventEmitter {
     };
     this.requestTimeoutMs = positiveTimeout(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
     this.initializeTimeoutMs = positiveTimeout(options.initializeTimeoutMs, DEFAULT_INITIALIZE_TIMEOUT_MS);
+    this.initializeRetryCount = nonNegativeInteger(options.initializeRetryCount, DEFAULT_INITIALIZE_RETRY_COUNT);
+    this.initializeRetryDelayMs = positiveTimeout(options.initializeRetryDelayMs, DEFAULT_INITIALIZE_RETRY_DELAY_MS);
     this.child = null;
     this.startPromise = null;
     this.restartPromise = null;
@@ -37,12 +41,27 @@ export class CodexAppServerClient extends EventEmitter {
     if (this.startPromise) return this.startPromise;
 
     let trackedStart;
-    trackedStart = this.spawnAndInitialize()
+    trackedStart = this.startWithInitializeRetry()
       .finally(() => {
         if (this.startPromise === trackedStart) this.startPromise = null;
       });
     this.startPromise = trackedStart;
     return trackedStart;
+  }
+
+  async startWithInitializeRetry() {
+    let lastError;
+    for (let attempt = 0; attempt <= this.initializeRetryCount; attempt += 1) {
+      try {
+        return await this.spawnAndInitialize();
+      } catch (error) {
+        lastError = error;
+        if (this.closing || !isInitializeTimeout(error) || attempt >= this.initializeRetryCount) throw error;
+        // The requested RPC has not been written yet, so this retry cannot duplicate it.
+        await new Promise((resolve) => setTimeout(resolve, this.initializeRetryDelayMs));
+      }
+    }
+    throw lastError;
   }
 
   async request(method, params = {}, options = {}) {
@@ -264,4 +283,13 @@ export class CodexAppServerClient extends EventEmitter {
 function positiveTimeout(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
+function nonNegativeInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
+}
+
+function isInitializeTimeout(error) {
+  return /Codex app-server \u8bf7\u6c42\u8d85\u65f6:\s*initialize\b/i.test(String(error?.message || ''));
 }

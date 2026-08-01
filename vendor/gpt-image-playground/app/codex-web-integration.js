@@ -15,6 +15,7 @@
   let pollTimer = 0;
   let toastTimer = 0;
   let ensureFrame = 0;
+  let reloadWhenIdleTimer = 0;
   let updateStartVersion = '';
 
   function createButton(kind) {
@@ -164,9 +165,22 @@
     const generating = document.querySelector('button[aria-label="\u505c\u6b62\u751f\u6210"]');
     if (generating) {
       showToast('\u66f4\u65b0\u5df2\u5b8c\u6210\uff0c\u5f53\u524d\u4efb\u52a1\u7ed3\u675f\u540e\u5237\u65b0', 'success', true);
+    }
+    scheduleReloadWhenIdle();
+  }
+
+  function scheduleReloadWhenIdle() {
+    if (reloadWhenIdleTimer) return;
+    reloadWhenIdleTimer = window.setTimeout(reloadWhenGenerationEnds, 900);
+  }
+
+  function reloadWhenGenerationEnds() {
+    reloadWhenIdleTimer = 0;
+    if (document.querySelector('button[aria-label="\u505c\u6b62\u751f\u6210"]')) {
+      scheduleReloadWhenIdle();
       return;
     }
-    window.setTimeout(() => window.location.reload(), 900);
+    window.location.reload();
   }
 
   function showToast(message, tone, sticky = false) {

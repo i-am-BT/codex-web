@@ -678,7 +678,8 @@ body .subQuotaClose:hover {
   transition: width 180ms var(--ease);
 }
 
-.subQuotaProgressBar[data-level="normal"] {
+.subQuotaProgressBar[data-level="normal"],
+.subQuotaProgressBar[data-level="available"] {
   background: #22c55e;
 }
 
@@ -3527,9 +3528,10 @@ body .histDelete .lucide {
 
 .histRunning {
   position: absolute;
-  z-index: 1;
+  z-index: 2;
   top: 50%;
-  left: -12px;
+  /* Keep the status signal inside the sidebar's clipping edge. */
+  left: -7px;
   display: block;
   width: 9px;
   height: 9px;
@@ -3537,6 +3539,21 @@ body .histDelete .lucide {
   border-radius: 50%;
   background: var(--surface);
   box-shadow: 0 0 0 2px var(--success-soft);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.histCompletionUnread {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  left: -7px;
+  display: block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--info);
+  box-shadow: 0 0 0 2px var(--surface);
   pointer-events: none;
   transform: translateY(-50%);
 }
@@ -5250,7 +5267,7 @@ body[data-theme] .activityBatch {
 }
 
 .liveProcessElapsed + .liveProcessTimeline {
-  margin-top: 14px;
+  margin-top: 10px;
 }
 
 body[data-theme="dark"] .liveProcessElapsed {
@@ -7256,10 +7273,6 @@ body .box.runActive {
   grid-template-columns: 34px max-content minmax(0, 1fr) max-content 34px;
 }
 
-body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-  grid-template-columns: 34px max-content minmax(0, 1fr) max-content 34px 34px;
-}
-
 body .box:focus-within {
   border-color: var(--border-strong);
   box-shadow: 0 14px 38px rgba(0, 0, 0, 0.13);
@@ -7281,8 +7294,7 @@ body .box.composerCollapsed {
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.10);
 }
 
-body .box.composerCollapsed.runActive,
-body .box.composerCollapsed.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
+body .box.composerCollapsed.runActive {
   grid-template-columns: 40px minmax(0, 1fr) 40px 40px !important;
 }
 
@@ -7443,9 +7455,13 @@ body .box:not(.composerCollapsed).runActive {
   grid-template-columns: 34px max-content minmax(0, 1fr) max-content 34px 34px;
 }
 
-body .box.composerExpanded.runActive:has(> .send:not(.cancelButton):not(:disabled)),
-body .box:not(.composerCollapsed).runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-  grid-template-columns: 34px max-content minmax(0, 1fr) max-content 34px 34px 34px;
+/* Narrow screens: keep the middle goal/context track wide enough so the
+   context toggle never overflows onto the permission toggle. */
+@media (max-width: 520px) {
+  body .box.composerExpanded > .composerModelToggle,
+  body .box:not(.composerCollapsed) > .composerModelToggle {
+    max-width: 120px;
+  }
 }
 
 body .box.composerExpanded > .send:not(.cancelButton),
@@ -7456,11 +7472,6 @@ body .box:not(.composerCollapsed) > .send:not(.cancelButton) {
 body .box.composerExpanded > .cancelButton,
 body .box:not(.composerCollapsed) > .cancelButton {
   grid-column: 6;
-}
-
-body .box.composerExpanded.runActive:has(> .send:not(.cancelButton):not(:disabled)) > .cancelButton,
-body .box:not(.composerCollapsed).runActive:has(> .send:not(.cancelButton):not(:disabled)) > .cancelButton {
-  grid-column: 7;
 }
 
 body[data-theme="light"] .box.composerCollapsed {
@@ -7873,8 +7884,8 @@ body .cancelButton {
   color: var(--canvas) !important;
 }
 
-body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) .cancelButton {
-  grid-column: 6;
+body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) > .cancelButton {
+  display: none !important;
 }
 
 body .cancelButton:hover {
@@ -7940,6 +7951,10 @@ body .composer > .promptQueue {
 
 .threadGoalBar.hidden {
   display: none !important;
+}
+
+.threadGoalBar.runtimeOnly {
+  display: none;
 }
 
 body .composer > .threadGoalBar {
@@ -8140,24 +8155,42 @@ body[data-theme="dark"] .promptQueue {
   height: 14px;
 }
 
-.promptQueueRow.dragging {
-  opacity: 0.96;
-  cursor: grabbing;
-  z-index: 5;
-  background: color-mix(in srgb, var(--surface) 88%, var(--primary) 12%);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.16);
-  transform: scale(1.012);
-  transition: none;
-}
-
 .promptQueueList.dragging {
   cursor: grabbing;
   user-select: none;
   -webkit-user-select: none;
 }
 
-.promptQueueList.dragging .promptQueueRow:not(.dragging) {
-  transition: transform 120ms var(--ease), background 120ms var(--ease), box-shadow 120ms var(--ease);
+.promptQueueList.dragging .promptQueueRow:not(.dragSource) {
+  transition: background 120ms var(--ease), box-shadow 120ms var(--ease);
+}
+
+.promptQueueRow.dragSource,
+.promptQueueDropPlaceholder {
+  position: relative;
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 58%, transparent);
+}
+
+.promptQueueRow.dragSource > * {
+  visibility: hidden;
+}
+
+.promptQueueDragGhost {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 1001;
+  box-sizing: border-box;
+  pointer-events: none;
+  cursor: grabbing;
+  opacity: 0.97;
+  border: 1px solid color-mix(in srgb, var(--primary) 46%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--primary) 8%);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.22);
+  transform-origin: center;
+  will-change: transform;
 }
 
 .promptQueueRow.dragOver {
@@ -8167,6 +8200,13 @@ body[data-theme="dark"] .promptQueue {
 
 .promptQueueRow.dragOver.dragOverAfter {
   box-shadow: inset 0 -2px 0 var(--primary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .promptQueueDragGhost,
+  .promptQueueList.dragging .promptQueueRow:not(.dragSource) {
+    transition: none;
+  }
 }
 
 .promptQueueRow:not(.sending) {
@@ -8185,12 +8225,6 @@ body[data-theme="dark"] .promptQueue {
   animation: spin 900ms linear infinite;
 }
 
-.promptQueueRow.appOwned .promptQueueLead,
-.promptQueueRow.appOwned:not(.sending) .promptQueueLead:active {
-  cursor: default;
-  touch-action: auto;
-}
-
 .promptQueueBody {
   display: flex;
   min-width: 0;
@@ -8202,6 +8236,10 @@ body[data-theme="dark"] .promptQueue {
   color: var(--text);
   padding: 0 3px;
   text-align: left;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
 }
 
 .promptQueueText {
@@ -9713,6 +9751,10 @@ body .composer > .box:focus-within {
     transition: opacity 120ms var(--ease), transform 180ms var(--ease);
   }
 
+  body .side:has(.subQuotaPopover:not(.hidden)) {
+    overflow-y: auto;
+  }
+
   body .app.sideCollapsed .side {
     visibility: hidden;
     border-right: 0;
@@ -9782,10 +9824,6 @@ body .composer > .box:focus-within {
 
   body .composer:has(> .composerProjectPicker.hidden) > .box.runActive {
     grid-template-columns: 32px max-content minmax(0, 1fr) max-content 30px;
-  }
-
-  body .composer:has(> .composerProjectPicker.hidden) > .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-    grid-template-columns: 32px max-content minmax(0, 1fr) max-content 30px 30px;
   }
 
   body .composer:has(> .composerProjectPicker.hidden) > .box.runActive > .cancelButton,
@@ -10093,8 +10131,9 @@ body .composer > .box:focus-within {
   }
 
   body.keyboardOpen .chat {
-    padding-bottom: max(calc(132px + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px) + 12px));
-    scroll-padding-bottom: max(calc(132px + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px) + 12px));
+    /* --composer-overlay-height already includes any unresized keyboard clearance. */
+    padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
+    scroll-padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
   }
 
   body .composer > * {
@@ -10159,7 +10198,17 @@ body .composer > .box:focus-within {
   body .composer > .promptQueue {
     width: min(calc(var(--composer-width) - 40px), calc(100% - 84px));
     max-width: min(calc(var(--composer-width) - 40px), calc(100% - 84px));
+    /* Three standard queue rows remain visible; additional rows retain touch scrolling. */
+    max-height: calc(3 * 48px + 8px);
     margin: 0 auto 10px;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .promptQueue::-webkit-scrollbar {
+    display: none;
   }
 
   body .box > .attachmentTray {
@@ -10189,8 +10238,7 @@ body .composer > .box:focus-within {
     padding: 0 12px 0 10px !important;
   }
 
-  body .box.composerCollapsed.runActive,
-  body .box.composerCollapsed.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
+  body .box.composerCollapsed.runActive {
     grid-template-columns: 40px minmax(0, 1fr) 40px 40px !important;
   }
 
@@ -10202,11 +10250,6 @@ body .composer > .box:focus-within {
   body .box.composerExpanded.runActive,
   body .box:not(.composerCollapsed).runActive {
     grid-template-columns: 38px max-content minmax(0, 1fr) max-content 38px 42px;
-  }
-
-  body .box.composerExpanded.runActive:has(> .send:not(.cancelButton):not(:disabled)),
-  body .box:not(.composerCollapsed).runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-    grid-template-columns: 38px max-content minmax(0, 1fr) max-content 38px 42px 42px;
   }
 
   body .composer > .box.composerCollapsed {
@@ -10227,10 +10270,6 @@ body .composer > .box:focus-within {
 
   body .box.runActive {
     grid-template-columns: 38px max-content minmax(0, 1fr) max-content 42px;
-  }
-
-  body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-    grid-template-columns: 38px max-content minmax(0, 1fr) max-content 42px 42px;
   }
 
   body .send {
@@ -10403,8 +10442,7 @@ body .composer > .box:focus-within {
     padding: 0 10px 0 8px !important;
   }
 
-  body .box.composerCollapsed.runActive,
-  body .box.composerCollapsed.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
+  body .box.composerCollapsed.runActive {
     grid-template-columns: 36px minmax(0, 1fr) 36px 36px !important;
   }
 
@@ -10416,11 +10454,6 @@ body .composer > .box:focus-within {
   body .box.composerExpanded.runActive,
   body .box:not(.composerCollapsed).runActive {
     grid-template-columns: 34px 34px minmax(0, 1fr) max-content 34px 38px;
-  }
-
-  body .box.composerExpanded.runActive:has(> .send:not(.cancelButton):not(:disabled)),
-  body .box:not(.composerCollapsed).runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-    grid-template-columns: 34px 34px minmax(0, 1fr) max-content 34px 38px 38px;
   }
 
   body .composer > .box.composerCollapsed {
@@ -10436,10 +10469,6 @@ body .composer > .box:focus-within {
 
   body .box.runActive {
     grid-template-columns: 34px 34px minmax(0, 1fr) max-content 38px;
-  }
-
-  body .box.runActive:has(> .send:not(.cancelButton):not(:disabled)) {
-    grid-template-columns: 34px 34px minmax(0, 1fr) max-content 38px 38px;
   }
 
   body[data-theme] .box textarea {
@@ -11695,16 +11724,22 @@ body[data-theme] .msg.image:not(.inputImage) img {
     box-shadow: none;
   }
 
+  body .composer > .threadGoalBar.runtimeOnly,
+  .threadGoalBar.runtimeOnly {
+    display: block;
+  }
+
   .threadGoalBar > :is(.threadGoalLead, .threadGoalBody, .threadGoalTime, .threadGoalActions) {
     display: none;
   }
 
   .threadRunMobile {
+    position: relative;
     display: flex;
     width: 100%;
     min-width: 0;
     flex-direction: column;
-    gap: 14px;
+    gap: 10px;
   }
 
   .threadRunPillsViewport {
@@ -11727,11 +11762,11 @@ body[data-theme] .msg.image:not(.inputImage) img {
     width: max-content;
     min-width: min-content;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     margin: 0 auto;
     border: 0;
     background: transparent;
-    padding: 0 16px;
+    padding: 0 12px;
     box-shadow: none;
   }
 
@@ -11741,19 +11776,19 @@ body[data-theme] .msg.image:not(.inputImage) img {
   body .threadRunPill:focus {
     display: inline-flex;
     min-width: 0;
-    height: 36px;
+    height: 34px;
     flex: 0 0 auto;
     align-items: center;
     justify-content: center;
-    gap: 7px;
+    gap: 6px;
     scroll-snap-align: center;
     border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
     border-radius: 999px;
     background: transparent;
     box-shadow: none;
     color: var(--text-muted);
-    padding: 0 12px;
-    font-size: 12px;
+    padding: 0 10px;
+    font-size: 11.5px;
     font-weight: 600;
     line-height: 1;
     white-space: nowrap;
@@ -11769,7 +11804,7 @@ body[data-theme] .msg.image:not(.inputImage) img {
   body .threadRunPill.isSelected:focus {
     border-color: var(--text);
     background: var(--text);
-    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+    box-shadow: none;
     color: var(--canvas);
   }
 
@@ -11779,9 +11814,9 @@ body[data-theme] .msg.image:not(.inputImage) img {
   }
 
   .threadRunPill > :is(svg, .lucide) {
-    width: 17px;
-    height: 17px;
-    flex: 0 0 17px;
+    width: 15px;
+    height: 15px;
+    flex: 0 0 15px;
     stroke-width: 1.9;
   }
 
@@ -11793,7 +11828,7 @@ body[data-theme] .msg.image:not(.inputImage) img {
   }
 
   .threadRunGoalPill {
-    gap: 8px;
+    gap: 6px;
   }
 
   .threadRunGoalTime {
@@ -11803,9 +11838,9 @@ body[data-theme] .msg.image:not(.inputImage) img {
 
   .threadRunPlanProgress {
     position: relative;
-    width: 17px;
-    height: 17px;
-    flex: 0 0 17px;
+    width: 15px;
+    height: 15px;
+    flex: 0 0 15px;
     border-radius: 50%;
     background: conic-gradient(currentColor var(--thread-run-progress, 0%), color-mix(in srgb, currentColor 18%, transparent) 0);
     -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 0);
@@ -11813,47 +11848,52 @@ body[data-theme] .msg.image:not(.inputImage) img {
   }
 
   .threadRunDetail {
-    width: min(680px, calc(100% - 20px));
-    max-width: min(680px, calc(100% - 20px));
+    position: absolute;
+    z-index: 3;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    width: min(560px, calc(100% - 36px));
+    max-width: min(560px, calc(100% - 36px));
     box-sizing: border-box;
     margin: 0 auto;
     border: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
-    border-radius: 20px;
+    border-radius: 14px;
     background: color-mix(in srgb, var(--surface) 97%, transparent);
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.12);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.10);
     color: var(--text);
+    transform: translateX(-50%);
   }
 
   .threadRunGoalDetail {
     display: grid;
-    min-height: 86px;
-    grid-template-rows: minmax(34px, auto) auto;
-    gap: 5px;
-    padding: 13px 12px 8px 16px;
+    min-height: 72px;
+    grid-template-rows: minmax(28px, auto) auto;
+    gap: 3px;
+    padding: 10px 10px 6px 12px;
   }
 
   .threadRunGoalObjective {
     min-width: 0;
     overflow-wrap: anywhere;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 500;
-    line-height: 1.45;
+    line-height: 1.4;
   }
 
   .threadRunGoalActions {
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    gap: 2px;
+    gap: 0;
   }
 
   body .threadRunGoalAction,
   body .threadRunGoalAction:hover,
   body .threadRunGoalAction:active,
   body .threadRunGoalAction:focus {
-    width: 38px;
-    min-width: 38px;
-    height: 38px;
+    width: 34px;
+    min-width: 34px;
+    height: 34px;
     background: transparent;
     color: var(--text-muted);
   }
@@ -11867,34 +11907,85 @@ body[data-theme] .msg.image:not(.inputImage) img {
   }
 
   .threadRunGoalAction > :is(svg, .lucide) {
-    width: 20px;
-    height: 20px;
+    width: 17px;
+    height: 17px;
     stroke-width: 1.8;
   }
 
   .threadRunPlanDetail {
     display: grid;
-    max-height: min(36vh, 240px);
-    gap: 3px;
+    max-height: min(32vh, 200px);
+    gap: 2px;
     overflow: hidden auto;
-    padding: 11px 14px;
+    padding: 8px 10px;
+  }
+
+  .threadRunFilesDetail,
+  .threadRunAgentsDetail {
+    display: grid;
+    max-height: min(32vh, 200px);
+    gap: 2px;
+    overflow: hidden auto;
+    padding: 8px 10px;
+  }
+
+  .threadRunFileRow,
+  .threadRunAgentRow {
+    display: grid;
+    min-height: 30px;
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px;
+    padding: 2px;
+    color: var(--text);
+  }
+
+  .threadRunFileRow > :is(svg, .lucide),
+  .threadRunAgentRow > :is(svg, .lucide) {
+    width: 15px;
+    height: 15px;
+    color: var(--text-muted);
+    stroke-width: 1.9;
+  }
+
+  .threadRunFileName,
+  .threadRunAgentName {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 500;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .threadRunFileMeta,
+  .threadRunAgentStatus {
+    color: var(--text-subtle);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .threadRunAgentRow[data-state="starting"] .threadRunAgentStatus,
+  .threadRunAgentRow[data-state="running"] .threadRunAgentStatus {
+    color: var(--warning);
   }
 
   .threadRunPlanStep {
     display: grid;
-    min-height: 34px;
-    grid-template-columns: 22px 25px minmax(0, 1fr);
+    min-height: 30px;
+    grid-template-columns: 18px 21px minmax(0, 1fr);
     align-items: start;
-    gap: 4px;
-    padding: 3px 0;
+    gap: 3px;
+    padding: 2px 0;
     color: var(--text);
   }
 
   .threadRunPlanMarker {
     position: relative;
     display: grid;
-    width: 18px;
-    height: 18px;
+    width: 16px;
+    height: 16px;
     place-items: center;
     margin-top: 1px;
     border: 2px solid color-mix(in srgb, var(--text-muted) 54%, transparent);
@@ -11915,24 +12006,24 @@ body[data-theme] .msg.image:not(.inputImage) img {
   }
 
   .threadRunPlanMarker > :is(svg, .lucide) {
-    width: 11px;
-    height: 11px;
+    width: 10px;
+    height: 10px;
     stroke-width: 2.4;
   }
 
   .threadRunPlanNumber {
     color: var(--text-subtle);
-    font-size: 13px;
-    line-height: 1.55;
+    font-size: 12px;
+    line-height: 1.5;
     text-align: right;
   }
 
   .threadRunPlanText {
     min-width: 0;
     overflow-wrap: anywhere;
-    font-size: 13.5px;
+    font-size: 12.5px;
     font-weight: 500;
-    line-height: 1.48;
+    line-height: 1.42;
   }
 
   body .composer > .editedFilesResult.live {
@@ -11947,5 +12038,95 @@ body[data-theme] .msg.image:not(.inputImage) img {
     .threadRunPlanStep[data-status="in_progress"] .threadRunPlanMarker {
       animation: none;
     }
+  }
+}
+
+@media (max-width: 360px) {
+  .threadRunDetail {
+    width: min(560px, calc(100% - 20px));
+    max-width: min(560px, calc(100% - 20px));
+  }
+
+  .threadRunPills {
+    padding-inline: 6px;
+  }
+}
+
+.forkToast {
+  position: fixed;
+  left: 50%;
+  top: calc(env(safe-area-inset-top, 0px) + 64px);
+  transform: translateX(-50%) translateY(-6px);
+  z-index: 130;
+  max-width: min(92vw, 460px);
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: var(--surface-raised, #242424);
+  border: 1px solid var(--border, #3d3d3d);
+  color: var(--text, #ececec);
+  font-size: 13px;
+  line-height: 1.4;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.38);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.forkToast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.forkToast.error {
+  background: var(--danger-soft, #3b1f1f);
+  border-color: var(--danger, #e05555);
+  color: var(--danger, #ff8d8d);
+}
+
+/* A running native turn can continue below the floating composer while the user reads history. */
+body .main > .jumpToLatest {
+  position: absolute;
+  z-index: 9;
+  bottom: calc(var(--composer-overlay-height, 156px) + 16px);
+  left: 50%;
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  box-shadow: none;
+  padding: 0;
+  transform: translate(-50%, 8px);
+  transition: color 140ms var(--ease), border-color 140ms var(--ease), background 140ms var(--ease), transform 140ms var(--ease);
+}
+
+body .main > .jumpToLatest:not(.hidden) {
+  transform: translate(-50%, 0);
+}
+
+body .main > .jumpToLatest:hover {
+  border-color: var(--primary-line);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+body .main > .jumpToLatest:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+body .main > .jumpToLatest .lucide {
+  width: 19px;
+  height: 19px;
+}
+
+@media(max-width:820px) {
+  body .main > .jumpToLatest {
+    bottom: calc(var(--composer-overlay-height, 132px) + 12px);
+    width: 44px;
+    height: 44px;
   }
 }

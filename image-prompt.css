@@ -25,6 +25,8 @@ body .top:has(> .workspaceNav) > .topConversationContext {
   right: calc(50% + 110px);
   overflow: hidden;
   justify-self: auto;
+  /* Desktop conversation context needs a little breathing room from its rail. */
+  padding-left: 10px;
   text-align: left;
 }
 
@@ -1131,7 +1133,25 @@ body[data-theme="light"] .imagePromptToolbar {
     gap: 7px;
   }
 
-  .topConversationContext,
+  body .top:has(> .workspaceNav) > .topConversationContext {
+    position: absolute;
+    display: block;
+    left: calc(50% + 104px);
+    right: 12px;
+    width: auto;
+    min-width: 0;
+    overflow: hidden;
+    justify-self: auto;
+    /* Mobile uses a compact, right-aligned status slot instead of the desktop rail. */
+    padding-left: 0;
+    text-align: right;
+  }
+
+  body .top:has(> .workspaceNav) > .topConversationContext #status {
+    display: none;
+  }
+
+  body .main.imagePromptMain > .top > .topConversationContext,
   body #modeLabel {
     display: none;
   }
@@ -1193,6 +1213,10 @@ body[data-theme="light"] .imagePromptToolbar {
 }
 
 @media (max-width: 560px) {
+  body .top:has(> .workspaceNav) > .topConversationContext {
+    left: calc(50% + 82px);
+  }
+
   .imagePromptViewBar {
     padding-inline: 10px;
   }

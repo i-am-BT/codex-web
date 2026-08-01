@@ -696,7 +696,7 @@ test('normalizes live Sub2API five-hour probe headers and ignores unrelated resp
   assert.deepEqual(normalizeSub2ApiRateLimitProbe(new Headers(), '{"object":"list"}'), []);
 });
 
-test('keeps the Sub2API five-hour window visible when the successful probe omits usage headers', async () => {
+test('does not invent a Sub2API five-hour window when the successful probe omits usage data', async () => {
   const service = new SubQuotaService({
     sources: [{
       id: 'sub',
@@ -713,16 +713,7 @@ test('keeps the Sub2API five-hour window visible when the successful probe omits
   });
 
   const result = await service.list();
-  assert.deepEqual(result.quotas[0].rateLimits, [{
-    window: '5h',
-    used: null,
-    limit: null,
-    remaining: null,
-    windowStart: '',
-    resetAt: '',
-    unit: '%',
-    availability: 'available',
-  }]);
+  assert.deepEqual(result.quotas[0].rateLimits, []);
 });
 
 test('keeps Sub2API subscription and last-known-good accounts on transient admin failure', async () => {
