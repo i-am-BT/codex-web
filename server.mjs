@@ -6886,10 +6886,15 @@ jumpToLatest.type='button';
 jumpToLatest.title='回到最新输出';
 jumpToLatest.setAttribute('aria-label','回到最新输出');
 jumpToLatest.setAttribute('aria-controls','chat');
-const jumpToLatestIcon=document.createElement('i');
-jumpToLatestIcon.setAttribute('data-lucide','chevron-down');
-jumpToLatestIcon.setAttribute('aria-hidden','true');
-jumpToLatest.appendChild(jumpToLatestIcon);
+const jumpToLatestDots=document.createElement('span');
+jumpToLatestDots.className='jumpToLatestDots';
+jumpToLatestDots.setAttribute('aria-hidden','true');
+for(let index=0;index<3;index+=1){
+  const jumpToLatestDot=document.createElement('span');
+  jumpToLatestDot.className='jumpToLatestDot';
+  jumpToLatestDots.appendChild(jumpToLatestDot);
+}
+jumpToLatest.appendChild(jumpToLatestDots);
 composer?.before(jumpToLatest);
 const dropZone = document.getElementById('dropZone'), attachFile = document.getElementById('attachFile'), fileInput = document.getElementById('fileInput'), attachmentTray = document.getElementById('attachmentTray');
 const provider = document.getElementById('provider'), model = document.getElementById('model'), reasoningEffort = document.getElementById('reasoningEffort'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');

@@ -12118,9 +12118,53 @@ body .main > .jumpToLatest:focus-visible {
   outline-offset: 2px;
 }
 
-body .main > .jumpToLatest .lucide {
-  width: 19px;
-  height: 19px;
+body .main > .jumpToLatest .jumpToLatestDots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  line-height: 0;
+}
+
+body .main > .jumpToLatest .jumpToLatestDot {
+  display: block;
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.58;
+  transform: translateY(2px);
+}
+
+body .main > .jumpToLatest:not(.hidden) .jumpToLatestDot {
+  animation: jumpToLatestDotFloat 720ms cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+body .main > .jumpToLatest:not(.hidden) .jumpToLatestDot:nth-child(2) {
+  animation-delay: 120ms;
+}
+
+body .main > .jumpToLatest:not(.hidden) .jumpToLatestDot:nth-child(3) {
+  animation-delay: 240ms;
+}
+
+@keyframes jumpToLatestDotFloat {
+  0%, 60%, 100% {
+    opacity: 0.58;
+    transform: translateY(2px);
+  }
+
+  30% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body .main > .jumpToLatest .jumpToLatestDot {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
 }
 
 @media(max-width:820px) {
