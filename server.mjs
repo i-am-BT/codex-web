@@ -14187,8 +14187,7 @@ function beginHistoryRename(row,open,item,source='codex'){
     input.disabled=true;
     const ok=await renameConversation(item.id,clean,source);
     if(ok){
-      historyRenameActive=false;
-      row.classList.remove('renaming');
+      endRename();
       await refreshHistory();
       statusEl.textContent='标题已更新';
     }else{

@@ -128,6 +128,80 @@ test('history rename uses an inline editor instead of a browser prompt', () => {
   assert.match(uiStyles, /\.histRenameInput\s*\{[^}]*height:\s*28px;[^}]*font-size:\s*12px/s);
 });
 
+test('history rename closes its inline editor after a successful Enter save', async () => {
+  const renameSource = sourceBetween('function beginHistoryRename', 'async function renameConversation');
+  const classes = new Set();
+  const statusEl = { textContent: '' };
+  const open = { isConnected: true };
+  const row = {
+    child: open,
+    classList: {
+      add: (...names) => names.forEach((name) => classes.add(name)),
+      remove: (...names) => names.forEach((name) => classes.delete(name)),
+      contains: (name) => classes.has(name),
+    },
+    replaceChild(next, previous) {
+      assert.equal(this.child, previous);
+      this.child = next;
+      previous.isConnected = false;
+      next.isConnected = true;
+    },
+  };
+  const makeInput = () => {
+    const listeners = new Map();
+    return {
+      isConnected: false,
+      value: '',
+      addEventListener(type, listener) { listeners.set(type, listener); },
+      dispatch(type, event) { return listeners.get(type)?.(event); },
+      setAttribute() {},
+      focus() {},
+      select() {},
+      replaceWith(next) {
+        assert.equal(row.child, this);
+        row.child = next;
+        this.isConnected = false;
+        next.isConnected = true;
+      },
+    };
+  };
+  let refreshes = 0;
+  const api = new Function(
+    'document',
+    'statusEl',
+    'flushPendingHistoryRefresh',
+    'renameConversation',
+    'refreshHistory',
+    'requestAnimationFrame',
+    `
+      let historyRenameActive = false;
+      ${renameSource}
+      return { beginHistoryRename, isActive: () => historyRenameActive };
+    `,
+  )(
+    { createElement: () => makeInput() },
+    statusEl,
+    () => {},
+    async () => true,
+    async () => { refreshes += 1; },
+    (callback) => callback(),
+  );
+
+  api.beginHistoryRename(row, open, { id: 'rename-1', title: '旧标题' });
+  const input = row.child;
+  input.value = '新标题';
+  let prevented = false;
+  input.dispatch('keydown', { key: 'Enter', preventDefault: () => { prevented = true; } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(prevented, true);
+  assert.equal(row.child, open, 'successful saves must restore the title button');
+  assert.equal(classes.has('renaming'), false);
+  assert.equal(api.isActive(), false);
+  assert.equal(refreshes, 1);
+  assert.equal(statusEl.textContent, '标题已更新');
+});
+
 test('native history archiving uses an in-app confirmation card', () => {
   const archiveSource = sourceBetween('function ensureArchiveConfirmDialog', 'function sidebarCollapsedPreference');
   const rowSource = sourceBetween('function createHistoryRow', 'function updateActiveHistory');
