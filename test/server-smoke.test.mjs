@@ -121,6 +121,25 @@ test('playground proxy maps an external host alias only to a matching loopback p
   ), false);
 });
 
+test('provider config reload guard preserves running app-server turns', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function assertAppServerConfigChangeAllowed');
+  const helperEnd = serverSource.indexOf('\nasync function restartAppServerForConfigChange', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const helperSource = serverSource.slice(helperStart, helperEnd);
+  const buildGuard = (turns) => new Function(
+    'activeNativeTurns',
+    `${helperSource}; return assertAppServerConfigChangeAllowed;`,
+  )(new Map(turns));
+
+  assert.doesNotThrow(buildGuard([]));
+  assert.doesNotThrow(buildGuard([['desktop', { status: 'running', transport: 'desktop-ipc' }]]));
+  assert.throws(
+    buildGuard([['local', { status: 'running', transport: 'app-server' }]]),
+    (error) => error.statusCode === 409 && /任务正在运行/.test(error.message),
+  );
+});
+
 test('login, read-only config, CLI arguments, and session restart', { timeout: 30000 }, async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-test-'));
   const runtime = path.join(temporary, 'runtime');
@@ -5739,6 +5758,8 @@ test('writable provider changes preserve unrelated Codex config', { timeout: 300
   const runtime = path.join(temporary, 'runtime');
   const codexHome = path.join(temporary, 'codex-home');
   const webEnv = path.join(temporary, 'web.env');
+  const fakeCodex = path.join(temporary, 'fake-codex.mjs');
+  const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
   let child;
 
   try {
@@ -5770,13 +5791,43 @@ args = ["keep-me"]
 [projects."/keep"]
 trust_level = "trusted"
 `);
+    await writeFile(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+if (process.argv[2] !== 'app-server') process.exit(2);
+appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify({
+  type: 'process_env',
+  openaiBaseUrl: process.env.OPENAI_BASE_URL,
+  openaiApiKey: process.env.OPENAI_API_KEY,
+  gammaApiKeyLength: String(process.env.GAMMA_API_KEY || '').length,
+}) + '\\n');
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  const lines = buffer.split('\\n');
+  buffer = lines.pop() || '';
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (!Object.hasOwn(message, 'id') || !message.method) continue;
+    const result = message.method === 'initialize'
+      ? { userAgent: 'fake' }
+      : message.method === 'model/list'
+        ? { data: [], nextCursor: null }
+        : {};
+    process.stdout.write(JSON.stringify({ id: message.id, result }) + '\\n');
+  }
+});
+`);
+    await chmod(fakeCodex, 0o755);
 
     child = startServer({
       temporary,
       runtime,
       codexHome,
-      fakeCodex: process.execPath,
+      fakeCodex,
       traceFile: path.join(temporary, 'unused-trace.json'),
+      appServerTraceFile,
       webEnv,
       configWritable: 'true',
     });
@@ -5791,6 +5842,17 @@ trust_level = "trusted"
 
     const initial = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
     assert.equal((await initial.json()).capabilities.manageProviders, true);
+    const initialCapabilities = await fetch(`${baseUrl}/api/native-model-capabilities`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(initialCapabilities.status, 200);
+    let appServerEnvironments = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(appServerEnvironments.length, 1);
+    assert.equal(appServerEnvironments[0].openaiBaseUrl, 'https://alpha.invalid/v1');
+    assert.equal(appServerEnvironments[0].gammaApiKeyLength, 0);
 
     const added = await fetch(`${baseUrl}/api/providers`, {
       method: 'POST',
@@ -5804,6 +5866,14 @@ trust_level = "trusted"
       }),
     });
     assert.equal(added.status, 200);
+    appServerEnvironments = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(appServerEnvironments.length, 2);
+    assert.equal(appServerEnvironments.at(-1).openaiBaseUrl, 'https://gamma.invalid/v1');
+    assert.equal(appServerEnvironments.at(-1).openaiApiKey, 'gamma-test-key');
+    assert.equal(appServerEnvironments.at(-1).gammaApiKeyLength, 14);
 
     let config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     assert.match(config, /notify = \["\/bin\/echo", "keep-me"\]/);
@@ -5819,6 +5889,12 @@ trust_level = "trusted"
       body: JSON.stringify({ provider: 'gamma', model: 'gamma-model', reasoningEffort: 'max' }),
     });
     assert.equal(defaults.status, 200);
+    appServerEnvironments = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(appServerEnvironments.length, 3);
+    assert.equal(appServerEnvironments.at(-1).gammaApiKeyLength, 14);
 
     config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     assert.match(config, /^model_provider = "gamma"/m);
@@ -5831,6 +5907,13 @@ trust_level = "trusted"
       headers: { Cookie: cookie },
     });
     assert.equal(deleted.status, 200);
+    appServerEnvironments = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.equal(appServerEnvironments.length, 4);
+    assert.equal(appServerEnvironments.at(-1).openaiBaseUrl, 'https://alpha.invalid/v1');
+    assert.equal(appServerEnvironments.at(-1).gammaApiKeyLength, 0);
 
     config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     assert.doesNotMatch(config, /\[model_providers\.gamma\]/);
@@ -5866,6 +5949,7 @@ function startServer({
     ...process.env,
     OPENAI_API_KEY: '',
     OPENAI_BASE_URL: '',
+    GAMMA_API_KEY: '',
     APP_NAME: 'Codex Web Test',
     CODEX_WEB_PASSWORD: 'test-password',
     SESSION_SECRET: 'test-session-secret-with-enough-entropy',

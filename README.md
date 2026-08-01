@@ -233,6 +233,8 @@ Image Prompt 的案例和模板保留仓库内置快照作为兜底。自动更�
 
 模型列表来自服务商的 `<base_url>/models` 接口，Web 不会按模型名称过滤。如果上游支持直接调用某个模型但没有在 `/models` 中返回它，该模型不会自动出现在下拉框中。
 
+在 Web 中新增、删除服务商或保存默认模型时，服务端会重载持久 Codex App Server，并在新进程初始化完成后才返回成功，因此新 Base URL、API Key 和模型设置无需重启 Codex Web 即可用于下一次调用。为避免中断会话，存在由 App Server 执行的任务时会拒绝修改并返回 `409`，任务完成后可立即重试。
+
 思考档位：
 
 1. 在设置中的 Reasoning 选择 `默认`、`low`、`medium`、`high`、`xhigh` 或 `max`。

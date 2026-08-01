@@ -216,11 +216,10 @@ delete process.env.CPA_QUOTA_API_KEY;
 delete process.env.SUB2API_API_KEY;
 delete process.env.SUB2API_ADMIN_API_KEY;
 let subQuotaService = createSubQuotaService(subQuotaConfigs);
-const codexProcessEnvironment = buildCodexProcessEnvironment();
 const appServerClient = new CodexAppServerClient({
   bin: CODEX_BIN,
   cwd: CODEX_PROCESS_HOME,
-  env: codexProcessEnvironment,
+  env: buildCodexProcessEnvironment(),
   clientName: 'codex-web',
   clientTitle: APP_NAME,
   clientVersion: '1.0.0',
@@ -1763,7 +1762,7 @@ app.post('/api/models', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/providers', requireAuth, requireConfigWrite, (req, res) => {
+app.post('/api/providers', requireAuth, requireConfigWrite, async (req, res) => {
   const name = cleanProviderName(req.body?.name);
   const baseUrl = String(req.body?.baseUrl || '').trim().replace(/\/+$/, '');
   const apiKey = String(req.body?.apiKey || '').trim();
@@ -1775,6 +1774,7 @@ app.post('/api/providers', requireAuth, requireConfigWrite, (req, res) => {
   if (!apiKey) return res.status(400).json({ error: 'API Key 不能为空' });
 
   try {
+    assertAppServerConfigChangeAllowed();
     const envKey = `${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`;
     upsertProvider({ name, baseUrl, envKey, wireApi, model });
     updateEnvVar(CODEX_ENV_FILE, envKey, apiKey);
@@ -1783,18 +1783,21 @@ app.post('/api/providers', requireAuth, requireConfigWrite, (req, res) => {
     process.env[envKey] = apiKey;
     process.env.DEFAULT_PROVIDER = name;
     process.env.DEFAULT_MODEL = model;
+    await restartAppServerForConfigChange(`provider:${name}`);
     res.json({ ok: true, provider: name, model, providers: readProviders() });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
-app.delete('/api/providers/:name', requireAuth, requireConfigWrite, (req, res) => {
+app.delete('/api/providers/:name', requireAuth, requireConfigWrite, async (req, res) => {
   const name = cleanProviderName(req.params.name);
   if (!name) return res.status(400).json({ error: '服务商名称无效' });
 
   try {
+    assertAppServerConfigChangeAllowed();
     const result = deleteProvider(name);
+    await restartAppServerForConfigChange(`delete-provider:${name}`);
     res.json({ ok: true, ...result, providers: readProviders() });
   } catch (err) {
     const status = err.statusCode || 500;
@@ -1802,24 +1805,31 @@ app.delete('/api/providers/:name', requireAuth, requireConfigWrite, (req, res) =
   }
 });
 
-app.post('/api/defaults', requireAuth, requireConfigWrite, (req, res) => {
+app.post('/api/defaults', requireAuth, requireConfigWrite, async (req, res) => {
   const provider = cleanProviderName(req.body?.provider || '');
   const model = cleanValue(req.body?.model) || '';
-  const reasoningEffort = cleanReasoningEffort(req.body?.reasoningEffort);
+  let reasoningEffort;
+  try {
+    reasoningEffort = cleanReasoningEffort(req.body?.reasoningEffort);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
 
   if (!provider) return res.status(400).json({ error: '请选择服务商' });
   if (!readProviders().includes(provider)) return res.status(404).json({ error: '服务商不存在' });
   if (!model) return res.status(400).json({ error: '请选择模型' });
 
   try {
+    assertAppServerConfigChangeAllowed();
     setCodexDefaults(provider, model, reasoningEffort);
     updateEnvVar(ENV_FILE, 'DEFAULT_PROVIDER', provider);
     updateEnvVar(ENV_FILE, 'DEFAULT_MODEL', model);
     process.env.DEFAULT_PROVIDER = provider;
     process.env.DEFAULT_MODEL = model;
+    await restartAppServerForConfigChange(`defaults:${provider}/${model}`);
     res.json({ ok: true, provider, model, reasoningEffort });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -1909,7 +1919,7 @@ app.post('/api/chat', requireAuth, (req, res) => {
 
   const child = spawn(CODEX_BIN, args, {
     cwd,
-    env: { ...process.env, ...codexProcessEnvironment },
+    env: { ...process.env, ...buildCodexProcessEnvironment() },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   activeProcess = child;
@@ -2952,6 +2962,29 @@ function handleAppServerError(params = {}) {
     message,
     updatedAt: new Date().toISOString(),
   });
+}
+
+function assertAppServerConfigChangeAllowed() {
+  const running = [...activeNativeTurns.values()].some((turn) => (
+    turn?.status === 'running' && turn.transport !== 'desktop-ipc'
+  ));
+  if (!running) return;
+  const error = new Error('Codex App 任务正在运行，请等待任务完成后再修改服务商设置');
+  error.statusCode = 409;
+  throw error;
+}
+
+async function restartAppServerForConfigChange(reason = '') {
+  const label = String(reason || 'config-change').slice(0, 120);
+  nativeModelCapabilitiesCache = { models: [], expiresAt: 0 };
+  try {
+    await appServerClient.restart({ env: buildCodexProcessEnvironment() });
+    console.warn(`codex app-server restarted: ${label}`);
+  } catch (cause) {
+    const error = new Error(`配置已保存，但 Codex App Server 重载失败: ${cause.message}`);
+    error.statusCode = 503;
+    throw error;
+  }
 }
 
 function handleAppServerNotification(event) {

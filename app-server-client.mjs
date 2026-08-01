@@ -23,6 +23,8 @@ export class CodexAppServerClient extends EventEmitter {
     this.initializeTimeoutMs = positiveTimeout(options.initializeTimeoutMs, DEFAULT_INITIALIZE_TIMEOUT_MS);
     this.child = null;
     this.startPromise = null;
+    this.restartPromise = null;
+    this.restartRevision = 0;
     this.initialized = false;
     this.closing = false;
     this.stdoutBuffer = '';
@@ -34,21 +36,37 @@ export class CodexAppServerClient extends EventEmitter {
     if (this.child && this.initialized) return;
     if (this.startPromise) return this.startPromise;
 
-    this.startPromise = this.spawnAndInitialize()
+    let trackedStart;
+    trackedStart = this.spawnAndInitialize()
       .finally(() => {
-        this.startPromise = null;
+        if (this.startPromise === trackedStart) this.startPromise = null;
       });
-    return this.startPromise;
+    this.startPromise = trackedStart;
+    return trackedStart;
   }
 
   async request(method, params = {}, options = {}) {
-    await this.start();
+    if (this.restartPromise) await this.restartPromise;
+    else await this.start();
     return this.sendRequest(method, params, options.timeoutMs);
   }
 
   async notify(method, params) {
-    await this.start();
+    if (this.restartPromise) await this.restartPromise;
+    else await this.start();
     this.writeMessage(params === undefined ? { method } : { method, params });
+  }
+
+  restart(options = {}) {
+    if (Object.hasOwn(options, 'env')) this.envOverrides = { ...(options.env || {}) };
+    this.restartRevision += 1;
+    if (this.restartPromise) return this.restartPromise;
+
+    this.restartPromise = this.restartUntilCurrent()
+      .finally(() => {
+        this.restartPromise = null;
+      });
+    return this.restartPromise;
   }
 
   respond(id, result) {
@@ -81,6 +99,15 @@ export class CodexAppServerClient extends EventEmitter {
 
   buildEnv() {
     return { ...process.env, ...this.envOverrides };
+  }
+
+  async restartUntilCurrent() {
+    let appliedRevision = 0;
+    while (appliedRevision !== this.restartRevision) {
+      appliedRevision = this.restartRevision;
+      this.close();
+      await this.start();
+    }
   }
 
   async spawnAndInitialize() {
