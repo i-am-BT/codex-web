@@ -12380,3 +12380,194 @@ body .main > .jumpToLatest:not(.hidden) .jumpToLatestDot:nth-child(3) {
     height: 44px;
   }
 }
+
+/* --- Login screen --- */
+body .login {
+  position: relative;
+  z-index: auto;
+  background:
+    radial-gradient(1100px 760px at 86% -12%, rgba(124, 92, 255, 0.30), transparent 56%),
+    radial-gradient(980px 680px at -10% 108%, rgba(47, 129, 247, 0.28), transparent 56%),
+    linear-gradient(160deg, #0a0e1a 0%, #121a2e 55%, #0a1120 100%);
+}
+
+body[data-theme="light"] .login {
+  background:
+    radial-gradient(1050px 720px at 88% -14%, rgba(124, 92, 255, 0.22), transparent 56%),
+    radial-gradient(950px 640px at -8% 110%, rgba(47, 129, 247, 0.20), transparent 56%),
+    linear-gradient(160deg, #eef2fb 0%, #f8faff 55%, #eaf1ff 100%);
+}
+
+.loginBg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.loginBlob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(90px);
+  will-change: transform;
+  animation: loginDrift 30s ease-in-out infinite alternate;
+}
+
+.loginBlobOne {
+  top: -130px;
+  right: -90px;
+  width: 480px;
+  height: 480px;
+  background: radial-gradient(circle at 32% 32%, #7c5cff, transparent 70%);
+  opacity: 0.5;
+}
+
+.loginBlobTwo {
+  bottom: -150px;
+  left: -110px;
+  width: 430px;
+  height: 430px;
+  background: radial-gradient(circle at 60% 40%, #2f81f7, transparent 70%);
+  opacity: 0.48;
+  animation-duration: 36s;
+  animation-direction: alternate-reverse;
+}
+
+.loginBlobThree {
+  top: 46%;
+  left: 56%;
+  width: 320px;
+  height: 320px;
+  background: radial-gradient(circle at 50% 50%, #37c871, transparent 70%);
+  opacity: 0.22;
+  animation-duration: 42s;
+}
+
+@keyframes loginDrift {
+  from {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  to {
+    transform: translate3d(42px, -30px, 0) scale(1.12);
+  }
+}
+
+.login .card {
+  position: relative;
+  z-index: 3;
+  width: min(420px, 100%);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 22px;
+  background: rgba(13, 18, 30, 0.70);
+  box-shadow:
+    0 30px 90px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  padding: 32px 30px 28px;
+  backdrop-filter: blur(22px) saturate(1.15);
+  -webkit-backdrop-filter: blur(22px) saturate(1.15);
+}
+
+body[data-theme="light"] .login .card {
+  border-color: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow:
+    0 30px 80px rgba(31, 41, 55, 0.16),
+    inset 0 1px 0 #ffffff;
+}
+
+.loginBrand {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  margin-bottom: 8px;
+}
+
+.loginLogo {
+  display: grid;
+  width: 54px;
+  height: 54px;
+  place-items: center;
+  border-radius: 17px;
+  background: linear-gradient(135deg, #2f81f7, #7c5cff);
+  box-shadow: 0 12px 32px rgba(96, 110, 255, 0.38);
+  color: #ffffff;
+}
+
+.loginLogo .lucide {
+  width: 25px;
+  height: 25px;
+}
+
+.login .brand {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+.login .sub {
+  margin: 0 0 22px;
+  text-align: center;
+  color: var(--text-subtle, var(--muted));
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.login .field {
+  margin-bottom: 14px;
+}
+
+.login .field input {
+  min-height: 46px;
+  border-radius: 12px;
+  background: rgba(9, 13, 20, 0.55);
+  padding: 12px 14px;
+}
+
+body[data-theme="light"] .login .field input {
+  background: #ffffff;
+}
+
+.login .primary {
+  display: inline-flex;
+  min-height: 46px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #2f81f7, #7c5cff);
+  box-shadow: 0 12px 30px rgba(63, 102, 255, 0.30);
+  transition: box-shadow 160ms var(--ease), transform 160ms var(--ease), filter 160ms var(--ease);
+}
+
+.login .primary:hover {
+  box-shadow: 0 14px 36px rgba(63, 102, 255, 0.42);
+  filter: brightness(1.06);
+}
+
+.login .primary:active {
+  transform: translateY(1px);
+}
+
+.login .primary .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.login .errorText {
+  text-align: center;
+}
+
+.loginFooter {
+  margin-top: 18px;
+  text-align: center;
+  color: var(--text-subtle, var(--muted));
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loginBlob {
+    animation: none;
+  }
+}
