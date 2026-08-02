@@ -46,6 +46,7 @@ const LUCIDE_BROWSER_FILE = path.join(ROOT, 'node_modules', 'lucide', 'dist', 'u
 const UI_CSS_FILE = path.join(ROOT, 'ui.css');
 const IMAGE_PROMPT_CSS_FILE = path.join(ROOT, 'image-prompt.css');
 const IMAGE_PROMPT_JS_FILE = path.join(ROOT, 'image-prompt.js');
+const FX_JS_FILE = path.join(ROOT, 'effects.js');
 const DREAM_SKIN_DIR = path.join(ROOT, 'vendor', 'codex-dream-skin');
 const DREAM_SKIN_SKILL_FILE = path.join(DREAM_SKIN_DIR, 'SKILL.md');
 const DREAM_SKIN_CONCEPT_FILE = path.join(DREAM_SKIN_DIR, 'background-generation-prompts.md');
@@ -360,6 +361,11 @@ app.get('/image-prompt.css', (_req, res) => {
 app.get('/image-prompt.js', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.type('text/javascript').sendFile(IMAGE_PROMPT_JS_FILE);
+});
+
+app.get('/effects.js', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.type('text/javascript').sendFile(FX_JS_FILE);
 });
 
 app.post('/api/login', (req, res) => {
@@ -19096,6 +19102,7 @@ async function send(){
 }
 </script>
   <script src="/image-prompt.js?v=image-prompt-main-20260728a"></script>
+  <script src="/effects.js?v=light-fx-20260802a"></script>
 </body>
 </html>`;
 }
