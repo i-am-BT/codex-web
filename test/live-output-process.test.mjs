@@ -192,6 +192,45 @@ test('browser comment attachment cards cannot collapse inside the chat scroll co
   assert.match(uiStyles, /body \.chat > \.msg\.user\.browserCommentSteering > \.msgBody\.browserCommentSource > p\s*\{[^}]*margin:\s*0/s);
 });
 
+test('browser design annotations use hover on desktop and toggle on touch devices', () => {
+  const annotationSource = sourceBetween('function browserAnnotationChangeMarkdown', 'function renderBrowserAnnotationCard');
+  const { browserAnnotationChangeMarkdown } = new Function(`${annotationSource}; return { browserAnnotationChangeMarkdown };`)();
+  assert.equal(browserAnnotationChangeMarkdown('界面批注\n- margin-top: 0px → 20px'), '- margin-top: 0px → 20px');
+  assert.equal(browserAnnotationChangeMarkdown('界面批注'), '');
+  assert.equal(browserAnnotationChangeMarkdown('普通浏览器评论\n- margin-top: 0px → 20px'), '');
+  assert.match(inlineScript, /function queueBrowserAnnotationPointerUpdate\(x,y\)\{[\s\S]*?requestAnimationFrame\(\(\)=>\{[\s\S]*?browserAnnotationCardAtPointer\(point\.x,point\.y\)/s);
+  assert.match(inlineScript, /function clearBrowserAnnotationPointerCard\(\)\{[\s\S]*?cancelAnimationFrame\(browserAnnotationPointerFrame\);[\s\S]*?setBrowserAnnotationPointerCard\(null\);/s);
+  assert.match(inlineScript, /function ensureBrowserAnnotationPointerTracking\(\)\{[\s\S]*?queueBrowserAnnotationPointerUpdate\(event\.clientX,event\.clientY\);[\s\S]*?window\.addEventListener\('pointermove',updateFromPointer,true\);[\s\S]*?window\.addEventListener\('mousemove',updateFromPointer,true\);/s);
+  assert.match(inlineScript, /function renderBrowserAnnotationCard\(body,changes\)\{[\s\S]*?card\.className='browserAnnotationCard';[\s\S]*?summary\.className='browserAnnotationTrigger';[\s\S]*?label\.textContent='注释';[\s\S]*?detail\.className='browserAnnotationDetails'/s);
+  assert.match(inlineScript, /function renderBrowserCommentMessageBody\(body,text\)\{[\s\S]*?const annotation=browserAnnotationChangeMarkdown\(source\);[\s\S]*?body\.classList\.remove\('browserAnnotationSource','markdownBody'\);[\s\S]*?if\(annotation\)\{[\s\S]*?renderBrowserAnnotationCard\(body,annotation\);[\s\S]*?refreshIcons\(body\);[\s\S]*?renderMessageMarkdown\(body,source\)/s);
+  assert.match(inlineScript, /if\(browserCommentUser\)renderBrowserCommentMessageBody\(body,text\)/);
+  assert.match(inlineScript, /message\.role==='user'&&existing\.classList\.contains\('browserCommentSteering'\)\)renderBrowserCommentMessageBody\(existing\._messageBody,text\)/);
+  assert.match(uiStyles, /\.browserAnnotationDetails\s*\{[^}]*display:\s*block;[^}]*position:\s*absolute;[^}]*opacity:\s*0;[^}]*visibility:\s*hidden;[^}]*pointer-events:\s*none/s);
+  assert.match(uiStyles, /\.browserAnnotationDetails\s*\{[^}]*bottom:\s*100%/s);
+  assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[\s\S]*?\.browserAnnotationCard:hover > \.browserAnnotationDetails,[\s\S]*?\.browserAnnotationCard\.browserAnnotationPointerOver > \.browserAnnotationDetails,[\s\S]*?\.browserAnnotationTrigger:focus-visible \+ \.browserAnnotationDetails\s*\{[^}]*opacity:\s*1;[^}]*visibility:\s*visible/s);
+  const touchMediaIndex = uiStyles.indexOf('@media (hover: none), (pointer: coarse)');
+  const touchOpenIndex = uiStyles.indexOf('.browserAnnotationCard[open] > .browserAnnotationDetails');
+  assert.ok(touchMediaIndex >= 0 && touchOpenIndex > touchMediaIndex);
+  assert.match(uiStyles, /@media \(hover: none\), \(pointer: coarse\)\s*\{[\s\S]*?\.browserAnnotationTrigger\s*\{[^}]*min-height:\s*40px[\s\S]*?\.browserAnnotationCard\[open\] > \.browserAnnotationDetails\s*\{[^}]*pointer-events:\s*auto/s);
+  assert.match(uiStyles, /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.browserAnnotationDetails\s*\{[^}]*transition:\s*none/s);
+});
+
+test('runtime text deltas leave sidebar rebuilding to the coalesced session snapshot', () => {
+  const runtimeHistoryHelperSource = inlineScript.match(/function nativeRuntimeNeedsHistoryRefresh\(type\)\{[^}]*\}/)?.[0];
+  assert.ok(runtimeHistoryHelperSource, 'missing native runtime history refresh helper');
+  const runtimeHandlerSource = sourceBetween('function connectSessionEvents', 'function nativeMessageElementBySequence');
+  const { nativeRuntimeNeedsHistoryRefresh } = new Function(`${runtimeHistoryHelperSource}; return { nativeRuntimeNeedsHistoryRefresh };`)();
+
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('delta'), false);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('item-started'), false);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('item-completed'), false);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('turn'), true);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('turn-cleared'), true);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('connection-error'), true);
+  assert.match(runtimeHandlerSource, /try\{runtime=JSON\.parse\(event\.data\|\|'\{\}'\)\}catch\(e\)\{\}\s*\/\/ Text deltas[\s\S]*?if\(nativeRuntimeNeedsHistoryRefresh\(runtime\.type\)\)void refreshHistory\(\);/);
+  assert.doesNotMatch(runtimeHandlerSource, /try\{runtime=JSON\.parse\(event\.data\|\|'\{\}'\)\}catch\(e\)\{\}\s*refreshHistory\(\);/);
+});
+
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
   const activitySource = sourceBetween('function decodeEmbeddedToolString', 'function toolMessageTitle');
   const activityApi = new Function(`${activitySource}; return { toolActivityPresentations, nativeFileChangePresentations };`)();
@@ -420,6 +459,7 @@ test('terminal states remove only the ephemeral progress pill', () => {
 test('a stop request freezes visible streaming without unlocking the running turn', () => {
   const pauseSource = sourceBetween('function pauseNativeLivePresentationForCancel', 'let turnProcessElapsedFrozen');
   const immediate = [];
+  const finalized = [];
   const makeLive = (turnId, { text = 'visible', targetText = 'visible tail', complete = false } = {}) => {
     const classes = new Set(['streaming']);
     return {
@@ -429,6 +469,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
       complete,
       renderTimer: 7,
       element: {
+        _messageBody: { textContent: '' },
         classList: {
           add: (...names) => names.forEach((name) => classes.add(name)),
           remove: (...names) => names.forEach((name) => classes.delete(name)),
@@ -439,6 +480,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   };
   const api = new Function(
     'renderNativeLiveItemImmediately',
+    'renderNativeLiveItemMarkdown',
     `
       let currentConversationId = 'thread-a';
       let activeNativeTurnId = 'turn-a';
@@ -452,11 +494,14 @@ test('a stop request freezes visible streaming without unlocking the running tur
         resume: resumeNativeLivePresentationForCancel,
       };
     `,
-  )((live) => {
-    live.renderTimer = null;
-    live.text = live.targetText;
-    immediate.push(live.turnId);
-  });
+  )(
+    (live) => {
+      live.renderTimer = null;
+      live.text = live.targetText;
+      immediate.push(live.turnId);
+    },
+    (live) => finalized.push(live.text),
+  );
   const matching = makeLive('turn-a');
   const other = makeLive('turn-b');
   api.items.clear();
@@ -469,6 +514,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.equal(matching.element.classList.contains('streaming'), false);
   assert.equal(other.cancelVisualPaused, undefined);
   assert.deepEqual(immediate, ['turn-a']);
+  assert.deepEqual(finalized, ['visible tail'], 'the frozen text must receive its final Markdown render');
 
   matching.targetText = 'visible tail received while the stop request was pending';
   api.resume('thread-a', 'turn-a');
@@ -487,6 +533,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.match(deltaSource, /const cancelPending=nativeCancelPendingMatches\(currentConversationId,runtimeTurnId\);/);
   assert.match(deltaSource, /if\(!live&&cancelPending\)return;/);
   assert.match(deltaSource, /live\.targetText\+=delta;\s*if\(cancelPending\|\|live\.cancelVisualPaused\)return;/);
+  assert.match(pauseSource, /renderNativeLiveItemImmediately\(live\);\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(scheduleSource, /if\(live\?\.cancelVisualPaused\)return;/);
   assert.match(snapshotSource, /if\(live\.cancelVisualPaused&&nativeCancelPendingMatches\(currentConversationId,pausedTurnId\)\)\{/);
   assert.match(snapshotSource, /if\(cancelPending\)\{[\s\S]*?return null;/);
@@ -905,6 +952,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.ok(first.text.length <= 64, 'persisted snapshot should advance in bounded steps');
   assert.equal(first.element.dataset.messageText, first.text);
   assert.equal(first.element.classList.contains('streaming'), true);
+  assert.equal(rendered.length, 0, 'typewriter ticks should not repeatedly parse the whole Markdown body');
   assert.deepEqual([...timers.values()].map((timer) => timer.delay).sort((a, b) => a - b), [60, 120]);
 
   const extended = { ...message, content: `${message.content}继续补充新的尾部。` };
@@ -917,6 +965,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.equal(first.element.classList.contains('streaming'), false);
   assert.equal(api.state().nativeLiveItems.size, 0);
   assert.equal(api.state().nativeRenderedMessageKeys.size, 1);
+  assert.equal(rendered.length, 1, 'completed output should receive one authoritative Markdown render');
   assert.equal(rendered.at(-1), extended.content);
   assert.ok(chatScrollWrites > 0, 'near-bottom live output should follow with a coalesced scroll');
 
@@ -965,6 +1014,9 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.doesNotMatch(liveSource, /scrollChatToLatest\(/);
   assert.match(liveSource, /function nativeLiveDocumentHidden\(\)/);
   assert.match(liveSource, /if\(!nativeLiveTypewriterEnabled\(\)\)\{\s*renderNativeLiveItemImmediately\(live\);/);
+  assert.match(liveSource, /function renderNativeLiveItem\(live\)\{[\s\S]*?_messageBody\.textContent=live\.text/);
+  assert.match(liveSource, /function renderNativeLiveItemMarkdown\(live\)\{[\s\S]*?renderAssistantMarkdown\(body,live\.text\);/);
+  assert.match(liveSource, /function settleNativeLiveItem\(live\)\{\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(inlineScript, /function handleNativeVisibilityChange\(\)[\s\S]*?nativeSnapshotResumeCatchup=true;[\s\S]*?flushNativeLiveItemsToTarget\(\);/);
   assert.match(inlineScript, /if\(nearBottom&&syncMessages\.length\)scheduleNativeLiveScroll\(\)/);
 });

@@ -316,11 +316,11 @@ test('permission picker mirrors native approval profiles and preserves custom co
 
   assert.match(
     uiStyles,
-    /\.composerPermissionPanel\s*\{[^}]*width:\s*min\(360px, calc\(100vw - 24px\)\);[^}]*max-height:\s*min\(410px, calc\(100dvh - 96px\)\)/s,
+    /\.composerPermissionPanel\s*\{[^}]*width:\s*min\(320px, calc\(100vw - 24px\)\);[^}]*max-height:\s*min\(410px, calc\(100dvh - 96px\)\)/s,
   );
   assert.match(
     uiStyles,
-    /\.composerPermissionOption\s*\{[^}]*min-height:\s*58px;[^}]*grid-template-columns:\s*24px minmax\(0, 1fr\) 20px/s,
+    /\.composerPermissionOption\s*\{[^}]*min-height:\s*50px;[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 18px/s,
   );
   assert.match(uiStyles, /\.composerPermissionOption\[aria-checked="true"\] \.composerPermissionCheck\s*\{[^}]*opacity:\s*1/s);
   assert.match(uiStyles, /\.composerPermissionOption\[data-permission-mode="full"\]\[aria-checked="true"\][^}]*#f2773d/s);

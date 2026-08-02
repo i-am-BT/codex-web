@@ -7231,6 +7231,7 @@ function pauseNativeLivePresentationForCancel(threadId=currentConversationId,tur
   for(const live of nativeLiveItems.values()){
     if(String(live?.turnId||'')!==cleanTurnId)continue;
     renderNativeLiveItemImmediately(live);
+    renderNativeLiveItemMarkdown(live);
     live.cancelVisualPaused=true;
     live.element?.classList?.remove('streaming');
   }
@@ -7410,8 +7411,8 @@ const HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY='codexWeb.historySidebarCollapsed';
 const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb.historyTasksCollapsed';
 const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
-const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb.historyCompletionRead.v1';
-const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v1';
+const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb.historyCompletionRead.v2';
+const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v2';
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 const SIDE_CHAT_STORAGE_KEY='codexWeb.sideChat.v1';
 const SIDE_CHAT_WIDTH_STORAGE_KEY='codexWeb.sideChatWidth.v1';
@@ -13062,6 +13063,7 @@ function flushPendingHistoryRefresh(){
   queueMicrotask(()=>refreshHistory());
 }
 async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')){historyRefreshPending=true;return}historyRefreshPending=false;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations)}
+function nativeRuntimeNeedsHistoryRefresh(type){return ['turn','turn-cleared','connection-error'].includes(String(type||''))}
 function composerModelItems(items,selected){const list=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];const selectedModel=String(selected||'').trim();if(selectedModel&&!list.includes(selectedModel))list.push(selectedModel);return list}
 function selectComposerModel(selected){const selectedModel=String(selected||'').trim();if(!selectedModel)return false;if(![...model.options].some((option)=>option.value===selectedModel)){const option=document.createElement('option');option.value=selectedModel;option.textContent=selectedModel;model.appendChild(option)}model.value=selectedModel;return true}
 function applyComposerModels(providerName,items,selected){const list=composerModelItems(items,selected);fillSelect(model,list,selected||list[0]||'');modelOptionsProvider=String(providerName||'')}
@@ -13970,6 +13972,7 @@ function storeHistoryCompletionState(key,state){
 function historyCompletionKey(item){return conversationKey(item?.source==='codex'?'codex':'web',item?.id)}
 function historyCompletionVersion(item){return String(item?.status||'')+'|'+String(item?.updatedAt||item?.recencyAt||item?.createdAt||'')}
 function isCompletedHistoryItem(item){return ['done','completed'].includes(String(item?.status||'').toLowerCase())}
+function isCompletedHistoryCompletionVersion(version){return ['done','completed'].includes(String(version||'').split('|',1)[0].toLowerCase())}
 function trackHistoryCompletionState(items){
   let seenChanged=false;
   let readChanged=false;
@@ -13992,8 +13995,15 @@ function trackHistoryCompletionState(items){
     historyCompletionSeen.set(key,version);
     seenChanged=true;
     if(isCompletedHistoryItem(item)){
-      historyCompletionRead.delete(key);
-      readChanged=true;
+      if(!isCompletedHistoryCompletionVersion(previous)){
+        historyCompletionRead.delete(key);
+        readChanged=true;
+      }else if(historyCompletionRead.get(key)===previous){
+        // A completed task can receive metadata updates after it was read.
+        // Keep its read marker aligned instead of treating that as a new completion.
+        historyCompletionRead.set(key,version);
+        readChanged=true;
+      }
     }
   }
   if(seenChanged)storeHistoryCompletionState(HISTORY_COMPLETION_SEEN_STORAGE_KEY,historyCompletionSeen);
@@ -15323,7 +15333,9 @@ function connectSessionEvents(){
   sessionEvents.addEventListener('native-runtime',(event)=>{
     let runtime={};
     try{runtime=JSON.parse(event.data||'{}')}catch(e){}
-    refreshHistory();
+    // Text deltas can arrive many times per second. Their persisted snapshot is already
+    // coalesced by the sessions listener, so only refresh the sidebar for lifecycle changes.
+    if(nativeRuntimeNeedsHistoryRefresh(runtime.type))void refreshHistory();
     if(runtime.threadId!==currentConversationId||currentConversationSource!=='codex')return;
     if(isCompletedNativeRuntimeTurn(runtime.turnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
     if(webRunActive&&activeNativeTurnId&&runtime.turnId&&String(runtime.turnId)!==String(activeNativeTurnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
@@ -15415,6 +15427,7 @@ function reconcileNativeResetMessage(message){
   if(message.at)existing.dataset.messageAt=String(message.at);
   if(existing._messageBody&&before!==after){
     if(message.role==='assistant')renderAssistantMarkdown(existing._messageBody,text);
+    else if(message.role==='user'&&existing.classList.contains('browserCommentSteering'))renderBrowserCommentMessageBody(existing._messageBody,text);
     else if(message.role==='user')renderMessageMarkdown(existing._messageBody,automationInstructionDisplayText(text));
   }
   if(message.role==='assistant'&&message.kind==='final_answer'){
@@ -15875,6 +15888,101 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
   if(inboxParsed.items.length)renderInboxItems(body,inboxParsed.items);
   if(parsed.comments.length)renderReviewComments(body,parsed.comments);
   if(memoryParsed.citations.length)renderMemoryCitations(body,memoryParsed.citations);
+}
+function browserAnnotationChangeMarkdown(text){
+  const source=String(text||'').replace(/\\r\\n/g,'\\n').trim();
+  const match=/^界面批注\\s*\\n([\\s\\S]+)$/.exec(source);
+  const changes=String(match?.[1]||'').trim();
+  return /^[-*]\\s+\\S/.test(changes)?changes:'';
+}
+let browserAnnotationPointerCard=null;
+let browserAnnotationPointerTrackingBound=false;
+let browserAnnotationPointerFrame=0;
+let browserAnnotationPointerPosition=null;
+function browserAnnotationRectContains(rect,x,y){
+  return Boolean(rect)&&x>=rect.left&&x<=rect.right&&y>=rect.top&&y<=rect.bottom;
+}
+function setBrowserAnnotationPointerCard(next){
+  if(next===browserAnnotationPointerCard)return;
+  browserAnnotationPointerCard?.classList.remove('browserAnnotationPointerOver');
+  browserAnnotationPointerCard=next;
+  browserAnnotationPointerCard?.classList.add('browserAnnotationPointerOver');
+}
+function browserAnnotationCardAtPointer(x,y){
+  for(const card of document.querySelectorAll('.browserAnnotationCard')){
+    const trigger=card.querySelector('.browserAnnotationTrigger');
+    if(browserAnnotationRectContains(trigger?.getBoundingClientRect(),x,y))return card;
+    if(card!==browserAnnotationPointerCard)continue;
+    const detail=card.querySelector('.browserAnnotationDetails');
+    if(browserAnnotationRectContains(detail?.getBoundingClientRect(),x,y))return card;
+  }
+  return null;
+}
+function queueBrowserAnnotationPointerUpdate(x,y){
+  browserAnnotationPointerPosition={x,y};
+  if(browserAnnotationPointerFrame)return;
+  browserAnnotationPointerFrame=requestAnimationFrame(()=>{
+    browserAnnotationPointerFrame=0;
+    const point=browserAnnotationPointerPosition;
+    browserAnnotationPointerPosition=null;
+    if(point)setBrowserAnnotationPointerCard(browserAnnotationCardAtPointer(point.x,point.y));
+  });
+}
+function clearBrowserAnnotationPointerCard(){
+  browserAnnotationPointerPosition=null;
+  if(browserAnnotationPointerFrame){
+    cancelAnimationFrame(browserAnnotationPointerFrame);
+    browserAnnotationPointerFrame=0;
+  }
+  setBrowserAnnotationPointerCard(null);
+}
+function ensureBrowserAnnotationPointerTracking(){
+  if(browserAnnotationPointerTrackingBound)return;
+  browserAnnotationPointerTrackingBound=true;
+  const updateFromPointer=(event)=>{
+    if(!matchMedia('(hover: hover) and (pointer: fine)').matches)return;
+    queueBrowserAnnotationPointerUpdate(event.clientX,event.clientY);
+  };
+  // Browser-side comment overlays can absorb CSS hover. Capture both event families
+  // and resolve the card from viewport coordinates instead of the event target.
+  window.addEventListener('pointermove',updateFromPointer,true);
+  window.addEventListener('mousemove',updateFromPointer,true);
+  window.addEventListener('blur',clearBrowserAnnotationPointerCard);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden)clearBrowserAnnotationPointerCard();
+  });
+}
+function renderBrowserAnnotationCard(body,changes){
+  body.classList.add('browserAnnotationSource');
+  const card=document.createElement('details');
+  card.className='browserAnnotationCard';
+  const summary=document.createElement('summary');
+  summary.className='browserAnnotationTrigger';
+  summary.title='查看注释';
+  summary.setAttribute('aria-label','查看注释');
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','message-square');
+  icon.setAttribute('aria-hidden','true');
+  const label=document.createElement('span');
+  label.textContent='注释';
+  summary.append(icon,label);
+  const detail=document.createElement('div');
+  detail.className='browserAnnotationDetails';
+  renderMessageMarkdown(detail,changes);
+  card.append(summary,detail);
+  body.replaceChildren(card);
+  ensureBrowserAnnotationPointerTracking();
+}
+function renderBrowserCommentMessageBody(body,text){
+  const source=automationInstructionDisplayText(text);
+  const annotation=browserAnnotationChangeMarkdown(source);
+  body.classList.remove('browserAnnotationSource','markdownBody');
+  if(annotation){
+    renderBrowserAnnotationCard(body,annotation);
+    refreshIcons(body);
+    return;
+  }
+  renderMessageMarkdown(body,source);
 }
 function automationHeartbeatDisplayText(text){
   const original=String(text||'');
@@ -18790,7 +18898,8 @@ function addMsg(role,text,options={}){
   }else{
     const body=document.createElement('div');
     body.className='msgBody';
-    if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text);
+    if(browserCommentUser)renderBrowserCommentMessageBody(body,text);
+    else if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text);
     else if(role==='user')renderMessageMarkdown(body,automationInstructionDisplayText(text));
     else body.textContent=text;
     const actions=document.createElement('div');
@@ -19189,8 +19298,20 @@ function pumpNativeLiveRender(live){
 }
 function renderNativeLiveItem(live){
   live.element.dataset.messageText=live.text;
-  if(live.element._messageBody)renderAssistantMarkdown(live.element._messageBody,live.text);
+  // Markdown parsing also enhances links, images, code blocks, and embedded cards. During
+  // a typewriter stream, updating a text node is substantially cheaper; settle renders the
+  // authoritative Markdown once the item is complete.
+  if(live.element._messageBody){
+    live.markdownText=null;
+    live.element._messageBody.textContent=live.text;
+  }
   scheduleNativeLiveScroll(live);
+}
+function renderNativeLiveItemMarkdown(live){
+  const body=live?.element?._messageBody;
+  if(!body||live.markdownText===live.text)return;
+  renderAssistantMarkdown(body,live.text);
+  live.markdownText=live.text;
 }
 function nativeLiveDocumentHidden(){
   return typeof document!=='undefined'&&document.visibilityState==='hidden';
@@ -19214,6 +19335,7 @@ function flushNativeLiveItemsToTarget(){
   for(const live of [...nativeLiveItems.values()])renderNativeLiveItemImmediately(live);
 }
 function settleNativeLiveItem(live){
+  renderNativeLiveItemMarkdown(live);
   live.element.classList.remove('streaming');
   if(live.source==='snapshot'){
     nativeRenderedMessageKeys.add(live.key);
