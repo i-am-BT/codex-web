@@ -1347,10 +1347,11 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
 
   const body = req.body || {};
   const hasTitle = Object.hasOwn(body, 'title');
+  const hasProvider = Object.hasOwn(body, 'provider');
   const hasModel = Object.hasOwn(body, 'model');
   const hasReasoningEffort = Object.hasOwn(body, 'reasoningEffort');
   const hasServiceTier = Object.hasOwn(body, 'serviceTier');
-  if (!hasTitle && !hasModel && !hasReasoningEffort && !hasServiceTier) {
+  if (!hasTitle && !hasProvider && !hasModel && !hasReasoningEffort && !hasServiceTier) {
     return res.status(400).json({ error: '缺少可更新字段' });
   }
 
@@ -1358,6 +1359,14 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
     ? String(body.title || '').trim().replace(/\s+/g, ' ').slice(0, 80)
     : undefined;
   if (hasTitle && !title) return res.status(400).json({ error: '标题不能为空' });
+
+  let provider;
+  if (hasProvider) {
+    provider = cleanProviderName(body.provider || '');
+    if (!provider) return res.status(400).json({ error: '服务商无效' });
+    if (!readProviders().includes(provider)) return res.status(404).json({ error: '服务商不存在' });
+    if (!hasModel) return res.status(400).json({ error: '切换服务商时必须同时指定模型' });
+  }
 
   let model;
   if (hasModel) {
@@ -1390,16 +1399,27 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
     if (hasTitle) {
       await appServerClient.request('thread/name/set', { threadId, name: title });
     }
-    if (hasModel || hasReasoningEffort || hasServiceTier) {
+    if (hasProvider || hasModel || hasReasoningEffort || hasServiceTier) {
       // Codex App persists per-thread model, effort, and Fast/Standard settings here.
       // Keep null so Standard is an explicit clear, not an omitted field.
       // Settings RPCs require the thread to be loaded in app-server first.
-      try {
-        await appServerClient.request('thread/resume', { threadId });
-      } catch (resumeErr) {
-        // Some already-loaded threads reject resume; still attempt the settings write.
-        if (!/not found|unknown thread|no such thread/i.test(String(resumeErr?.message || resumeErr))) {
-          // continue to settings update anyway for soft failures
+      if (hasProvider) {
+        // A provider and its model are one setting pair. Resume with both before
+        // publishing the local overlay so polling can never expose a mixed pair.
+        await appServerClient.request('thread/resume', {
+          threadId,
+          modelProvider: provider,
+          model,
+          excludeTurns: true,
+        });
+      } else {
+        try {
+          await appServerClient.request('thread/resume', { threadId });
+        } catch (resumeErr) {
+          // Some already-loaded threads reject resume; still attempt the settings write.
+          if (!/not found|unknown thread|no such thread/i.test(String(resumeErr?.message || resumeErr))) {
+            // continue to settings update anyway for soft failures
+          }
         }
       }
       await appServerClient.request('thread/settings/update', {
@@ -1410,6 +1430,7 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
       });
       nativeSessions.applyThreadSettings?.({
         threadId,
+        ...(hasProvider ? { modelProvider: provider } : {}),
         ...(hasModel ? { model } : {}),
         ...(hasReasoningEffort ? { effort: reasoningEffort } : {}),
         ...(hasServiceTier ? { serviceTier } : {}),
@@ -1418,12 +1439,13 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
     nativeSessions.scheduleRefresh();
     const payload = { ok: true, id: threadId };
     if (hasTitle) payload.title = title;
+    if (hasProvider) payload.provider = provider;
     if (hasModel) payload.model = model;
     if (hasReasoningEffort) payload.reasoningEffort = reasoningEffort;
     if (hasServiceTier) payload.serviceTier = serviceTier;
     res.json(payload);
   } catch (err) {
-    const hasSettings = hasModel || hasReasoningEffort || hasServiceTier;
+    const hasSettings = hasProvider || hasModel || hasReasoningEffort || hasServiceTier;
     const action = hasSettings && !hasTitle ? '会话设置' : hasTitle && !hasSettings ? '会话标题' : '会话设置';
     res.status(nativeAppErrorStatus(err)).json({ error: `修改 Codex App ${action}失败: ${err.message}` });
   }
@@ -7081,6 +7103,7 @@ let composerAtLoadedAt = 0;
 let nativeComposerOverride = null;
 let nativeComposerSettingsQueue = Promise.resolve();
 let nativeComposerSettingsWriteId = 0;
+let modelLoadRevision = 0;
 let nativeForkCreating = false;
 let promptQueuePanel = null;
 let promptQueueList = null;
@@ -11261,8 +11284,8 @@ function enhanceComposer(){
   composerContextToggle.addEventListener('blur',scheduleComposerContextHide);
   composerContextPanel.addEventListener('mouseenter',()=>{if(composerContextHoverTimer)clearTimeout(composerContextHoverTimer)});
   composerContextPanel.addEventListener('mouseleave',scheduleComposerContextHide);
-  composerProviderSelect.addEventListener('change',async()=>{provider.value=composerProviderSelect.value;await loadModels(provider.value);void syncNativeComposerSettings({model:model.value});syncComposerChrome()});
-  composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;reconcileComposerFastSupport();void syncNativeComposerSettings({model:model.value});syncComposerChrome()});
+  composerProviderSelect.addEventListener('change',()=>{void changeComposerProvider(composerProviderSelect.value)});
+  composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;reconcileComposerFastSupport();void syncNativeComposerSettings({provider:provider.value,model:model.value});syncComposerChrome()});
   composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;void syncNativeComposerSettings({reasoningEffort:reasoningEffort.value});syncComposerChrome()});
   input.addEventListener('focus',()=>{closeComposerPopovers();expandComposer()});
   input.addEventListener('blur',scheduleComposerCollapse);
@@ -12561,8 +12584,8 @@ document.addEventListener('pointerdown',(event)=>{if(!promptQueueMenu||promptQue
 document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
-provider?.addEventListener('change',async()=>{await loadModels(provider.value);void syncNativeComposerSettings({model:model.value});syncComposerChrome()});
-model?.addEventListener('change',()=>{void syncNativeComposerSettings({model:model.value});syncComposerChrome()});
+provider?.addEventListener('change',()=>{void changeComposerProvider(provider.value)});
+model?.addEventListener('change',()=>{void syncNativeComposerSettings({provider:provider.value,model:model.value});syncComposerChrome()});
 reasoningEffort?.addEventListener('change',()=>{void syncNativeComposerSettings({reasoningEffort:reasoningEffort.value});syncComposerChrome()});
 sandbox?.addEventListener('change',()=>{composerPermissionMode=composerPermissionModeFromValues(sandbox.value,approval.value);dangerConfirmed=false;rememberNativeComposerOverride();updateSafetyHint();syncComposerChrome()});
 approval?.addEventListener('change',()=>{composerPermissionMode=composerPermissionModeFromValues(sandbox.value,approval.value);dangerConfirmed=false;rememberNativeComposerOverride();updateSafetyHint();syncComposerChrome()});
@@ -12706,7 +12729,8 @@ function flushPendingHistoryRefresh(){
   queueMicrotask(()=>refreshHistory());
 }
 async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')){historyRefreshPending=true;return}historyRefreshPending=false;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations)}
-async function loadModels(providerName,selected){model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:providerName});if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return}fillSelect(model,data.models,selected||data.models[0]||'')}
+async function loadModels(providerName,selected){const requestedProvider=String(providerName||'');const revision=++modelLoadRevision;model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:requestedProvider});if(revision!==modelLoadRevision||String(provider.value||'')!==requestedProvider)return false;if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return false}fillSelect(model,data.models,selected||data.models[0]||'');return true}
+async function changeComposerProvider(nextProvider){const requestedProvider=String(nextProvider||'');provider.value=requestedProvider;rememberNativeComposerOverride({pending:true});syncComposerChrome();const loaded=await loadModels(requestedProvider);if(!loaded){if(String(provider.value||'')===requestedProvider&&nativeComposerOverride?.provider===requestedProvider){clearNativeComposerOverride();void syncCurrentNativeConversation()}return false}await syncNativeComposerSettings({provider:requestedProvider,model:model.value});syncComposerChrome();return true}
 async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
 async function deleteSelectedProvider(){const name=provider.value;if(!name){defaultMsg.textContent='请选择要删除的具体服务商';return}if(!confirm('删除服务商 '+name+'？该操作会移除对应配置和 API Key。'))return;defaultMsg.textContent='删除中...';const res=await fetch('/api/providers/'+encodeURIComponent(name),{method:'DELETE'});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'删除失败';return}defaultMsg.textContent='已删除服务商 '+name;await boot();if(data.provider){provider.value=data.provider;await loadModels(data.provider,data.model)}statusEl.textContent='Provider deleted'}
@@ -14466,7 +14490,11 @@ function syncNativeComposerSettings(changes={}){
   if(currentConversationSource!=='codex'||!currentConversationId)return Promise.resolve(false);
   const threadId=currentConversationId;
   const payload={};
-  if(Object.hasOwn(changes,'model'))payload.model=String(changes.model||'').trim()||null;
+  if(Object.hasOwn(changes,'provider'))payload.provider=String(changes.provider||'').trim()||null;
+  if(Object.hasOwn(changes,'model')){
+    payload.model=String(changes.model||'').trim()||null;
+    if(!Object.hasOwn(payload,'provider'))payload.provider=String(provider.value||'').trim()||null;
+  }
   if(Object.hasOwn(changes,'reasoningEffort'))payload.reasoningEffort=String(changes.reasoningEffort||'').trim()||null;
   if(!Object.keys(payload).length)return Promise.resolve(true);
   const writeId=++nativeComposerSettingsWriteId;
@@ -14477,6 +14505,7 @@ function syncNativeComposerSettings(changes={}){
       const data=await res.json().catch(()=>({}));
       if(!res.ok)throw new Error(data.error||res.statusText||'设置同步失败');
       if(currentConversationSource==='codex'&&currentConversationId===threadId&&nativeComposerOverride?.writeId===writeId){
+        if(Object.hasOwn(data,'provider')&&data.provider&&[...provider.options].some((option)=>option.value===data.provider))provider.value=data.provider;
         if(Object.hasOwn(data,'model')&&data.model){
           if(![...model.options].some((option)=>option.value===data.model)){const option=document.createElement('option');option.value=data.model;option.textContent=data.model;model.appendChild(option)}
           model.value=data.model;
@@ -18941,19 +18970,19 @@ async function send(){
     const requestedPermissionMode=composerPermissionMode;
     const requestedSandbox=sandbox.value;
     const requestedApproval=approval.value;
-    setNativeComposerOverride(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier);
-    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,attachments,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:requestedServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
+    setNativeComposerOverride(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,{pending:true});
+    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,attachments,provider:requestedProvider,model:requestedModel,reasoningEffort:reasoningEffort.value,serviceTier:requestedServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||res.statusText);
     currentConversationSource='codex';
     currentConversationId=data.threadId;
-    setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier);
+    setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,{pending:true});
     activeNativeTurnId=data.turnId||'';
     markPromptQueueTurnRunning(data.threadId,activeNativeTurnId);
     if(!existingId){nativeCursor=0;nativeGeneration=0}
     updateActiveHistory();
     nativeNotice.textContent='Codex App 会话 · 双向同步';
-    setTimeout(syncCurrentNativeConversation,240);
+    setTimeout(async()=>{try{await syncCurrentNativeConversation()}catch{}if(nativeComposerOverride?.threadId===data.threadId&&nativeComposerOverride?.pending)clearNativeComposerOverride()},240);
     refreshHistory();
   }catch(e){
     webRunActive=false;
