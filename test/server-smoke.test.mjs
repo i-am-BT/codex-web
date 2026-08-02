@@ -848,6 +848,14 @@ if (args[0] === 'app-server') {
   const fixtureThreadId = '${nativeSessionId}';
   const archivedThreadId = '${archivedNativeSessionId}';
   const archivedThreadIds = new Set([archivedThreadId]);
+  try {
+    for (const line of readFileSync(process.env.FAKE_APP_SERVER_TRACE, 'utf8').split('\\n')) {
+      if (!line.trim()) continue;
+      const previous = JSON.parse(line);
+      const previousThreadId = String(previous.params?.threadId || '');
+      if (['thread/unarchive', 'thread/delete'].includes(previous.method)) archivedThreadIds.delete(previousThreadId);
+    }
+  } catch {}
   const archiveListCounters = new Map();
   let threadGoal = null;
   const archiveControl = () => {
@@ -2178,10 +2186,14 @@ updated_at = 1784422800000
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'reasoningEffort'\)\)/);
     assert.match(page, /function rememberNativeComposerOverride\(\{pending=false,writeId=0\}=\{\}\)/);
     assert.match(page, /function syncNativeComposerSettings\(changes=\{\}\)/);
-    assert.match(page, /provider\?\.addEventListener\('change',\(\)=>\{void changeComposerProvider\(provider\.value\)\}\)/);
-    assert.match(page, /composerProviderSelect\.addEventListener\('change',\(\)=>\{void changeComposerProvider\(composerProviderSelect\.value\)\}\)/);
+    assert.match(page, /provider\?\.addEventListener\('change',\(\)=>\{void requestComposerProviderChange\(provider\.value\)\}\)/);
+    assert.match(page, /composerProviderSelect\.addEventListener\('change',\(\)=>\{void requestComposerProviderChange\(composerProviderSelect\.value\)\}\)/);
     assert.match(page, /async function changeComposerProvider\(nextProvider\)[\s\S]*?syncNativeComposerSettings\(\{provider:requestedProvider,model:model\.value\}\)/);
+    assert.match(page, /const settingsReady=await syncNativeComposerSettings[\s\S]*?return settingsReady/);
+    assert.match(page, /function requestComposerProviderChange\(nextProvider\)[\s\S]*?composerProviderChangePromise=pending\.catch\(\(\)=>false\)/);
+    assert.match(page, /const providerReady=await waitForLatestComposerProviderChange\(\);\s*await waitForLatestComposerModelLoad\(\);\s*await nativeComposerSettingsQueue\.catch\(\(\)=>false\)/);
     assert.match(page, /const revision=\+\+modelLoadRevision[\s\S]*?revision!==modelLoadRevision/);
+    assert.match(page, /modelListCache\.has\(requestedProvider\)/);
     assert.match(page, /composerModelSelect\.addEventListener\('change',\(\)=>\{model\.value=composerModelSelect\.value;reconcileComposerFastSupport\(\);void syncNativeComposerSettings\(\{provider:provider\.value,model:model\.value\}\);syncComposerChrome\(\)\}\)/);
     assert.match(page, /model\?\.addEventListener\('change',\(\)=>\{void syncNativeComposerSettings\(\{provider:provider\.value,model:model\.value\}\);syncComposerChrome\(\)\}\)/);
     assert.match(page, /payload\.provider=String\(provider\.value\|\|''\)\.trim\(\)\|\|null/);
@@ -2191,6 +2203,11 @@ updated_at = 1784422800000
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'reasoningEffort'\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'modelProvider'\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'model'\)\)/);
+    assert.match(page, /async function applyNativeConversationMetadata\(metadata/);
+    assert.match(page, /if\(modelOptionsProvider!==modelProvider\|\|modelLoadInFlight\?\.provider===modelProvider\)await loadModels\(modelProvider,selectedModel\)/);
+    assert.match(page, /selectComposerModel\(selectedModel\)/);
+    assert.match(page, /function resetComposerProviderChange\(\)\{composerProviderChangePromise=Promise\.resolve\(true\)\}/);
+    assert.match(page, /if\(conversationChanged\)\{clearNativeCancelPending\(\);resetComposerProviderChange\(\)\}/);
     assert.match(page, /clearNativeComposerOverride\(\);\s*syncComposerChrome\(\);\s*void syncCurrentNativeConversation\(\)/);
     assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,\{pending:true\}\)/);
     assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,\{pending:true\}\)/);
@@ -2216,7 +2233,7 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\);\s*syncComposerChrome\(\);\s*let syncMessages=conversation\.messages\|\|\[\];\s*if\(conversation\.reset\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -2232,6 +2249,67 @@ updated_at = 1784422800000
     assert.match(page, /async function boot\(selectRecent=false\)/);
     const inlineScript = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert.ok(inlineScript);
+    const composerModelItemsHelper = inlineScript.match(/(function composerModelItems[\s\S]*?)(?=function selectComposerModel)/)?.[1];
+    assert.ok(composerModelItemsHelper);
+    const composerModelItems = new Function(`${composerModelItemsHelper}; return composerModelItems;`)();
+    assert.deepEqual(composerModelItems(['gpt-5.5', 'gpt-5.5', ''], 'retired-model'), ['gpt-5.5', 'retired-model']);
+    assert.deepEqual(composerModelItems(['gpt-5.5', 'retired-model'], 'retired-model'), ['gpt-5.5', 'retired-model']);
+
+    const providerChangeHelper = inlineScript.match(/(async function changeComposerProvider[\s\S]*?)(?=function requestComposerProviderChange)/)?.[1];
+    assert.ok(providerChangeHelper);
+    const buildProviderChange = (loadModels, syncNativeComposerSettings) => new Function(
+      'provider',
+      'model',
+      'rememberNativeComposerOverride',
+      'syncComposerChrome',
+      'loadModels',
+      'syncNativeComposerSettings',
+      'clearNativeComposerOverride',
+      'syncCurrentNativeConversation',
+      `let currentConversationSource='codex';
+       let currentConversationId='thread-a';
+       let nativeComposerOverride={threadId:'thread-a',provider:'beta'};
+       ${providerChangeHelper}
+       return {
+         changeComposerProvider,
+         setConversation(source,id){currentConversationSource=source;currentConversationId=id;},
+       };`,
+    )(
+      { value: 'alpha' },
+      { value: 'beta-model' },
+      () => {},
+      () => {},
+      loadModels,
+      syncNativeComposerSettings,
+      () => {},
+      () => {},
+    );
+    let settingsWrites = 0;
+    const rejectedProviderChange = buildProviderChange(
+      async () => true,
+      async () => { settingsWrites += 1; return false; },
+    );
+    assert.equal(await rejectedProviderChange.changeComposerProvider('beta'), false);
+    assert.equal(settingsWrites, 1);
+
+    let finishModelLoad;
+    const movedProviderChange = buildProviderChange(
+      () => new Promise((resolve) => { finishModelLoad = resolve; }),
+      async () => { settingsWrites += 1; return true; },
+    );
+    const staleChange = movedProviderChange.changeComposerProvider('beta');
+    movedProviderChange.setConversation('codex', 'thread-b');
+    finishModelLoad(true);
+    assert.equal(await staleChange, false);
+    assert.equal(settingsWrites, 1);
+
+    const newTaskProviderChange = buildProviderChange(async () => true, async () => {
+      settingsWrites += 1;
+      return false;
+    });
+    newTaskProviderChange.setConversation('codex', '');
+    assert.equal(await newTaskProviderChange.changeComposerProvider('beta'), true);
+    assert.equal(settingsWrites, 1);
     const completedRuntimeHelper = inlineScript.match(/(function isCompletedNativeRuntimeTurn[\s\S]*?)(?=function refreshPromptQueueOnResume)/)?.[1];
     assert.ok(completedRuntimeHelper);
     const isCompletedNativeRuntimeTurn = new Function(
@@ -5562,12 +5640,14 @@ updated_at = 1784422800000
     assert.equal(updatedThreadSettingsPayload.provider, 'switchtest');
     assert.equal(updatedThreadSettingsPayload.model, 'switch-model');
     assert.equal(updatedThreadSettingsPayload.reasoningEffort, 'xhigh');
-    const threadSettingsCalls = (await readFile(appServerTraceFile, 'utf8'))
+    const threadSettingsProtocol = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
       .filter(Boolean)
       .map((line) => JSON.parse(line))
-      .slice(protocolBeforeThreadSettingsUpdate.length)
+      .slice(protocolBeforeThreadSettingsUpdate.length);
+    assert.ok(threadSettingsProtocol.some((message) => message.type === 'process_env'));
+    const threadSettingsCalls = threadSettingsProtocol
       .filter((message) => ['thread/resume', 'thread/settings/update'].includes(message.method));
     assert.equal(threadSettingsCalls.length, 2);
     assert.equal(threadSettingsCalls[0].method, 'thread/resume');
@@ -5583,6 +5663,25 @@ updated_at = 1784422800000
       model: 'switch-model',
       effort: 'xhigh',
     });
+
+    const protocolBeforeSameProviderUpdate = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const sameProviderSettings = await fetch(`${baseUrl}/api/native-sessions/${createdNativeSessionId}`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'switchtest', model: 'switch-model' }),
+    });
+    assert.equal(sameProviderSettings.status, 200);
+    const sameProviderProtocol = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .slice(protocolBeforeSameProviderUpdate.length);
+    assert.equal(sameProviderProtocol.some((message) => message.type === 'process_env'), false);
 
     const archived = await fetch(`${baseUrl}/api/native-sessions/${createdNativeSessionId}`, {
       method: 'DELETE',
@@ -5835,7 +5934,7 @@ updated_at = 1784422800000
         .length,
       createdDeleteCountBeforeBulkRace,
     );
-    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 5);
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 6);
     assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 7);
     const switchedProviderResume = protocolMessages.find((message) => (
       message.method === 'thread/resume'

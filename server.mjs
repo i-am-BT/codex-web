@@ -1404,8 +1404,18 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
       // Keep null so Standard is an explicit clear, not an omitted field.
       // Settings RPCs require the thread to be loaded in app-server first.
       if (hasProvider) {
-        // A provider and its model are one setting pair. Resume with both before
-        // publishing the local overlay so polling can never expose a mixed pair.
+        const current = nativeSessions.get(threadId);
+        const currentProvider = String(
+          current?.metadata?.modelProvider
+          || activeNativeTurns.get(threadId)?.provider
+          || '',
+        );
+        if (currentProvider && currentProvider !== provider) {
+          assertAppServerConfigChangeAllowed();
+          // Resuming an already loaded thread only rejoins it and ignores modelProvider.
+          // Reload app-server so resume can apply the new provider to the thread.
+          await appServerClient.restart({ env: buildCodexProcessEnvironment() });
+        }
         await appServerClient.request('thread/resume', {
           threadId,
           modelProvider: provider,
@@ -1435,6 +1445,16 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
         ...(hasReasoningEffort ? { effort: reasoningEffort } : {}),
         ...(hasServiceTier ? { serviceTier } : {}),
       });
+      const active = activeNativeTurns.get(threadId);
+      if (active) {
+        activeNativeTurns.set(threadId, {
+          ...active,
+          ...(hasProvider ? { provider } : {}),
+          ...(hasModel ? { model } : {}),
+          ...(hasServiceTier ? { serviceTier } : {}),
+          updatedAt: new Date().toISOString(),
+        });
+      }
     }
     nativeSessions.scheduleRefresh();
     const payload = { ok: true, id: threadId };
@@ -7104,6 +7124,11 @@ let nativeComposerOverride = null;
 let nativeComposerSettingsQueue = Promise.resolve();
 let nativeComposerSettingsWriteId = 0;
 let modelLoadRevision = 0;
+let modelOptionsProvider = null;
+let modelListCache = new Map();
+let modelLoadInFlight = null;
+let composerModelLoadPromise = Promise.resolve(true);
+let composerProviderChangePromise = Promise.resolve(true);
 let nativeForkCreating = false;
 let promptQueuePanel = null;
 let promptQueueList = null;
@@ -11284,7 +11309,7 @@ function enhanceComposer(){
   composerContextToggle.addEventListener('blur',scheduleComposerContextHide);
   composerContextPanel.addEventListener('mouseenter',()=>{if(composerContextHoverTimer)clearTimeout(composerContextHoverTimer)});
   composerContextPanel.addEventListener('mouseleave',scheduleComposerContextHide);
-  composerProviderSelect.addEventListener('change',()=>{void changeComposerProvider(composerProviderSelect.value)});
+  composerProviderSelect.addEventListener('change',()=>{void requestComposerProviderChange(composerProviderSelect.value)});
   composerModelSelect.addEventListener('change',()=>{model.value=composerModelSelect.value;reconcileComposerFastSupport();void syncNativeComposerSettings({provider:provider.value,model:model.value});syncComposerChrome()});
   composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;void syncNativeComposerSettings({reasoningEffort:reasoningEffort.value});syncComposerChrome()});
   input.addEventListener('focus',()=>{closeComposerPopovers();expandComposer()});
@@ -12584,7 +12609,7 @@ document.addEventListener('pointerdown',(event)=>{if(!promptQueueMenu||promptQue
 document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
-provider?.addEventListener('change',()=>{void changeComposerProvider(provider.value)});
+provider?.addEventListener('change',()=>{void requestComposerProviderChange(provider.value)});
 model?.addEventListener('change',()=>{void syncNativeComposerSettings({provider:provider.value,model:model.value});syncComposerChrome()});
 reasoningEffort?.addEventListener('change',()=>{void syncNativeComposerSettings({reasoningEffort:reasoningEffort.value});syncComposerChrome()});
 sandbox?.addEventListener('change',()=>{composerPermissionMode=composerPermissionModeFromValues(sandbox.value,approval.value);dangerConfirmed=false;rememberNativeComposerOverride();updateSafetyHint();syncComposerChrome()});
@@ -12722,16 +12747,66 @@ async function handleCustomBackground(file){if(!file){await saveAppearance({chat
 async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
 document.addEventListener('click',(event)=>{if(!event.target.closest('.msg.user, .msg.assistant, .msgActions'))clearMessageActionsOpen()});
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(selectRecent&&data.conversations.length){const saved=readActiveConversationPreference();const conversations=Array.isArray(data.conversations)?data.conversations:[];const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=match||conversations[0];if(target)await loadConversation(target.id,target.source||'codex');}await restoreSideChatIfNeeded()}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(selectRecent&&data.conversations.length){const saved=readActiveConversationPreference();const conversations=Array.isArray(data.conversations)?data.conversations:[];const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=match||conversations[0];if(target)await loadConversation(target.id,target.source||'codex');}await restoreSideChatIfNeeded()}
 function flushPendingHistoryRefresh(){
   if(!historyRefreshPending||activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive)return;
   historyRefreshPending=false;
   queueMicrotask(()=>refreshHistory());
 }
 async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')){historyRefreshPending=true;return}historyRefreshPending=false;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations)}
-async function loadModels(providerName,selected){const requestedProvider=String(providerName||'');const revision=++modelLoadRevision;model.innerHTML='<option value="">获取模型中...</option>';const data=await requestModels({provider:requestedProvider});if(revision!==modelLoadRevision||String(provider.value||'')!==requestedProvider)return false;if(data.error){fillSelect(model,[selected||'gpt-5.5'],selected||'gpt-5.5');statusEl.textContent=data.error;return false}fillSelect(model,data.models,selected||data.models[0]||'');return true}
-async function changeComposerProvider(nextProvider){const requestedProvider=String(nextProvider||'');provider.value=requestedProvider;rememberNativeComposerOverride({pending:true});syncComposerChrome();const loaded=await loadModels(requestedProvider);if(!loaded){if(String(provider.value||'')===requestedProvider&&nativeComposerOverride?.provider===requestedProvider){clearNativeComposerOverride();void syncCurrentNativeConversation()}return false}await syncNativeComposerSettings({provider:requestedProvider,model:model.value});syncComposerChrome();return true}
-async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const data=await requestModels({provider:providerName});if(data.error){defaultMsg.textContent=data.error;return}fillSelect(model,data.models,selected);defaultMsg.textContent=data.models.length?'模型列表已更新，共 '+data.models.length+' 个':'没有返回模型'}
+function composerModelItems(items,selected){const list=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];const selectedModel=String(selected||'').trim();if(selectedModel&&!list.includes(selectedModel))list.push(selectedModel);return list}
+function selectComposerModel(selected){const selectedModel=String(selected||'').trim();if(!selectedModel)return false;if(![...model.options].some((option)=>option.value===selectedModel)){const option=document.createElement('option');option.value=selectedModel;option.textContent=selectedModel;model.appendChild(option)}model.value=selectedModel;return true}
+function applyComposerModels(providerName,items,selected){const list=composerModelItems(items,selected);fillSelect(model,list,selected||list[0]||'');modelOptionsProvider=String(providerName||'')}
+function loadModels(providerName,selected,{force=false}={}){
+  const requestedProvider=String(providerName||'');
+  const selectedModel=String(selected||'').trim();
+  if(!force&&modelLoadInFlight?.provider===requestedProvider){
+    const joined=modelLoadInFlight.promise.then((loaded)=>{if(String(provider.value||'')===requestedProvider)selectComposerModel(selectedModel);return loaded});
+    composerModelLoadPromise=joined.catch(()=>false);
+    return joined;
+  }
+  if(!force&&modelListCache.has(requestedProvider)){
+    applyComposerModels(requestedProvider,modelListCache.get(requestedProvider),selectedModel);
+    composerModelLoadPromise=Promise.resolve(true);
+    return composerModelLoadPromise;
+  }
+  const revision=++modelLoadRevision;
+  modelOptionsProvider=requestedProvider;
+  model.innerHTML='<option value="">获取模型中...</option>';
+  let pending;
+  pending=(async()=>{
+    const data=await requestModels({provider:requestedProvider});
+    if(revision!==modelLoadRevision||String(provider.value||'')!==requestedProvider)return false;
+    if(data.error){applyComposerModels(requestedProvider,[],selectedModel||'gpt-5.5');statusEl.textContent=data.error;return false}
+    const items=composerModelItems(data.models,'');
+    modelListCache.set(requestedProvider,items);
+    applyComposerModels(requestedProvider,items,selectedModel||items[0]||'');
+    return true;
+  })().finally(()=>{if(modelLoadInFlight?.promise===pending)modelLoadInFlight=null});
+  modelLoadInFlight={provider:requestedProvider,promise:pending};
+  composerModelLoadPromise=pending.catch(()=>false);
+  return pending;
+}
+async function changeComposerProvider(nextProvider){
+  const requestedProvider=String(nextProvider||'');
+  const source=currentConversationSource;
+  const threadId=currentConversationId;
+  provider.value=requestedProvider;
+  rememberNativeComposerOverride({pending:true});
+  syncComposerChrome();
+  const loaded=await loadModels(requestedProvider);
+  const contextMatches=currentConversationSource===source&&currentConversationId===threadId;
+  if(!loaded||!contextMatches){
+    if(contextMatches&&String(provider.value||'')===requestedProvider&&nativeComposerOverride?.threadId===threadId&&nativeComposerOverride?.provider===requestedProvider){clearNativeComposerOverride();void syncCurrentNativeConversation()}
+    return false;
+  }
+  if(source!=='codex'||!threadId){syncComposerChrome();return true}
+  const settingsReady=await syncNativeComposerSettings({provider:requestedProvider,model:model.value});
+  syncComposerChrome();
+  return settingsReady;
+}
+function requestComposerProviderChange(nextProvider){const pending=changeComposerProvider(nextProvider);composerProviderChangePromise=pending.catch(()=>false);return pending}
+async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const loaded=await loadModels(providerName,selected,{force:true});if(!loaded){defaultMsg.textContent='模型列表更新失败';return}const count=modelListCache.get(String(providerName||''))?.length||0;defaultMsg.textContent=count?'模型列表已更新，共 '+count+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
 async function deleteSelectedProvider(){const name=provider.value;if(!name){defaultMsg.textContent='请选择要删除的具体服务商';return}if(!confirm('删除服务商 '+name+'？该操作会移除对应配置和 API Key。'))return;defaultMsg.textContent='删除中...';const res=await fetch('/api/providers/'+encodeURIComponent(name),{method:'DELETE'});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'删除失败';return}defaultMsg.textContent='已删除服务商 '+name;await boot();if(data.provider){provider.value=data.provider;await loadModels(data.provider,data.model)}statusEl.textContent='Provider deleted'}
 async function requestModels(payload){try{const res=await fetch('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();return res.ok?data:{error:data.error||'获取模型失败'}}catch(e){return{error:e.message}}}
@@ -14477,6 +14552,9 @@ function resetNewTaskComposerCwd(){
   currentNativeWorkspaceKind='';
 }
 function clearNativeComposerOverride(){nativeComposerOverride=null}
+function resetComposerProviderChange(){composerProviderChangePromise=Promise.resolve(true)}
+async function waitForLatestComposerProviderChange(){let pending;let ready;do{pending=composerProviderChangePromise;ready=await pending.catch(()=>false)}while(pending!==composerProviderChangePromise);return ready}
+async function waitForLatestComposerModelLoad(){let pending;do{pending=composerModelLoadPromise;await pending.catch(()=>false)}while(pending!==composerModelLoadPromise)}
 function rememberNativeComposerOverride({pending=false,writeId=0}={}){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
   nativeComposerOverride={threadId:currentConversationId,provider:String(provider.value||''),model:String(model.value||''),reasoningEffort:String(reasoningEffort.value||''),serviceTier:normalizeComposerServiceTier(composerServiceTier),permissionMode:composerPermissionMode,sandbox:String(sandbox.value||''),approval:String(approval.value||''),pending:Boolean(pending),writeId:Number(writeId)||0};
@@ -14530,7 +14608,7 @@ function syncNativeComposerSettings(changes={}){
   nativeComposerSettingsQueue=queued.catch(()=>false);
   return queued;
 }
-function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -14699,7 +14777,7 @@ async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   const nextConversationSource=source==='codex'?'codex':'web';
   const conversationChanged=id!==currentConversationId||nextConversationSource!==currentConversationSource;
-  if(conversationChanged)clearNativeCancelPending();
+  if(conversationChanged){clearNativeCancelPending();resetComposerProviderChange()}
   if(conversationChanged&&appQueueEditSaving){statusEl.textContent='正在保存队列修改，请稍后切换会话';return false}
   if(conversationChanged&&appQueueEditDraft){appQueueEditDraft=null;input.value='';input.style.height='auto';clearPendingAttachments()}
   if(source!=='codex'||currentConversationSource!=='codex'||currentConversationId!==id)clearNativeComposerOverride();
@@ -14748,7 +14826,10 @@ async function loadConversation(id,source='web',options={}){
   webRunActive=currentConversationSource==='codex'&&(conversation.status==='running'||Boolean(queueTurnId));
   if(!webRunActive||!nativeCancelPendingMatches(currentConversationId,activeNativeTurnId))clearNativeCancelPending();
   syncComposerContextWindow(conversation.contextWindow||null);
-  if(currentConversationSource==='codex')applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(conversation.id)});
+  if(currentConversationSource==='codex'){
+    await applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(conversation.id)});
+    if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==conversation.id)return false;
+  }
   applyConversationMode();
   updateActiveHistory();
   chat.innerHTML='';
@@ -14797,7 +14878,7 @@ function updateConversationStatus(conversation){
     statusEl.textContent='Loaded '+stamp;
   }
 }
-function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,preservePermissions=preserveProviderModel}={}){
+async function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,preservePermissions=preserveProviderModel}={}){
   currentNativeWorkspaceKind=String(metadata.workspaceKind||currentNativeWorkspaceKind||'');
   if(metadata.cwd)cwd.value=metadata.cwd;
   if(!forceFullAccess&&!preservePermissions){
@@ -14813,17 +14894,17 @@ function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,p
   }
   if(!preserveProviderModel&&Object.hasOwn(metadata,'modelProvider')){
     const modelProvider=String(metadata.modelProvider||'').trim();
-    if([...provider.options].some((opt)=>opt.value===modelProvider))provider.value=modelProvider;
+    if([...provider.options].some((opt)=>opt.value===modelProvider)){
+      provider.value=modelProvider;
+      const selectedModel=String(metadata.model||'').trim();
+      if(modelOptionsProvider!==modelProvider||modelLoadInFlight?.provider===modelProvider)await loadModels(modelProvider,selectedModel);
+      if(String(provider.value||'')!==modelProvider)return false;
+      selectComposerModel(selectedModel);
+    }
   }
   if(!preserveProviderModel&&Object.hasOwn(metadata,'model')){
     const selectedModel=String(metadata.model||'').trim();
-    if(selectedModel&&! [...model.options].some((opt)=>opt.value===selectedModel)){
-      const opt=document.createElement('option');
-      opt.value=selectedModel;
-      opt.textContent=selectedModel;
-      model.appendChild(opt);
-    }
-    model.value=selectedModel;
+    selectComposerModel(selectedModel);
   }
   if(!preserveProviderModel){
     composerServiceTier=Object.hasOwn(metadata,'serviceTier')
@@ -14837,6 +14918,7 @@ function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,p
     composerPermissionMode='full';
   }
   updateSafetyHint();
+  return true;
 }
 async function rollbackConversation(messageIndex){if(!currentConversationId||currentConversationSource==='codex')return;if(sendBtn.disabled){statusEl.textContent='任务运行中，不能回退';return}if(!confirm('重新编辑这条用户消息？这条消息及其后的所有消息都会被删除。'))return;statusEl.textContent='回退中...';const res=await fetch('/api/conversations/'+encodeURIComponent(currentConversationId)+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'回退失败';return}clearPendingAttachments();await loadConversation(data.conversation.id,'web');input.value=data.draft||'';input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';input.focus();await refreshHistory();statusEl.textContent='已回退，可重新编辑后发送'}
 let forkToastTimer=null;
@@ -14872,13 +14954,15 @@ async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=nu
     clearPendingAttachments();
     const loaded=await loadConversation(data.threadId,'codex',{conversation:data.conversation,skipPromptQueueSync:true});
     if(!loaded){
+      if(currentConversationSource!=='codex'||currentConversationId!==data.threadId)return;
       newChat();
       currentConversationId=data.threadId;
       currentConversationSource='codex';
       setCurrentConversationTitle(data.conversation?.title||'新分支','新分支');
       nativeNotice.textContent='Codex App 会话 · 历史分支';
       statusEl.textContent='Codex App · 新分支';
-      applyNativeConversationMetadata(data.conversation?.metadata||{});
+      await applyNativeConversationMetadata(data.conversation?.metadata||{});
+      if(currentConversationSource!=='codex'||currentConversationId!==data.threadId)return;
       applyConversationMode();
       updateActiveHistory();
     }
@@ -15066,8 +15150,10 @@ async function syncCurrentNativeConversationOnce(){
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
   const data=await res.json();
+  if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   const conversation=data.conversation;
-  applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
+  await applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
+  if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   syncComposerContextWindow(conversation.contextWindow||null);
   syncComposerChrome();
   let syncMessages=conversation.messages||[];
@@ -18943,6 +19029,14 @@ async function send(){
   const attachments=[...pendingAttachments];
   if((!text&&!attachments.length)||sendBtn.disabled)return;
   if(appQueueEditDraft){await saveAppQueueEdit(text);return}
+  const sendLoadSeq=conversationLoadSeq;
+  const sendConversationId=currentConversationId;
+  const sendConversationSource=currentConversationSource;
+  const providerReady=await waitForLatestComposerProviderChange();
+  await waitForLatestComposerModelLoad();
+  await nativeComposerSettingsQueue.catch(()=>false);
+  if(sendLoadSeq!==conversationLoadSeq||sendConversationId!==currentConversationId||sendConversationSource!==currentConversationSource)return;
+  if(providerReady===false){statusEl.textContent='服务商模型尚未准备好，请重新选择后再发送';return}
   const existingId=currentConversationSource==='codex'?currentConversationId:'';
   if(existingId&&webRunActive){
     enqueuePrompt(text,attachments);
