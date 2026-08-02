@@ -2961,6 +2961,181 @@ body.modalOpen {
   color: var(--success);
 }
 
+/* --- Settings dialog polish --- */
+.settingsDialog {
+  border-radius: 14px;
+  box-shadow: 0 32px 90px rgba(0, 0, 0, 0.32);
+  animation: settingsDialogIn 0.18s var(--ease);
+}
+
+@keyframes settingsDialogIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.settingsDialogHead {
+  min-height: 62px;
+  flex-basis: 62px;
+  padding: 0 16px 0 20px;
+  background: color-mix(in srgb, var(--surface-hover) 52%, var(--surface));
+}
+
+.settingsDialogTitle {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.settingsDialogHead h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 740;
+}
+
+.settingsDialogHead h2 .lucide {
+  width: 16px;
+  height: 16px;
+  color: var(--primary);
+}
+
+.settingsDialogHead p {
+  margin: 0;
+  color: var(--text-subtle);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.settingsSectionTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 720;
+  letter-spacing: 0.04em;
+}
+
+.settingsSectionTitle .lucide {
+  width: 15px;
+  height: 15px;
+  color: var(--primary);
+}
+
+.settingsDialog .settingsActions {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settingsDialog .settingsActions .miniSecondary {
+  width: auto;
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.settingsDialog .settingsDanger {
+  grid-column: 1 / -1;
+  width: max-content;
+  justify-self: start;
+}
+
+.settingsDialog .providerBox {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  padding: 4px 12px 12px;
+}
+
+.settingsDialog .providerBox summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.settingsDialog .providerBox summary::-webkit-details-marker {
+  display: none;
+}
+
+.settingsDialog .providerBox summary::after {
+  content: "";
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  border-right: 1.6px solid var(--text-muted);
+  border-bottom: 1.6px solid var(--text-muted);
+  transform: rotate(45deg);
+  transition: transform 0.18s var(--ease);
+}
+
+.settingsDialog .providerBox[open] summary::after {
+  transform: rotate(-135deg);
+}
+
+.settingsDialog .providerBox summary .lucide {
+  width: 15px;
+  height: 15px;
+  color: var(--primary);
+}
+
+.settingsDialog .providerBox form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+  gap: 10px 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.settingsDialog .providerBox form > .field {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.settingsDialog .providerBox form > .providerFetchBtn {
+  align-self: end;
+  width: 100%;
+  min-height: 40px;
+}
+
+.settingsDialog .providerBox .providerFormFooter {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px dashed var(--border);
+  padding-top: 12px;
+  margin-top: 2px;
+}
+
+.settingsDialog .providerBox .providerFormFooter .miniPrimary {
+  width: auto;
+  min-width: 160px;
+}
+
+.settingsDialog .providerBox .providerFormFooter .errorText {
+  min-width: 0;
+  margin: 0;
+}
+
 .smallrow {
   gap: 8px;
 }
@@ -10391,6 +10566,19 @@ body .composer > .box:focus-within {
   .settingsDialog .settings > *,
   .passwordForm > * {
     grid-column: 1;
+  }
+
+  .settingsDialog .providerBox form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settingsDialog .providerBox .providerFormFooter {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .settingsDialog .providerBox .providerFormFooter .miniPrimary {
+    width: 100%;
   }
 
   .dreamSkinOptions {
