@@ -135,6 +135,106 @@ test('playground updater keeps the active version when patch validation fails', 
   }
 });
 
+test('playground updater coalesces concurrent starts during async preflight', async () => {
+  let releaseFetchCalls = 0;
+  let updateCalls = 0;
+  let releaseFetchResolve;
+  let updateResolve;
+  const releaseFetchGate = new Promise((resolve) => {
+    releaseFetchResolve = resolve;
+  });
+  const updateGate = new Promise((resolve) => {
+    updateResolve = resolve;
+  });
+  const updater = new PlaygroundUpdater({
+    runtimeDir: path.join(tmpdir(), 'codex-web-playground-concurrent-runtime'),
+    vendorDir: path.join(tmpdir(), 'codex-web-playground-concurrent-vendor'),
+    patchDir: path.join(tmpdir(), 'codex-web-playground-concurrent-patches'),
+  });
+  updater.readCurrentVersion = async () => ({ version: '0.7.1', tag: 'v0.7.1', source: 'runtime' });
+  updater.fetchLatestRelease = async ({ force = false } = {}) => {
+    releaseFetchCalls += 1;
+    assert.equal(force, true);
+    await releaseFetchGate;
+    return { version: '0.7.2', tag: 'v0.7.2' };
+  };
+  updater.performUpdate = async () => {
+    updateCalls += 1;
+    await updateGate;
+    return { version: '0.7.2', tag: 'v0.7.2', updatedAt: '2026-07-31T00:00:00.000Z' };
+  };
+
+  const first = updater.startUpdate();
+  const second = updater.startUpdate();
+  let idleResolved = false;
+  const idle = updater.waitForIdle().then((result) => {
+    idleResolved = true;
+    return result;
+  });
+  await Promise.resolve();
+  assert.equal(releaseFetchCalls, 1);
+  assert.equal(idleResolved, false);
+  releaseFetchResolve();
+  const started = await Promise.all([first, second]);
+  assert.deepEqual(started.map((status) => status.status), ['updating', 'updating']);
+  await Promise.resolve();
+  assert.equal(idleResolved, false);
+  updateResolve();
+  const completed = await idle;
+  assert.equal(completed.status, 'success');
+  assert.equal(updateCalls, 1);
+});
+
+test('playground updater can force a release refresh without discarding its cache first', async () => {
+  let releaseFetchCalls = 0;
+  const updater = new PlaygroundUpdater({
+    runtimeDir: path.join(tmpdir(), 'codex-web-playground-refresh-runtime'),
+    vendorDir: path.join(tmpdir(), 'codex-web-playground-refresh-vendor'),
+    patchDir: path.join(tmpdir(), 'codex-web-playground-refresh-patches'),
+    fetchImpl: async () => {
+      releaseFetchCalls += 1;
+      const tag = releaseFetchCalls === 1 ? 'v0.7.2' : 'v0.7.3';
+      return new Response(JSON.stringify({ tag_name: tag }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+  });
+  updater.readCurrentVersion = async () => ({ version: '0.7.1', tag: 'v0.7.1', source: 'runtime' });
+
+  assert.equal((await updater.getStatus()).latestVersion, '0.7.2');
+  assert.equal((await updater.getStatus()).latestVersion, '0.7.2');
+  assert.equal(releaseFetchCalls, 1);
+  assert.equal((await updater.getStatus({ refresh: true })).latestVersion, '0.7.3');
+  assert.equal(releaseFetchCalls, 2);
+});
+
+test('playground updater reads the served previous version while current is absent', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-playground-previous-'));
+  const runtimeDir = path.join(temporary, 'runtime');
+  const packageDir = path.join(temporary, 'vendor', 'gpt-image-playground');
+  try {
+    await mkdir(path.join(runtimeDir, 'previous'), { recursive: true });
+    await mkdir(path.join(packageDir, 'app'), { recursive: true });
+    await writeFile(
+      path.join(runtimeDir, 'previous', 'codex-web-version.json'),
+      '{"tag":"v0.7.2","version":"0.7.2"}\n',
+    );
+    await writeFile(path.join(packageDir, 'NOTICE.md'), '- Version: `0.7.1`\n');
+    const updater = new PlaygroundUpdater({
+      runtimeDir,
+      vendorDir: path.join(packageDir, 'app'),
+      patchDir: path.join(packageDir, 'patches'),
+    });
+
+    const current = await updater.readCurrentVersion();
+    assert.equal(current.version, '0.7.2');
+    assert.equal(current.source, 'runtime');
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('playground updater helpers accept only ordered stable versions and inject assets once', () => {
   assert.ok(compareVersions('0.7.2', '0.7.1') > 0);
   assert.equal(compareVersions('v0.7.2', '0.7.2'), 0);

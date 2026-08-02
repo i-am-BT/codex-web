@@ -324,18 +324,7 @@ export class SubQuotaService {
         signal: controller.signal,
       });
       const bodyText = await readLimitedBody(response, MAX_RESPONSE_BYTES);
-      const limits = normalizeSub2ApiRateLimitProbe(response.headers, bodyText, this.now());
-      if (limits.length || !response.ok) return limits;
-      return [{
-        window: '5h',
-        used: null,
-        limit: null,
-        remaining: null,
-        windowStart: '',
-        resetAt: '',
-        unit: '%',
-        availability: 'available',
-      }];
+      return normalizeSub2ApiRateLimitProbe(response.headers, bodyText, this.now());
     } finally {
       clearTimeout(timeout);
     }

@@ -34,6 +34,7 @@ export class PlaygroundUpdater {
     this.currentDir = path.join(this.runtimeDir, 'current');
     this.previousDir = path.join(this.runtimeDir, 'previous');
     this.latestCache = null;
+    this.startPromise = null;
     this.updatePromise = null;
     this.state = {
       status: 'idle',
@@ -49,9 +50,14 @@ export class PlaygroundUpdater {
     let latest = this.latestCache?.release || null;
     let checkError = '';
 
-    if (this.enabled && !this.updatePromise && (refresh || !this.latestCache || Date.now() - this.latestCache.checkedAt > LATEST_CACHE_MS)) {
+    if (
+      this.enabled
+      && !this.startPromise
+      && !this.updatePromise
+      && (refresh || !this.latestCache || Date.now() - this.latestCache.checkedAt > LATEST_CACHE_MS)
+    ) {
       try {
-        latest = await this.fetchLatestRelease();
+        latest = await this.fetchLatestRelease({ force: refresh });
       } catch (error) {
         checkError = cleanError(error);
       }
@@ -62,10 +68,21 @@ export class PlaygroundUpdater {
 
   async startUpdate() {
     if (!this.enabled) throw statusError(403, '生图工作台在线更新已禁用');
+    if (this.startPromise) return this.startPromise;
     if (this.updatePromise) return this.getStatus();
 
+    const startPromise = this.prepareUpdate();
+    this.startPromise = startPromise;
+    try {
+      return await startPromise;
+    } finally {
+      if (this.startPromise === startPromise) this.startPromise = null;
+    }
+  }
+
+  async prepareUpdate() {
     const current = await this.readCurrentVersion();
-    const latest = await this.fetchLatestRelease();
+    const latest = await this.fetchLatestRelease({ force: true });
     if (compareVersions(latest.version, current.version) <= 0) {
       this.state = {
         status: 'success',
@@ -84,7 +101,7 @@ export class PlaygroundUpdater {
       message: `正在更新到 ${latest.tag}`,
       updatedAt: null,
     };
-    this.updatePromise = this.performUpdate(current, latest)
+    const updatePromise = this.performUpdate(current, latest)
       .then((installed) => {
         this.state = {
           status: 'success',
@@ -106,19 +123,21 @@ export class PlaygroundUpdater {
         return null;
       })
       .finally(() => {
-        this.updatePromise = null;
+        if (this.updatePromise === updatePromise) this.updatePromise = null;
       });
+    this.updatePromise = updatePromise;
 
     return this.publicStatus(current, latest);
   }
 
   async waitForIdle() {
+    if (this.startPromise) await this.startPromise;
     if (this.updatePromise) await this.updatePromise;
     return this.getStatus();
   }
 
-  async fetchLatestRelease() {
-    if (this.latestCache && Date.now() - this.latestCache.checkedAt <= LATEST_CACHE_MS) {
+  async fetchLatestRelease({ force = false } = {}) {
+    if (!force && this.latestCache && Date.now() - this.latestCache.checkedAt <= LATEST_CACHE_MS) {
       return this.latestCache.release;
     }
 
@@ -273,6 +292,14 @@ export class PlaygroundUpdater {
       const version = normalizeVersion(payload.version || payload.tag);
       if (version) return { ...payload, version, tag: payload.tag || `v${version}`, source: 'runtime' };
     } catch {}
+
+    if (!existsSync(this.currentDir)) {
+      try {
+        const payload = JSON.parse(await readFile(path.join(this.previousDir, 'codex-web-version.json'), 'utf8'));
+        const version = normalizeVersion(payload.version || payload.tag);
+        if (version) return { ...payload, version, tag: payload.tag || `v${version}`, source: 'runtime' };
+      } catch {}
+    }
 
     try {
       const notice = await readFile(path.join(path.dirname(this.vendorDir), 'NOTICE.md'), 'utf8');

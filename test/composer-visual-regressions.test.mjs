@@ -18,6 +18,24 @@ test('new-task composer treats project selection as optional', () => {
   assert.match(serverSource, /直接输入任务；项目路径可选。/);
 });
 
+test('running output can jump back to the latest item without joining the composer layout', () => {
+  assert.match(serverSource, /jumpToLatest\.id='jumpToLatest'/);
+  assert.match(serverSource, /jumpToLatest\.setAttribute\('aria-controls','chat'\)/);
+  assert.match(serverSource, /jumpToLatestDots\.className='jumpToLatestDots'/);
+  assert.match(serverSource, /jumpToLatestDots\.setAttribute\('aria-hidden','true'\)/);
+  assert.match(serverSource, /for\(let index=0;index<3;index\+=1\)\{[\s\S]*?jumpToLatestDot\.className='jumpToLatestDot'/);
+  assert.match(serverSource, /jumpToLatest\?\.addEventListener\('click',scrollToLatestOutput\)/);
+  assert.match(serverSource, /function updateJumpToLatestButton\(\)[\s\S]*?activeMainView==='chat'[\s\S]*?currentConversationSource==='codex'[\s\S]*?webRunActive[\s\S]*?!nativeLiveFollowBottom/s);
+  assert.match(serverSource, /function scrollToLatestOutput\(\)[\s\S]*?chat\.scrollTo\(\{top:chat\.scrollHeight,behavior:reducedMotion\?'auto':'smooth'\}\)/);
+  assert.match(uiStyles, /body \.main > \.jumpToLatest\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*9;[^}]*bottom:\s*calc\(var\(--composer-overlay-height, 156px\) \+ 16px\);[^}]*width:\s*40px;[^}]*height:\s*40px;[^}]*box-shadow:\s*none/s);
+  assert.match(uiStyles, /body \.main > \.jumpToLatest \.jumpToLatestDot\s*\{[^}]*width:\s*4px;[^}]*height:\s*4px;[^}]*background:\s*currentColor/s);
+  assert.match(uiStyles, /body \.main > \.jumpToLatest:not\(\.hidden\) \.jumpToLatestDot\s*\{[^}]*animation:\s*jumpToLatestDotFloat 720ms/s);
+  assert.match(uiStyles, /@keyframes jumpToLatestDotFloat\s*\{[\s\S]*?transform:\s*translateY\(-2px\)/);
+  assert.match(uiStyles, /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?body \.main > \.jumpToLatest \.jumpToLatestDot\s*\{[^}]*animation:\s*none;[^}]*transform:\s*none/s);
+  assert.match(uiStyles, /@media\(max-width:820px\)\s*\{[\s\S]*?body \.main > \.jumpToLatest\s*\{[^}]*bottom:\s*calc\(var\(--composer-overlay-height, 132px\) \+ 12px\);[^}]*width:\s*44px;[^}]*height:\s*44px/s);
+  assert.doesNotMatch(uiStyles.match(/body \.main > \.jumpToLatest\s*\{[^}]*\}/)?.[0] || '', /keyboard-inset|safe-area-inset/);
+});
+
 test('composer project row and queued prompts share the native visual surface', () => {
   assert.match(
     uiStyles,
@@ -102,7 +120,7 @@ test('running history dots stay before App without changing the row grid', () =>
   );
   assert.match(
     uiStyles,
-    /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-12px;[^}]*pointer-events:\s*none/s,
+    /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-7px;[^}]*pointer-events:\s*none/s,
   );
   assert.match(
     serverSource,

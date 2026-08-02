@@ -85,3 +85,21 @@ process.stdin.on('data', (chunk) => {
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test('retries one timed-out initialize before sending a request', async () => {
+  const client = new CodexAppServerClient({
+    initializeRetryCount: 1,
+    initializeRetryDelayMs: 1,
+  });
+  let attempts = 0;
+  client.spawnAndInitialize = async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('Codex app-server \u8bf7\u6c42\u8d85\u65f6: initialize');
+    client.initialized = true;
+  };
+
+  await client.start();
+
+  assert.equal(attempts, 2);
+  assert.equal(client.initialized, true);
+});

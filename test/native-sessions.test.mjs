@@ -276,7 +276,10 @@ This block is automatically supplied ambient UI state, not part of the user's re
       {
         timestamp: '2026-07-11T04:52:32.004Z',
         type: 'compacted',
-        payload: { replacement_history: [] },
+        payload: {
+          message: 'Another language model started to solve this problem.\n**Current Task**\nInternal handoff summary',
+          replacement_history: [],
+        },
       },
       {
         timestamp: '2026-07-11T04:52:32.004Z',
@@ -1477,6 +1480,106 @@ test('native session store supports Codex state databases without recency_at_ms'
   }
 });
 
+test('native session store refreshes state-only model and reasoning changes without recency movement', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-thread-settings-state-'));
+  const codexHome = path.join(temporary, '.codex');
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '01');
+  const id = '019f4f84-ea9f-73c2-b997-deba7b4aa713';
+  const sessionFile = path.join(sessionDir, `rollout-2026-08-01T10-00-00-${id}.jsonl`);
+  const initialUpdatedAtMs = 1785578400000;
+  const recencyAtMs = 1785578460000;
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([{
+      timestamp: '2026-08-01T02:00:00.000Z',
+      type: 'session_meta',
+      payload: { id, cwd: '/workspace', source: 'vscode' },
+    }]));
+
+    const dbFile = path.join(codexHome, 'state_5.sqlite');
+    const db = new DatabaseSync(dbFile);
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL,
+        source TEXT NOT NULL,
+        cwd TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        archived INTEGER NOT NULL DEFAULT 0,
+        preview TEXT NOT NULL DEFAULT '',
+        cli_version TEXT NOT NULL DEFAULT '',
+        thread_source TEXT,
+        model TEXT,
+        reasoning_effort TEXT,
+        created_at_ms INTEGER,
+        updated_at_ms INTEGER,
+        recency_at_ms INTEGER
+      )
+    `);
+    db.prepare(`
+      INSERT INTO threads (
+        id, rollout_path, source, cwd, title, archived, preview, cli_version, thread_source,
+        model, reasoning_effort, created_at_ms, updated_at_ms, recency_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      sessionFile,
+      'vscode',
+      '/workspace',
+      'State settings fixture',
+      0,
+      'preview',
+      'test',
+      'user',
+      'gpt-5.5',
+      'high',
+      initialUpdatedAtMs - 1000,
+      initialUpdatedAtMs,
+      recencyAtMs,
+    );
+    db.close();
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const initialConversation = store.get(id);
+    assert.equal(initialConversation?.metadata.model, 'gpt-5.5');
+    assert.equal(initialConversation?.metadata.reasoningEffort, 'high');
+    const initialEntry = store.entries.get(id);
+    assert.equal(initialEntry?.recencyMs, recencyAtMs);
+
+    const changes = [];
+    store.on('change', (change) => changes.push(change));
+    const writer = new DatabaseSync(dbFile);
+    const previousTimestamps = writer.prepare(
+      'SELECT updated_at_ms, recency_at_ms FROM threads WHERE id = ?',
+    ).get(id);
+    writer.prepare(
+      'UPDATE threads SET model = ?, reasoning_effort = ?, updated_at_ms = ? WHERE id = ?',
+    ).run('gpt-5.6-terra', 'xhigh', initialUpdatedAtMs + 1000, id);
+    const updatedTimestamps = writer.prepare(
+      'SELECT updated_at_ms, recency_at_ms FROM threads WHERE id = ?',
+    ).get(id);
+    assert.equal(updatedTimestamps.updated_at_ms, initialUpdatedAtMs + 1000);
+    assert.equal(updatedTimestamps.recency_at_ms, recencyAtMs);
+    assert.equal(previousTimestamps.recency_at_ms, recencyAtMs);
+    writer.close();
+
+    store.refresh();
+    assert.equal(changes.length, 1);
+    assert.deepEqual(changes[0].changedIds, [id]);
+    assert.equal(store.entries.get(id)?.recencyMs, recencyAtMs);
+    assert.equal(store.entries.get(id)?.mtimeMs, initialEntry?.mtimeMs);
+    const refreshedConversation = store.get(id);
+    assert.equal(refreshedConversation?.metadata.model, 'gpt-5.6-terra');
+    assert.equal(refreshedConversation?.metadata.reasoningEffort, 'xhigh');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('native session store merges consecutive same-turn assistant segments into one copyable message', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-assistant-merge-'));
   const codexHome = path.join(temporary, '.codex');
@@ -1659,7 +1762,7 @@ test('native session store merges consecutive same-turn assistant segments into 
   }
 });
 
-test('hides hash-title handoff agent summaries from web history', async () => {
+test('hides structured handoff summaries without hiding ordinary task headings', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-handoff-hide-'));
   const codexHome = path.join(temporary, '.codex');
   const id = '019f8873-f27d-70b2-8946-25f4e14e80d7';
@@ -1756,6 +1859,20 @@ test('hides hash-title handoff agent summaries from web history', async () => {
         },
       },
       {
+        timestamp: '2026-07-23T10:00:02.800Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: [
+            '## 当前任务',
+            '',
+            '已完成用户可见的样式修复，等待验收。',
+          ].join('\n') }],
+        },
+      },
+      {
         timestamp: '2026-07-23T10:00:02.875Z',
         type: 'response_item',
         payload: {
@@ -1833,10 +1950,10 @@ test('hides hash-title handoff agent summaries from web history', async () => {
     const conversation = store.get(id);
     assert.ok(conversation);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Handoff: Codex Web UI')), false);
-    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Current Progress')), false);
+    assert.ok(conversation.messages.some((message) => String(message.content || '').includes('Current Progress')));
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Context checkpoint')), false);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('fix/internal-summary')), false);
-    assert.equal(conversation.messages.some((message) => String(message.content || '').includes('Send the final response')), false);
+    assert.ok(conversation.messages.some((message) => String(message.content || '').includes('Send the final response')));
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('remove the visible scrollbar')), false);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('internal handoff was rendered')), false);
     assert.equal(conversation.messages.some((message) => String(message.content || '').includes('当前源码仍是上一轮')), false);
@@ -1844,6 +1961,10 @@ test('hides hash-title handoff agent summaries from web history', async () => {
     assert.ok(conversation.messages.some((message) => (
       message.role === 'assistant'
       && message.content.includes('没有清理或回滚；等待用户验收')
+    )));
+    assert.ok(conversation.messages.some((message) => (
+      message.role === 'assistant'
+      && message.content.includes('已完成用户可见的样式修复，等待验收')
     )));
     assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content.includes('已隐藏交接摘要')));
   } finally {
@@ -2126,7 +2247,7 @@ test('collapses consecutive rolled-back retries into the latest logical reply', 
   }
 });
 
-test('native session store prefers user/assistant history over trailing tool spam', async () => {
+test('native session store preserves user, assistant, and terminal turn boundaries over trailing tool spam', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-trim-'));
   const codexHome = path.join(temporary, '.codex');
   const id = '019fa8b3-09e8-75a0-abd8-5ece634e5144';
@@ -2136,6 +2257,7 @@ test('native session store prefers user/assistant history over trailing tool spa
 
   try {
     await mkdir(sessionDir, { recursive: true });
+    const terminalKinds = ['task_complete', 'task_error', 'turn_aborted', 'error'];
     const records = [
       {
         timestamp: '2026-07-28T12:00:00.000Z',
@@ -2148,31 +2270,47 @@ test('native session store prefers user/assistant history over trailing tool spa
           source: 'vscode',
         },
       },
-      {
-        timestamp: '2026-07-28T12:00:01.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_started', turn_id: 'turn-trim' },
-      },
-      {
-        timestamp: '2026-07-28T12:00:02.000Z',
-        type: 'response_item',
-        payload: {
-          type: 'message',
-          role: 'user',
-          content: [{ type: 'input_text', text: '保留用户正文' }],
-        },
-      },
-      {
-        timestamp: '2026-07-28T12:00:03.000Z',
-        type: 'response_item',
-        payload: {
-          type: 'message',
-          role: 'assistant',
-          phase: 'commentary',
-          content: [{ type: 'output_text', text: '保留助手正文' }],
-        },
-      },
     ];
+    for (const [index, kind] of terminalKinds.entries()) {
+      const turnId = `turn-trim-${index + 1}`;
+      const second = String(index + 1).padStart(2, '0');
+      records.push(
+        {
+          timestamp: `2026-07-28T12:00:${second}.000Z`,
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: turnId },
+        },
+        {
+          timestamp: `2026-07-28T12:00:${second}.100Z`,
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `保留用户正文-${kind}` }],
+          },
+        },
+        {
+          timestamp: `2026-07-28T12:00:${second}.200Z`,
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'final_answer',
+            content: [{ type: 'output_text', text: `保留助手正文-${kind}` }],
+          },
+        },
+        {
+          timestamp: `2026-07-28T12:00:${second}.300Z`,
+          type: 'event_msg',
+          payload: {
+            type: kind,
+            turn_id: turnId,
+            duration_ms: kind === 'task_complete' ? 1000 : undefined,
+            message: kind === 'task_complete' ? undefined : `${kind} terminal`,
+          },
+        },
+      );
+    }
     for (let index = 0; index < 40; index += 1) {
       const stamp = String(index).padStart(2, '0');
       records.push({
@@ -2206,14 +2344,27 @@ test('native session store prefers user/assistant history over trailing tool spa
 
     const conversation = store.get(id);
     assert.equal(conversation.truncated, true);
-    assert.ok(conversation.messages.some((message) => message.role === 'user' && message.content === '保留用户正文'));
-    assert.ok(conversation.messages.some((message) => message.role === 'assistant' && message.content === '保留助手正文'));
+    assert.deepEqual(
+      conversation.messages.filter((message) => message.role === 'user').map((message) => message.content),
+      terminalKinds.map((kind) => `保留用户正文-${kind}`),
+    );
+    assert.deepEqual(
+      conversation.messages.filter((message) => message.role === 'assistant').map((message) => message.content),
+      terminalKinds.map((kind) => `保留助手正文-${kind}`),
+    );
+    assert.deepEqual(
+      conversation.messages
+        .filter((message) => message.role === 'process' && terminalKinds.includes(message.kind))
+        .map((message) => ({ kind: message.kind, turnId: message.turnId })),
+      terminalKinds.map((kind, index) => ({ kind, turnId: `turn-trim-${index + 1}` })),
+    );
     assert.ok(conversation.messages.length <= 12);
-    assert.ok(conversation.messages.filter((message) => message.role === 'tool').length <= 10);
+    assert.equal(conversation.messages.filter((message) => message.role === 'tool').length, 0);
 
     const limited = store.get(id, { limit: 8 });
-    assert.ok(limited.messages.some((message) => message.role === 'user' && message.content === '保留用户正文'));
-    assert.ok(limited.messages.some((message) => message.role === 'assistant' && message.content === '保留助手正文'));
+    assert.ok(limited.messages.some((message) => message.role === 'user' && message.content === '保留用户正文-error'));
+    assert.ok(limited.messages.some((message) => message.role === 'assistant' && message.content === '保留助手正文-error'));
+    assert.ok(limited.messages.some((message) => message.role === 'process' && message.kind === 'error'));
     assert.ok(limited.messages.length <= 8);
     assert.equal(limited.hasEarlierMessages, true);
   } finally {

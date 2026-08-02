@@ -108,7 +108,8 @@ test('the pinned section renders above tasks, collapses independently, and marks
   assert.match(rowSource, /if\(source==='codex'\)\{\s*if\(running\)row\.appendChild\(running\);[\s\S]*row\.appendChild\(badge\);\s*}\s*row\.appendChild\(open\)/);
   assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
   assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
-  assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-12px;[^}]*pointer-events:\s*none/s);
+  assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*2;[^}]*left:\s*-7px;[^}]*pointer-events:\s*none/s);
+  assert.match(uiStyles, /\.histCompletionUnread\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-7px;[^}]*background:\s*var\(--info\);[^}]*pointer-events:\s*none/s);
   assert.match(uiStyles, /\.historyPinned,\s*\.historySidebarTasks,\s*\.historyTasks\s*\{[^}]*display:\s*grid/s);
   assert.match(uiStyles, /\.historyPinnedItems\[hidden\],\s*\.historySidebarItems\[hidden\],\s*\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
   assert.match(uiStyles, /\.historyPinnedHead\[aria-expanded="true"\] \.historyPinnedChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);
@@ -127,6 +128,80 @@ test('history rename uses an inline editor instead of a browser prompt', () => {
   assert.match(uiStyles, /\.histRenameInput\s*\{[^}]*height:\s*28px;[^}]*font-size:\s*12px/s);
 });
 
+test('history rename closes its inline editor after a successful Enter save', async () => {
+  const renameSource = sourceBetween('function beginHistoryRename', 'async function renameConversation');
+  const classes = new Set();
+  const statusEl = { textContent: '' };
+  const open = { isConnected: true };
+  const row = {
+    child: open,
+    classList: {
+      add: (...names) => names.forEach((name) => classes.add(name)),
+      remove: (...names) => names.forEach((name) => classes.delete(name)),
+      contains: (name) => classes.has(name),
+    },
+    replaceChild(next, previous) {
+      assert.equal(this.child, previous);
+      this.child = next;
+      previous.isConnected = false;
+      next.isConnected = true;
+    },
+  };
+  const makeInput = () => {
+    const listeners = new Map();
+    return {
+      isConnected: false,
+      value: '',
+      addEventListener(type, listener) { listeners.set(type, listener); },
+      dispatch(type, event) { return listeners.get(type)?.(event); },
+      setAttribute() {},
+      focus() {},
+      select() {},
+      replaceWith(next) {
+        assert.equal(row.child, this);
+        row.child = next;
+        this.isConnected = false;
+        next.isConnected = true;
+      },
+    };
+  };
+  let refreshes = 0;
+  const api = new Function(
+    'document',
+    'statusEl',
+    'flushPendingHistoryRefresh',
+    'renameConversation',
+    'refreshHistory',
+    'requestAnimationFrame',
+    `
+      let historyRenameActive = false;
+      ${renameSource}
+      return { beginHistoryRename, isActive: () => historyRenameActive };
+    `,
+  )(
+    { createElement: () => makeInput() },
+    statusEl,
+    () => {},
+    async () => true,
+    async () => { refreshes += 1; },
+    (callback) => callback(),
+  );
+
+  api.beginHistoryRename(row, open, { id: 'rename-1', title: '旧标题' });
+  const input = row.child;
+  input.value = '新标题';
+  let prevented = false;
+  input.dispatch('keydown', { key: 'Enter', preventDefault: () => { prevented = true; } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(prevented, true);
+  assert.equal(row.child, open, 'successful saves must restore the title button');
+  assert.equal(classes.has('renaming'), false);
+  assert.equal(api.isActive(), false);
+  assert.equal(refreshes, 1);
+  assert.equal(statusEl.textContent, '标题已更新');
+});
+
 test('native history archiving uses an in-app confirmation card', () => {
   const archiveSource = sourceBetween('function ensureArchiveConfirmDialog', 'function sidebarCollapsedPreference');
   const rowSource = sourceBetween('function createHistoryRow', 'function updateActiveHistory');
@@ -140,6 +215,11 @@ test('native history archiving uses an in-app confirmation card', () => {
   assert.match(archiveSource, /if\(!confirm\('删除会话：'\+title\+'？'\)\)return/);
   assert.match(archiveSource, /fallbackRow=archiveConfirmReturnKey\?\[\.\.\.history\.querySelectorAll\('\.hist'\)\]\.find\(\(row\)=>row\.dataset\.key===archiveConfirmReturnKey\):null/);
   assert.match(archiveSource, /fallbackRow\?\.querySelector\('\.histDelete'\)/);
+  assert.match(archiveSource, /const visibleRows=\[\.\.\.history\.querySelectorAll\('\.hist'\)\]\.filter\(\(row\)=>!row\.closest\('\[hidden\]'\)\)/);
+  assert.match(archiveSource, /visibleRows\[triggerRowIndex\+1\]\|\|visibleRows\[triggerRowIndex-1\]/);
+  assert.match(archiveSource, /const adjacentRow=adjacentKey\?\[\.\.\.history\.querySelectorAll\('\.hist'\)\]\.find\(\(row\)=>row\.dataset\.key===adjacentKey\):null/);
+  assert.match(archiveSource, /const nextFocus=adjacentRow\?\.querySelector\('\.histOpen'\)\|\|document\.getElementById\('newChat'\)/);
+  assert.match(archiveSource, /requestAnimationFrame\(\(\)=>nextFocus\?\.focus\(\)\)/);
   assert.match(rowSource, /deleteConversation\(item\.id,item\.title,source,del\)/);
   assert.match(inlineScript, /if\(archiveConfirmOverlay&&!archiveConfirmOverlay\.classList\.contains\('hidden'\)\)\{closeArchiveConfirm\(\);return\}/);
   assert.match(uiStyles, /\.archiveConfirmDialog\s*\{[^}]*border-radius:\s*8px/s);
