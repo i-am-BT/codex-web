@@ -70,6 +70,15 @@ const IMAGE_DIR = path.join(RUNTIME_DIR, 'images');
 const FILE_DIR = path.join(RUNTIME_DIR, 'files');
 const BACKGROUND_DIR = path.join(RUNTIME_DIR, 'backgrounds');
 const IMAGE_PROMPT_CACHE_DIR = path.join(RUNTIME_DIR, 'image-prompts');
+const SUB_QUOTA_DEFAULT_ORDER = ['cpa-codex', 'sub2api', 'grok2api', 'deepseek'];
+const DEEPSEEK_USAGE_FILE = path.join(RUNTIME_DIR, 'deepseek-usage.json');
+const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com';
+const DEEPSEEK_PRICE_TABLE = {
+  'deepseek-v4-pro': { input: 0.435, cached: 0.003625, output: 0.87 },
+  'deepseek-v4-flash': { input: 0.14, cached: 0.0028, output: 0.28 },
+  'deepseek-reasoner': { input: 0.55, cached: 0.14, output: 2.19 },
+  'deepseek-chat': { input: 0.28, cached: 0.028, output: 0.42 },
+};
 const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
 const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
 const PLAYGROUND_PREVIOUS_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'previous');
@@ -704,7 +713,14 @@ app.get('/api/automations', requireAuth, (_req, res) => {
 app.get('/api/sub-quotas', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   try {
-    res.json(await subQuotaService.list({ refresh: req.query.refresh === '1' }));
+    const data = await subQuotaService.list({ refresh: req.query.refresh === '1' });
+    if (Array.isArray(data.quotas)) {
+      const deepSeekStats = readDeepSeekUsageStats();
+      for (const quota of data.quotas) {
+        if (quota.provider === 'deepseek' && deepSeekStats) quota.usageStats = deepSeekStats;
+      }
+    }
+    res.json(data);
   } catch (err) {
     res.status(502).json({ error: `读取额度失败: ${err.message}` });
   }
@@ -761,6 +777,7 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
         'cpa-codex': emptySubQuotaConfig('cpa-codex'),
         sub2api: emptySubQuotaConfig('sub2api'),
         grok2api: emptySubQuotaConfig('grok2api'),
+        deepseek: emptySubQuotaConfig('deepseek'),
       };
     for (const requested of requestedSources) {
       const existing = subQuotaConfigs[requested.provider] || emptySubQuotaConfig(requested.provider);
@@ -774,10 +791,18 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
       if (apiKey) validateSubQuotaApiKey(apiKey);
       const provider = normalizeSubQuotaProvider(requested.provider);
       nextConfigs[provider] = {
+        ...(existing.provider === provider ? { order: existing.order } : {}),
         provider,
         baseUrl: normalizeSubQuotaBaseUrl(rawBaseUrl, { provider }),
         apiKey,
       };
+    }
+    const requestedOrder = normalizeSubQuotaOrderRequest(req.body?.order);
+    if (requestedOrder) {
+      for (const provider of SUB_QUOTA_DEFAULT_ORDER) {
+        const current = nextConfigs[provider] || emptySubQuotaConfig(provider);
+        nextConfigs[provider] = { ...current, order: requestedOrder.indexOf(provider) };
+      }
     }
     const configured = configuredSubQuotaConfigs(nextConfigs);
 
@@ -2031,6 +2056,9 @@ app.post('/api/chat', requireAuth, (req, res) => {
   writeEvent(res, { type: 'process', content: startContent, kind: 'task_started' });
   writeEvent(res, { type: 'tool', content: `执行 codex\n${redactArgs(args).join(' ')}`, kind: 'codex_exec' });
 
+  const deepSeekActive = isDeepSeekCodexProvider(provider);
+  const deepSeekTurnUsage = { input: 0, cached: 0, output: 0, total: 0, requests: 0, seen: 0 };
+
   const child = spawn(CODEX_BIN, args, {
     cwd,
     env: { ...process.env, ...buildCodexProcessEnvironment() },
@@ -2055,17 +2083,22 @@ app.post('/api/chat', requireAuth, (req, res) => {
 
   child.stdin.end(buildConversationPrompt(convo, model));
 
-  child.stdout.on('data', (chunk) => {
-    rawBuffer += chunk.toString();
-    const lines = rawBuffer.split('\n');
-    rawBuffer = lines.pop() || '';
-    for (const line of lines) parseCodexEvent(line, res, convo, (text) => {
+  const processCodexLine = (line) => {
+    if (deepSeekActive) captureDeepSeekTurnUsage(line, deepSeekTurnUsage);
+    parseCodexEvent(line, res, convo, (text) => {
       finalText = text;
       if (text !== lastText) {
         lastText = text;
         appendMessage(convo, 'assistant', text, 'text');
       }
     });
+  };
+
+  child.stdout.on('data', (chunk) => {
+    rawBuffer += chunk.toString();
+    const lines = rawBuffer.split('\n');
+    rawBuffer = lines.pop() || '';
+    for (const line of lines) processCodexLine(line);
   });
 
   child.stderr.on('data', (chunk) => {
@@ -2086,10 +2119,10 @@ app.post('/api/chat', requireAuth, (req, res) => {
 
   child.on('close', (code) => {
     finished = true;
-    if (rawBuffer.trim()) parseCodexEvent(rawBuffer, res, convo, (text) => {
-      finalText = text;
-      if (text !== lastText) appendMessage(convo, 'assistant', text, 'text');
-    });
+    if (rawBuffer.trim()) processCodexLine(rawBuffer);
+    if (deepSeekActive && deepSeekTurnUsage.total > 0) {
+      accumulateDeepSeekUsage(model, deepSeekTurnUsage);
+    }
     activeProcess = null;
     activeConversationId = '';
     convo.status = code === 0 ? 'done' : 'error';
@@ -2329,6 +2362,87 @@ function saveAppearance(next) {
     : cleanChatBackground(next.chatBackground, appearance.customBackgrounds);
   writeFileSync(APPEARANCE_FILE, JSON.stringify(appearance, null, 2), { mode: 0o600 });
   return appearance;
+}
+
+function isDeepSeekCodexProvider(providerName) {
+  const name = cleanValue(providerName);
+  if (!name) return false;
+  const detail = readProviderDetails().find((item) => item.name === name);
+  return Boolean(detail && String(detail.baseUrl || '').includes('api.deepseek.com'));
+}
+
+function captureDeepSeekTurnUsage(line, usage) {
+  if (!usage || !line) return;
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return;
+  }
+  const payload = event?.payload || event?.item || event?.msg || event;
+  if (String(payload?.type || event?.type || '') !== 'token_count') return;
+  const info = payload?.info && typeof payload.info === 'object' && !Array.isArray(payload.info) ? payload.info : {};
+  const u = info.total_token_usage || info.last_token_usage;
+  if (!u || typeof u !== 'object' || Array.isArray(u)) return;
+  const total = Number(u.total_tokens);
+  if (!Number.isFinite(total) || total <= 0) return;
+  if (total > usage.seen) {
+    usage.requests += 1;
+    usage.seen = total;
+    usage.input = Math.max(usage.input, Number(u.input_tokens) || 0);
+    usage.cached = Math.max(usage.cached, Number(u.cached_input_tokens) || 0);
+    usage.output = Math.max(usage.output, Number(u.output_tokens) || 0);
+    usage.total = Math.max(usage.total, total);
+  }
+}
+
+function deepSeekPriceFor(model) {
+  const key = String(model || '').trim().toLowerCase();
+  return DEEPSEEK_PRICE_TABLE[key] || DEEPSEEK_PRICE_TABLE['deepseek-v4-flash'];
+}
+
+function readDeepSeekUsageStats() {
+  try {
+    if (!existsSync(DEEPSEEK_USAGE_FILE)) return null;
+    const data = JSON.parse(readFileSync(DEEPSEEK_USAGE_FILE, 'utf8'));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    return {
+      totalTokens: Number(data.totalTokens) || 0,
+      inputTokens: Number(data.inputTokens) || 0,
+      outputTokens: Number(data.outputTokens) || 0,
+      cachedInputTokens: Number(data.cachedInputTokens) || 0,
+      cost: Number(data.cost) || 0,
+      requests: Number(data.requests) || 0,
+      updatedAt: String(data.updatedAt || ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function accumulateDeepSeekUsage(model, usage) {
+  if (!usage || !(Number(usage.total) > 0)) return;
+  try {
+    const current = readDeepSeekUsageStats() || {};
+    const price = deepSeekPriceFor(model);
+    const cost = (
+      (Math.max(0, Number(usage.input) - Number(usage.cached)) * price.input)
+      + (Number(usage.cached) * price.cached)
+      + (Number(usage.output) * price.output)
+    ) / 1e6;
+    const next = {
+      totalTokens: (Number(current.totalTokens) || 0) + usage.total,
+      inputTokens: (Number(current.inputTokens) || 0) + usage.input,
+      outputTokens: (Number(current.outputTokens) || 0) + usage.output,
+      cachedInputTokens: (Number(current.cachedInputTokens) || 0) + usage.cached,
+      cost: Math.round(((Number(current.cost) || 0) + cost) * 1e6) / 1e6,
+      requests: (Number(current.requests) || 0) + (Number(usage.requests) || 1),
+      updatedAt: new Date().toISOString(),
+    };
+    atomicWriteFile(DEEPSEEK_USAGE_FILE, JSON.stringify(next, null, 2) + '\n');
+  } catch {
+    // 用量统计失败不应阻塞聊天流程
+  }
 }
 
 function saveUploadedBackground(body) {
@@ -4365,6 +4479,7 @@ function createSubQuotaService(configs = {}) {
     SUB2API_API_KEY: String(configs.sub2api?.apiKey || ''),
     SUB2API_ADMIN_API_KEY,
     GROK2API_ADMIN_PASSWORD: String(configs.grok2api?.apiKey || ''),
+    DEEPSEEK_API_KEY: String(configs.deepseek?.apiKey || ''),
     SUB_QUOTA_TIMEOUT_MS: process.env.SUB_QUOTA_TIMEOUT_MS,
     SUB_QUOTA_CACHE_SECONDS: process.env.SUB_QUOTA_CACHE_SECONDS,
     SUB_QUOTA_SOURCES: configured.length
@@ -4377,7 +4492,9 @@ function createSubQuotaService(configs = {}) {
           ? 'SUB2API_API_KEY'
           : config.provider === 'grok2api'
             ? 'GROK2API_ADMIN_PASSWORD'
-            : 'CPA_QUOTA_API_KEY',
+            : config.provider === 'deepseek'
+              ? 'DEEPSEEK_API_KEY'
+              : 'CPA_QUOTA_API_KEY',
         ...(config.provider === 'sub2api' ? { adminApiKeyEnv: 'SUB2API_ADMIN_API_KEY' } : {}),
       })))
       : '',
@@ -4390,6 +4507,7 @@ function normalizeSubQuotaProvider(value) {
   if (text === 'sub2api' || text === 'sub' || text === 'sub2') return 'sub2api';
   if (text === 'cpa' || text === 'cpa-codex' || text === 'codex' || text === 'cliproxyapi') return 'cpa-codex';
   if (text === 'grok2api' || text === 'grok' || text === 'grok-api' || text === 'grok_api') return 'grok2api';
+  if (text === 'deepseek' || text === 'deep-seek' || text === 'deepseek-api' || text === 'deep_seek' || text === 'ds') return 'deepseek';
   return 'cpa-codex';
 }
 
@@ -4397,6 +4515,7 @@ function subQuotaProviderLabel(provider) {
   const resolved = normalizeSubQuotaProvider(provider);
   if (resolved === 'sub2api') return 'Sub2API';
   if (resolved === 'grok2api') return 'Grok2API';
+  if (resolved === 'deepseek') return 'DeepSeek';
   return 'CPA Codex';
 }
 
@@ -4405,26 +4524,54 @@ function subQuotaProvidersMultiLabel(providers = []) {
   return labels.length ? labels.join(' + ') : 'CPA Codex';
 }
 
+function subQuotaOrderFromEnv(env = process.env) {
+  const raw = String(env.SUB_QUOTA_ORDER || '').trim();
+  const ordered = [];
+  if (raw) {
+    for (const item of raw.split(',')) {
+      const provider = normalizeSubQuotaProvider(item);
+      if (provider && !ordered.includes(provider)) ordered.push(provider);
+    }
+  }
+  for (const provider of SUB_QUOTA_DEFAULT_ORDER) {
+    if (!ordered.includes(provider)) ordered.push(provider);
+  }
+  return ordered;
+}
+
+function subQuotaOrderIndex(provider, order) {
+  const index = (Array.isArray(order) ? order : []).indexOf(provider);
+  return index >= 0 ? index : SUB_QUOTA_DEFAULT_ORDER.indexOf(provider);
+}
+
 function emptySubQuotaConfig(provider) {
   const resolvedProvider = normalizeSubQuotaProvider(provider);
-  return { provider: resolvedProvider, baseUrl: '', apiKey: '' };
+  return {
+    provider: resolvedProvider,
+    order: SUB_QUOTA_DEFAULT_ORDER.indexOf(resolvedProvider),
+    baseUrl: resolvedProvider === 'deepseek' ? DEEPSEEK_DEFAULT_BASE_URL : '',
+    apiKey: '',
+  };
 }
 
 function readStartupSubQuotaConfigs(env = process.env) {
   const rawProvider = String(env.SUB_QUOTA_PROVIDER || 'cpa-codex').trim().toLowerCase();
   const legacyProvider = normalizeSubQuotaProvider(rawProvider);
+  const order = subQuotaOrderFromEnv(env);
   const legacyBaseUrl = String(env.SUB2API_BASE_URL || '').trim().replace(/\/+$/, '');
   const legacyApiKey = String(env.SUB2API_API_KEY || '').trim();
   const cpaExplicit = String(env.CPA_QUOTA_BASE_URL || '').trim().replace(/\/+$/, '')
     || String(env.CPA_QUOTA_API_KEY || '').trim();
   const cpa = {
     provider: 'cpa-codex',
+    order: subQuotaOrderIndex('cpa-codex', order),
     baseUrl: String(env.CPA_QUOTA_BASE_URL || (legacyProvider === 'cpa-codex' ? legacyBaseUrl : '')).trim().replace(/\/+$/, ''),
     apiKey: String(env.CPA_QUOTA_API_KEY || (legacyProvider === 'cpa-codex' ? legacyApiKey : '')).trim(),
   };
   const useSub2ApiLegacyValues = legacyProvider === 'sub2api' || rawProvider === 'multi';
   const sub2api = {
     provider: 'sub2api',
+    order: subQuotaOrderIndex('sub2api', order),
     baseUrl: useSub2ApiLegacyValues ? legacyBaseUrl : '',
     apiKey: useSub2ApiLegacyValues ? legacyApiKey : '',
   };
@@ -4434,29 +4581,37 @@ function readStartupSubQuotaConfigs(env = process.env) {
   }
   const grok2api = {
     provider: 'grok2api',
+    order: subQuotaOrderIndex('grok2api', order),
     baseUrl: String(env.GROK2API_BASE_URL || '').trim().replace(/\/+$/, ''),
     apiKey: String(env.GROK2API_ADMIN_PASSWORD || env.GROK2API_API_KEY || '').trim(),
   };
-  return { 'cpa-codex': cpa, sub2api, grok2api };
+  const deepseek = {
+    provider: 'deepseek',
+    order: subQuotaOrderIndex('deepseek', order),
+    baseUrl: String(env.DEEPSEEK_BASE_URL || DEEPSEEK_DEFAULT_BASE_URL).trim().replace(/\/+$/, ''),
+    apiKey: String(env.DEEPSEEK_API_KEY || '').trim(),
+  };
+  return { 'cpa-codex': cpa, sub2api, grok2api, deepseek };
 }
 
 function configuredSubQuotaConfigs(configs = subQuotaConfigs) {
-  return ['cpa-codex', 'sub2api', 'grok2api']
+  return ['cpa-codex', 'sub2api', 'grok2api', 'deepseek']
     .map((provider) => configs?.[provider] || emptySubQuotaConfig(provider))
-    .filter((config) => Boolean(config.baseUrl && config.apiKey));
+    .filter((config) => Boolean(config.baseUrl && config.apiKey))
+    .sort((a, b) => (a.order ?? SUB_QUOTA_DEFAULT_ORDER.indexOf(a.provider)) - (b.order ?? SUB_QUOTA_DEFAULT_ORDER.indexOf(b.provider)));
 }
 
 function publicSubQuotaConfigs(configs = subQuotaConfigs) {
-  return ['cpa-codex', 'sub2api', 'grok2api'].map((provider) => {
-    const config = configs?.[provider] || emptySubQuotaConfig(provider);
-    return {
+  return ['cpa-codex', 'sub2api', 'grok2api', 'deepseek']
+    .map((provider) => ({ provider, config: configs?.[provider] || emptySubQuotaConfig(provider) }))
+    .sort((a, b) => (a.config.order ?? SUB_QUOTA_DEFAULT_ORDER.indexOf(a.provider)) - (b.config.order ?? SUB_QUOTA_DEFAULT_ORDER.indexOf(b.provider)))
+    .map(({ provider, config }) => ({
       provider,
       providerLabel: subQuotaProviderLabel(provider),
       baseUrl: String(config.baseUrl || ''),
       keyConfigured: Boolean(config.apiKey),
       configured: Boolean(config.baseUrl && config.apiKey),
-    };
-  });
+    }));
 }
 
 function normalizeSubQuotaConfigRequest(body = {}) {
@@ -4465,7 +4620,7 @@ function normalizeSubQuotaConfigRequest(body = {}) {
     const seen = new Set();
     return body.sources.map((source) => {
       const rawProvider = String(source?.provider || '').trim().toLowerCase();
-      if (!['cpa', 'cpa-codex', 'codex', 'cliproxyapi', 'sub', 'sub2', 'sub2api', 'grok2api', 'grok', 'grok-api', 'grok_api'].includes(rawProvider)) {
+      if (!['cpa', 'cpa-codex', 'codex', 'cliproxyapi', 'sub', 'sub2', 'sub2api', 'grok2api', 'grok', 'grok-api', 'grok_api', 'deepseek', 'deep-seek', 'deepseek-api', 'deep_seek', 'ds'].includes(rawProvider)) {
         throw new Error('额度来源类型无效');
       }
       const provider = normalizeSubQuotaProvider(rawProvider);
@@ -4483,16 +4638,39 @@ function normalizeSubQuotaConfigRequest(body = {}) {
   }];
 }
 
+function normalizeSubQuotaOrderRequest(value) {
+  if (!Array.isArray(value) || !value.length) return null;
+  const ordered = [];
+  for (const item of value) {
+    const provider = normalizeSubQuotaProvider(item);
+    if (provider && !ordered.includes(provider)) ordered.push(provider);
+  }
+  for (const provider of SUB_QUOTA_DEFAULT_ORDER) {
+    if (!ordered.includes(provider)) ordered.push(provider);
+  }
+  return ordered;
+}
+
 function validateSubQuotaApiKey(apiKey) {
   if (!apiKey) throw new Error('API Key / Management Key 不能为空');
   if (apiKey.length > 4096 || /[\r\n\0]/.test(apiKey)) throw new Error('API Key 包含无效字符');
+}
+
+function subQuotaOrderValue(configs) {
+  return SUB_QUOTA_DEFAULT_ORDER
+    .map((provider) => configs?.[provider] || emptySubQuotaConfig(provider))
+    .sort((a, b) => (a.order ?? SUB_QUOTA_DEFAULT_ORDER.indexOf(a.provider)) - (b.order ?? SUB_QUOTA_DEFAULT_ORDER.indexOf(b.provider)))
+    .map((config) => config.provider)
+    .join(',');
 }
 
 function persistSubQuotaConfigs(configs) {
   const cpa = configs['cpa-codex'] || emptySubQuotaConfig('cpa-codex');
   const sub2api = configs.sub2api || emptySubQuotaConfig('sub2api');
   const grok2api = configs.grok2api || emptySubQuotaConfig('grok2api');
+  const deepseek = configs.deepseek || emptySubQuotaConfig('deepseek');
   const configured = configuredSubQuotaConfigs(configs);
+  const order = subQuotaOrderValue(configs);
   const legacy = sub2api.baseUrl && sub2api.apiKey ? sub2api : cpa;
   updateEnvVars(ENV_FILE, {
     CPA_QUOTA_BASE_URL: cpa.baseUrl,
@@ -4501,11 +4679,17 @@ function persistSubQuotaConfigs(configs) {
     SUB2API_API_KEY: legacy.apiKey,
     GROK2API_BASE_URL: grok2api.baseUrl,
     GROK2API_ADMIN_PASSWORD: grok2api.apiKey,
+    DEEPSEEK_BASE_URL: deepseek.baseUrl,
+    DEEPSEEK_API_KEY: deepseek.apiKey,
+    SUB_QUOTA_ORDER: order,
     SUB_QUOTA_PROVIDER: configured.length > 1 ? 'multi' : (configured[0]?.provider || ''),
   });
+  process.env.SUB_QUOTA_ORDER = order;
   process.env.SUB_QUOTA_PROVIDER = configured.length > 1 ? 'multi' : (configured[0]?.provider || '');
   process.env.GROK2API_BASE_URL = grok2api.baseUrl;
   process.env.GROK2API_ADMIN_PASSWORD = grok2api.apiKey;
+  process.env.DEEPSEEK_BASE_URL = deepseek.baseUrl;
+  process.env.DEEPSEEK_API_KEY = deepseek.apiKey;
 }
 
 function currentSubQuotaProvider() {
@@ -11695,7 +11879,7 @@ function ensureSubQuotaSettingsDialog(){
   body.className='subQuotaSettingsBody';
   const subQuotaDescription=document.createElement('p');
   subQuotaDescription.className='subQuotaSettingsDescription';
-  subQuotaDescription.textContent='CPA、Sub2API 与 Grok2API 可独立配置；保存不受连接、Key 或额度检测错误影响。';
+  subQuotaDescription.textContent='CPA、Sub2API、Grok2API 与 DeepSeek 官方可独立配置；保存不受连接、Key 或额度检测错误影响。';
   subQuotaSettingsForm=document.createElement('form');
   subQuotaSettingsForm.id='subQuotaSettingsForm';
   subQuotaSettingsForm.className='subQuotaSettingsForm';
@@ -11705,15 +11889,37 @@ function ensureSubQuotaSettingsDialog(){
     const source=document.createElement('section');
     source.className='subQuotaSettingsSource';
     source.dataset.provider=provider;
+    const sourceHead=document.createElement('div');
+    sourceHead.className='subQuotaSettingsSourceHead';
     const sourceTitle=document.createElement('h3');
     sourceTitle.className='subQuotaSettingsSourceTitle';
     sourceTitle.textContent=title;
+    const moveButtons=document.createElement('div');
+    moveButtons.className='subQuotaMoveButtons';
+    const moveUp=document.createElement('button');
+    moveUp.type='button';
+    moveUp.className='subQuotaMoveButton subQuotaMoveUp';
+    moveUp.title='上移';
+    moveUp.setAttribute('aria-label','上移');
+    setIconLabel(moveUp,'chevron-up','上移',false);
+    moveUp.addEventListener('click',()=>moveSubQuotaSource(source,-1));
+    const moveDown=document.createElement('button');
+    moveDown.type='button';
+    moveDown.className='subQuotaMoveButton subQuotaMoveDown';
+    moveDown.title='下移';
+    moveDown.setAttribute('aria-label','下移');
+    setIconLabel(moveDown,'chevron-down','下移',false);
+    moveDown.addEventListener('click',()=>moveSubQuotaSource(source,1));
+    moveButtons.appendChild(moveUp);
+    moveButtons.appendChild(moveDown);
+    sourceHead.appendChild(sourceTitle);
+    sourceHead.appendChild(moveButtons);
     const urlField=document.createElement('label');
     urlField.className='field';
     const urlLabel=document.createElement('span');
     urlLabel.textContent='上游 URL';
     const baseUrlInput=document.createElement('input');
-    baseUrlInput.id=provider==='sub2api'?'sub2ApiBaseUrl':(provider==='grok2api'?'grok2ApiBaseUrl':'cpaQuotaBaseUrl');
+    baseUrlInput.id=provider==='sub2api'?'sub2ApiBaseUrl':(provider==='grok2api'?'grok2ApiBaseUrl':(provider==='deepseek'?'deepSeekBaseUrl':'cpaQuotaBaseUrl'));
     baseUrlInput.name=provider+'BaseUrl';
     baseUrlInput.type='url';
     baseUrlInput.maxLength=2048;
@@ -11726,9 +11932,9 @@ function ensureSubQuotaSettingsDialog(){
     const keyField=document.createElement('label');
     keyField.className='field';
     const keyLabel=document.createElement('span');
-    keyLabel.textContent=provider==='sub2api'?'API Key':(provider==='grok2api'?'管理员密码':'Management Key');
+    keyLabel.textContent=provider==='sub2api'?'API Key':(provider==='grok2api'?'管理员密码':(provider==='deepseek'?'API Key':'Management Key'));
     const apiKeyInput=document.createElement('input');
-    apiKeyInput.id=provider==='sub2api'?'sub2ApiKey':(provider==='grok2api'?'grok2ApiAdminPassword':'cpaQuotaApiKey');
+    apiKeyInput.id=provider==='sub2api'?'sub2ApiKey':(provider==='grok2api'?'grok2ApiAdminPassword':(provider==='deepseek'?'deepSeekApiKey':'cpaQuotaApiKey'));
     apiKeyInput.name=provider+'ApiKey';
     apiKeyInput.type='password';
     apiKeyInput.maxLength=4096;
@@ -11740,15 +11946,17 @@ function ensureSubQuotaSettingsDialog(){
     credentialHint.className='subQuotaCredentialHint';
     credentialHint.textContent='Key 未配置';
     keyField.appendChild(credentialHint);
-    source.appendChild(sourceTitle);
+    source.appendChild(sourceHead);
     source.appendChild(urlField);
     source.appendChild(keyField);
-    subQuotaSettingsInputs.set(provider,{baseUrlInput,apiKeyInput,credentialHint});
+    subQuotaSettingsInputs.set(provider,{baseUrlInput,apiKeyInput,credentialHint,source});
     return source;
   };
   subQuotaSettingsForm.appendChild(createSourceFields('cpa-codex','CPA Codex','http://127.0.0.1:8327','CPA Management Key'));
   subQuotaSettingsForm.appendChild(createSourceFields('sub2api','Sub2API','https://sub.example.com','Sub2API API Key'));
   subQuotaSettingsForm.appendChild(createSourceFields('grok2api','Grok2API','http://127.0.0.1:8100','管理员密码，或 username:password'));
+  subQuotaSettingsForm.appendChild(createSourceFields('deepseek','DeepSeek 官方','https://api.deepseek.com','DeepSeek API Key'));
+  syncSubQuotaMoveButtons();
   const subQuotaSave=document.createElement('button');
   subQuotaSave.type='submit';
   subQuotaSave.className='miniPrimary subQuotaSettingsSubmit';
@@ -11874,6 +12082,26 @@ function enhanceSettingsModal(){
   settingsDialog.addEventListener('keydown',trapSettingsFocus);
   passwordForm.addEventListener('submit',submitPasswordChange);
 }
+function moveSubQuotaSource(source,delta){
+  if(!source||!subQuotaSettingsForm)return;
+  const sources=[...subQuotaSettingsForm.querySelectorAll('.subQuotaSettingsSource')];
+  const index=sources.indexOf(source);
+  const target=sources[index+delta];
+  if(!target)return;
+  if(delta<0)subQuotaSettingsForm.insertBefore(source,target);
+  else subQuotaSettingsForm.insertBefore(target,source);
+  syncSubQuotaMoveButtons();
+}
+function syncSubQuotaMoveButtons(){
+  if(!subQuotaSettingsForm)return;
+  const sources=[...subQuotaSettingsForm.querySelectorAll('.subQuotaSettingsSource')];
+  sources.forEach((source,index)=>{
+    const up=source.querySelector('.subQuotaMoveUp');
+    const down=source.querySelector('.subQuotaMoveDown');
+    if(up)up.disabled=index===0;
+    if(down)down.disabled=index===sources.length-1;
+  });
+}
 async function syncSubQuotaSettings(){
   if(!subQuotaSettingsInputs.size||!subQuotaSettingsStatus)return;
   subQuotaSettingsStatus.textContent='';
@@ -11887,8 +12115,15 @@ async function syncSubQuotaSettings(){
       const source=sources.find((item)=>item.provider===provider)||{};
       inputs.baseUrlInput.value=source.baseUrl||'';
       inputs.apiKeyInput.value='';
-      inputs.apiKeyInput.placeholder=source.keyConfigured?'Key 已配置，留空保留':(provider==='sub2api'?'Sub2API API Key':(provider==='grok2api'?'管理员密码，或 username:password':'CPA Management Key'));
+      inputs.apiKeyInput.placeholder=source.keyConfigured?'Key 已配置，留空保留':(provider==='sub2api'?'Sub2API API Key':(provider==='grok2api'?'管理员密码，或 username:password':(provider==='deepseek'?'DeepSeek API Key':'CPA Management Key')));
       inputs.credentialHint.textContent=source.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，可先保存 URL';
+    }
+    if(Array.isArray(data.sources)&&data.sources.length){
+      for(const item of data.sources){
+        const inputs=subQuotaSettingsInputs.get(item.provider);
+        if(inputs?.source)subQuotaSettingsForm.appendChild(inputs.source);
+      }
+      syncSubQuotaMoveButtons();
     }
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'读取设置失败')}
 }
@@ -11901,7 +12136,8 @@ async function submitSubQuotaSettings(event){
   subQuotaSettingsStatus.textContent='正在保存额度配置…';
   try{
     const sources=[...subQuotaSettingsInputs].map(([provider,inputs])=>({provider,baseUrl:inputs.baseUrlInput.value,apiKey:inputs.apiKeyInput.value}));
-    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources})});
+    const order=[...subQuotaSettingsForm.querySelectorAll('.subQuotaSettingsSource')].map((element)=>element.dataset.provider);
+    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources,order})});
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'保存失败');
     for(const inputs of subQuotaSettingsInputs.values())inputs.apiKeyInput.value='';
@@ -12284,7 +12520,7 @@ function renderSubQuota(data){
     const planName=document.createElement('span');
     planName.textContent=quota.planName||(quota.mode==='cpa_codex'?'Codex':quota.mode==='quota_limited'?'API Key 限额':'额度');
     const sourceName=document.createElement('span');
-    const providerName=quota.provider==='sub2api'?'Sub2API':(quota.provider==='grok2api'?'Grok2API':'CPA Codex');
+    const providerName=quota.provider==='sub2api'?'Sub2API':(quota.provider==='grok2api'?'Grok2API':(quota.provider==='deepseek'?'DeepSeek':'CPA Codex'));
     sourceName.textContent=quota.provider==='cpa-codex'
       ? providerName
       : (quota.provider==='grok2api' ? providerName : (quota.name||quota.sourceName||providerName));
@@ -12334,6 +12570,31 @@ function renderSubQuota(data){
         source.appendChild(actions);
       }
       if(detailCount || meta.childElementCount){
+        subQuotaContent.appendChild(source);
+        rendered+=1;
+      }
+      continue;
+    }
+    if(quota.provider==='deepseek'){
+      let detailCount=0;
+      const balanceValue=finiteSubQuotaNumber(quota.balance??quota.remaining);
+      const currency=String(quota.currency||'CNY').toUpperCase();
+      if(balanceValue!==null)detailCount+=appendSubQuotaWindow(source,'余额',{remaining:balanceValue},currency,{fixedCurrency:false})?1:0;
+      const meta=document.createElement('div');
+      meta.className='subQuotaMeta';
+      if(Number.isFinite(Number(quota.grantedBalance))&&Number.isFinite(Number(quota.toppedUpBalance))
+        &&(Number(quota.grantedBalance)>0||Number(quota.toppedUpBalance)>0)){
+        appendSubQuotaMeta(meta,'赠送 '+formatSubQuotaAmount(quota.grantedBalance,currency)+' · 充值 '+formatSubQuotaAmount(quota.toppedUpBalance,currency));
+      }
+      const stats=quota.usageStats||{};
+      if(Number.isFinite(Number(stats.cost))&&Number(stats.cost)>0)appendSubQuotaMeta(meta,'累计消费 '+formatSubQuotaAmount(stats.cost,'USD'));
+      if(Number.isFinite(Number(stats.totalTokens))&&Number(stats.totalTokens)>0)appendSubQuotaMeta(meta,'累计 Token '+Number(stats.totalTokens).toLocaleString('zh-CN'));
+      if(Number.isFinite(Number(stats.requests))&&Number(stats.requests)>0)appendSubQuotaMeta(meta,'累计请求 '+Number(stats.requests).toLocaleString('zh-CN'));
+      if(Number.isFinite(Number(stats.totalTokens))&&Number(stats.totalTokens)>0)appendSubQuotaMeta(meta,'按官方单价统计');
+      if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
+      if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
+      if(meta.childElementCount)source.appendChild(meta);
+      if(detailCount||meta.childElementCount){
         subQuotaContent.appendChild(source);
         rendered+=1;
       }

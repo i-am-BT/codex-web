@@ -78,6 +78,19 @@ if (process.argv[2] === 'app-server') {
         res.end(JSON.stringify({ isValid: true, planName: 'Sub plan', remaining: 42, unit: 'USD' }));
         return;
       }
+      if (req.url === '/user/balance') {
+        assert.equal(req.headers.authorization, 'Bearer deepseek-key');
+        res.end(JSON.stringify({
+          is_available: true,
+          balance_infos: [{
+            currency: 'CNY',
+            total_balance: '100.00',
+            granted_balance: '10.00',
+            topped_up_balance: '90.00',
+          }],
+        }));
+        return;
+      }
       res.statusCode = 404;
       res.end(JSON.stringify({ error: 'not found' }));
     });
@@ -114,6 +127,9 @@ if (process.argv[2] === 'app-server') {
         GROK2API_BASE_URL: '',
         GROK2API_ADMIN_PASSWORD: '',
         GROK2API_API_KEY: '',
+        DEEPSEEK_BASE_URL: '',
+        DEEPSEEK_API_KEY: '',
+        SUB_QUOTA_ORDER: '',
         SUB_QUOTA_PROVIDER: '',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -135,27 +151,39 @@ if (process.argv[2] === 'app-server') {
         sources: [
           { provider: 'cpa-codex', baseUrl: providerBaseUrl, apiKey: 'cpa-key' },
           { provider: 'sub2api', baseUrl: providerBaseUrl, apiKey: 'sub-key' },
+          { provider: 'deepseek', baseUrl: providerBaseUrl, apiKey: 'deepseek-key' },
         ],
+        order: ['sub2api', 'deepseek', 'cpa-codex', 'grok2api'],
       }),
     });
     assert.equal(saved.status, 200);
     const savedPayload = await saved.json();
     assert.equal(savedPayload.provider, 'multi');
-    assert.equal(savedPayload.configuredCount, 2);
-    assert.equal(savedPayload.sources.filter((source) => source.configured).length, 2);
-    assert.doesNotMatch(JSON.stringify(savedPayload), /cpa-key|sub-key/);
+    assert.equal(savedPayload.configuredCount, 3);
+    assert.equal(savedPayload.sources.filter((source) => source.configured).length, 3);
+    assert.deepEqual(savedPayload.sources.map((source) => source.provider), ['sub2api', 'deepseek', 'cpa-codex', 'grok2api']);
+    assert.doesNotMatch(JSON.stringify(savedPayload), /cpa-key|sub-key|deepseek-key/);
+
+    const configAfterSave = await fetch(`${baseUrl}/api/sub-quota-config`, { headers: { Cookie: cookie } });
+    const configAfterSavePayload = await configAfterSave.json();
+    assert.deepEqual(configAfterSavePayload.sources.map((source) => source.provider), ['sub2api', 'deepseek', 'cpa-codex', 'grok2api']);
 
     const quotas = await fetch(`${baseUrl}/api/sub-quotas?refresh=1`, { headers: { Cookie: cookie } });
     assert.equal(quotas.status, 200);
     const quotaPayload = await quotas.json();
-    assert.equal(quotaPayload.count, 2);
-    assert.deepEqual(new Set(quotaPayload.quotas.map((quota) => quota.provider)), new Set(['cpa-codex', 'sub2api']));
-    assert.doesNotMatch(JSON.stringify(quotaPayload), /cpa-key|sub-key/);
+    assert.equal(quotaPayload.count, 3);
+    assert.deepEqual(quotaPayload.quotas.map((quota) => quota.provider), ['sub2api', 'deepseek', 'cpa-codex']);
+    assert.doesNotMatch(JSON.stringify(quotaPayload), /cpa-key|sub-key|deepseek-key/);
+    const deepSeekQuota = quotaPayload.quotas.find((quota) => quota.provider === 'deepseek');
+    assert.equal(deepSeekQuota.balance, 100);
+    assert.equal(deepSeekQuota.currency, 'CNY');
 
     const persisted = await readFile(envFile, 'utf8');
     assert.match(persisted, /^SUB_QUOTA_PROVIDER="multi"$/m);
+    assert.match(persisted, /^SUB_QUOTA_ORDER="sub2api,deepseek,cpa-codex,grok2api"$/m);
     assert.match(persisted, /^CPA_QUOTA_API_KEY="cpa-key"$/m);
     assert.match(persisted, /^SUB2API_API_KEY="sub-key"$/m);
+    assert.match(persisted, /^DEEPSEEK_API_KEY="deepseek-key"$/m);
 
     await new Promise((resolve) => provider.close(resolve));
     provider = null;
@@ -166,17 +194,19 @@ if (process.argv[2] === 'app-server') {
         sources: [
           { provider: 'cpa-codex', baseUrl: providerBaseUrl, apiKey: 'offline-cpa-key' },
           { provider: 'sub2api', baseUrl: providerBaseUrl, apiKey: 'offline-sub-key' },
+          { provider: 'deepseek', baseUrl: providerBaseUrl, apiKey: 'offline-deepseek-key' },
         ],
       }),
     });
     assert.equal(savedWhileOffline.status, 200);
     const offlinePayload = await savedWhileOffline.json();
     assert.equal(offlinePayload.saved, true);
-    assert.equal(offlinePayload.configuredCount, 2);
+    assert.equal(offlinePayload.configuredCount, 3);
     assert.match(offlinePayload.detectDetail, /检测结果不会阻止保存/);
     const persistedOffline = await readFile(envFile, 'utf8');
     assert.match(persistedOffline, /^CPA_QUOTA_API_KEY="offline-cpa-key"$/m);
     assert.match(persistedOffline, /^SUB2API_API_KEY="offline-sub-key"$/m);
+    assert.match(persistedOffline, /^DEEPSEEK_API_KEY="offline-deepseek-key"$/m);
   } finally {
     if (child && child.exitCode === null) {
       child.kill('SIGTERM');
