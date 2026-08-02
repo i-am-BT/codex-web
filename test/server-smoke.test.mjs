@@ -489,6 +489,13 @@ base_url = "${providerBaseUrl}/v1"
 wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "test-token"
+
+[model_providers.switchtest]
+name = "Switch Test"
+base_url = "http://127.0.0.1:9/v1"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "switch-test-token"
 `);
     await writeFile(codexGlobalStateFile, JSON.stringify({
       'pinned-thread-ids': [nativeSessionId, archivedNativeSessionId],
@@ -2171,7 +2178,13 @@ updated_at = 1784422800000
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'reasoningEffort'\)\)/);
     assert.match(page, /function rememberNativeComposerOverride\(\{pending=false,writeId=0\}=\{\}\)/);
     assert.match(page, /function syncNativeComposerSettings\(changes=\{\}\)/);
-    assert.match(page, /provider\?\.addEventListener\('change',async\(\)=>\{await loadModels\(provider\.value\);void syncNativeComposerSettings\(\{model:model\.value\}\);syncComposerChrome\(\)\}\)/);
+    assert.match(page, /provider\?\.addEventListener\('change',\(\)=>\{void changeComposerProvider\(provider\.value\)\}\)/);
+    assert.match(page, /composerProviderSelect\.addEventListener\('change',\(\)=>\{void changeComposerProvider\(composerProviderSelect\.value\)\}\)/);
+    assert.match(page, /async function changeComposerProvider\(nextProvider\)[\s\S]*?syncNativeComposerSettings\(\{provider:requestedProvider,model:model\.value\}\)/);
+    assert.match(page, /const revision=\+\+modelLoadRevision[\s\S]*?revision!==modelLoadRevision/);
+    assert.match(page, /composerModelSelect\.addEventListener\('change',\(\)=>\{model\.value=composerModelSelect\.value;reconcileComposerFastSupport\(\);void syncNativeComposerSettings\(\{provider:provider\.value,model:model\.value\}\);syncComposerChrome\(\)\}\)/);
+    assert.match(page, /model\?\.addEventListener\('change',\(\)=>\{void syncNativeComposerSettings\(\{provider:provider\.value,model:model\.value\}\);syncComposerChrome\(\)\}\)/);
+    assert.match(page, /payload\.provider=String\(provider\.value\|\|''\)\.trim\(\)\|\|null/);
     assert.match(page, /reasoningEffort\?\.addEventListener\('change',\(\)=>\{void syncNativeComposerSettings\(\{reasoningEffort:reasoningEffort\.value\}\);syncComposerChrome\(\)\}\)/);
     assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*pending:Boolean\(pending\),writeId:Number\(writeId\)\|\|0\}/);
     assert.match(page, /function nativeComposerOverrideApplies\(threadId\)\{return Boolean\(nativeComposerOverride\?\.pending/);
@@ -2179,8 +2192,9 @@ updated_at = 1784422800000
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'modelProvider'\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'model'\)\)/);
     assert.match(page, /clearNativeComposerOverride\(\);\s*syncComposerChrome\(\);\s*void syncCurrentNativeConversation\(\)/);
-    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier\)/);
-    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier\)/);
+    assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,\{pending:true\}\)/);
+    assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,\{pending:true\}\)/);
+    assert.match(page, /body:JSON\.stringify\(\{message:text,attachments,provider:requestedProvider,model:requestedModel/);
     assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort,item\.permissionMode,item\.sandbox,item\.approval,item\.serviceTier\);/);
     assert.match(page, /permissionMode:\s*composerPermissionMode/);
     assert.match(page, /\.\.\.composerPermissionPayload\(item\.permissionMode,item\.sandbox,item\.approval\)/);
@@ -5541,11 +5555,12 @@ updated_at = 1784422800000
     const updatedThreadSettings = await fetch(`${baseUrl}/api/native-sessions/${createdNativeSessionId}`, {
       method: 'PATCH',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-5.6-terra', reasoningEffort: 'xhigh' }),
+      body: JSON.stringify({ provider: 'switchtest', model: 'switch-model', reasoningEffort: 'xhigh' }),
     });
     assert.equal(updatedThreadSettings.status, 200);
     const updatedThreadSettingsPayload = await updatedThreadSettings.json();
-    assert.equal(updatedThreadSettingsPayload.model, 'gpt-5.6-terra');
+    assert.equal(updatedThreadSettingsPayload.provider, 'switchtest');
+    assert.equal(updatedThreadSettingsPayload.model, 'switch-model');
     assert.equal(updatedThreadSettingsPayload.reasoningEffort, 'xhigh');
     const threadSettingsCalls = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
@@ -5556,11 +5571,16 @@ updated_at = 1784422800000
       .filter((message) => ['thread/resume', 'thread/settings/update'].includes(message.method));
     assert.equal(threadSettingsCalls.length, 2);
     assert.equal(threadSettingsCalls[0].method, 'thread/resume');
-    assert.equal(threadSettingsCalls[0].params.threadId, createdNativeSessionId);
+    assert.deepEqual(threadSettingsCalls[0].params, {
+      threadId: createdNativeSessionId,
+      modelProvider: 'switchtest',
+      model: 'switch-model',
+      excludeTurns: true,
+    });
     assert.equal(threadSettingsCalls[1].method, 'thread/settings/update');
     assert.deepEqual(threadSettingsCalls[1].params, {
       threadId: createdNativeSessionId,
-      model: 'gpt-5.6-terra',
+      model: 'switch-model',
       effort: 'xhigh',
     });
 
