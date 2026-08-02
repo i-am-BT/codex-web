@@ -24,7 +24,7 @@ test('DeepSeek local usage persists native turn deduplication without exposing t
     'existsSync',
     'readFileSync',
     'atomicWriteFile',
-    `${serverSource.slice(helperStart, helperEnd)}; return { readDeepSeekUsageStats, accumulateDeepSeekUsage };`,
+    `${serverSource.slice(helperStart, helperEnd)}; return { readDeepSeekUsageStats, accumulateDeepSeekUsage, calibrateDeepSeekUsage };`,
   )(
     '/runtime/deepseek-usage.json',
     () => Boolean(persisted),
@@ -52,6 +52,30 @@ test('DeepSeek local usage persists native turn deduplication without exposing t
     requests: 2,
     updatedAt: state.updatedAt,
   });
+
+  const calibrated = api.calibrateDeepSeekUsage('123,408,356', '1,020');
+  assert.equal(calibrated.totalTokens, 123408356);
+  assert.equal(calibrated.requests, 1020);
+  const calibratedState = JSON.parse(persisted);
+  assert.equal(calibratedState.inputTokens, 200);
+  assert.equal(calibratedState.cachedInputTokens, 80);
+  assert.equal(calibratedState.outputTokens, 50);
+  assert.deepEqual(calibratedState.countedTurns, ['thread-a:turn-1', 'thread-a:turn-2']);
+  assert.equal(calibratedState.calibratedAt, calibrated.updatedAt);
+  assert.throws(
+    () => api.calibrateDeepSeekUsage('-1', '10'),
+    (error) => error.statusCode === 400 && /累计 Token/.test(error.message),
+  );
+  assert.throws(
+    () => api.calibrateDeepSeekUsage('10', '1.5'),
+    (error) => error.statusCode === 400 && /累计请求/.test(error.message),
+  );
+
+  assert.equal(api.accumulateDeepSeekUsage('deepseek-v4-flash', usage, 'thread-a:turn-3'), true);
+  const advancedState = JSON.parse(persisted);
+  assert.equal(advancedState.totalTokens, 123408481);
+  assert.equal(advancedState.requests, 1021);
+  assert.equal(advancedState.calibratedAt, calibrated.updatedAt);
 });
 
 test('native DeepSeek completions feed the local usage accumulator', async () => {
@@ -136,6 +160,8 @@ test('DeepSeek quota card hides balance funding breakdown and keeps local totals
   assert.match(uiStyles, /\.subQuotaWindowHeadInline \.subQuotaInlineStatus\s*\{[^}]*margin-left:\s*auto/s);
   assert.match(uiStyles, /\.subQuotaMetaDeepSeek\s*\{[^}]*flex-wrap:\s*nowrap/s);
   assert.match(uiStyles, /\.subQuotaMetaDeepSeek \.subQuotaMetaTrailing\s*\{[^}]*margin-left:\s*auto/s);
+  assert.match(uiStyles, /\.deepSeekUsageCalibrationFields\s*\{[^}]*grid-template-columns:/s);
+  assert.match(uiStyles, /\.deepSeekUsageCalibrationStatus\.success\s*\{[^}]*color:\s*var\(--success\)/s);
 });
 
 test('native queue turns ignore unscoped idle status and stale completions', async () => {
@@ -1467,6 +1493,12 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedSubQuotas.status, 401);
     const unauthorizedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`);
     assert.equal(unauthorizedSubQuotaConfig.status, 401);
+    const unauthorizedDeepSeekUsageCalibration = await fetch(`${baseUrl}/api/deepseek-usage-calibration`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ totalTokens: '123,408,356', requests: '1,020' }),
+    });
+    assert.equal(unauthorizedDeepSeekUsageCalibration.status, 401);
     const unauthorizedModelCapabilities = await fetch(`${baseUrl}/api/native-model-capabilities`);
     assert.equal(unauthorizedModelCapabilities.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
@@ -1566,7 +1598,46 @@ if (args[0] === 'app-server') {
     assert.equal(subQuotaConfigPayload.keyConfigured, true);
     assert.equal(subQuotaConfigPayload.provider, 'cpa-codex');
     assert.equal(subQuotaConfigPayload.providerLabel, 'CPA Codex');
+    assert.deepEqual(subQuotaConfigPayload.deepSeekUsage, {
+      totalTokens: 0,
+      requests: 0,
+      updatedAt: '',
+    });
     assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
+
+    const rejectedDeepSeekUsageCalibration = await fetch(`${baseUrl}/api/deepseek-usage-calibration`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ totalTokens: '123,408,356', requests: '1.5' }),
+    });
+    assert.equal(rejectedDeepSeekUsageCalibration.status, 400);
+    assert.match((await rejectedDeepSeekUsageCalibration.json()).error, /累计请求必须是非负整数/);
+
+    const calibratedDeepSeekUsage = await fetch(`${baseUrl}/api/deepseek-usage-calibration`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ totalTokens: '123,408,356', requests: '1,020' }),
+    });
+    assert.equal(calibratedDeepSeekUsage.status, 200);
+    const calibratedDeepSeekUsagePayload = await calibratedDeepSeekUsage.json();
+    assert.equal(calibratedDeepSeekUsagePayload.ok, true);
+    assert.equal(calibratedDeepSeekUsagePayload.usage.totalTokens, 123408356);
+    assert.equal(calibratedDeepSeekUsagePayload.usage.requests, 1020);
+    assert.equal(typeof calibratedDeepSeekUsagePayload.usage.updatedAt, 'string');
+    assert.doesNotMatch(JSON.stringify(calibratedDeepSeekUsagePayload), /countedTurns/);
+
+    const calibratedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(calibratedSubQuotaConfig.status, 200);
+    const calibratedSubQuotaConfigPayload = await calibratedSubQuotaConfig.json();
+    assert.equal(calibratedSubQuotaConfigPayload.deepSeekUsage.totalTokens, 123408356);
+    assert.equal(calibratedSubQuotaConfigPayload.deepSeekUsage.requests, 1020);
+    assert.equal(
+      calibratedSubQuotaConfigPayload.deepSeekUsage.updatedAt,
+      calibratedDeepSeekUsagePayload.usage.updatedAt,
+    );
+    assert.doesNotMatch(JSON.stringify(calibratedSubQuotaConfigPayload), /countedTurns/);
 
     const rejectedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
@@ -2188,6 +2259,13 @@ updated_at = 1784422800000
     assert.match(page, /baseUrlInput\.autocomplete='url'/);
     assert.match(page, /subQuotaSettingsForm\.appendChild\(createSourceFields\('cpa-codex','CPA Codex'/);
     assert.match(page, /subQuotaSettingsForm\.appendChild\(createSourceFields\('sub2api','Sub2API'/);
+    assert.match(page, /calibrationTitle\.textContent='本地累计校准'/);
+    assert.match(page, /createCalibrationField\('deepSeekTotalTokens','累计 Token'\)/);
+    assert.match(page, /createCalibrationField\('deepSeekTotalRequests','累计请求'\)/);
+    assert.match(page, /fetch\('\/api\/deepseek-usage-calibration'/);
+    assert.match(page, /校准完成，后续本地用量将继续累加/);
+    assert.match(page, /footer\.className='subQuotaSettingsFooter'/);
+    assert.match(page, /subQuotaSettingsForm\.insertBefore\(inputs\.source,footer\)/);
     assert.match(page, /inputs\.baseUrlInput\.value=source\.baseUrl\|\|''/);
     assert.match(page, /source\.keyConfigured\?'Key 已配置，留空保留'/);
     assert.match(page, /正在保存额度配置…/);

@@ -749,6 +749,7 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   const sources = publicSubQuotaConfigs();
   const primary = sources.find((source) => source.configured) || sources[0];
+  const deepSeekUsage = readDeepSeekUsageStats() || {};
   res.json({
     baseUrl: primary?.baseUrl || '',
     provider: configuredSubQuotaConfigs().length > 1 ? 'multi' : currentSubQuotaProvider(),
@@ -759,7 +760,23 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
     configured: sources.some((source) => source.configured),
     configuredCount: sources.filter((source) => source.configured).length,
     sources,
+    deepSeekUsage: {
+      totalTokens: Number(deepSeekUsage.totalTokens) || 0,
+      requests: Number(deepSeekUsage.requests) || 0,
+      updatedAt: String(deepSeekUsage.updatedAt || ''),
+    },
   });
+});
+
+app.put('/api/deepseek-usage-calibration', requireAuth, (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    const usage = calibrateDeepSeekUsage(req.body?.totalTokens, req.body?.requests);
+    res.json({ ok: true, usage });
+  } catch (err) {
+    const status = Number(err?.statusCode) || 500;
+    res.status(status).json({ error: `校准 DeepSeek 本地累计失败: ${err.message}` });
+  }
 });
 
 app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
@@ -2416,6 +2433,7 @@ function readDeepSeekUsageState() {
       cachedInputTokens: Number(data.cachedInputTokens) || 0,
       requests: Number(data.requests) || 0,
       updatedAt: String(data.updatedAt || ''),
+      calibratedAt: String(data.calibratedAt || ''),
       countedTurns: Array.isArray(data.countedTurns)
         ? [...new Set(data.countedTurns.map((item) => String(item || '').trim()).filter(Boolean))]
         : [],
@@ -2439,6 +2457,7 @@ function accumulateDeepSeekUsage(model, usage, turnKey = '') {
       cachedInputTokens: (Number(current.cachedInputTokens) || 0) + usage.cached,
       requests: (Number(current.requests) || 0) + (Number(usage.requests) || 1),
       updatedAt: new Date().toISOString(),
+      ...(current.calibratedAt ? { calibratedAt: current.calibratedAt } : {}),
       countedTurns: key ? [...countedTurns, key] : countedTurns,
     };
     atomicWriteFile(DEEPSEEK_USAGE_FILE, JSON.stringify(next, null, 2) + '\n');
@@ -2447,6 +2466,45 @@ function accumulateDeepSeekUsage(model, usage, turnKey = '') {
     // 用量统计失败不应阻塞聊天流程
     return false;
   }
+}
+
+function deepSeekCalibrationInteger(value, label) {
+  const compact = String(value ?? '').trim().replace(/[,，\s]/g, '');
+  if (!/^\d+$/.test(compact)) {
+    const error = new Error(`${label}必须是非负整数`);
+    error.statusCode = 400;
+    throw error;
+  }
+  const number = Number(compact);
+  if (!Number.isSafeInteger(number)) {
+    const error = new Error(`${label}超出安全整数范围`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return number;
+}
+
+function calibrateDeepSeekUsage(totalTokensValue, requestsValue) {
+  const totalTokens = deepSeekCalibrationInteger(totalTokensValue, '累计 Token');
+  const requests = deepSeekCalibrationInteger(requestsValue, '累计请求');
+  const current = readDeepSeekUsageState() || {};
+  const calibratedAt = new Date().toISOString();
+  const next = {
+    totalTokens,
+    inputTokens: Number(current.inputTokens) || 0,
+    outputTokens: Number(current.outputTokens) || 0,
+    cachedInputTokens: Number(current.cachedInputTokens) || 0,
+    requests,
+    updatedAt: calibratedAt,
+    calibratedAt,
+    countedTurns: Array.isArray(current.countedTurns) ? current.countedTurns : [],
+  };
+  atomicWriteFile(DEEPSEEK_USAGE_FILE, JSON.stringify(next, null, 2) + '\n');
+  return {
+    totalTokens: next.totalTokens,
+    requests: next.requests,
+    updatedAt: next.updatedAt,
+  };
 }
 
 function saveUploadedBackground(body) {
@@ -11990,7 +12048,61 @@ function ensureSubQuotaSettingsDialog(){
     source.appendChild(sourceHead);
     source.appendChild(urlField);
     source.appendChild(keyField);
-    subQuotaSettingsInputs.set(provider,{baseUrlInput,apiKeyInput,credentialHint,source});
+    let calibration=null;
+    if(provider==='deepseek'){
+      const panel=document.createElement('div');
+      panel.className='deepSeekUsageCalibration';
+      const calibrationTitle=document.createElement('h4');
+      calibrationTitle.className='deepSeekUsageCalibrationTitle';
+      calibrationTitle.textContent='本地累计校准';
+      const calibrationHint=document.createElement('p');
+      calibrationHint.className='deepSeekUsageCalibrationHint';
+      calibrationHint.textContent='填写 DeepSeek 官网当前显示值；校准后，新的本地调用会继续累加。';
+      const fields=document.createElement('div');
+      fields.className='deepSeekUsageCalibrationFields';
+      const createCalibrationField=(name,labelText)=>{
+        const field=document.createElement('label');
+        field.className='field';
+        const label=document.createElement('span');
+        label.textContent=labelText;
+        const input=document.createElement('input');
+        input.name=name;
+        input.type='text';
+        input.inputMode='numeric';
+        input.autocomplete='off';
+        input.maxLength=32;
+        input.placeholder='0';
+        field.appendChild(label);
+        field.appendChild(input);
+        fields.appendChild(field);
+        return input;
+      };
+      const totalTokensInput=createCalibrationField('deepSeekTotalTokens','累计 Token');
+      const requestsInput=createCalibrationField('deepSeekTotalRequests','累计请求');
+      const actions=document.createElement('div');
+      actions.className='deepSeekUsageCalibrationActions';
+      const calibrateButton=document.createElement('button');
+      calibrateButton.type='button';
+      calibrateButton.className='miniSecondary deepSeekUsageCalibrationSubmit';
+      setIconLabel(calibrateButton,'crosshair','校准累计量');
+      const calibrationStatus=document.createElement('div');
+      calibrationStatus.className='deepSeekUsageCalibrationStatus';
+      calibrationStatus.setAttribute('role','status');
+      calibrationStatus.setAttribute('aria-live','polite');
+      actions.appendChild(calibrateButton);
+      panel.appendChild(calibrationTitle);
+      panel.appendChild(calibrationHint);
+      panel.appendChild(fields);
+      panel.appendChild(actions);
+      panel.appendChild(calibrationStatus);
+      source.appendChild(panel);
+      calibration={totalTokensInput,requestsInput,calibrateButton,calibrationStatus};
+      calibrateButton.addEventListener('click',submitDeepSeekUsageCalibration);
+      for(const input of [totalTokensInput,requestsInput]){
+        input.addEventListener('keydown',(event)=>{if(event.key==='Enter'){event.preventDefault();calibrateButton.click()}});
+      }
+    }
+    subQuotaSettingsInputs.set(provider,{baseUrlInput,apiKeyInput,credentialHint,source,calibration});
     return source;
   };
   subQuotaSettingsForm.appendChild(createSourceFields('cpa-codex','CPA Codex','http://127.0.0.1:8327','CPA Management Key'));
@@ -12005,8 +12117,11 @@ function ensureSubQuotaSettingsDialog(){
   subQuotaSettingsStatus=document.createElement('div');
   subQuotaSettingsStatus.className='errorText subQuotaSettingsStatus';
   subQuotaSettingsStatus.setAttribute('role','status');
-  subQuotaSettingsForm.appendChild(subQuotaSave);
-  subQuotaSettingsForm.appendChild(subQuotaSettingsStatus);
+  const footer=document.createElement('div');
+  footer.className='subQuotaSettingsFooter';
+  footer.appendChild(subQuotaSettingsStatus);
+  footer.appendChild(subQuotaSave);
+  subQuotaSettingsForm.appendChild(footer);
   body.appendChild(subQuotaDescription);
   body.appendChild(subQuotaSettingsForm);
   subQuotaSettingsDialog.appendChild(head);
@@ -12159,14 +12274,49 @@ async function syncSubQuotaSettings(){
       inputs.apiKeyInput.placeholder=source.keyConfigured?'Key 已配置，留空保留':(provider==='sub2api'?'Sub2API API Key':(provider==='grok2api'?'管理员密码，或 username:password':(provider==='deepseek'?'DeepSeek API Key':'CPA Management Key')));
       inputs.credentialHint.textContent=source.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，可先保存 URL';
     }
+    const calibration=subQuotaSettingsInputs.get('deepseek')?.calibration;
+    if(calibration){
+      const usage=data.deepSeekUsage||{};
+      calibration.totalTokensInput.value=Number(usage.totalTokens||0).toLocaleString('en-US',{maximumFractionDigits:0});
+      calibration.requestsInput.value=Number(usage.requests||0).toLocaleString('en-US',{maximumFractionDigits:0});
+      calibration.calibrationStatus.textContent='';
+      calibration.calibrationStatus.classList.remove('success');
+    }
     if(Array.isArray(data.sources)&&data.sources.length){
+      const footer=subQuotaSettingsForm.querySelector('.subQuotaSettingsFooter');
       for(const item of data.sources){
         const inputs=subQuotaSettingsInputs.get(item.provider);
-        if(inputs?.source)subQuotaSettingsForm.appendChild(inputs.source);
+        if(inputs?.source){
+          if(footer)subQuotaSettingsForm.insertBefore(inputs.source,footer);
+          else subQuotaSettingsForm.appendChild(inputs.source);
+        }
       }
       syncSubQuotaMoveButtons();
     }
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'读取设置失败')}
+}
+async function submitDeepSeekUsageCalibration(){
+  const calibration=subQuotaSettingsInputs.get('deepseek')?.calibration;
+  if(!calibration)return;
+  const {totalTokensInput,requestsInput,calibrateButton,calibrationStatus}=calibration;
+  calibrateButton.disabled=true;
+  calibrationStatus.classList.remove('success');
+  calibrationStatus.textContent='正在校准本地累计…';
+  try{
+    const response=await fetch('/api/deepseek-usage-calibration',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({totalTokens:totalTokensInput.value,requests:requestsInput.value})});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||'校准失败');
+    const usage=data.usage||{};
+    totalTokensInput.value=Number(usage.totalTokens||0).toLocaleString('en-US',{maximumFractionDigits:0});
+    requestsInput.value=Number(usage.requests||0).toLocaleString('en-US',{maximumFractionDigits:0});
+    calibrationStatus.classList.add('success');
+    calibrationStatus.textContent='校准完成，后续本地用量将继续累加';
+    void loadSubQuota({refresh:true});
+  }catch(error){
+    calibrationStatus.textContent=String(error?.message||'校准失败');
+  }finally{
+    calibrateButton.disabled=false;
+  }
 }
 async function submitSubQuotaSettings(event){
   event.preventDefault();
