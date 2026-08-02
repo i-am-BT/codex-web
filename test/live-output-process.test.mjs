@@ -1865,7 +1865,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(mobileGoalStyles, /body \.composer > \.threadGoalBar\.runtimeOnly,[\s\S]*?display:\s*block;/s);
   const refreshFilesSource = sourceBetween('function refreshLiveEditedFilesResult', 'function createWebPreviewResultCard');
   assert.equal((refreshFilesSource.match(/renderThreadGoalBar\(\)/g) || []).length, 2);
-  assert.match(serverSource, /ui\.css\?v=queue-mobile-three-plan-pill-20260801b/);
+  assert.match(serverSource, /ui\.css\?v=login-theme-20260802c/);
 });
 
 test('desktop live plan stays a compact pill with an on-demand detail popup', () => {
