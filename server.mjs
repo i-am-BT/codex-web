@@ -73,12 +73,6 @@ const IMAGE_PROMPT_CACHE_DIR = path.join(RUNTIME_DIR, 'image-prompts');
 const SUB_QUOTA_DEFAULT_ORDER = ['cpa-codex', 'sub2api', 'grok2api', 'deepseek'];
 const DEEPSEEK_USAGE_FILE = path.join(RUNTIME_DIR, 'deepseek-usage.json');
 const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com';
-const DEEPSEEK_PRICE_TABLE = {
-  'deepseek-v4-pro': { input: 0.435, cached: 0.003625, output: 0.87 },
-  'deepseek-v4-flash': { input: 0.14, cached: 0.0028, output: 0.28 },
-  'deepseek-reasoner': { input: 0.55, cached: 0.14, output: 2.19 },
-  'deepseek-chat': { input: 0.28, cached: 0.028, output: 0.42 },
-};
 const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
 const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
 const PLAYGROUND_PREVIOUS_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'previous');
@@ -255,6 +249,7 @@ const desktopIpcClient = new CodexDesktopIpcClient({
 });
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
+const pendingDeepSeekNativeTurns = new Map();
 const nativeTurnReservations = new Set();
 const promptQueueItemReservations = new Map();
 let appQueueMutationTail = Promise.resolve();
@@ -2396,12 +2391,20 @@ function captureDeepSeekTurnUsage(line, usage) {
   }
 }
 
-function deepSeekPriceFor(model) {
-  const key = String(model || '').trim().toLowerCase();
-  return DEEPSEEK_PRICE_TABLE[key] || DEEPSEEK_PRICE_TABLE['deepseek-v4-flash'];
+function readDeepSeekUsageStats() {
+  const state = readDeepSeekUsageState();
+  if (!state) return null;
+  return {
+    totalTokens: state.totalTokens,
+    inputTokens: state.inputTokens,
+    outputTokens: state.outputTokens,
+    cachedInputTokens: state.cachedInputTokens,
+    requests: state.requests,
+    updatedAt: state.updatedAt,
+  };
 }
 
-function readDeepSeekUsageStats() {
+function readDeepSeekUsageState() {
   try {
     if (!existsSync(DEEPSEEK_USAGE_FILE)) return null;
     const data = JSON.parse(readFileSync(DEEPSEEK_USAGE_FILE, 'utf8'));
@@ -2411,37 +2414,38 @@ function readDeepSeekUsageStats() {
       inputTokens: Number(data.inputTokens) || 0,
       outputTokens: Number(data.outputTokens) || 0,
       cachedInputTokens: Number(data.cachedInputTokens) || 0,
-      cost: Number(data.cost) || 0,
       requests: Number(data.requests) || 0,
       updatedAt: String(data.updatedAt || ''),
+      countedTurns: Array.isArray(data.countedTurns)
+        ? [...new Set(data.countedTurns.map((item) => String(item || '').trim()).filter(Boolean))]
+        : [],
     };
   } catch {
     return null;
   }
 }
 
-function accumulateDeepSeekUsage(model, usage) {
-  if (!usage || !(Number(usage.total) > 0)) return;
+function accumulateDeepSeekUsage(model, usage, turnKey = '') {
+  if (!usage || !(Number(usage.total) > 0)) return false;
   try {
-    const current = readDeepSeekUsageStats() || {};
-    const price = deepSeekPriceFor(model);
-    const cost = (
-      (Math.max(0, Number(usage.input) - Number(usage.cached)) * price.input)
-      + (Number(usage.cached) * price.cached)
-      + (Number(usage.output) * price.output)
-    ) / 1e6;
+    const current = readDeepSeekUsageState() || {};
+    const key = String(turnKey || '').trim().slice(0, 160);
+    const countedTurns = Array.isArray(current.countedTurns) ? current.countedTurns : [];
+    if (key && countedTurns.includes(key)) return true;
     const next = {
       totalTokens: (Number(current.totalTokens) || 0) + usage.total,
       inputTokens: (Number(current.inputTokens) || 0) + usage.input,
       outputTokens: (Number(current.outputTokens) || 0) + usage.output,
       cachedInputTokens: (Number(current.cachedInputTokens) || 0) + usage.cached,
-      cost: Math.round(((Number(current.cost) || 0) + cost) * 1e6) / 1e6,
       requests: (Number(current.requests) || 0) + (Number(usage.requests) || 1),
       updatedAt: new Date().toISOString(),
+      countedTurns: key ? [...countedTurns, key] : countedTurns,
     };
     atomicWriteFile(DEEPSEEK_USAGE_FILE, JSON.stringify(next, null, 2) + '\n');
+    return true;
   } catch {
     // 用量统计失败不应阻塞聊天流程
+    return false;
   }
 }
 
@@ -2932,9 +2936,34 @@ function broadcastNativeSessionChange(change) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'sessions', change);
 }
 
+function captureDeepSeekNativeTurnUsage(change) {
+  for (const threadId of change?.changedIds || []) {
+    const conversation = nativeSessions.get(threadId);
+    for (const [turnKey, pending] of pendingDeepSeekNativeTurns) {
+      if (pending.threadId !== threadId) continue;
+      const completion = [...(conversation?.messages || [])].reverse().find((message) => (
+        message.kind === 'task_complete'
+        && String(message.turnId || '') === pending.turnId
+        && Number(message.tokenUsage?.totalTokens) > 0
+      ));
+      if (!completion) continue;
+      const tokenUsage = completion.tokenUsage;
+      const recorded = accumulateDeepSeekUsage(pending.model, {
+        input: Number(tokenUsage.inputTokens) || 0,
+        cached: Number(tokenUsage.cachedInputTokens) || 0,
+        output: Number(tokenUsage.outputTokens) || 0,
+        total: Number(tokenUsage.totalTokens) || 0,
+        requests: 1,
+      }, turnKey);
+      if (recorded) pendingDeepSeekNativeTurns.delete(turnKey);
+    }
+  }
+}
+
 function handleNativeSessionChange(change) {
   // Session snapshots can briefly report idle before the matching turn completion
   // notification arrives. They must not release the turn lock used by queue dispatch.
+  captureDeepSeekNativeTurnUsage(change);
   broadcastNativeSessionChange(change);
 }
 
@@ -3461,6 +3490,18 @@ function setNativeTurnState(threadId, state) {
   if (Object.hasOwn(state, 'serviceTier')) next.serviceTier = cleanServiceTier(state.serviceTier);
   else if (Object.hasOwn(current || {}, 'serviceTier')) next.serviceTier = current.serviceTier;
   activeNativeTurns.set(cleanId, next);
+  const deepSeekTurnKey = `${cleanId}:${next.turnId}`;
+  if (next.status === 'running' && next.turnId) {
+    if (isDeepSeekCodexProvider(next.provider)) {
+      pendingDeepSeekNativeTurns.set(deepSeekTurnKey, {
+        threadId: cleanId,
+        turnId: next.turnId,
+        model: next.model,
+      });
+    }
+  } else if (next.status === 'error' || next.status === 'interrupted') {
+    pendingDeepSeekNativeTurns.delete(deepSeekTurnKey);
+  }
   if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
   broadcastNativeRuntime({ type: 'turn', threadId: cleanId, ...next });
   nativeSessions.scheduleRefresh();
@@ -12579,20 +12620,17 @@ function renderSubQuota(data){
       let detailCount=0;
       const balanceValue=finiteSubQuotaNumber(quota.balance??quota.remaining);
       const currency=String(quota.currency||'CNY').toUpperCase();
-      if(balanceValue!==null)detailCount+=appendSubQuotaWindow(source,'余额',{remaining:balanceValue},currency,{fixedCurrency:false})?1:0;
+      const balanceStatus=quota.status?'状态 '+formatSubQuotaStatus(quota.status):'';
+      if(balanceValue!==null)detailCount+=appendSubQuotaWindow(source,'余额',{remaining:balanceValue},currency,{fixedCurrency:false,inlineStatus:balanceStatus,showRemainingLabel:false})?1:0;
       const meta=document.createElement('div');
-      meta.className='subQuotaMeta';
-      if(Number.isFinite(Number(quota.grantedBalance))&&Number.isFinite(Number(quota.toppedUpBalance))
-        &&(Number(quota.grantedBalance)>0||Number(quota.toppedUpBalance)>0)){
-        appendSubQuotaMeta(meta,'赠送 '+formatSubQuotaAmount(quota.grantedBalance,currency)+' · 充值 '+formatSubQuotaAmount(quota.toppedUpBalance,currency));
-      }
+      meta.className='subQuotaMeta subQuotaMetaDeepSeek';
       const stats=quota.usageStats||{};
-      if(Number.isFinite(Number(stats.cost))&&Number(stats.cost)>0)appendSubQuotaMeta(meta,'累计消费 '+formatSubQuotaAmount(stats.cost,'USD'));
       if(Number.isFinite(Number(stats.totalTokens))&&Number(stats.totalTokens)>0)appendSubQuotaMeta(meta,'累计 Token '+Number(stats.totalTokens).toLocaleString('zh-CN'));
-      if(Number.isFinite(Number(stats.requests))&&Number(stats.requests)>0)appendSubQuotaMeta(meta,'累计请求 '+Number(stats.requests).toLocaleString('zh-CN'));
-      if(Number.isFinite(Number(stats.totalTokens))&&Number(stats.totalTokens)>0)appendSubQuotaMeta(meta,'按官方单价统计');
-      if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
       if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
+      if(Number.isFinite(Number(stats.requests))&&Number(stats.requests)>0){
+        const requests=appendSubQuotaMeta(meta,'累计请求 '+Number(stats.requests).toLocaleString('zh-CN'));
+        requests.className='subQuotaMetaTrailing';
+      }
       if(meta.childElementCount)source.appendChild(meta);
       if(detailCount||meta.childElementCount){
         subQuotaContent.appendChild(source);
@@ -12665,11 +12703,13 @@ function appendSubQuotaWindow(parent,label,windowData,unit,options={}){
   const availabilityOnly=available&&used===null&&limit===null&&remaining===null;
   const displayUsed=options.displayUsed===true||windowData.display==='used';
   const fixedCurrency=options.fixedCurrency===true;
+  const remainingLabel=options.showRemainingLabel===false?'':'剩余 ';
   if(used===null&&limit===null&&remaining===null&&!available)return false;
   const row=document.createElement('div');
   row.className='subQuotaWindow';
   const head=document.createElement('div');
-  head.className='subQuotaWindowHead';
+  const inlineStatus=String(options.inlineStatus||'').trim();
+  head.className='subQuotaWindowHead'+(inlineStatus?' subQuotaWindowHeadInline':'');
   const title=document.createElement('span');
   title.textContent=label;
   const value=document.createElement('span');
@@ -12678,19 +12718,25 @@ function appendSubQuotaWindow(parent,label,windowData,unit,options={}){
   }else if(available&&used===null&&remaining===null){
     value.textContent='当前可用';
   }else if(unit==='%'&&(used!==null||remaining!==null)){
-    if(remaining!==null)value.textContent='剩余 '+formatSubQuotaAmount(remaining,'%');
+    if(remaining!==null)value.textContent=remainingLabel+formatSubQuotaAmount(remaining,'%');
     else value.textContent='已用 '+formatSubQuotaAmount(used,'%');
   }else if(limit!==null&&limit>0){
-    if(remaining!==null)value.textContent='剩余 '+formatSubQuotaAmount(remaining,unit)+' / '+formatSubQuotaAmount(limit,unit);
+    if(remaining!==null)value.textContent=remainingLabel+formatSubQuotaAmount(remaining,unit)+' / '+formatSubQuotaAmount(limit,unit);
     else if(used!==null)value.textContent='已用 '+formatSubQuotaAmount(used,unit)+' / '+formatSubQuotaAmount(limit,unit);
     else value.textContent='限额 '+formatSubQuotaAmount(limit,unit);
   }else if(remaining!==null){
-    value.textContent='剩余 '+formatSubQuotaAmount(remaining,unit);
+    value.textContent=remainingLabel+formatSubQuotaAmount(remaining,unit);
   }else{
     value.textContent='不限额'+(used===null?'':' · 已用 '+formatSubQuotaAmount(used,unit));
   }
   head.appendChild(title);
   head.appendChild(value);
+  if(inlineStatus){
+    const status=document.createElement('span');
+    status.className='subQuotaInlineStatus';
+    status.textContent=inlineStatus;
+    head.appendChild(status);
+  }
   row.appendChild(head);
   const percent=subQuotaProgressPercent(used,limit,displayUsed?null:remaining,unit,availabilityOnly);
   if(percent!==null){
@@ -12763,7 +12809,7 @@ function stopSubQuotaCountdowns(){
   clearInterval(subQuotaCountdownTimer);
   subQuotaCountdownTimer=null;
 }
-function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item)}
+function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item);return item}
 function finiteSubQuotaNumber(value){if(value===null||value===undefined||value==='')return null;const number=Number(value);return Number.isFinite(number)&&number>=0?number:null}
 function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[String(value||'').toLowerCase()]||String(value||'限速')}
 function formatSubQuotaStatus(value){return({active:'正常',quota_exhausted:'额度耗尽',expired:'已过期',no_access:'无访问权限',blocked:'已限制'})[String(value||'').toLowerCase()]||String(value||'')}
