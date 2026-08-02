@@ -3032,22 +3032,18 @@ body.modalOpen {
 
 .settingsDialog .settingsActions {
   display: flex;
-  grid-column: 1 / -1;
   flex-wrap: wrap;
+  align-items: end;
   justify-content: flex-end;
   gap: 8px;
 }
 
-.settingsDialog .settingsActions .miniSecondary {
+.settingsDialog .settingsActions .miniSecondary,
+.settingsDialog .settingsActions .miniDanger {
   width: auto;
   min-width: 0;
+  min-height: 40px;
   flex: 0 0 auto;
-}
-
-.settingsDialog .settingsDanger {
-  grid-column: 1 / -1;
-  width: max-content;
-  justify-self: start;
 }
 
 .settingsDialog .providerBox {
@@ -10566,6 +10562,14 @@ body .composer > .box:focus-within {
   .settingsDialog .settings > *,
   .passwordForm > * {
     grid-column: 1;
+  }
+
+  .settingsDialog .settingsActions {
+    justify-content: stretch;
+  }
+
+  .settingsDialog .settingsActions .miniSecondary {
+    flex: 1 1 0;
   }
 
   .settingsDialog .providerBox form {
