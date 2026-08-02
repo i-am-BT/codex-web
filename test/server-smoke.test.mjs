@@ -2065,7 +2065,7 @@ updated_at = 1784422800000
     assert.match(page, /inputs\.baseUrlInput\.value=source\.baseUrl\|\|''/);
     assert.match(page, /source\.keyConfigured\?'Key 已配置，留空保留'/);
     assert.match(page, /正在保存额度配置…/);
-    assert.match(page, /JSON\.stringify\(\{sources\}\)/);
+    assert.match(page, /JSON\.stringify\(\{sources,order\}\)/);
     assert.match(page, /检测错误不影响保存/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);
@@ -6335,6 +6335,9 @@ function startServer({
   env.GROK2API_BASE_URL = '';
   env.GROK2API_ADMIN_PASSWORD = '';
   env.GROK2API_API_KEY = '';
+  delete env.DEEPSEEK_BASE_URL;
+  delete env.DEEPSEEK_API_KEY;
+  delete env.SUB_QUOTA_ORDER;
   env.SUB_QUOTA_SOURCES = '';
   env.SUB_QUOTA_PROVIDER = 'cpa-codex';
   if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;

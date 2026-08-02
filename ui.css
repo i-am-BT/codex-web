@@ -839,6 +839,43 @@ body .subQuotaReset:disabled {
   line-height: 1.35;
 }
 
+.subQuotaSettingsSourceHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.subQuotaMoveButtons {
+  display: inline-flex;
+  gap: 4px;
+  flex: none;
+}
+
+.subQuotaMoveButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-subtle);
+  cursor: pointer;
+}
+
+.subQuotaMoveButton:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.subQuotaMoveButton:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 .subQuotaCredentialHint {
   color: var(--text-subtle);
   font-size: 10px;

@@ -14,6 +14,7 @@ const CODEX_USAGE_HEADERS = {
   Accept: 'application/json',
   'User-Agent': 'codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal',
 };
+const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com';
 const TRANSIENT_FETCH_ERROR = Symbol('transientFetchError');
 const SOURCE_WIDE_FETCH_ERROR = Symbol('sourceWideFetchError');
 const PARTIAL_SOURCE_FETCH_ERROR = Symbol('partialSourceFetchError');
@@ -94,6 +95,7 @@ export class SubQuotaService {
   async fetchSource(source, fetchedAt) {
     if (source.provider === 'cpa-codex') return this.fetchCpaCodexSource(source, fetchedAt);
     if (source.provider === 'grok2api') return this.fetchGrok2ApiSource(source, fetchedAt);
+    if (source.provider === 'deepseek') return this.fetchDeepSeekSource(source, fetchedAt);
     return this.fetchSub2ApiSource(source, fetchedAt);
   }
 
@@ -114,6 +116,23 @@ export class SubQuotaService {
     const summary = unwrapGrok2ApiData(data);
     if (!isRecord(summary)) throw new Error('Grok2API 账号汇总响应无效');
     return summary;
+  }
+
+  async fetchDeepSeekSource(source, fetchedAt) {
+    const base = { id: source.id, name: source.name, provider: 'deepseek', fetchedAt };
+    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+
+    try {
+      const data = await this.requestJson(`${source.baseUrl}/user/balance`, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${source.apiKey}`,
+        },
+      });
+      return [{ ...base, ...normalizeDeepSeekBalance(data) }];
+    } catch (error) {
+      return [fetchErrorQuota(base, error, { sourceWide: true })];
+    }
   }
 
   async resetGrok2ApiQuota(source, options = {}) {
@@ -499,7 +518,9 @@ export function parseSubQuotaSources(value, env = process.env) {
       throw new Error(`额度来源 ${id} 的 adminApiKeyEnv 无效`);
     }
     ids.add(id);
-    const baseUrl = normalizeSubQuotaBaseUrl(item?.baseUrl, { provider });
+    const baseUrl = provider === 'deepseek'
+      ? normalizeSubQuotaBaseUrl(String(item?.baseUrl || '').trim() || DEEPSEEK_DEFAULT_BASE_URL, { provider: 'deepseek' })
+      : normalizeSubQuotaBaseUrl(item?.baseUrl, { provider });
     return {
       id,
       name,
@@ -756,6 +777,41 @@ export function normalizeGrok2ApiSummary(data) {
   };
 }
 
+export function normalizeDeepSeekBalance(data) {
+  if (!isRecord(data)) throw new Error('DeepSeek 余额响应格式无效');
+  const infos = Array.isArray(data.balance_infos) ? data.balance_infos.filter(isRecord) : [];
+  const info = infos.find((item) => cleanText(item.currency, 8).toUpperCase() === 'CNY')
+    || infos.find((item) => cleanText(item.currency, 8).toUpperCase() === 'USD')
+    || infos[0];
+  const currency = cleanText(info?.currency, 8).toUpperCase() || 'CNY';
+  const totalBalance = nonNegativeNumber(info?.total_balance);
+  const grantedBalance = nonNegativeNumber(info?.granted_balance);
+  const toppedUpBalance = nonNegativeNumber(info?.topped_up_balance);
+  return {
+    valid: data.is_available !== false,
+    mode: 'deepseek',
+    status: data.is_available === false
+      ? 'no_access'
+      : totalBalance !== null && totalBalance > 0
+        ? 'active'
+        : 'no_access',
+    planName: 'DeepSeek 官方',
+    unit: currency,
+    remaining: totalBalance,
+    balance: totalBalance,
+    currency,
+    grantedBalance,
+    toppedUpBalance,
+    quota: null,
+    subscription: null,
+    rateLimits: [],
+    expiresAt: '',
+    daysUntilExpiry: null,
+    today: null,
+    total: null,
+  };
+}
+
 export async function detectSubQuotaProvider(baseUrl, apiKey, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = positiveNumber(options.timeoutMs, DEFAULT_TIMEOUT_MS);
@@ -910,7 +966,9 @@ export function normalizeSubQuotaBaseUrl(value, options = {}) {
     ? 'CPA Management URL'
     : provider === 'grok2api'
       ? 'Grok2API URL'
-      : 'API URL';
+      : provider === 'deepseek'
+        ? 'DeepSeek API URL'
+        : 'API URL';
   const text = String(value || '').trim();
   if (!text) throw new Error(`${label} 不能为空`);
   if (text.length > MAX_BASE_URL_LENGTH || /[\r\n\0]/.test(text)) {
@@ -938,6 +996,10 @@ export function normalizeSubQuotaBaseUrl(value, options = {}) {
     pathname = pathname
       .replace(/\/api\/admin(?:\/.*)?$/i, '')
       .replace(/\/admin(?:\/.*)?$/i, '')
+      .replace(/\/v1\/usage$/i, '')
+      .replace(/\/v1$/i, '');
+  } else if (provider === 'deepseek') {
+    pathname = pathname
       .replace(/\/v1\/usage$/i, '')
       .replace(/\/v1$/i, '');
   } else {
@@ -1029,6 +1091,7 @@ function normalizeProvider(value) {
   if (!text || text === 'sub2api' || text === 'sub') return 'sub2api';
   if (text === 'cpa' || text === 'cpa-codex' || text === 'codex' || text === 'cliproxyapi') return 'cpa-codex';
   if (text === 'grok2api' || text === 'grok' || text === 'grok-api' || text === 'grok_api') return 'grok2api';
+  if (text === 'deepseek' || text === 'deep-seek' || text === 'deepseek-api' || text === 'deep_seek' || text === 'ds') return 'deepseek';
   return 'sub2api';
 }
 

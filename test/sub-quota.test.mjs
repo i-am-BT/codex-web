@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   detectSubQuotaProvider,
   normalizeCpaCodexQuota,
+  normalizeDeepSeekBalance,
   normalizeGrok2ApiSummary,
   normalizeSubQuota,
   normalizeSub2ApiCodexAccounts,
@@ -57,6 +58,14 @@ test('normalizes editable CPA Management URLs and rejects unsafe values', () => 
   assert.equal(normalizeSubQuotaBaseUrl('http://127.0.0.1:8327/v1/usage', { provider: 'cpa-codex' }), 'http://127.0.0.1:8327');
   assert.throws(() => normalizeSubQuotaBaseUrl('', { provider: 'cpa-codex' }), /不能为空/);
   assert.throws(() => normalizeSubQuotaBaseUrl('file:///tmp/cpa', { provider: 'cpa-codex' }), /http\/https/);
+});
+
+test('normalizes editable DeepSeek API URLs', () => {
+  assert.equal(normalizeSubQuotaBaseUrl('https://api.deepseek.com/', { provider: 'deepseek' }), 'https://api.deepseek.com');
+  assert.equal(normalizeSubQuotaBaseUrl('https://api.deepseek.com/v1', { provider: 'deepseek' }), 'https://api.deepseek.com');
+  assert.equal(normalizeSubQuotaBaseUrl('https://api.deepseek.com/v1/usage/', { provider: 'deepseek' }), 'https://api.deepseek.com');
+  assert.throws(() => normalizeSubQuotaBaseUrl('', { provider: 'deepseek' }), /不能为空/);
+  assert.throws(() => normalizeSubQuotaBaseUrl('ftp://api.deepseek.com', { provider: 'deepseek' }), /http\/https/);
 });
 
 test('normalizes CPA Codex usage windows into percent rate limits', () => {
@@ -123,6 +132,90 @@ test('parses server-side Sub quota sources without embedding credentials', () =>
   assert.equal(adminEnriched[0].adminApiKeyEnv, 'SUB_ADMIN_API_KEY');
   assert.equal(adminEnriched[0].adminApiKey, 'admin-secret');
   assert.throws(() => parseSubQuotaSources('[{"baseUrl":"file:///tmp/key"}]'), /apiKeyEnv/);
+});
+
+test('parses DeepSeek official quota sources with a default base URL', () => {
+  const sources = parseSubQuotaSources(JSON.stringify([{
+    id: 'deepseek',
+    name: 'DeepSeek 官方',
+    provider: 'deepseek',
+    apiKeyEnv: 'DEEPSEEK_API_KEY',
+  }]), { DEEPSEEK_API_KEY: 'sk-deepseek' });
+
+  assert.deepEqual(sources, [{
+    id: 'deepseek',
+    name: 'DeepSeek 官方',
+    provider: 'deepseek',
+    apiKeyEnv: 'DEEPSEEK_API_KEY',
+    apiKey: 'sk-deepseek',
+    baseUrl: 'https://api.deepseek.com',
+    usageUrl: '',
+  }]);
+});
+
+test('normalizes DeepSeek balance responses', () => {
+  const quota = normalizeDeepSeekBalance({
+    is_available: true,
+    balance_infos: [{
+      currency: 'CNY',
+      total_balance: '110.00',
+      granted_balance: '10.00',
+      topped_up_balance: '100.00',
+    }],
+  });
+  assert.equal(quota.mode, 'deepseek');
+  assert.equal(quota.planName, 'DeepSeek 官方');
+  assert.equal(quota.balance, 110);
+  assert.equal(quota.remaining, 110);
+  assert.equal(quota.currency, 'CNY');
+  assert.equal(quota.grantedBalance, 10);
+  assert.equal(quota.toppedUpBalance, 100);
+  assert.equal(quota.status, 'active');
+  assert.equal(quota.valid, true);
+  assert.deepEqual(quota.rateLimits, []);
+
+  const unavailable = normalizeDeepSeekBalance({ is_available: false, balance_infos: [] });
+  assert.equal(unavailable.valid, false);
+  assert.equal(unavailable.status, 'no_access');
+  assert.throws(() => normalizeDeepSeekBalance(null), /格式无效/);
+});
+
+test('fetches DeepSeek official balance without leaking credentials', async () => {
+  const fetchImpl = async (url, options) => {
+    assert.equal(url, 'https://api.deepseek.com/user/balance');
+    assert.equal(options.headers.Authorization, 'Bearer sk-deepseek');
+    return new Response(JSON.stringify({
+      is_available: true,
+      balance_infos: [{
+        currency: 'CNY',
+        total_balance: '88.50',
+        granted_balance: '0.00',
+        topped_up_balance: '88.50',
+      }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'deepseek',
+      name: 'DeepSeek',
+      provider: 'deepseek',
+      apiKeyEnv: 'DEEPSEEK_API_KEY',
+      apiKey: 'sk-deepseek',
+      baseUrl: 'https://api.deepseek.com',
+      usageUrl: '',
+    }],
+    fetchImpl,
+    now: () => 1000000,
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.count, 1);
+  assert.equal(listed.quotas[0].provider, 'deepseek');
+  assert.equal(listed.quotas[0].balance, 88.5);
+  assert.equal(listed.quotas[0].currency, 'CNY');
+  assert.equal(listed.quotas[0].mode, 'deepseek');
+  assert.doesNotMatch(JSON.stringify(listed), /sk-deepseek/);
 });
 
 test('normalizes Sub2API subscription and quota-limited responses', () => {

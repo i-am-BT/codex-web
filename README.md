@@ -169,8 +169,12 @@ cp .env.example .env
 | `SUB2API_BASE_URL` | Sub2API 地址；旧的单 CPA 配置仍可通过 `SUB_QUOTA_PROVIDER=cpa-codex` 兼容读取 |
 | `SUB2API_API_KEY` | Sub2API API Key；旧的单 CPA Management Key 仍兼容读取 |
 | `SUB2API_ADMIN_API_KEY` | 可选的 Sub2API 管理 API Key；仅在服务端用于补充 Codex 账号 5 小时/7 天额度 |
-| `SUB_QUOTA_TIMEOUT_MS` | CPA/Sub2API 额度请求超时，默认 10000 毫秒 |
-| `SUB_QUOTA_CACHE_SECONDS` | CPA/Sub2API 额度结果缓存时间，默认 30 秒 |
+| `GROK2API_BASE_URL` | Grok2API 管理面板地址；与 `GROK2API_ADMIN_PASSWORD` 同时设置后启用 Grok2API 额度 |
+| `GROK2API_ADMIN_PASSWORD` | Grok2API 管理员密码（或 `username:password`），仅保存在服务端本地 `.env` |
+| `DEEPSEEK_BASE_URL` | DeepSeek 官方 API 地址，默认 `https://api.deepseek.com` |
+| `DEEPSEEK_API_KEY` | DeepSeek 官方 API Key；设置后启用 DeepSeek 官方余额监控，仅保存在服务端本地 `.env` |
+| `SUB_QUOTA_TIMEOUT_MS` | 额度请求超时，默认 10000 毫秒 |
+| `SUB_QUOTA_CACHE_SECONDS` | 额度结果缓存时间，默认 30 秒 |
 | `IMAGE_PROMPT_AUTO_SYNC` | 启动时及定时检查 `awesome-gpt-image-2` 更新，默认开启 |
 | `IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` | 提示词库自动检查间隔，默认 360 分钟 |
 | `IMAGE_PROMPT_SYNC_TIMEOUT_MS` | 单次 GitHub 请求超时，默认 20000 毫秒 |
@@ -194,9 +198,11 @@ cp .env.example .env
 | `DEFAULT_SANDBOX` | Codex 默认沙箱模式 |
 | `DEFAULT_APPROVAL` | Codex 默认审批模式 |
 
-### CPA Codex 与 Sub2API 额度
+### 额度监控
 
-左侧额度入口可同时查询本地 CLIProxyAPI（CPA）中的 Codex 账号额度与 Sub2API 额度。悬停额度图标显示两路只读额度卡，点击图标可分别填写两组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与 API Key 限速窗口。可选设置 `SUB2API_ADMIN_API_KEY` 后，服务端还会读取 `/api/v1/admin/accounts` 中缓存的 Codex 提供商账号 5 小时/7 天使用百分比；管理 Key 不会发送到浏览器。
+左侧额度入口可同时查询本地 CLIProxyAPI（CPA）Codex 账号额度、Sub2API 额度、Grok2API 账号池与 DeepSeek 官方余额。悬停额度图标显示各渠道只读额度卡，点击图标可分别填写各组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与 API Key 限速窗口；Grok2API 通过管理面板汇总账号池。可选设置 `SUB2API_ADMIN_API_KEY` 后，服务端还会读取 `/api/v1/admin/accounts` 中缓存的 Codex 提供商账号 5 小时/7 天使用百分比；管理 Key 不会发送到浏览器。
+
+**DeepSeek 官方额度**：余额通过官方 `GET https://api.deepseek.com/user/balance` 实时查询；官方 API 未开放累计消费/用量查询接口，因此累计 Token 与累计消费由本服务根据每次实际 API 调用返回的 `usage` 本地累计，消费金额按官方单价统计（缓存命中按缓存价），仅供参考。统计文件保存在 `runtime/deepseek-usage.json`。
 
 ```bash
 CPA_QUOTA_BASE_URL=http://127.0.0.1:8327
@@ -204,10 +210,14 @@ CPA_QUOTA_API_KEY=<replace-with-cpa-management-key>
 SUB2API_BASE_URL=https://sub.example.com
 SUB2API_API_KEY=<replace-with-sub2api-key>
 SUB2API_ADMIN_API_KEY=<optional-sub2api-admin-key>
+GROK2API_BASE_URL=http://127.0.0.1:8100
+GROK2API_ADMIN_PASSWORD=<optional-grok2api-admin-password>
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_API_KEY=<replace-with-deepseek-api-key>
 SUB_QUOTA_PROVIDER=multi
 ```
 
-两路 URL 与 Key 均可在额度设置弹窗中保存，环境变量仍可用于首次或手工配置。真实 Key 只应写入已忽略的本地 `.env`，不要写入 `.env.example`、README、提交记录或浏览器端代码。点击设置时 Key 输入框不会回显现有值，留空不会替换对应来源的当前 Key。只配置一路时仍会正常显示；两路均配置后会在同一个额度弹层中依次显示。
+各组 URL 与 Key 均可在额度设置弹窗中保存，环境变量仍可用于首次或手工配置。真实 Key 只应写入已忽略的本地 `.env`，不要写入 `.env.example`、README、提交记录或浏览器端代码。点击设置时 Key 输入框不会回显现有值，留空不会替换对应来源的当前 Key。只配置一路时仍会正常显示；多路均配置后会在同一个额度弹层中依次显示。
 
 ### 同源代理
 
