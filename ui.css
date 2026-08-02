@@ -98,6 +98,24 @@ body[data-theme="dark"] {
   letter-spacing: 0;
 }
 
+/* Ambient light particles + mouse-following light rays. */
+#fxCanvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 0.45s ease;
+}
+
+body[data-chat-bg="custom"] #fxCanvas,
+body[data-chat-bg="skin"] #fxCanvas {
+  opacity: 0.28;
+}
+
 * {
   scrollbar-color: var(--border-strong) transparent;
   scrollbar-width: thin;
