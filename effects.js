@@ -4,12 +4,9 @@
 (() => {
   'use strict';
 
-  const canvas = document.createElement('canvas');
-  canvas.id = 'fxCanvas';
-  canvas.setAttribute('aria-hidden', 'true');
-  document.body.insertBefore(canvas, document.body.firstChild);
-
-  const ctx = canvas.getContext('2d');
+  let running = false;
+  let canvas = null;
+  let ctx = null;
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const DPR_CAP = 2;
   const TRAIL_MS = 520;
@@ -118,6 +115,7 @@
   }
 
   function onPointerMove(event) {
+    if (!running) return;
     pointer.x = event.clientX;
     pointer.y = event.clientY;
     pointer.lastMove = performance.now();
@@ -213,6 +211,7 @@
   }
 
   window.addEventListener('resize', () => {
+    if (!running) return;
     cancelAnimationFrame(resizeRaf);
     resizeRaf = requestAnimationFrame(resize);
   });
@@ -220,6 +219,7 @@
   window.addEventListener('pointermove', onPointerMove, { passive: true });
 
   document.addEventListener('visibilitychange', () => {
+    if (!running) return;
     if (document.hidden) {
       cancelAnimationFrame(raf);
     } else if (!reducedMotion) {
@@ -229,6 +229,10 @@
   });
 
   const bodyObserver = new MutationObserver(() => {
+    const fxOn = document.body.dataset.fx === 'on';
+    if (fxOn && !running) startFx();
+    else if (!fxOn && running) stopFx();
+    if (!running) return;
     const next = readPalette();
     const colorsChanged =
       colorKey(next.primary) !== colorKey(palette.primary) ||
@@ -243,15 +247,40 @@
   });
   bodyObserver.observe(document.body, {
     attributes: true,
-    attributeFilter: ['data-theme', 'data-chat-bg', 'data-skin-concept'],
+    attributeFilter: ['data-theme', 'data-chat-bg', 'data-skin-concept', 'data-fx'],
   });
 
-  rebuildSprites();
-  resize();
-  if (reducedMotion) {
-    render(performance.now(), 0);
-  } else {
+  function startFx() {
+    if (running) return;
+    running = true;
+    canvas = document.createElement('canvas');
+    canvas.id = 'fxCanvas';
+    canvas.setAttribute('aria-hidden', 'true');
+    document.body.insertBefore(canvas, document.body.firstChild);
+    ctx = canvas.getContext('2d');
+    rebuildSprites();
+    resize();
     last = performance.now();
-    raf = requestAnimationFrame(frame);
+    if (reducedMotion) {
+      render(performance.now(), 0);
+    } else {
+      raf = requestAnimationFrame(frame);
+    }
   }
+
+  function stopFx() {
+    if (!running) return;
+    running = false;
+    cancelAnimationFrame(raf);
+    raf = 0;
+    pointer.history.length = 0;
+    pointer.lastMove = -Infinity;
+    if (canvas) {
+      canvas.remove();
+      canvas = null;
+    }
+    ctx = null;
+  }
+
+  if (document.body.dataset.fx === 'on') startFx();
 })();
