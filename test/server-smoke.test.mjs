@@ -12,6 +12,132 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+test('DeepSeek local usage persists native turn deduplication without exposing turn ids', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function readDeepSeekUsageStats');
+  const helperEnd = serverSource.indexOf('\nfunction saveUploadedBackground', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  let persisted = '';
+  const api = new Function(
+    'DEEPSEEK_USAGE_FILE',
+    'existsSync',
+    'readFileSync',
+    'atomicWriteFile',
+    `${serverSource.slice(helperStart, helperEnd)}; return { readDeepSeekUsageStats, accumulateDeepSeekUsage };`,
+  )(
+    '/runtime/deepseek-usage.json',
+    () => Boolean(persisted),
+    () => persisted,
+    (_file, content) => { persisted = content; },
+  );
+
+  const usage = { input: 100, cached: 40, output: 25, total: 125, requests: 1 };
+  assert.equal(api.accumulateDeepSeekUsage('deepseek-v4-flash', usage, 'thread-a:turn-1'), true);
+  assert.equal(api.accumulateDeepSeekUsage('deepseek-v4-flash', usage, 'thread-a:turn-1'), true);
+  assert.equal(api.accumulateDeepSeekUsage('deepseek-v4-flash', usage, 'thread-a:turn-2'), true);
+
+  const state = JSON.parse(persisted);
+  assert.equal(state.totalTokens, 250);
+  assert.equal(state.inputTokens, 200);
+  assert.equal(state.cachedInputTokens, 80);
+  assert.equal(state.outputTokens, 50);
+  assert.equal(state.requests, 2);
+  assert.deepEqual(state.countedTurns, ['thread-a:turn-1', 'thread-a:turn-2']);
+  assert.deepEqual(api.readDeepSeekUsageStats(), {
+    totalTokens: 250,
+    inputTokens: 200,
+    outputTokens: 50,
+    cachedInputTokens: 80,
+    requests: 2,
+    updatedAt: state.updatedAt,
+  });
+});
+
+test('native DeepSeek completions feed the local usage accumulator', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function captureDeepSeekNativeTurnUsage');
+  const helperEnd = serverSource.indexOf('\nfunction handleNativeSessionChange', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const pendingDeepSeekNativeTurns = new Map([
+    ['thread-a:turn-1', { threadId: 'thread-a', turnId: 'turn-1', model: 'deepseek-v4-flash' }],
+    ['thread-a:turn-2', { threadId: 'thread-a', turnId: 'turn-2', model: 'deepseek-v4-flash' }],
+  ]);
+  const recorded = [];
+  const captureDeepSeekNativeTurnUsage = new Function(
+    'pendingDeepSeekNativeTurns',
+    'nativeSessions',
+    'accumulateDeepSeekUsage',
+    `${serverSource.slice(helperStart, helperEnd)}; return captureDeepSeekNativeTurnUsage;`,
+  )(
+    pendingDeepSeekNativeTurns,
+    {
+      get: () => ({
+        messages: [
+          {
+            kind: 'task_complete',
+            turnId: 'turn-1',
+            tokenUsage: {
+              inputTokens: 100,
+              cachedInputTokens: 40,
+              outputTokens: 25,
+              totalTokens: 125,
+            },
+          },
+          {
+            kind: 'task_complete',
+            turnId: 'turn-2',
+            tokenUsage: {
+              inputTokens: 200,
+              cachedInputTokens: 80,
+              outputTokens: 50,
+              totalTokens: 250,
+            },
+          },
+        ],
+      }),
+    },
+    (model, usage, turnKey) => {
+      recorded.push({ model, usage, turnKey });
+      return true;
+    },
+  );
+
+  captureDeepSeekNativeTurnUsage({ changedIds: ['thread-a'] });
+  assert.deepEqual(recorded, [{
+    model: 'deepseek-v4-flash',
+    usage: { input: 100, cached: 40, output: 25, total: 125, requests: 1 },
+    turnKey: 'thread-a:turn-1',
+  }, {
+    model: 'deepseek-v4-flash',
+    usage: { input: 200, cached: 80, output: 50, total: 250, requests: 1 },
+    turnKey: 'thread-a:turn-2',
+  }]);
+  assert.equal(pendingDeepSeekNativeTurns.has('thread-a:turn-1'), false);
+  assert.equal(pendingDeepSeekNativeTurns.has('thread-a:turn-2'), false);
+});
+
+test('DeepSeek quota card hides balance funding breakdown and keeps local totals', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const uiStyles = await readFile(path.join(ROOT, 'ui.css'), 'utf8');
+  const branchStart = serverSource.indexOf("if(quota.provider==='deepseek')");
+  const branchEnd = serverSource.indexOf("const unit=quota.unit", branchStart);
+  assert.ok(branchStart >= 0 && branchEnd > branchStart);
+  const branch = serverSource.slice(branchStart, branchEnd);
+  assert.doesNotMatch(branch, /grantedBalance|toppedUpBalance|赠送|充值/);
+  assert.match(branch, /累计 Token/);
+  assert.match(branch, /累计请求/);
+  assert.match(branch, /inlineStatus:balanceStatus,showRemainingLabel:false/);
+  assert.match(branch, /subQuotaMeta subQuotaMetaDeepSeek/);
+  assert.match(branch, /requests\.className='subQuotaMetaTrailing'/);
+  assert.doesNotMatch(branch, /appendSubQuotaMeta\(meta,'状态 /);
+  assert.doesNotMatch(serverSource, /subQuotaInlineSeparator/);
+  assert.match(uiStyles, /\.subQuotaWindowHeadInline \.subQuotaInlineStatus\s*\{[^}]*margin-left:\s*auto/s);
+  assert.match(uiStyles, /\.subQuotaMetaDeepSeek\s*\{[^}]*flex-wrap:\s*nowrap/s);
+  assert.match(uiStyles, /\.subQuotaMetaDeepSeek \.subQuotaMetaTrailing\s*\{[^}]*margin-left:\s*auto/s);
+});
+
 test('native queue turns ignore unscoped idle status and stale completions', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const notificationStart = serverSource.indexOf('function handleAppServerNotification');
@@ -6335,9 +6461,9 @@ function startServer({
   env.GROK2API_BASE_URL = '';
   env.GROK2API_ADMIN_PASSWORD = '';
   env.GROK2API_API_KEY = '';
-  delete env.DEEPSEEK_BASE_URL;
-  delete env.DEEPSEEK_API_KEY;
-  delete env.SUB_QUOTA_ORDER;
+  env.DEEPSEEK_BASE_URL = '';
+  env.DEEPSEEK_API_KEY = '';
+  env.SUB_QUOTA_ORDER = '';
   env.SUB_QUOTA_SOURCES = '';
   env.SUB_QUOTA_PROVIDER = 'cpa-codex';
   if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;

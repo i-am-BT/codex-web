@@ -680,6 +680,16 @@ body .subQuotaClose:hover {
   white-space: nowrap;
 }
 
+.subQuotaWindowHeadInline {
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+.subQuotaWindowHeadInline .subQuotaInlineStatus {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .subQuotaProgress {
   height: 6px;
   overflow: hidden;
@@ -723,6 +733,23 @@ body .subQuotaClose:hover {
   color: var(--text-subtle);
   font-size: 10px;
   line-height: 1.4;
+}
+
+.subQuotaMetaDeepSeek {
+  flex-wrap: nowrap;
+  align-items: baseline;
+}
+
+.subQuotaMetaDeepSeek > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaMetaDeepSeek .subQuotaMetaTrailing {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .subQuotaRefresh {
