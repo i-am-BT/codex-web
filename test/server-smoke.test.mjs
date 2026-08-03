@@ -12,6 +12,72 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+test('Homepage stats expose current and concurrent running task names', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function homepageTaskName');
+  const helperEnd = serverSource.indexOf('\nfunction requireConfigWrite', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  assert.match(serverSource, /const taskStats = homepageRunningTaskStats\(nativeSessionList\)/);
+  assert.match(serverSource, /currentTask: taskStats\.currentTask/);
+  assert.match(serverSource, /runningTasks: taskStats\.runningTasks/);
+
+  const buildStats = ({ turns = new Map(), process = null, conversations = [] } = {}) => new Function(
+    'activeNativeTurns',
+    'activeProcess',
+    'activeConversationId',
+    'conversations',
+    `${serverSource.slice(helperStart, helperEnd)}; return homepageRunningTaskStats;`,
+  )(turns, process, 'legacy-active', conversations);
+
+  const sessions = [
+    {
+      id: 'older',
+      title: 'Older task',
+      status: 'running',
+      updatedAt: '2026-08-03T00:00:00.000Z',
+    },
+    {
+      id: 'newer',
+      title: '  Current\n task  ',
+      status: 'running',
+      updatedAt: '2026-08-03T00:01:00.000Z',
+    },
+    { id: 'done', title: 'Finished task', status: 'done' },
+  ];
+  const turns = new Map([
+    ['older', { startedAt: '2026-08-03T00:02:00.000Z' }],
+    ['newer', { startedAt: '2026-08-03T00:03:00.000Z' }],
+  ]);
+  const nativeStats = buildStats({ turns })(sessions);
+  assert.deepEqual(nativeStats, {
+    running: 2,
+    currentTask: 'Current task',
+    runningTasks: [
+      { name: 'Current task', status: '执行中', startedAt: '2026-08-03T00:03:00.000Z' },
+      { name: 'Older task', status: '执行中', startedAt: '2026-08-03T00:02:00.000Z' },
+    ],
+  });
+
+  const withLegacyStats = buildStats({
+    turns,
+    process: { pid: 123 },
+    conversations: [{
+      id: 'legacy-active',
+      title: 'Legacy current task',
+      updatedAt: '2026-08-03T00:04:00.000Z',
+    }],
+  })(sessions);
+  assert.equal(withLegacyStats.running, 3);
+  assert.equal(withLegacyStats.currentTask, 'Legacy current task');
+  assert.equal(withLegacyStats.runningTasks[0].name, 'Legacy current task');
+
+  assert.deepEqual(buildStats()([]), {
+    running: 0,
+    currentTask: '空闲',
+    runningTasks: [],
+  });
+});
+
 test('DeepSeek local usage persists native turn deduplication without exposing turn ids', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('function readDeepSeekUsageStats');
