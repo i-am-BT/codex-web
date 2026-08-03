@@ -1,0 +1,1117 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 5fc1614..2ec9586 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,11 +1,11 @@
+ import { useEffect } from 'react'
+ import { initStore } from './store'
+-import { useStore } from './store'
++import { useStore, createInputImageFromFile } from './store'
+ import { activateFirstImportedProfile, buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
+ import { isDefaultConfigOnlyEnabled, mergeImportedSettings } from './lib/apiProfiles'
+ import { getCustomProviderConfigUrl, loadCustomProviderSettingsFromUrl } from './lib/customProviderConfigUrl'
+ import { useDockerApiUrlMigrationNotice } from './hooks/useDockerApiUrlMigrationNotice'
+-import type { AppSettings } from './types'
++import type { ApiProfile, AppSettings } from './types'
+ import Header from './components/Header'
+ import SearchBar from './components/SearchBar'
+ import TaskGrid from './components/TaskGrid'
+@@ -96,6 +96,73 @@ export default function App() {
+     initStore()
+   }, [setSettings])
+ 
++  useEffect(() => {
++    if (window.parent === window) return
++
++    void fetch('/api/playground-config', { cache: 'no-store' })
++      .then(async (response) => {
++        if (!response.ok) throw new Error(`HTTP ${response.status}`)
++        return response.json() as Promise<{
++          profile?: ApiProfile
++          profiles?: ApiProfile[]
++          agentApiConfigMode?: 'hybrid'
++          agentTextProfileId?: string
++          agentImageProfileId?: string
++          allowedOrigins?: string[]
++        }>
++      })
++      .then((config) => {
++        const state = useStore.getState()
++        const importedProfiles = Array.isArray(config.profiles) && config.profiles.length
++          ? config.profiles
++          : config.profile
++            ? [config.profile]
++            : []
++        if (!importedProfiles.length) return
++
++        const imageProfileId = config.agentImageProfileId || 'codex-web-default'
++        const importedById = new Map(importedProfiles.map((profile) => [profile.id, profile]))
++        const allowedOrigins = new Set(config.allowedOrigins || [])
++        const updatedProfiles = importedProfiles.map((profile) => {
++          const existing = state.settings.profiles.find((item) => item.id === profile.id)
++          const existingBaseUrl = existing?.baseUrl?.trim() || ''
++          let existingOrigin = ''
++          try {
++            existingOrigin = new URL(existingBaseUrl).origin
++          } catch {
++            // Ignore stale or malformed browser-local API URLs.
++          }
++          const preserveExistingUpstream = allowedOrigins.has(existingOrigin)
++          return {
++            ...existing,
++            ...profile,
++            baseUrl: preserveExistingUpstream ? existingBaseUrl : profile.baseUrl,
++            apiKey: preserveExistingUpstream ? existing?.apiKey?.trim() || profile.apiKey : profile.apiKey,
++            model: profile.id === imageProfileId ? existing?.model || profile.model : profile.model,
++            streamImages: typeof existing?.streamImages === 'boolean' ? existing.streamImages : profile.streamImages,
++            streamPartialImages: typeof existing?.streamPartialImages === 'number' ? existing.streamPartialImages : profile.streamPartialImages,
++          }
++        })
++        const importedIds = new Set(importedProfiles.map((profile) => profile.id))
++        const profiles = [
++          ...state.settings.profiles.filter((profile) => !importedIds.has(profile.id)),
++          ...updatedProfiles,
++        ]
++        const imageProfile = importedById.get(imageProfileId) || updatedProfiles[0]
++        const textProfile = importedById.get(config.agentTextProfileId || 'codex-web-agent') || updatedProfiles[1] || updatedProfiles[0]
++        state.setSettings({
++          profiles,
++          activeProfileId: imageProfile.id,
++          agentApiConfigMode: config.agentApiConfigMode || (profiles.length > 1 ? 'hybrid' : undefined),
++          agentTextProfileId: textProfile.id,
++          agentImageProfileId: imageProfile.id,
++        })
++      })
++      .catch((error) => {
++        console.warn('Failed to import Codex Web API profiles:', error)
++      })
++  }, [])
++
+   useEffect(() => {
+     const preventPageImageDrag = (e: DragEvent) => {
+       if ((e.target as HTMLElement | null)?.closest('img')) {
+@@ -107,6 +174,64 @@ export default function App() {
+     return () => document.removeEventListener('dragstart', preventPageImageDrag)
+   }, [])
+ 
++  useEffect(() => {
++    if (window.parent === window) return
++
++    const post = (type: string, requestId = '', error = '') => {
++      window.parent.postMessage({ type, requestId, ...(error ? { error } : {}) }, window.location.origin)
++    }
++
++    const applyPrompt = async (message: { prompt?: unknown; params?: Record<string, unknown>; images?: unknown[] }) => {
++      const prompt = typeof message.prompt === 'string' ? message.prompt.trim() : ''
++      if (!prompt) throw new Error('提示词为空')
++      const params = message.params && typeof message.params === 'object' ? message.params : {}
++      const quality = params.quality === 'low' || params.quality === 'medium' || params.quality === 'high' ? params.quality : 'auto'
++      const outputFormat = params.output_format === 'jpeg' || params.output_format === 'webp' ? params.output_format : 'png'
++      const count = Number(params.n)
++      const state = useStore.getState()
++      state.setAppMode('gallery')
++      state.setParams({
++        size: typeof params.size === 'string' && params.size.trim() ? params.size : 'auto',
++        quality,
++        output_format: outputFormat,
++        n: Number.isInteger(count) ? Math.min(8, Math.max(1, count)) : 1,
++        transparent_output: params.transparent_output === true,
++      })
++
++      const inputImages = []
++      const images = Array.isArray(message.images) ? message.images.slice(0, 12) : []
++      for (const [index, item] of images.entries()) {
++        if (!item || typeof item !== 'object') continue
++        const dataUrl = typeof (item as { dataUrl?: unknown }).dataUrl === 'string' ? (item as { dataUrl: string }).dataUrl : ''
++        if (!dataUrl.startsWith('data:image/')) continue
++        const blob = await fetch(dataUrl).then((response) => response.blob())
++        if (!blob.type.startsWith('image/')) continue
++        const name = typeof (item as { name?: unknown }).name === 'string' && (item as { name: string }).name.trim()
++          ? (item as { name: string }).name
++          : `reference-${index + 1}`
++        const image = await createInputImageFromFile(new File([blob], name, { type: blob.type }))
++        if (image) inputImages.push(image)
++      }
++      state.setInputImages(inputImages)
++      state.setPrompt(prompt)
++      state.showToast('已从提示词库载入', 'success')
++    }
++
++    const handleMessage = (event: MessageEvent) => {
++      if (event.origin !== window.location.origin || event.source !== window.parent) return
++      const message = event.data
++      if (!message || typeof message !== 'object' || message.type !== 'codex-web:image-prompt') return
++      const requestId = typeof message.requestId === 'string' ? message.requestId : ''
++      void applyPrompt(message)
++        .then(() => post('codex-web:image-prompt-applied', requestId))
++        .catch((error: unknown) => post('codex-web:image-prompt-error', requestId, error instanceof Error ? error.message : String(error)))
++    }
++
++    window.addEventListener('message', handleMessage)
++    post('codex-web:playground-ready')
++    return () => window.removeEventListener('message', handleMessage)
++  }, [])
++
+   return (
+     <>
+       <Header />
+diff --git a/src/components/AgentWorkspace.tsx b/src/components/AgentWorkspace.tsx
+index 2c51e32..ea1dbab 100644
+--- a/src/components/AgentWorkspace.tsx
++++ b/src/components/AgentWorkspace.tsx
+@@ -780,6 +780,15 @@ export default function AgentWorkspace() {
+                 const hasRoundFavoriteTasks = favoriteTasksForRound.length > 0
+                 const allRoundTasksFavorited = hasRoundFavoriteTasks && favoriteTasksForRound.every((task) => task.isFavorite)
+                 const assistantBlocks = isAssistant ? getAgentAssistantBlocks(round ?? null, taskSlotsForRound, tasks, Boolean(message.content.trim())) : []
++                const suppressCompletedImageTimeout = isAssistant
++                  && round?.status === 'error'
++                  && taskSlotsForRound.length > 0
++                  && taskSlotsForRound.every((slot) => slot.task?.status === 'done' && slot.task.outputImages.length > 0)
++                  && /failed to stream request:\s*stream first event timeout/i.test(round.error ?? message.content)
++                const visibleAssistantBlocks = suppressCompletedImageTimeout
++                  ? assistantBlocks.filter((block) => block.type !== 'text')
++                  : assistantBlocks
++                const visibleAssistantText = suppressCompletedImageTimeout ? '' : message.content
+                 const inputImagesForRound = (round?.inputImageIds || []).map(id => ({ id, dataUrl: '' }))
+                 const parts = getPromptMentionParts(message.content, inputImagesForRound)
+                 return (
+@@ -817,41 +826,57 @@ export default function AgentWorkspace() {
+                       </div>
+                     )}
+ 
+-                    {round?.status === 'error' && isAssistant && message.content.startsWith('请求失败：') ? (
+-                      <div
+-                        data-selectable-text
+-                        className="-m-2 flex cursor-copy select-text flex-col rounded-xl p-2 transition-colors hover:bg-red-50/60 dark:hover:bg-red-500/5"
+-                        title="点击复制完整报错"
+-                        onPointerDown={handleErrorCopyPointerDown}
+-                        onClick={(e) => handleErrorCopyClick(e, message.content)}
+-                      >
+-                        {(() => {
+-                          const content = message.content.replace(/^请求失败：/, '');
+-                          const [mainErr, ...hints] = content.split('\n提示：');
+-                          return (
+-                            <>
+-                              <div className="flex items-start gap-2 text-red-500 dark:text-red-400">
+-                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-[18px] h-[18px] mt-[1.5px] flex-shrink-0">
+-                                  <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-8-5a.75.75 0 01.75.75v4.5a.75.75 0 01-1.5 0v-4.5A.75.75 0 0110 5zm0 10a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+-                                </svg>
+-                                <div className="whitespace-pre-wrap text-[14px] leading-relaxed break-words font-medium">
+-                                  {mainErr}
+-                                </div>
+-                              </div>
+-                              {hints.length > 0 && (
+-                                <div className="pl-[26px] mt-1.5 whitespace-pre-wrap text-[13px] leading-relaxed text-gray-500 dark:text-gray-400 break-words opacity-90">
+-                                  <span className="font-medium">提示：</span>{hints.join('\n提示：')}
++                    {round?.status === 'error' && isAssistant && message.content.startsWith('请求失败：') && !suppressCompletedImageTimeout ? (
++                      <>
++                        <div
++                          data-selectable-text
++                          className="-m-2 flex cursor-copy select-text flex-col rounded-xl p-2 transition-colors hover:bg-red-50/60 dark:hover:bg-red-500/5"
++                          title="点击复制完整报错"
++                          onPointerDown={handleErrorCopyPointerDown}
++                          onClick={(e) => handleErrorCopyClick(e, message.content)}
++                        >
++                          {(() => {
++                            const content = message.content.replace(/^请求失败：/, '');
++                            const [mainErr, ...hints] = content.split('\n提示：');
++                            return (
++                              <>
++                                <div className="flex items-start gap-2 text-red-500 dark:text-red-400">
++                                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-[18px] h-[18px] mt-[1.5px] flex-shrink-0">
++                                    <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-8-5a.75.75 0 01.75.75v4.5a.75.75 0 01-1.5 0v-4.5A.75.75 0 0110 5zm0 10a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
++                                  </svg>
++                                  <div className="whitespace-pre-wrap text-[14px] leading-relaxed break-words font-medium">
++                                    {mainErr}
++                                  </div>
+                                 </div>
+-                              )}
+-                            </>
+-                          );
+-                        })()}
+-                      </div>
++                                {hints.length > 0 && (
++                                  <div className="pl-[26px] mt-1.5 whitespace-pre-wrap text-[13px] leading-relaxed text-gray-500 dark:text-gray-400 break-words opacity-90">
++                                    <span className="font-medium">提示：</span>{hints.join('\n提示：')}
++                                  </div>
++                                )}
++                              </>
++                            );
++                          })()}
++                        </div>
++                        {assistantBlocks
++                          .filter((block) => block.type === 'image-task' && block.task.outputImages.length > 0)
++                          .map((block) => block.type === 'image-task' && (
++                            <div key={block.key} className="mt-4 max-w-sm" onClick={e => e.stopPropagation()}>
++                              <TaskCard
++                                task={block.task}
++                                disableSwipe={true}
++                                onClick={() => setDetailTaskId(block.task.id)}
++                                onReuse={() => handleReuse(block.task)}
++                                onEditOutputs={() => editOutputs(block.task)}
++                                onDelete={() => setConfirmDialog({ title: '删除任务', message: '确定要删除这个任务吗？', action: () => removeTask(block.task) })}
++                              />
++                            </div>
++                          ))}
++                      </>
+                     ) : (
+                       <div data-selectable-text className={`text-[15px] leading-relaxed text-gray-800 dark:text-gray-100 ${!isAssistant ? 'select-text' : ''}`}>
+                         {isAssistant ? (
+                           <>
+-                            {assistantBlocks.length > 0 ? assistantBlocks.map((block, index) => {
++                            {visibleAssistantBlocks.length > 0 ? visibleAssistantBlocks.map((block, index) => {
+                               if (block.type === 'web-search') return <AgentWebSearchStatusLines key={block.key} statuses={[block.status]} />
+                               if (block.type === 'text') return <div key={block.key} className={index > 0 ? 'mt-3' : undefined}><MarkdownRenderer content={block.content ?? message.content} streaming={isStreamingAssistant} /></div>
+                               if (block.type === 'batch-params') {
+@@ -932,8 +957,8 @@ export default function AgentWorkspace() {
+                         )}
+                         {isAssistant ? (
+                           <>
+-                            <AgentActionButton tooltip="复制输出文本" className={`p-1.5 rounded-md transition-colors ${message.content.trim() ? 'text-gray-400 hover:text-gray-700 hover:bg-gray-100 dark:hover:text-gray-200 dark:hover:bg-white/[0.06]' : 'text-gray-300 dark:text-gray-600 opacity-50 cursor-not-allowed'}`} disabled={!message.content.trim()} onClick={() => {
+-                              void handleCopyMessage(getAgentAssistantCopyContent(message.content, assistantBlocks), '输出文本已复制', '复制输出文本失败');
++                            <AgentActionButton tooltip="复制输出文本" className={`p-1.5 rounded-md transition-colors ${visibleAssistantText.trim() ? 'text-gray-400 hover:text-gray-700 hover:bg-gray-100 dark:hover:text-gray-200 dark:hover:bg-white/[0.06]' : 'text-gray-300 dark:text-gray-600 opacity-50 cursor-not-allowed'}`} disabled={!visibleAssistantText.trim()} onClick={() => {
++                              void handleCopyMessage(getAgentAssistantCopyContent(visibleAssistantText, visibleAssistantBlocks), '输出文本已复制', '复制输出文本失败');
+                             }}>
+                               <CopyIcon className="w-4 h-4" />
+                             </AgentActionButton>
+diff --git a/src/components/InputBar.tsx b/src/components/InputBar.tsx
+index b0ba6de..f343f48 100644
+--- a/src/components/InputBar.tsx
++++ b/src/components/InputBar.tsx
+@@ -48,6 +48,7 @@ function useIsMobile() {
+ type AtImageOption =
+   | { type: 'input'; key: string; label: string; imageId: string; dataUrl: string; imageIndex: number }
+   | { type: 'agent-output'; key: string; label: string; imageId: string; insertText: string }
++  | { type: 'upload'; key: string; label: string }
+ 
+ function agentImageMentionMatches(query: string, label: string) {
+   const normalized = query.trim().toLowerCase()
+@@ -57,13 +58,23 @@ function agentImageMentionMatches(query: string, label: string) {
+ }
+ 
+ function AtImageOptionThumb({ option }: { option: AtImageOption }) {
+-  const [src, setSrc] = useState(option.type === 'input' ? option.dataUrl : getCachedImage(option.imageId) || '')
++  const [src, setSrc] = useState(
++    option.type === 'input'
++      ? option.dataUrl
++      : option.type === 'agent-output'
++        ? getCachedImage(option.imageId) || ''
++        : '',
++  )
+ 
+   useEffect(() => {
+     if (option.type === 'input') {
+       setSrc(option.dataUrl)
+       return
+     }
++    if (option.type === 'upload') {
++      setSrc('')
++      return
++    }
+ 
+     let cancelled = false
+     setSrc(getCachedImage(option.imageId) || '')
+@@ -76,8 +87,14 @@ function AtImageOptionThumb({ option }: { option: AtImageOption }) {
+   }, [option])
+ 
+   return (
+-    <span className="h-9 w-9 shrink-0 overflow-hidden rounded-lg border border-gray-200/70 bg-gray-100 dark:border-white/[0.08] dark:bg-white/[0.04]">
+-      {src && <img src={src} className="h-full w-full object-cover" alt="" />}
++    <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-gray-200/70 bg-gray-100 text-gray-500 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-gray-300">
++      {option.type === 'upload' ? (
++        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
++          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
++        </svg>
++      ) : src ? (
++        <img src={src} className="h-full w-full object-cover" alt="" />
++      ) : null}
+     </span>
+   )
+ }
+@@ -437,7 +454,7 @@ export default function InputBar() {
+     ? maskDraft ? '遮罩编辑' : '生成图像'
+     : '请先配置 API'
+   const submitTooltipText = activeAgentIsRunning ? '停止生成' : '尚未完成 API 配置，请在右上角设置中进行'
+-  const promptPlaceholder = '描述你想生成的图片，可输入 @ 来指定参考图...'
++  const promptPlaceholder = '描述你想生成的图片，输入 @ 选择或上传参考图...'
+   const submitCurrentMode = useCallback(() => {
+     if (appMode === 'agent') {
+       void submitAgentMessage()
+@@ -530,7 +547,10 @@ export default function InputBar() {
+   const atImageSourceCount = inputImages.length + agentOutputImageOptions.length
+   const atImageQuery = isCursorInSelectedImageMention(prompt, cursorPosition)
+     ? null
+-    : getAtImageQuery(visiblePrompt, cursorPosition, { length: atImageSourceCount })
++    : getAtImageQuery(visiblePrompt, cursorPosition, { length: Math.max(1, atImageSourceCount) })
++  const uploadOptionMatches = atImageQuery
++    ? ['', '上传', '参考', '图片', '新图'].some((label) => label.includes(atImageQuery.query.trim().toLowerCase()))
++    : false
+   const atImageOptions = atImageQuery
+     ? [
+         ...inputImages
+@@ -544,6 +564,9 @@ export default function InputBar() {
+           } satisfies AtImageOption))
+           .filter((option) => imageMentionMatches(atImageQuery.query, option.imageIndex)),
+         ...agentOutputImageOptions.filter((option) => agentImageMentionMatches(atImageQuery.query, option.label)),
++        ...(!atImageLimit && uploadOptionMatches
++          ? [{ type: 'upload', key: 'upload-reference', label: inputImages.length ? '上传新的参考图' : '上传参考图' } satisfies AtImageOption]
++          : []),
+       ]
+     : []
+   const showAtImageMenu = !atImageMenuDismissed && atImageOptions.length > 0
+@@ -553,6 +576,13 @@ export default function InputBar() {
+ 
+ 
+   const selectAtImageOption = useCallback((option: AtImageOption) => {
++    if (option.type === 'upload') {
++      setAtImageMenuDismissed(true)
++      setAtImageMenuIndex(0)
++      fileInputRef.current?.click()
++      return
++    }
++
+     const el = textareaRef.current
+     const cursor = el ? getContentEditableCursor(el) : prompt.length
+     const query = getAtImageQuery(stripImageMentionMarkers(prompt), cursor, { length: atImageSourceCount })
+@@ -832,8 +862,20 @@ export default function InputBar() {
+   handleFilesRef.current = handleFiles
+ 
+   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
++    const imageCountBeforeUpload = useStore.getState().inputImages.length
++    const reopenMentionMenu = Boolean(
++      getAtImageQuery(stripImageMentionMarkers(prompt), cursorPosition, { length: 1 }),
++    )
+     await handleFilesRef.current(e.target.files || [])
+     e.target.value = ''
++    if (reopenMentionMenu && useStore.getState().inputImages.length > imageCountBeforeUpload) {
++      setAtImageMenuIndex(0)
++      setAtImageMenuDismissed(false)
++      window.requestAnimationFrame(() => {
++        textareaRef.current?.focus()
++        if (textareaRef.current) setContentEditableCursor(textareaRef.current, cursorPosition)
++      })
++    }
+   }
+ 
+   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+diff --git a/src/components/SettingsModal.tsx b/src/components/SettingsModal.tsx
+index 177581d..b792cae 100644
+--- a/src/components/SettingsModal.tsx
++++ b/src/components/SettingsModal.tsx
+@@ -1392,13 +1392,12 @@ export default function SettingsModal() {
+                     onChange={(e) => updateActiveProfile({ baseUrl: e.target.value })}
+                     onBlur={(e) => commitActiveProfilePatch({ baseUrl: e.target.value })}
+                     type="text"
+-                    disabled={apiProxyEnabled}
+                     placeholder={activeProfile.provider === 'fal' ? DEFAULT_FAL_BASE_URL : DEFAULT_SETTINGS.baseUrl}
+-                    className={`w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50 ${apiProxyEnabled ? 'opacity-50 cursor-not-allowed' : ''}`}
++                    className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
+                   />
+                   <div data-selectable-text className="mt-1.5 min-h-[22px] flex items-center text-xs text-gray-500 dark:text-gray-500">
+                     {apiProxyEnabled ? (
+-                      <span className="text-yellow-600 dark:text-yellow-500">已开启代理，实际请求目标由部署端决定，此处设置被忽略。</span>
++                      <span className="text-yellow-600 dark:text-yellow-500">请求将通过 Codex Web 同源代理转发到此 URL。</span>
+                     ) : activeProfile.provider === 'fal' ? (
+                       <span>默认使用 <code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">{DEFAULT_FAL_BASE_URL}</code>；填写自定义地址时将作为 fal.ai 代理 URL。</span>
+                     ) : (
+@@ -1428,7 +1427,7 @@ export default function SettingsModal() {
+                     </button>
+                   </div>
+                   <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
+-                    {apiProxyLocked ? '部署端已锁定代理开启，请求经服务器转发到上游 API，上方 URL 设置将失效。' : '开启后请求经服务器转发到上游 API，可绕过浏览器跨域限制，上方 URL 设置将失效。'}
++                    {apiProxyLocked ? '部署端已锁定代理开启，请求经服务器转发到上方 URL 指定的上游 API。' : '开启后请求经服务器转发到上方 URL 指定的上游 API，可绕过浏览器跨域限制。'}
+                   </div>
+                 </div>
+               )}
+diff --git a/src/lib/agentApi.test.ts b/src/lib/agentApi.test.ts
+index a9c05b3..c83c7b7 100644
+--- a/src/lib/agentApi.test.ts
++++ b/src/lib/agentApi.test.ts
+@@ -250,6 +250,35 @@ describe('callAgentResponsesApi', () => {
+     expect(textDeltas).toEqual(['Hel'])
+   })
+ 
++  it('surfaces nested Responses API stream failure details', async () => {
++    const streamBody = [
++      'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"sensitive_words_detected","message":"sensitive_words_detected (request id: test-request)"}}}',
++      '',
++      '',
++    ].join('\n')
++    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(new ReadableStream({
++      start(controller) {
++        controller.enqueue(new TextEncoder().encode(streamBody))
++        controller.close()
++      },
++    }), {
++      status: 200,
++      headers: { 'Content-Type': 'text/event-stream' },
++    }))
++    const profile = createDefaultOpenAIProfile({
++      apiKey: 'test-key',
++      apiMode: 'responses',
++      streamImages: true,
++    })
++
++    await expect(callAgentResponsesApi({
++      settings: DEFAULT_SETTINGS,
++      profile,
++      params: DEFAULT_PARAMS,
++      input: [{ role: 'user', content: [{ type: 'input_text', text: 'prompt' }] }],
++    })).rejects.toThrow('sensitive_words_detected (request id: test-request)')
++  })
++
+   it('generates a short conversation title without image tools', async () => {
+     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+       output: [{
+diff --git a/src/lib/agentApi.ts b/src/lib/agentApi.ts
+index 5fdf13a..896dab7 100644
+--- a/src/lib/agentApi.ts
++++ b/src/lib/agentApi.ts
+@@ -296,15 +296,19 @@ function applyUrlCitations(text: string, annotations: ResponseTextAnnotation[] |
+ }
+ 
+ function getStreamEventErrorMessage(event: Record<string, unknown>): string | null {
+-  const error = event.error
+-  if (isRecordValue(error)) {
+-    const message = getStringValue(error, 'message')
+-    if (message) return message
+-  }
+-  if (typeof error === 'string' && error.trim()) return error
++  const directError = getErrorMessageFromValue(event.error)
++  if (directError) return directError
++
++  const response = isRecordValue(event.response) ? event.response : null
++  const responseError = getErrorMessageFromValue(response?.error)
++  if (responseError) return responseError
+ 
+   const type = getStringValue(event, 'type')
+-  if (type?.endsWith('.failed')) return getStringValue(event, 'message') ?? 'Agent 流式请求失败'
++  if (type?.endsWith('.failed')) {
++    return getStringValue(event, 'message')
++      ?? (response ? getStringValue(response, 'message') : null)
++      ?? '上游 Agent 流式请求失败'
++  }
+   return null
+ }
+ 
+diff --git a/src/lib/api.test.ts b/src/lib/api.test.ts
+index 5d693d0..e005f23 100644
+--- a/src/lib/api.test.ts
++++ b/src/lib/api.test.ts
+@@ -669,7 +669,7 @@ describe('callImageApi', () => {
+     })
+ 
+     expect(fetchMock).toHaveBeenCalledWith(
+-      '/api-proxy/images/generations',
++      '/api-proxy/images/generations?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1',
+       expect.objectContaining({ method: 'POST' }),
+     )
+   })
+@@ -696,7 +696,7 @@ describe('callImageApi', () => {
+     })
+ 
+     expect(fetchMock).toHaveBeenCalledWith(
+-      '/api-proxy/images/generations',
++      '/api-proxy/images/generations?codex_upstream=',
+       expect.objectContaining({ method: 'POST' }),
+     )
+   })
+@@ -745,7 +745,7 @@ describe('callImageApi', () => {
+     })
+ 
+     expect(fetchMock).toHaveBeenCalledWith(
+-      '/api-proxy/custom/images',
++      '/api-proxy/custom/images?codex_upstream=',
+       expect.objectContaining({ method: 'POST' }),
+     )
+   })
+@@ -823,7 +823,7 @@ describe('callImageApi', () => {
+     })
+ 
+     expect(fetchMock).toHaveBeenCalledWith(
+-      '/api-proxy/images/generations',
++      '/api-proxy/images/generations?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1',
+       expect.objectContaining({ method: 'POST' }),
+     )
+   })
+diff --git a/src/lib/devProxy.test.ts b/src/lib/devProxy.test.ts
+index adc16bb..fd5327a 100644
+--- a/src/lib/devProxy.test.ts
++++ b/src/lib/devProxy.test.ts
+@@ -4,13 +4,13 @@ import { buildApiUrl } from './devProxy'
+ describe('buildApiUrl', () => {
+   it('uses the same-origin proxy prefix when API proxy is enabled', () => {
+     expect(buildApiUrl('http://api.example.com/v1', 'images/edits', null, true)).toBe(
+-      '/api-proxy/images/edits',
++      '/api-proxy/images/edits?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1',
+     )
+   })
+ 
+   it('leaves API versioning to the proxy target when proxying', () => {
+     expect(buildApiUrl('http://api.example.com', 'images/generations', null, true)).toBe(
+-      '/api-proxy/images/generations',
++      '/api-proxy/images/generations?codex_upstream=http%3A%2F%2Fapi.example.com',
+     )
+   })
+ 
+@@ -28,7 +28,7 @@ describe('buildApiUrl', () => {
+         },
+         true,
+       ),
+-    ).toBe('/openai-proxy/responses')
++    ).toBe('/openai-proxy/responses?codex_upstream=http%3A%2F%2Fapi.example.com%2Fv1')
+   })
+ 
+   it('uses the configured API URL directly when API proxy is disabled', () => {
+diff --git a/src/lib/devProxy.ts b/src/lib/devProxy.ts
+index ede2298..b9bc384 100644
+--- a/src/lib/devProxy.ts
++++ b/src/lib/devProxy.ts
+@@ -64,7 +64,9 @@ export function buildApiUrl(
+   const endpointPath = path.replace(/^\/+/, '')
+ 
+   if (useApiProxy) {
+-    return `${proxyConfig?.prefix ?? DEFAULT_PROXY_PREFIX}/${endpointPath}`
++    const proxyUrl = `${proxyConfig?.prefix ?? DEFAULT_PROXY_PREFIX}/${endpointPath}`
++    const separator = proxyUrl.includes('?') ? '&' : '?'
++    return `${proxyUrl}${separator}codex_upstream=${encodeURIComponent(normalizedBaseUrl)}`
+   }
+ 
+   const apiPath = normalizedBaseUrl.endsWith('/v1')
+diff --git a/src/store.test.ts b/src/store.test.ts
+index 5985107..ed49b9d 100644
+--- a/src/store.test.ts
++++ b/src/store.test.ts
+@@ -134,7 +134,7 @@ import { callImageApi } from './lib/api'
+ import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
+ import { getFalQueuedImageResult } from './lib/falAiImageApi'
+ import { removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
+-import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
++import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, isDirectAgentImageFallbackPrompt, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
+ 
+ const commitTaskDeletionImplementation = vi.mocked(commitTaskDeletion).getMockImplementation()!
+ const deleteDbImageImplementation = vi.mocked(deleteDbImage).getMockImplementation()!
+@@ -154,6 +154,112 @@ describe('error toast messages', () => {
+   })
+ })
+ 
++describe('Agent direct image fallback', () => {
++  const textProfile = createDefaultOpenAIProfile({
++    id: 'agent-text-profile',
++    apiKey: 'text-key',
++    apiMode: 'responses',
++    streamImages: true,
++  })
++  const imageProfile = createDefaultOpenAIProfile({
++    id: 'agent-image-profile',
++    apiKey: 'image-key',
++    apiMode: 'images',
++    model: 'gpt-image-2',
++  })
++
++  beforeEach(async () => {
++    await clearTasks()
++    await clearImages()
++    await clearAgentConversations()
++    const { callImageApi } = await import('./lib/api')
++    vi.mocked(callImageApi).mockClear()
++    vi.mocked(callAgentResponsesApi).mockClear()
++    useStore.setState({
++      settings: normalizeSettings({
++        ...DEFAULT_SETTINGS,
++        profiles: [textProfile, imageProfile],
++        activeProfileId: imageProfile.id,
++        agentApiConfigMode: 'hybrid',
++        agentTextProfileId: textProfile.id,
++        agentImageProfileId: imageProfile.id,
++      }),
++      prompt: '生成凡人修仙传海报图',
++      inputImages: [],
++      maskDraft: null,
++      params: { ...DEFAULT_PARAMS },
++      appMode: 'agent',
++      tasks: [],
++      streamPreviews: {},
++      streamPreviewSlots: {},
++      agentConversations: [agentConversation({ id: 'conversation-fallback' })],
++      activeAgentConversationId: 'conversation-fallback',
++      agentEditingRoundId: null,
++      showToast: vi.fn(),
++    })
++  })
++
++  it('recognizes explicit image requests without treating text-only prompts as images', () => {
++    expect(isDirectAgentImageFallbackPrompt('生成凡人修仙传海报图')).toBe(true)
++    expect(isDirectAgentImageFallbackPrompt('Create a cinematic poster for a fantasy story')).toBe(true)
++    expect(isDirectAgentImageFallbackPrompt('修改第一张的背景', true)).toBe(true)
++    expect(isDirectAgentImageFallbackPrompt('只回复连接正常')).toBe(false)
++  })
++
++  it('generates directly with the image profile when the first hybrid Agent request fails', async () => {
++    const { callImageApi } = await import('./lib/api')
++    vi.mocked(callAgentResponsesApi).mockRejectedValueOnce(new Error('sensitive_words_detected'))
++    vi.mocked(callImageApi).mockResolvedValueOnce({
++      images: ['data:image/webp;base64,ZmFsbGJhY2s='],
++      actualParams: { size: '1024x1024', output_format: 'webp' },
++      actualParamsList: [{ size: '1024x1024', output_format: 'webp' }],
++      revisedPrompts: ['生成凡人修仙传海报图'],
++    })
++
++    await submitAgentMessage()
++    for (let i = 0; i < 20 && useStore.getState().agentConversations[0]?.rounds[0]?.status !== 'done'; i += 1) {
++      await new Promise((resolve) => setTimeout(resolve, 0))
++    }
++
++    expect(callImageApi).toHaveBeenCalledWith(expect.objectContaining({
++      prompt: '生成凡人修仙传海报图',
++      inputImageDataUrls: [],
++    }))
++    const state = useStore.getState()
++    const round = state.agentConversations[0].rounds[0]
++    expect(round).toMatchObject({ status: 'done', error: null })
++    expect(round.outputTaskIds).toHaveLength(1)
++    expect(state.tasks[0]).toMatchObject({
++      status: 'done',
++      apiProfileId: imageProfile.id,
++      sourceMode: 'agent',
++    })
++    expect(state.agentConversations[0].messages.find((message) => message.role === 'assistant')?.content).toBe('图像已生成。')
++    expect(state.showToast).toHaveBeenCalledWith('Agent 规划服务暂时不可用，已切换为直接生图', 'info')
++    await vi.waitFor(async () => {
++      expect((await getAllTasks())[0]).toMatchObject({ status: 'done', outputImages: expect.arrayContaining([expect.any(String)]) })
++      expect((await getAllAgentConversations())[0]?.rounds[0]).toMatchObject({ status: 'done', outputTaskIds: expect.arrayContaining([state.tasks[0].id]) })
++    })
++  })
++
++  it('keeps text-only Agent failures as errors instead of generating an image', async () => {
++    const { callImageApi } = await import('./lib/api')
++    useStore.setState({ prompt: '只回复连接正常' })
++    vi.mocked(callAgentResponsesApi).mockRejectedValueOnce(new Error('upstream unavailable'))
++
++    await submitAgentMessage()
++    for (let i = 0; i < 20 && useStore.getState().agentConversations[0]?.rounds[0]?.status !== 'error'; i += 1) {
++      await new Promise((resolve) => setTimeout(resolve, 0))
++    }
++
++    expect(callImageApi).not.toHaveBeenCalled()
++    expect(useStore.getState().agentConversations[0].rounds[0]).toMatchObject({
++      status: 'error',
++      error: 'upstream unavailable',
++    })
++  })
++})
++
+ function agentConversation(overrides: Partial<AgentConversation> = {}): AgentConversation {
+   return {
+     id: 'conversation-a',
+@@ -3828,6 +3934,61 @@ describe('agent built-in image tool failure', () => {
+     })
+   })
+ 
++  it('accepts a successful Agent image when a later response continuation times out', async () => {
++    const imageProfile = createDefaultOpenAIProfile({ id: 'image-profile', apiKey: 'image-key', apiMode: 'images' })
++    useStore.setState({
++      settings: normalizeSettings({
++        ...useStore.getState().settings,
++        profiles: [responsesProfile, imageProfile],
++        activeProfileId: responsesProfile.id,
++        agentApiConfigMode: 'hybrid',
++        agentTextProfileId: responsesProfile.id,
++        agentImageProfileId: imageProfile.id,
++        agentMaxToolRounds: 3,
++      }),
++    })
++    vi.mocked(callAgentResponsesApi)
++      .mockResolvedValueOnce({
++        text: '',
++        images: [],
++        outputItems: [{
++          type: 'function_call',
++          name: 'generate_image',
++          call_id: 'hybrid-success-before-timeout',
++          arguments: JSON.stringify({ id: 'motorcycle', prompt: '生成一台概念摩托车' }),
++        }],
++        responseId: 'response-image-call',
++      })
++      .mockRejectedValueOnce(new Error('failed to stream request: stream first event timeout'))
++    vi.mocked(callImageApi).mockResolvedValueOnce({
++      images: ['data:image/png;base64,persisted-agent-image'],
++      actualParams: { size: '1024x1024', output_format: 'png' },
++      actualParamsList: [{ size: '1024x1024', output_format: 'png' }],
++      revisedPrompts: ['生成一台概念摩托车'],
++    })
++
++    await submitAgentMessage()
++    await vi.waitFor(() => {
++      expect(useStore.getState().agentConversations[0]?.rounds[0]).toMatchObject({
++        status: 'done',
++        error: null,
++      })
++    })
++
++    const task = useStore.getState().tasks.find((item) => item.agentToolCallId === 'hybrid-success-before-timeout')
++    if (!task) throw new Error('Expected persisted Agent image task')
++    expect(task).toMatchObject({ status: 'done', outputImages: expect.arrayContaining([expect.any(String)]) })
++    expect(useStore.getState().agentConversations[0]?.messages.find((message) => message.role === 'assistant')).toMatchObject({
++      content: '图像已生成。',
++      outputTaskIds: [task.id],
++    })
++    expect(useStore.getState().showToast).toHaveBeenCalledWith('Agent 已生成图片', 'success')
++    await vi.waitFor(async () => {
++      expect((await getAllTasks()).find((item) => item.id === task.id)).toMatchObject({ status: 'done', outputImages: task.outputImages })
++      expect((await getAllAgentConversations())[0]?.rounds[0]).toMatchObject({ status: 'done', error: null, outputTaskIds: [task.id] })
++    })
++  })
++
+   it('does not commit or report a deleted Hybrid single-image result', async () => {
+     const imageProfile = createDefaultOpenAIProfile({ id: 'image-profile', apiKey: 'image-key', apiMode: 'images' })
+     const request = deferred<Awaited<ReturnType<typeof callImageApi>>>()
+diff --git a/src/store.ts b/src/store.ts
+index 872a4db..17b2673 100644
+--- a/src/store.ts
++++ b/src/store.ts
+@@ -81,6 +81,7 @@ let agentConversationPersistenceReady = false
+ let agentConversationMigrationPending = false
+ const AGENT_STOPPED_MESSAGE = '已停止生成。'
+ const AGENT_RECOVERY_PAUSE_ERROR = 'AgentRecoveryPauseError'
++const AGENT_POST_IMAGE_STREAM_TIMEOUT = /failed to stream request:\s*stream first event timeout/i
+ const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
+ const ERROR_TOAST_MAX_LENGTH = 80
+ type ToastType = 'info' | 'success' | 'error'
+@@ -952,24 +953,29 @@ export const useStore = create<AppState>()(
+ let lastStoredAgentConversations = useStore.getState().agentConversations
+ let agentConversationPersistRunning = false
+ let agentConversationPersistQueued = false
++let agentConversationPersistPromise: Promise<void> | null = null
+ 
+ async function flushAgentConversationsToIndexedDB() {
+   if (agentConversationPersistRunning) {
+     agentConversationPersistQueued = true
+-    return
++    return agentConversationPersistPromise ?? Promise.resolve()
+   }
+ 
+   agentConversationPersistRunning = true
+-  try {
+-    do {
+-      agentConversationPersistQueued = false
+-      const conversations = useStore.getState().agentConversations
+-      await replaceStoredAgentConversations(conversations)
+-      lastStoredAgentConversations = conversations
+-    } while (agentConversationPersistQueued || useStore.getState().agentConversations !== lastStoredAgentConversations)
+-  } finally {
+-    agentConversationPersistRunning = false
+-  }
++  agentConversationPersistPromise = (async () => {
++    try {
++      do {
++        agentConversationPersistQueued = false
++        const conversations = useStore.getState().agentConversations
++        await replaceStoredAgentConversations(conversations)
++        lastStoredAgentConversations = conversations
++      } while (agentConversationPersistQueued || useStore.getState().agentConversations !== lastStoredAgentConversations)
++    } finally {
++      agentConversationPersistRunning = false
++      agentConversationPersistPromise = null
++    }
++  })()
++  return agentConversationPersistPromise
+ }
+ 
+ useStore.subscribe((state) => {
+@@ -2367,6 +2373,16 @@ export async function submitAgentMessage() {
+   void executeAgentRound(conversation.id, roundId, normalizedParams, requestSettings, activeProfile, imageProfile)
+ }
+ 
++export function isDirectAgentImageFallbackPrompt(prompt: string, hasInputImages = false): boolean {
++  const text = prompt.trim()
++  if (!text) return false
++
++  const chineseImageRequest = /(?:生成|创建|制作|设计|绘制|画|做).{0,24}(?:图片|图像|海报|插画|照片|封面|壁纸|头像|logo|图|画)|(?:图片|图像|海报|插画|照片|封面|壁纸|头像|logo).{0,24}(?:生成|创建|制作|设计|绘制|画|做)|生图/i
++  const englishImageRequest = /\b(?:generate|create|make|draw|design|render|illustrate)\b[\s\S]{0,80}\b(?:image|picture|poster|illustration|photo|wallpaper|cover|avatar|logo)\b|\b(?:image|picture|poster|illustration|photo|wallpaper|cover|avatar|logo)\b[\s\S]{0,80}\b(?:generate|create|make|draw|design|render|illustrate)\b/i
++  const referenceEditRequest = hasInputImages && /(?:修改|编辑|重做|重绘|变体|换成|改成|去掉|添加|美化|扩图|抠图)|\b(?:edit|change|modify|transform|replace|remove|add|retouch|extend)\b/i.test(text)
++  return chineseImageRequest.test(text) || englishImageRequest.test(text) || referenceEditRequest
++}
++
+ export async function regenerateAgentAssistantMessage(conversationId: string, roundId: string) {
+   const state = useStore.getState()
+   const { settings, params, showToast } = state
+@@ -2617,7 +2633,7 @@ async function executeAgentRound(
+         return { taskId, committed: false }
+       }
+       const actualParams = deriveAgentImageActualParams(image.actualParams, stored)
+-      updateTaskInStore(taskId, {
++      await updateTaskInStore(taskId, {
+         prompt: image.revisedPrompt ?? latestBeforeUpdate.prompt,
+         outputImages: [stored.id],
+         actualParams,
+@@ -3030,16 +3046,18 @@ async function executeAgentRound(
+       if (reachedToolLimit) break
+       const textBeforeResponse = accumulatedText
+       let currentResponseOutputItems: ResponsesOutputItem[] = []
+-      const result = await callAgentResponsesApi({
+-        settings: requestSettings,
+-        profile: activeProfile,
+-        imageProfile,
+-        params: imageParams,
+-        input: apiInputForTurn,
+-        maskDataUrl,
+-        signal: controller.signal,
+-        onTextDelta: shouldStreamAssistantMessage
+-          ? (delta) => {
++      let result: Awaited<ReturnType<typeof callAgentResponsesApi>>
++      try {
++        result = await callAgentResponsesApi({
++          settings: requestSettings,
++          profile: activeProfile,
++          imageProfile,
++          params: imageParams,
++          input: apiInputForTurn,
++          maskDataUrl,
++          signal: controller.signal,
++          onTextDelta: shouldStreamAssistantMessage
++            ? (delta) => {
+               if (controller.signal.aborted) return
+               if (pendingToolTextSeparator && delta && accumulatedText.trim()) {
+                 accumulatedText += '\n\n'
+@@ -3049,9 +3067,9 @@ async function executeAgentRound(
+               accumulatedText += delta
+               appendAgentAssistantMessageContent(conversationId, assistantMessageId, delta)
+             }
+-          : undefined,
+-        onOutputItems: shouldStreamAssistantMessage
+-          ? (outputItems) => {
++            : undefined,
++          onOutputItems: shouldStreamAssistantMessage
++            ? (outputItems) => {
+               if (controller.signal.aborted) return
+               currentResponseOutputItems = canonicalizeBatchFunctionCallArguments(outputItems)
+               updateAgentConversation(conversationId, (current) => ({
+@@ -3059,15 +3077,15 @@ async function executeAgentRound(
+                 rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, currentResponseOutputItems) } : item),
+               }))
+             }
+-          : undefined,
+-        onImageToolStarted: shouldStreamAssistantMessage
+-          ? async ({ toolCallId }) => {
++            : undefined,
++          onImageToolStarted: shouldStreamAssistantMessage
++            ? async ({ toolCallId }) => {
+               if (controller.signal.aborted) return
+               await ensureStreamingAgentTask(toolCallId)
+             }
+-          : undefined,
+-        onImagePartialImage: shouldStreamAssistantMessage
+-          ? async ({ toolCallId, image, partialImageIndex }) => {
++            : undefined,
++          onImagePartialImage: shouldStreamAssistantMessage
++            ? async ({ toolCallId, image, partialImageIndex }) => {
+               if (controller.signal.aborted) return
+               const taskId = await ensureStreamingAgentTask(toolCallId)
+               if (controller.signal.aborted) return
+@@ -3076,22 +3094,86 @@ async function executeAgentRound(
+                 void persistTaskStreamPartialImage(taskId, image)
+               }
+             }
+-          : undefined,
+-        onImageToolCompleted: shouldStreamAssistantMessage
+-          ? async (image) => {
++            : undefined,
++          onImageToolCompleted: shouldStreamAssistantMessage
++            ? async (image) => {
+               if (controller.signal.aborted) return
+               await completeAgentImageTask(image)
+             }
+-          : undefined,
+-        onImageToolFailed: shouldStreamAssistantMessage
+-          ? async ({ toolCallId, error }) => {
++            : undefined,
++          onImageToolFailed: shouldStreamAssistantMessage
++            ? async ({ toolCallId, error }) => {
+               if (controller.signal.aborted) return
+               await ensureStreamingAgentTask(toolCallId)
+               if (controller.signal.aborted) return
+               failAgentImageTask(toolCallId, error)
+             }
+-          : undefined,
+-      })
++            : undefined,
++        })
++      } catch (agentError) {
++        const canUseDirectImageFallback =
++          !resume
++          && requestSettings.agentApiConfigMode === 'hybrid'
++          && toolCallsUsed === 0
++          && accumulatedOutputItems.length === 0
++          && streamingTaskIds.length === 0
++          && isDirectAgentImageFallbackPrompt(round.prompt || userMessage.content, round.inputImageIds.length > 0)
++        if (!canUseDirectImageFallback) throw agentError
++        if (controller.signal.aborted) throw createAgentAbortError()
++
++        useStore.getState().showToast('Agent 规划服务暂时不可用，已切换为直接生图', 'info')
++        const fallbackToolCallId = `direct-image-${genId()}`
++        const referenceImageDataUrls: string[] = []
++        const referenceImageIds: string[] = []
++        for (const imageId of round.inputImageIds) {
++          const dataUrl = await ensureImageCached(imageId)
++          if (!dataUrl) continue
++          referenceImageIds.push(imageId)
++          referenceImageDataUrls.push(dataUrl)
++        }
++        const fallbackParams = {
++          ...normalizeParamsForSettings(imageParams, imageRequestSettings, { hasInputImages: referenceImageDataUrls.length > 0 }),
++          n: 1,
++        }
++        const taskId = await ensureStreamingAgentTask(
++          fallbackToolCallId,
++          round.prompt || userMessage.content,
++          referenceImageIds,
++          { createdAt: Date.now(), taskParams: fallbackParams },
++        )
++        try {
++          const fallbackResult = await callHybridImageApiSingle({
++            taskId,
++            prompt: round.prompt || userMessage.content,
++            referenceImageDataUrls,
++            taskParams: fallbackParams,
++            signal: controller.signal,
++            onPartialImage: async ({ image, partialImageIndex }) => {
++              if (controller.signal.aborted) return
++              useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
++              if (partialImageIndex === 0 || partialImageIndex == null) {
++                void persistTaskStreamPartialImage(taskId, image)
++              }
++            },
++          })
++          if (!fallbackResult.image) {
++            const fallbackError = fallbackResult.error ?? '接口未返回图片数据'
++            failAgentImageTask(fallbackToolCallId, fallbackError, fallbackResult.rawResponsePayload)
++            const combinedError = new Error(`Agent 规划请求失败，直接生图也失败：${fallbackError}`)
++            combinedError.name = 'AgentDirectImageFallbackError'
++            throw combinedError
++          }
++          await completeAgentImageTask({ ...fallbackResult.image, toolCallId: fallbackToolCallId }, fallbackResult.rawResponsePayload)
++          toolCallsUsed += 1
++          break
++        } catch (fallbackError) {
++          if (controller.signal.aborted) throw createAgentAbortError()
++          if (fallbackError instanceof Error && fallbackError.name === 'AgentDirectImageFallbackError') throw fallbackError
++          const message = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
++          failAgentImageTask(fallbackToolCallId, message)
++          throw new Error(`Agent 规划请求失败，直接生图也失败：${message}`)
++        }
++      }
+       if (controller.signal.aborted) throw createAgentAbortError()
+ 
+       lastResponseId = result.responseId ?? lastResponseId
+@@ -3356,6 +3438,7 @@ async function executeAgentRound(
+         ? current.messages.map((message) => message.id === assistantMessageId ? assistantMessage : message)
+         : [...current.messages, assistantMessage],
+     }))
++    await flushAgentConversationsToIndexedDB()
+ 
+     useStore.getState().showToast(outputIds.length > 0 ? 'Agent 已生成图片' : 'Agent 已回复', 'success')
+     showTaskCompletionNotification(
+@@ -3379,8 +3462,66 @@ async function executeAgentRound(
+       message += `\n${networkErrorHint}`
+     }
+ 
++    const roundImageTasks = useStore.getState().tasks.filter((task) =>
++      task.agentConversationId === conversationId &&
++      task.agentRoundId === roundId,
++    )
++    const completeWithSuccessfulImages = AGENT_POST_IMAGE_STREAM_TIMEOUT.test(message)
++      && roundImageTasks.length > 0
++      && roundImageTasks.every((task) => task.status === 'done' && task.outputImages.length > 0)
++
+     markAgentRoundTasksFailed(conversationId, roundId, message, getRawErrorPayload(err).rawResponsePayload)
+ 
++    if (completeWithSuccessfulImages) {
++      const successfulTaskIds = roundImageTasks.map((task) => task.id)
++      const successfulImageCount = roundImageTasks.reduce((count, task) => count + task.outputImages.length, 0)
++      updateAgentConversation(conversationId, (current) => {
++        const completedRound = current.rounds.find((round) => round.id === roundId)
++        if (!completedRound) return current
++        const existingAssistantMessage = completedRound.assistantMessageId
++          ? current.messages.find((item) => item.id === completedRound.assistantMessageId)
++          : current.messages.find((item) => item.roundId === roundId && item.role === 'assistant')
++        const outputTaskIds = uniqueIds([...completedRound.outputTaskIds, ...successfulTaskIds])
++        const existingContent = existingAssistantMessage?.content.trim() ?? ''
++        const successContent = existingContent && !existingContent.startsWith('请求失败：')
++          ? existingContent
++          : '图像已生成。'
++        const assistantMessage: AgentMessage = {
++          id: existingAssistantMessage?.id ?? genId(),
++          role: 'assistant',
++          content: successContent,
++          roundId,
++          outputTaskIds,
++          createdAt: existingAssistantMessage?.createdAt ?? Date.now(),
++        }
++
++        return {
++          ...current,
++          updatedAt: Date.now(),
++          rounds: current.rounds.map((round) => round.id === roundId
++            ? {
++                ...round,
++                assistantMessageId: assistantMessage.id,
++                outputTaskIds,
++                status: 'done',
++                error: null,
++                finishedAt: Date.now(),
++              }
++            : round),
++          messages: existingAssistantMessage
++            ? current.messages.map((item) => item.id === existingAssistantMessage.id ? assistantMessage : item)
++            : [...current.messages, assistantMessage],
++        }
++      })
++      await flushAgentConversationsToIndexedDB()
++      useStore.getState().showToast('Agent 已生成图片', 'success')
++      showTaskCompletionNotification(
++        'Agent 已生成图片',
++        `Agent 回复已结束，共生成 ${successfulImageCount} 张图片。`,
++      )
++      return
++    }
++
+     updateAgentConversation(conversationId, (current) => {
+       const failedRound = current.rounds.find((round) => round.id === roundId)
+       const existingAssistantMessage = failedRound?.assistantMessageId
+@@ -3417,6 +3558,7 @@ async function executeAgentRound(
+             ],
+       }
+     })
++    await flushAgentConversationsToIndexedDB()
+     useStore.getState().showToast(`Agent 请求失败：${message}`, 'error')
+   } finally {
+     if (agentRoundControllers.get(controllerKey) === controller) {
+@@ -3652,7 +3794,7 @@ export function updateTaskInStore(taskId: string, patch: Partial<TaskRecord>) {
+   const task = updated.find((t) => t.id === taskId)
+   setTasks(updated)
+   maybeOpenSupportPrompt(tasks, updated, taskId)
+-  if (task) putTask(task)
++  return task ? putTask(task) : Promise.resolve(undefined)
+ }
+ 
+ export function createFavoriteCollection(name: string) {
+@@ -4460,4 +4602,3 @@ export async function addImageFromUrl(src: string): Promise<void> {
+   cacheImage(id, dataUrl)
+   useStore.getState().addInputImage({ id, dataUrl })
+ }
+-
+diff --git a/vite.config.ts b/vite.config.ts
+index b03396a..8bbb331 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -23,6 +23,9 @@ export default defineConfig(({ command }) => {
+   return {
+     plugins: [react()],
+     base: './',
++    build: {
++      modulePreload: { polyfill: false },
++    },
+     define: {
+       __APP_VERSION__: JSON.stringify(pkg.version),
+       __DEV_PROXY_CONFIG__: JSON.stringify(devProxyConfig),

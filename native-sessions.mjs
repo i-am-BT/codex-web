@@ -2122,6 +2122,12 @@ function normalizeUserDisplayText(text) {
   const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
   const requestMarker = '## My request for Codex:';
   const requestIndex = normalized.indexOf(requestMarker);
+  // A design annotation has the same browser-comment envelope as a regular
+  // comment, but only its changed declarations belong in the visible history.
+  const standaloneAnnotation = browserAnnotationDisplayText(normalized);
+  if (standaloneAnnotation && normalized.startsWith('Browser annotation:')) {
+    return standaloneAnnotation;
+  }
   if (!normalized.startsWith('# Browser comments:')) {
     return cleanUserRequest(requestIndex === -1 ? normalized : normalized.slice(requestIndex + requestMarker.length));
   }
@@ -2134,13 +2140,18 @@ function normalizeUserDisplayText(text) {
     if (clean && !parts.includes(clean)) parts.push(clean);
   };
 
-  const commentPattern = /^Comment:\s*\n([\s\S]*?)(?=\n(?:<in-app-browser-context\b|## (?:User )?Comment \d+\b|## Requested annotation \d+\b)|$)/gm;
+  const commentPattern = /^Comment:\s*\n([\s\S]*?)(?=\n(?:<in-app-browser-context\b|## (?:User )?Comment \d+\b|## Requested annotation \d+\b)|$(?![\s\S]))/gm;
   let match;
   while ((match = commentPattern.exec(commentsBlock))) pushPart(match[1]);
 
-  const sectionPattern = /^## (?:User Comment|Comment|Requested annotation) \d+\s*$([\s\S]*?)(?=^## (?:User Comment|Comment|Requested annotation) \d+\s*$|^## My request for Codex:|<in-app-browser-context\b|\Z)/gm;
+  const sectionPattern = /^## (?:User Comment|Comment|Requested annotation) \d+\s*$([\s\S]*?)(?=^## (?:User Comment|Comment|Requested annotation) \d+\s*$|^## My request for Codex:|^<in-app-browser-context\b|$(?![\s\S]))/gm;
   while ((match = sectionPattern.exec(commentsBlock))) {
     const section = String(match[1] || '');
+    const annotation = browserAnnotationDisplayText(section);
+    if (annotation) {
+      pushPart(annotation);
+      continue;
+    }
     const explicit = section.match(/^Comment:\s*\n([\s\S]*)$/m)?.[1]
       || section.match(/^Comment:\s*(.+)$/m)?.[1]
       || '';
@@ -2162,7 +2173,7 @@ function normalizeUserDisplayText(text) {
       .replace(/^Saved marker screenshot:[^\n]*$/gm, '')
       .replace(/^Annotated screenshot:[^\n]*$/gm, '')
       .replace(/^Attached image:[^\n]*$/gm, '')
-      .replace(/^Browser annotation:[\s\S]*?(?=^Comment:|\Z)/gm, ''));
+      .replace(/^Browser annotation:[\s\S]*?(?=^Comment:|$(?![\s\S]))/gm, ''));
     pushPart(cleanedSection);
   }
 
@@ -2172,6 +2183,26 @@ function normalizeUserDisplayText(text) {
     return request;
   }
   return parts.length ? parts.join('\n\n') : cleanUserRequest(normalized);
+}
+
+function browserAnnotationDisplayText(source) {
+  const normalized = String(source || '').replace(/\r\n/g, '\n');
+  const annotationStart = normalized.indexOf('Browser annotation:');
+  if (annotationStart === -1) return '';
+
+  const annotation = normalized.slice(annotationStart + 'Browser annotation:'.length);
+  const requestedChanges = /^Requested changes:\s*$/m.exec(annotation);
+  if (!requestedChanges || requestedChanges.index == null) return '';
+
+  const afterChanges = annotation.slice(requestedChanges.index + requestedChanges[0].length);
+  const boilerplateStart = afterChanges.search(/^(?:Apply each annotation|Treat the visible viewport|Do not copy temporary)/m);
+  const changeLines = (boilerplateStart === -1 ? afterChanges : afterChanges.slice(0, boilerplateStart))
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^-\s+\S/.test(line))
+    .map((line) => line.replace(/\s+->\s+/g, ' → '));
+
+  return changeLines.length ? `界面批注\n${changeLines.join('\n')}` : '界面批注';
 }
 
 function cleanUserRequest(source) {

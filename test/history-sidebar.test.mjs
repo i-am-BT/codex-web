@@ -19,6 +19,7 @@ function sourceBetween(start, end) {
 
 const groupingSource = sourceBetween('function conversationKey', 'function setMainView');
 const composerProjectsSource = sourceBetween('function composerProjectPaths', 'function selectComposerProjectPath');
+const completionStateSource = sourceBetween('function readHistoryCompletionState', 'function historyProjectName');
 
 test('projectless sessions remain tasks even when they have generated working directories', () => {
   const api = new Function(`${groupingSource}; return { isStandaloneHistoryItem, partitionHistoryItems };`)();
@@ -100,6 +101,8 @@ test('the pinned section renders above tasks, collapses independently, and marks
   assert.match(pinnedRenderSource, /setHistoryPinnedExpanded\(section,Boolean\(query\)\|\|containsCurrent\|\|!historyPinnedCollapsed\)/);
   assert.match(pinnedRenderSource, /historyPinnedCollapsed=expanded;\s*storeHistoryPinnedCollapsed\(\)/);
   assert.match(inlineScript, /const HISTORY_PINNED_COLLAPSED_STORAGE_KEY='codexWeb\.historyPinnedCollapsed'/);
+  assert.match(inlineScript, /const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb\.historyCompletionRead\.v2'/);
+  assert.match(inlineScript, /const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb\.historyCompletionSeen\.v2'/);
   assert.match(inlineScript, /const \{pinned,remaining:pinnedRemaining\}=partitionPinnedHistoryItems\(visibleItems\);\s*appendPinnedHistoryTasks\(pinned,\{query:Boolean\(query\)\}\);/);
   assert.match(rowSource, /automationIcon\.className='histAutomationIcon'/);
   assert.match(rowSource, /icon\.setAttribute\('data-lucide','calendar-clock'\)/);
@@ -115,6 +118,47 @@ test('the pinned section renders above tasks, collapses independently, and marks
   assert.match(uiStyles, /\.historyPinnedHead\[aria-expanded="true"\] \.historyPinnedChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);
   assert.match(uiStyles, /\.histOpen\.hasAutomation\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 16px/s);
   assert.match(uiStyles, /\.histAutomationIcon \.lucide,\s*body \.histRename \.lucide,\s*body \.histDelete \.lucide\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px/s);
+});
+
+test('a read completion stays read when its completed metadata changes', () => {
+  const storage = new Map();
+  const localStorage = {
+    getItem: (key) => storage.get(key) || null,
+    setItem: (key, value) => storage.set(key, value),
+  };
+  const api = new Function(
+    'localStorage',
+    'conversationKey',
+    'renderHistory',
+    `const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb.historyCompletionRead.v2';
+     const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v2';
+     let historyCompletionRead=new Map();
+     let historyCompletionSeen=new Map();
+     ${completionStateSource}
+     return { trackHistoryCompletionState, historyCompletionUnread };`,
+  )(localStorage, (source, id) => `${source}:${id}`, () => {});
+
+  const doneAtFirstSync = { source: 'codex', id: 'thread-a', status: 'done', updatedAt: '2026-08-02T01:00:00.000Z' };
+  const doneAfterMetadataSync = { ...doneAtFirstSync, updatedAt: '2026-08-02T01:05:00.000Z' };
+  const runningAgain = { ...doneAtFirstSync, status: 'running', updatedAt: '2026-08-02T02:00:00.000Z' };
+  const doneAgain = { ...doneAtFirstSync, updatedAt: '2026-08-02T02:05:00.000Z' };
+
+  api.trackHistoryCompletionState([doneAtFirstSync]);
+  assert.equal(api.historyCompletionUnread(doneAtFirstSync), false);
+  api.trackHistoryCompletionState([doneAfterMetadataSync]);
+  assert.equal(api.historyCompletionUnread(doneAfterMetadataSync), false);
+  api.trackHistoryCompletionState([runningAgain]);
+  api.trackHistoryCompletionState([doneAgain]);
+  assert.equal(api.historyCompletionUnread(doneAgain), true);
+
+  const runningUnread = { source: 'codex', id: 'thread-b', status: 'running', updatedAt: '2026-08-02T03:00:00.000Z' };
+  const doneUnread = { ...runningUnread, status: 'done', updatedAt: '2026-08-02T03:05:00.000Z' };
+  const doneUnreadAfterMetadataSync = { ...doneUnread, updatedAt: '2026-08-02T03:10:00.000Z' };
+  api.trackHistoryCompletionState([runningUnread]);
+  api.trackHistoryCompletionState([doneUnread]);
+  assert.equal(api.historyCompletionUnread(doneUnread), true);
+  api.trackHistoryCompletionState([doneUnreadAfterMetadataSync]);
+  assert.equal(api.historyCompletionUnread(doneUnreadAfterMetadataSync), true);
 });
 
 test('history rename uses an inline editor instead of a browser prompt', () => {
@@ -308,8 +352,23 @@ test('archived standalone tasks keep a separate task group and filter', () => {
 
 test('history refreshes deferred while a project menu or preview is open', () => {
   assert.match(inlineScript, /let historyRefreshPending=false/);
+  assert.match(inlineScript, /let historyRefreshPointerId=null/);
+  assert.match(inlineScript, /function historyRefreshBlocked\(\)\{return historyRefreshPointerId!==null\|\|activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\}/);
+  assert.match(inlineScript, /function beginHistoryRefreshPointerLock\(event\)\{[\s\S]*event\.button!==0\|\|event\.isPrimary===false\|\|!event\.target\.closest\?\.\('\.hist'\)[\s\S]*historyRefreshPointerId=event\.pointerId/);
+  assert.match(inlineScript, /history\?\.addEventListener\('pointerdown',beginHistoryRefreshPointerLock,true\)/);
+  assert.match(inlineScript, /window\.addEventListener\('pointerup',releaseHistoryRefreshPointerLock,true\)/);
+  assert.match(inlineScript, /window\.addEventListener\('pointercancel',releaseHistoryRefreshPointerLock,true\)/);
+  assert.match(inlineScript, /window\.addEventListener\('blur',clearHistoryRefreshPointerLock\)/);
+  const pointerLockSource = sourceBetween('function beginHistoryRefreshPointerLock', 'function flushPendingHistoryRefresh');
+  assert.doesNotMatch(pointerLockSource, /loadConversation\(|preventDefault\(/);
   assert.match(inlineScript, /function flushPendingHistoryRefresh/);
-  assert.match(inlineScript, /if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\)\{historyRefreshPending=true;return\}/);
+  assert.match(inlineScript, /if\(!historyRefreshPending\|\|historyRefreshBlocked\(\)\)return/);
+  assert.match(inlineScript, /async function refreshHistory\(\)\{\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}[\s\S]*const data=await res\.json\(\);\s*\/\/ A live-session refresh may have started just before the user pressed a row\.\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}\s*pinnedThreadIds=/);
+  const rowSource = sourceBetween('function createHistoryRow', 'function updateActiveHistory');
+  assert.match(rowSource, /row\.addEventListener\('click',openConversation\)/);
+  assert.match(rowSource, /open\.addEventListener\('click',\(e\)=>\{e\.stopPropagation\(\);openConversation\(\)\}\)/);
+  assert.match(rowSource, /rename\.addEventListener\('click',\(e\)=>\{e\.preventDefault\(\);e\.stopPropagation\(\);beginHistoryRename/);
+  assert.match(rowSource, /del\.addEventListener\('click',\(e\)=>\{e\.stopPropagation\(\);deleteConversation/);
   assert.match(inlineScript, /flushPendingHistoryRefresh\(\)/);
 });
 

@@ -252,6 +252,9 @@ const activeNativeTurns = new Map();
 const pendingDeepSeekNativeTurns = new Map();
 const nativeTurnReservations = new Set();
 const promptQueueItemReservations = new Map();
+const serverPromptQueueDispatchTimers = new Map();
+const serverPromptQueueDispatchingThreads = new Set();
+const serverPromptQueueDispatchRetries = new Map();
 let appQueueMutationTail = Promise.resolve();
 const pendingNativeRequests = new Map();
 const desktopThreadStates = new Map();
@@ -1260,6 +1263,7 @@ app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
   }
   nativeTurnReservations.add(threadId);
   let queueReservation = null;
+  let startAttempted = false;
 
   try {
     const current = nativeSessions.get(threadId);
@@ -1269,11 +1273,17 @@ app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
     const turn = parseNativeTurnPayload(req.body || {}, settingsOptions);
     const queueItemId = String(req.body?.queueItemId || '').trim();
     if (queueItemId) queueReservation = reservePromptQueueItem(threadId, queueItemId);
+    startAttempted = true;
     const turnStarted = await continueNativeTurn(threadId, turn);
     const queue = queueReservation ? consumePromptQueueReservation(queueReservation) : null;
     nativeSessions.scheduleRefresh();
     res.status(202).json({ ok: true, threadId, turnId: turnStarted.turnId, ...(queue ? { queue } : {}) });
   } catch (err) {
+    if (queueReservation && startAttempted) {
+      try { markServerPromptQueueItemUncertain(threadId, queueReservation.item, err); } catch (markError) {
+        console.warn(`队列条目未确认状态保存失败 (${threadId}): ${markError?.message || markError}`);
+      }
+    }
     res.status(nativeAppErrorStatus(err)).json({ error: `继续 Codex App 会话失败: ${err.message}` });
   } finally {
     releasePromptQueueReservation(queueReservation);
@@ -1375,12 +1385,14 @@ app.post('/api/native-sessions/:id/interrupt', requireAuth, async (req, res) => 
         setNativeTurnState(threadId, { turnId, status: 'interrupted', transport: 'local-stale' });
         try { nativeSessions.markTurnTerminal?.(threadId, turnId, 'interrupted'); } catch {}
         try { nativeSessions.scheduleRefresh?.(); } catch {}
+        scheduleServerPromptQueueDispatch(threadId, 160);
         return res.json({ ok: true, threadId, turnId, stale: true });
       }
       throw err;
     }
     if (!turnId) return res.status(409).json({ error: '该会话没有可取消的任务' });
     setNativeTurnState(threadId, { turnId, status: 'interrupted', transport: result?.transport || 'app-server' });
+    scheduleServerPromptQueueDispatch(threadId, 160);
     res.json({ ok: true, threadId, turnId });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `取消 Codex App 任务失败: ${err.message}` });
@@ -1736,12 +1748,29 @@ app.get('/api/prompt-queues/:threadId', requireAuth, (req, res) => {
   if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
   res.setHeader('Cache-Control', 'no-store');
   const queue = getPromptQueueState(threadId);
-  res.json({ ok: true, threadId, ...queue });
+  res.json({ ok: true, threadId, ...queue, dismissedItemIds: getPromptQueueDismissedItemIds(threadId) });
+});
+
+app.post('/api/prompt-queues/:threadId/append-beacon', requireAuth, (req, res) => {
+  try {
+    const threadId = cleanNativeThreadId(req.params.threadId);
+    if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
+    appendWebPromptQueueItem(threadId, req.body?.item);
+    // sendBeacon does not expose a response to the page. A no-content response
+    // keeps the mobile background write as small as possible.
+    res.status(204).end();
+  } catch (err) {
+    res.status(Number(err?.statusCode) || 400).json({
+      error: err.message || '追加队列失败',
+      ...(err.current ? err.current : {}),
+    });
+  }
 });
 
 app.put('/api/prompt-queues/:threadId', requireAuth, (req, res) => {
+  let threadId = '';
   try {
-    const threadId = cleanNativeThreadId(req.params.threadId);
+    threadId = cleanNativeThreadId(req.params.threadId);
     if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
     const items = Array.isArray(req.body?.items) ? req.body.items : null;
     if (!items) return res.status(400).json({ error: 'items 必须是数组' });
@@ -1752,6 +1781,7 @@ app.put('/api/prompt-queues/:threadId', requireAuth, (req, res) => {
     res.status(status).json({
       error: err.message || '保存队列失败',
       ...(err.current ? err.current : {}),
+      ...(status === 409 && threadId ? { dismissedItemIds: getPromptQueueDismissedItemIds(threadId) } : {}),
     });
   }
 });
@@ -3063,10 +3093,58 @@ function captureDeepSeekNativeTurnUsage(change) {
 }
 
 function handleNativeSessionChange(change) {
+  clearPersistedTerminalNativeTurns(change);
+  scheduleTerminalPromptQueueDispatches(change);
   // Session snapshots can briefly report idle before the matching turn completion
   // notification arrives. They must not release the turn lock used by queue dispatch.
   captureDeepSeekNativeTurnUsage(change);
   broadcastNativeSessionChange(change);
+}
+
+function scheduleTerminalPromptQueueDispatches(change) {
+  for (const candidate of Array.isArray(change?.changedIds) ? change.changedIds : []) {
+    const threadId = cleanNativeThreadId(candidate);
+    if (!threadId || !serverPromptQueueHasDispatchableItem(threadId)) continue;
+    let conversation = null;
+    try { conversation = nativeSessions.get(threadId); } catch {}
+    const active = activeNativeTurns.get(threadId);
+    if (active?.status === 'running' || (!active && conversation?.status === 'running')) continue;
+    scheduleServerPromptQueueDispatch(threadId, 160);
+  }
+}
+
+function nativeTurnHasPersistedTerminal(conversation, turnId) {
+  const cleanTurnId = String(turnId || '');
+  if (!cleanTurnId) return false;
+  return Boolean(conversation?.messages?.some((message) => (
+    String(message?.turnId || '') === cleanTurnId
+      && message?.role === 'process'
+      && ['task_complete', 'task_error', 'turn_aborted', 'error'].includes(String(message?.kind || ''))
+  )));
+}
+
+function clearPersistedTerminalNativeTurns(change) {
+  for (const candidate of Array.isArray(change?.changedIds) ? change.changedIds : []) {
+    clearPersistedTerminalNativeTurn(candidate);
+  }
+}
+
+function clearPersistedTerminalNativeTurn(threadId) {
+  const cleanId = cleanNativeThreadId(threadId);
+  const active = cleanId ? activeNativeTurns.get(cleanId) : null;
+  if (!active?.turnId) return false;
+  let conversation = null;
+  try { conversation = nativeSessions.get(cleanId); } catch {}
+  const latestTurnId = String(conversation?.latestTurnId || '');
+  // Desktop-owned turns can finish in JSONL without this app-server connection
+  // receiving turn/completed. A terminal record for the exact active turn is
+  // authoritative; an unscoped idle snapshot is not.
+  const persistedTerminal = nativeTurnHasPersistedTerminal(conversation, active.turnId);
+  const newerTurnRunning = conversation?.status === 'running' && latestTurnId && latestTurnId !== active.turnId;
+  if (!persistedTerminal && (active.status === 'running' || !newerTurnRunning)) return false;
+  activeNativeTurns.delete(cleanId);
+  broadcastNativeRuntime({ type: 'turn-cleared', threadId: cleanId, turnId: active.turnId });
+  return true;
 }
 
 function broadcastNativeRuntime(event) {
@@ -3305,6 +3383,9 @@ function handleAppServerError(params = {}) {
   console.warn(`codex app-server ${willRetry ? 'retrying' : 'error'}: ${message}`);
   if (!threadId) return;
   if (willRetry) setNativeTurnState(threadId, { turnId, status: 'running' });
+  else if (current?.status === 'running' && current.turnId === turnId) {
+    recordNativeTurnCompletion(threadId, { id: turnId, status: 'failed' });
+  }
   broadcastNativeRuntime({
     type: 'connection-error',
     threadId,
@@ -3627,13 +3708,9 @@ function recordNativeTurnCompletion(threadId, turn = {}) {
   if (current?.turnId && current.turnId !== turnId) return false;
   const status = nativeTurnStatus(turn?.status);
   setNativeTurnState(cleanId, { turnId, status });
-  setTimeout(() => {
-    const active = activeNativeTurns.get(cleanId);
-    if (active?.turnId === turnId && active.status !== 'running') {
-      activeNativeTurns.delete(cleanId);
-      broadcastNativeRuntime({ type: 'turn-cleared', threadId: cleanId, turnId });
-    }
-  }, 1800).unref?.();
+  // The JSONL watcher may have observed task_complete before this notification.
+  clearPersistedTerminalNativeTurn(cleanId);
+  scheduleServerPromptQueueDispatch(cleanId, 160);
   return true;
 }
 
@@ -3905,6 +3982,7 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
     : (!forcedTerminal && conversation.status === 'running')
       ? conversation.latestTurnId || ''
       : '';
+  const terminalTurnId = forcedTerminal && active?.turnId ? active.turnId : '';
   const persistedStartedAt = activeTurnId && String(conversation.latestTurnId || '') === String(activeTurnId)
     ? conversation.latestTurnStartedAt || ''
     : '';
@@ -3925,6 +4003,7 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
     status,
     readOnly: false,
     activeTurnId,
+    terminalTurnId,
     activeTurnStartedAt: activeTurnId ? persistedStartedAt || active?.startedAt || '' : '',
   };
 }
@@ -5621,6 +5700,7 @@ function normalizeServerQueuedPrompt(item) {
   const source = item.source === 'codex-app' ? 'codex-app' : (item.source === 'web' ? 'web' : '');
   const inferredSource = source || ((!String(item.provider || '').trim() && !String(item.model || '').trim() && !attachments.length) ? 'codex-app' : 'web');
   const rawId = String(item.id || '').trim();
+  const dispatchState = inferredSource === 'web' && item.dispatchState === 'uncertain' ? 'uncertain' : '';
   return {
     id: rawId || `q-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`,
     // Marks that `id` above was invented on this read rather than provided by the
@@ -5640,6 +5720,11 @@ function normalizeServerQueuedPrompt(item) {
     approval: String(item.approval || (permissionMode === 'custom' ? '' : 'on-request')),
     createdAt: String(item.createdAt || new Date().toISOString()),
     source: inferredSource,
+    // Web-created items may be dispatched by the server after their current
+    // turn completes, so a suspended mobile page cannot strand them.
+    autoDispatch: inferredSource === 'web' ? dispatchState !== 'uncertain' && item.autoDispatch !== false : false,
+    dispatchState,
+    dispatchError: dispatchState ? String(item.dispatchError || '上一次发送结果未确认，请检查会话后手动重试').slice(0, 180) : '',
   };
 }
 
@@ -6688,7 +6773,10 @@ function syncAppQueuedFollowUpsIntoWeb({ force = false } = {}) {
     changedThreads.push(threadId);
     broadcastPromptQueueChange({ threadId, items: merged, updatedAt, revision, source: 'codex-app' });
   }
-  if (changedThreads.length) savePromptQueuesWithDismissed(webQueues, dismissed);
+  if (changedThreads.length) {
+    savePromptQueuesWithDismissed(webQueues, dismissed);
+    for (const threadId of changedThreads) scheduleServerPromptQueueDispatch(threadId);
+  }
   return { changed: changedThreads.length > 0, threads: changedThreads };
 }
 
@@ -6698,6 +6786,10 @@ function startAppQueueSync() {
   try { syncAppQueuedFollowUpsIntoWeb({ force: true }); } catch (error) {
     console.warn('导入 Codex App 队列失败: ' + (error?.message || error));
   }
+  // Resume durable Web queues after a server restart once the native session
+  // index has had a chance to load. App-owned items are excluded by the worker.
+  const initialDispatch = setTimeout(scheduleIdleServerPromptQueueDispatches, 700);
+  initialDispatch.unref?.();
   appQueueWatchTimer = setInterval(() => {
     try { syncAppQueuedFollowUpsIntoWeb(); } catch {}
   }, 1500);
@@ -6836,6 +6928,19 @@ function loadPromptQueueDismissedRaw() {
   } catch {
     return {};
   }
+}
+
+function getPromptQueueDismissedItemIds(threadId) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return [];
+  const keys = loadPromptQueueDismissedRaw()[id];
+  if (!Array.isArray(keys)) return [];
+  return [...new Set(keys
+    .map((key) => String(key || ''))
+    .filter((key) => key.startsWith('id:'))
+    .map((key) => key.slice(3))
+    .filter(Boolean))]
+    .slice(-200);
 }
 
 function savePromptQueuesWithDismissed(queues, dismissed) {
@@ -7038,6 +7143,7 @@ async function reorderPromptQueueItems(threadId, itemIds, expectedRevision) {
       revision: Number(saved.revision || revision),
     };
     broadcastPromptQueueChange({ threadId: id, ...result, source: 'order' });
+    scheduleServerPromptQueueDispatch(id);
     return result;
   });
 }
@@ -7053,19 +7159,107 @@ function setPromptQueueItems(threadId, items, expectedRevision) {
     throw error;
   }
   assertPromptQueueExpectedRevision(current, expectedRevision);
-  const incoming = (Array.isArray(items) ? items : []).slice(0, 50).map(normalizeServerQueuedPrompt).filter(Boolean);
+  const currentItemsById = new Map(current.items.map((item) => [String(item?.id || '').trim(), item]));
+  const incoming = (Array.isArray(items) ? items : []).slice(0, 50).map(normalizeServerQueuedPrompt).filter(Boolean).map((item) => {
+    const previous = currentItemsById.get(String(item.id || '').trim());
+    // This status is server-owned. A stale browser snapshot must not silently
+    // turn an uncertain send back into an automatic background retry.
+    return previous?.dispatchState === 'uncertain'
+      ? { ...item, autoDispatch: false, dispatchState: 'uncertain', dispatchError: previous.dispatchError }
+      : item;
+  });
   const appOwned = current.items.filter(isAppSourcedQueueItem);
   const cleanItems = filterDismissedPromptQueueItems(
     id,
     mergePromptQueueItemsWithAuthoritativeAppItems(incoming, appOwned),
     dismissed,
   ).slice(0, 50);
-  if (JSON.stringify(current.items) === JSON.stringify(cleanItems)) return current;
+  if (JSON.stringify(current.items) === JSON.stringify(cleanItems)) {
+    scheduleServerPromptQueueDispatch(id);
+    return current;
+  }
   const updatedAt = new Date().toISOString();
   const revision = current.revision + 1;
   queues[id] = { updatedAt, revision, items: cleanItems };
   savePromptQueuesWithDismissed(queues, dismissed);
   broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision });
+  scheduleServerPromptQueueDispatch(id);
+  return { items: cleanItems, updatedAt, revision };
+}
+
+function markServerPromptQueueItemUncertain(threadId, item, error) {
+  const id = cleanNativeThreadId(threadId);
+  const itemId = String(item?.id || '').trim();
+  if (!id || !itemId) return getPromptQueueState(id);
+  const current = getPromptQueueState(id);
+  const dispatchError = String(error?.message || '上一次发送结果未确认，请检查会话后手动重试')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180) || '上一次发送结果未确认，请检查会话后手动重试';
+  let changed = false;
+  const items = current.items.map((entry) => {
+    if (String(entry?.id || '').trim() !== itemId) return entry;
+    if (entry.dispatchState === 'uncertain' && entry.autoDispatch === false && entry.dispatchError === dispatchError) return entry;
+    changed = true;
+    return { ...entry, autoDispatch: false, dispatchState: 'uncertain', dispatchError };
+  });
+  if (!changed) return current;
+  const queues = loadPromptQueuesRaw();
+  const dismissed = loadPromptQueueDismissedRaw();
+  const updatedAt = new Date().toISOString();
+  const revision = current.revision + 1;
+  queues[id] = { updatedAt, revision, items };
+  savePromptQueuesWithDismissed(queues, dismissed);
+  broadcastPromptQueueChange({ threadId: id, items, updatedAt, revision, source: 'uncertain-dispatch' });
+  resetServerPromptQueueDispatchRetries(id);
+  return { items, updatedAt, revision };
+}
+
+function appendWebPromptQueueItem(threadId, item) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) throw new Error('会话 ID 无效');
+  const rawId = String(item?.id || '').trim();
+  if (!rawId) {
+    const error = new Error('队列条目缺少 ID');
+    error.statusCode = 400;
+    throw error;
+  }
+  const normalized = normalizeServerQueuedPrompt(item);
+  if (!normalized || normalized.source !== 'web') {
+    const error = new Error('后台追加仅支持 Web 队列消息');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  // Read the merged state so App-owned entries remain authoritative and retain
+  // their order. Unlike PUT, this can safely run while the first item is reserved.
+  const current = getPromptQueueState(id);
+  if (current.items.some((entry) => String(entry?.id || '').trim() === rawId)) {
+    scheduleServerPromptQueueDispatch(id);
+    return current;
+  }
+  if (current.items.length >= 50) {
+    const error = new Error('队列最多包含 50 条消息');
+    error.statusCode = 409;
+    error.current = current;
+    throw error;
+  }
+
+  const queues = loadPromptQueuesRaw();
+  const dismissed = loadPromptQueueDismissedRaw();
+  const cleanItems = filterDismissedPromptQueueItems(id, [...current.items, normalized], dismissed).slice(0, 50);
+  // A duplicate that was already dismissed must remain dismissed even if a
+  // delayed mobile beacon arrives after the user removed it elsewhere.
+  if (!cleanItems.some((entry) => String(entry?.id || '').trim() === rawId)) {
+    scheduleServerPromptQueueDispatch(id);
+    return current;
+  }
+  const updatedAt = new Date().toISOString();
+  const revision = current.revision + 1;
+  queues[id] = { updatedAt, revision, items: cleanItems };
+  savePromptQueuesWithDismissed(queues, dismissed);
+  broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision, source: 'background-append' });
+  scheduleServerPromptQueueDispatch(id);
   return { items: cleanItems, updatedAt, revision };
 }
 
@@ -7092,6 +7286,7 @@ function dismissPromptQueueItem(threadId, item) {
   queues[id] = { updatedAt, revision, items: cleanItems };
   savePromptQueuesWithDismissed(queues, dismissed);
   broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision });
+  scheduleServerPromptQueueDispatch(id);
   return { items: cleanItems, updatedAt, revision };
 }
 
@@ -7164,6 +7359,167 @@ function releasePromptQueueReservation(reservation) {
   if (!reservation) return;
   if (promptQueueItemReservations.get(reservation.key) === reservation) {
     promptQueueItemReservations.delete(reservation.key);
+  }
+}
+
+const SERVER_PROMPT_QUEUE_SETTLING_RETRY_LIMIT = 4;
+const SERVER_PROMPT_QUEUE_SETTLING_RETRY_BASE_DELAY_MS = 240;
+const SERVER_PROMPT_QUEUE_SETTLING_RETRY_MAX_DELAY_MS = 2000;
+
+function serverPromptQueueHasDispatchableItem(threadId) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return false;
+  const item = getPromptQueueItems(id)[0];
+  return Boolean(item && !isAppSourcedQueueItem(item) && item.autoDispatch !== false && item.dispatchState !== 'uncertain');
+}
+
+function resetServerPromptQueueDispatchRetries(threadId) {
+  const id = cleanNativeThreadId(threadId);
+  if (id) serverPromptQueueDispatchRetries.delete(id);
+}
+
+function scheduleServerPromptQueueDispatch(threadId, delay = 180, { retainRetries = false } = {}) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id || !serverPromptQueueHasDispatchableItem(id)) return;
+  if (!retainRetries) resetServerPromptQueueDispatchRetries(id);
+  const previous = serverPromptQueueDispatchTimers.get(id);
+  if (previous) clearTimeout(previous);
+  const wait = Number.isFinite(Number(delay)) ? Math.max(0, Number(delay)) : 180;
+  const timer = setTimeout(() => {
+    serverPromptQueueDispatchTimers.delete(id);
+    void dispatchNextServerQueuedPrompt(id);
+  }, wait);
+  timer.unref?.();
+  serverPromptQueueDispatchTimers.set(id, timer);
+}
+
+function isServerPromptQueueDispatchSettlingError(error, { startAttempted = false } = {}) {
+  // Only retry a local queue conflict that happened before a turn-start request.
+  // A timeout or an upstream "already running" response after the request may
+  // mean Desktop accepted it, so that result must remain visible for manual
+  // retry rather than risking a duplicate turn.
+  return !startAttempted && Number(error?.statusCode) === 409;
+}
+
+function retryServerPromptQueueDispatchAfterSettling(threadId, { quiet = false } = {}) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id || !serverPromptQueueHasDispatchableItem(id)) return false;
+  const attempts = Number(serverPromptQueueDispatchRetries.get(id) || 0);
+  if (attempts >= SERVER_PROMPT_QUEUE_SETTLING_RETRY_LIMIT) {
+    serverPromptQueueDispatchRetries.delete(id);
+    if (!quiet) console.warn(`后台队列等待会话状态稳定超时 (${id})`);
+    return false;
+  }
+  const nextAttempt = attempts + 1;
+  serverPromptQueueDispatchRetries.set(id, nextAttempt);
+  const delay = Math.min(
+    SERVER_PROMPT_QUEUE_SETTLING_RETRY_BASE_DELAY_MS * (2 ** (nextAttempt - 1)),
+    SERVER_PROMPT_QUEUE_SETTLING_RETRY_MAX_DELAY_MS,
+  );
+  // The JSONL index is eventually consistent with Desktop/app-server events.
+  // Refresh first, then retry the idle check without issuing another turn start.
+  try { nativeSessions.scheduleRefresh?.(); } catch {}
+  scheduleServerPromptQueueDispatch(id, delay, { retainRetries: true });
+  return true;
+}
+
+function scheduleIdleServerPromptQueueDispatches() {
+  for (const threadId of Object.keys(loadPromptQueues())) {
+    if (!serverPromptQueueHasDispatchableItem(threadId)) continue;
+    let conversation = null;
+    try { conversation = nativeSessions.get(threadId); } catch {}
+    if (!conversation) {
+      retryServerPromptQueueDispatchAfterSettling(threadId);
+      continue;
+    }
+    const active = activeNativeTurns.get(threadId);
+    if (active?.status === 'running') continue;
+    if (conversation.status === 'running') {
+      retryServerPromptQueueDispatchAfterSettling(threadId, { quiet: true });
+      continue;
+    }
+    scheduleServerPromptQueueDispatch(threadId, 0);
+  }
+}
+
+function serverQueuedPromptToNativeTurn(item, conversation) {
+  const metadata = conversation?.metadata || {};
+  const fallback = Object.hasOwn(metadata, 'serviceTier')
+    ? { fallbackServiceTier: metadata.serviceTier }
+    : {};
+  return parseNativeTurnPayload({
+    message: item.message,
+    attachments: item.attachments,
+    provider: item.provider || metadata.modelProvider || DEFAULT_PROVIDER,
+    model: item.model || metadata.model || DEFAULT_MODEL,
+    reasoningEffort: item.reasoningEffort,
+    serviceTier: item.serviceTier,
+    cwd: item.cwd || metadata.cwd || DEFAULT_CWD,
+    permissionMode: item.permissionMode,
+    sandbox: item.sandbox,
+    approval: item.approval,
+  }, fallback);
+}
+
+async function dispatchNextServerQueuedPrompt(threadId) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return false;
+  // Another start request may already have reached Desktop/app-server. Do not
+  // retry around that reservation: its eventual session event is authoritative.
+  if (serverPromptQueueDispatchingThreads.has(id) || nativeTurnReservations.has(id)) return false;
+  let conversation = null;
+  try { conversation = nativeSessions.get(id); } catch {}
+  const active = activeNativeTurns.get(id);
+  if (!conversation) {
+    retryServerPromptQueueDispatchAfterSettling(id);
+    return false;
+  }
+  if (active?.status === 'running') return false;
+  if (conversation.status === 'running') {
+    retryServerPromptQueueDispatchAfterSettling(id, { quiet: true });
+    return false;
+  }
+  const item = getPromptQueueItems(id)[0];
+  if (!item || isAppSourcedQueueItem(item) || item.autoDispatch === false || item.dispatchState === 'uncertain') {
+    resetServerPromptQueueDispatchRetries(id);
+    return false;
+  }
+
+  let reservation = null;
+  let retryAfterSettling = false;
+  let startAttempted = false;
+  serverPromptQueueDispatchingThreads.add(id);
+  nativeTurnReservations.add(id);
+  try {
+    reservation = reservePromptQueueItem(id, item.id);
+    const latestActive = activeNativeTurns.get(id);
+    if (latestActive?.status === 'running') return false;
+    conversation = nativeSessions.get(id) || conversation;
+    if (!conversation) {
+      retryAfterSettling = true;
+      return false;
+    }
+    if (conversation.status === 'running') return false;
+    startAttempted = true;
+    const started = await continueNativeTurn(id, serverQueuedPromptToNativeTurn(reservation.item, conversation));
+    consumePromptQueueReservation(reservation);
+    nativeSessions.scheduleRefresh();
+    resetServerPromptQueueDispatchRetries(id);
+    return Boolean(started?.turnId);
+  } catch (error) {
+    retryAfterSettling = isServerPromptQueueDispatchSettlingError(error, { startAttempted });
+    if (!retryAfterSettling) {
+      try { if (startAttempted && reservation) markServerPromptQueueItemUncertain(id, reservation.item, error); } catch (markError) {
+        console.warn(`后台队列标记未确认失败 (${id}): ${markError?.message || markError}`);
+      }
+      console.warn(`后台队列发送失败 (${id}): ${error?.message || error}`);
+    }
+    return false;
+  } finally {
+    releasePromptQueueReservation(reservation);
+    nativeTurnReservations.delete(id);
+    serverPromptQueueDispatchingThreads.delete(id);
+    if (retryAfterSettling) retryServerPromptQueueDispatchAfterSettling(id);
   }
 }
 
@@ -7374,6 +7730,7 @@ function pauseNativeLivePresentationForCancel(threadId=currentConversationId,tur
   for(const live of nativeLiveItems.values()){
     if(String(live?.turnId||'')!==cleanTurnId)continue;
     renderNativeLiveItemImmediately(live);
+    renderNativeLiveItemMarkdown(live);
     live.cancelVisualPaused=true;
     live.element?.classList?.remove('streaming');
   }
@@ -7553,8 +7910,8 @@ const HISTORY_SIDEBAR_COLLAPSED_STORAGE_KEY='codexWeb.historySidebarCollapsed';
 const HISTORY_TASKS_COLLAPSED_STORAGE_KEY='codexWeb.historyTasksCollapsed';
 const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
-const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb.historyCompletionRead.v1';
-const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v1';
+const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb.historyCompletionRead.v2';
+const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v2';
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 const SIDE_CHAT_STORAGE_KEY='codexWeb.sideChat.v1';
 const SIDE_CHAT_WIDTH_STORAGE_KEY='codexWeb.sideChatWidth.v1';
@@ -7581,6 +7938,8 @@ let historyCompletionRead=readHistoryCompletionState(HISTORY_COMPLETION_READ_STO
 let historyCompletionSeen=readHistoryCompletionState(HISTORY_COMPLETION_SEEN_STORAGE_KEY);
 let activeHistoryProjectMenu=null;
 let historyRefreshPending=false;
+let historyRefreshPointerId=null;
+let historyRefreshReleaseTimer=null;
 let historyRenameActive=false;
 let historyProjectPreview=null;
 let historyProjectPreviewAnchor=null;
@@ -7965,6 +8324,7 @@ function normalizeQueuedPrompt(item){
   const permissionMode=['ask','auto','full','custom'].includes(item.permissionMode)?item.permissionMode:'legacy';
   const source=item.source==='codex-app'?'codex-app':(item.source==='web'?'web':'');
   const inferredSource=source||((!String(item.provider||'').trim()&&!String(item.model||'').trim()&&!attachments.length)?'codex-app':'web');
+  const dispatchState=inferredSource==='web'&&item.dispatchState==='uncertain'?'uncertain':'';
   return{
     id:String(item.id||makePromptQueueId()),
     message,
@@ -7979,6 +8339,9 @@ function normalizeQueuedPrompt(item){
     approval:String(item.approval||(permissionMode==='custom'?'':'on-request')),
     createdAt:String(item.createdAt||new Date().toISOString()),
     source:inferredSource,
+    autoDispatch:inferredSource==='web'?dispatchState!=='uncertain'&&item.autoDispatch!==false:false,
+    dispatchState,
+    dispatchError:dispatchState?String(item.dispatchError||'上一次发送结果未确认，请检查会话后手动重试').slice(0,180):'',
   };
 }
 function isAppOwnedQueuedPrompt(item){return item?.source==='codex-app'}
@@ -8042,6 +8405,9 @@ function promptQueueFingerprint(items){
     approval:item.approval,
     createdAt:item.createdAt,
     source:item.source,
+    autoDispatch:item.autoDispatch,
+    dispatchState:item.dispatchState,
+    dispatchError:item.dispatchError,
   })));
 }
 function applyPromptQueueLocal(threadId,items,{persist=true,render=true}={}){
@@ -8081,6 +8447,72 @@ const promptQueueOrderIntents=new Map();
 const promptQueueOrderSyncing=new Map();
 let promptQueueRemoteSyncing=false;
 const promptQueueServerRevisions=new Map();
+const promptQueueBeaconItemIds=new Map();
+const PROMPT_QUEUE_BEACON_MAX_BYTES=60*1024;
+function rememberPromptQueueBeaconItem(threadId,item){
+  const id=String(threadId||'').trim();
+  const itemId=String(item?.id||'').trim();
+  if(!id||!itemId)return;
+  const pending=promptQueueBeaconItemIds.get(id)||new Set();
+  pending.add(itemId);
+  while(pending.size>50)pending.delete(pending.values().next().value);
+  promptQueueBeaconItemIds.set(id,pending);
+}
+function acknowledgePromptQueueBeaconItems(threadId,items){
+  const id=String(threadId||'').trim();
+  const pending=promptQueueBeaconItemIds.get(id);
+  if(!pending?.size)return;
+  for(const item of Array.isArray(items)?items:[])pending.delete(String(item?.id||'').trim());
+  if(!pending.size)promptQueueBeaconItemIds.delete(id);
+}
+function acknowledgePromptQueueBeaconItemIds(threadId,itemIds){
+  acknowledgePromptQueueBeaconItems(threadId,(Array.isArray(itemIds)?itemIds:[]).map((id)=>({id})));
+}
+function missingUnconfirmedWebPromptQueueItemIds(local,remoteIds,dismissedItemIds=[]){
+  const remote=remoteIds instanceof Set?remoteIds:new Set((Array.isArray(remoteIds)?remoteIds:[]).map((item)=>String(item?.id||item||'').trim()).filter(Boolean));
+  const dismissed=new Set((Array.isArray(dismissedItemIds)?dismissedItemIds:[]).map((itemId)=>String(itemId||'').trim()).filter(Boolean));
+  return [...new Set((Array.isArray(local)?local:[]).map((item)=>{
+    const itemId=String(item?.id||'').trim();
+    return itemId&&!isAppOwnedQueuedPrompt(item)&&!remote.has(itemId)&&!dismissed.has(itemId)?itemId:'';
+  }).filter(Boolean))];
+}
+function mergePromptQueueSyncConflict(threadId,local,remote,dismissedItemIds=[],{preferRemoteOrder=false}={}){
+  const id=String(threadId||'').trim();
+  const dismissedIds=new Set((Array.isArray(dismissedItemIds)?dismissedItemIds:[]).map((itemId)=>String(itemId||'').trim()).filter(Boolean));
+  // A server tombstone proves this exact item was already consumed or deleted.
+  // Keep every locally queued item without that confirmation for a later retry.
+  const localItems=(Array.isArray(local)?local:[]).filter((item)=>!dismissedIds.has(String(item?.id||'').trim()));
+  const remoteItems=Array.isArray(remote)?remote:[];
+  const remoteIds=new Set(remoteItems.map((item)=>String(item?.id||'')));
+  const remoteById=new Map(remoteItems.map((item)=>[String(item?.id||''),item]));
+  const pending=promptQueueBeaconItemIds.get(id);
+  const remoteOrderWins=preferRemoteOrder||Boolean(pending?.size&&[...pending].some((itemId)=>remoteIds.has(itemId)));
+  if(!remoteOrderWins){
+    const localIds=new Set(localItems.map((item)=>String(item?.id||'')));
+    // The server owns durable dispatch state. Preserve the local ordering but
+    // never let an old tab turn an uncertain item back into an automatic one.
+    return [
+      ...localItems.map((item)=>remoteById.get(String(item?.id||''))||item),
+      ...remoteItems.filter((item)=>!localIds.has(String(item?.id||''))),
+    ];
+  }
+  // A beacon append is tail-only. If it won the race against a full PUT, keep
+  // the server's order and add only local items the server has not seen yet.
+  return [...remoteItems,...localItems.filter((item)=>!remoteIds.has(String(item?.id||'')))];
+}
+function appendPromptQueueItemViaBeacon(threadId,item,{trackPending=false,budget=null}={}){
+  const id=String(threadId||'').trim();
+  if(!id||isAppOwnedQueuedPrompt(item))return false;
+  if(trackPending)rememberPromptQueueBeaconItem(id,item);
+  if(typeof navigator==='undefined'||typeof navigator.sendBeacon!=='function'||typeof Blob!=='function')return false;
+  try{
+    const payload=new Blob([JSON.stringify({item})],{type:'application/json'});
+    if(payload.size>PROMPT_QUEUE_BEACON_MAX_BYTES||(budget&&payload.size>budget.remaining))return false;
+    const accepted=navigator.sendBeacon('/api/prompt-queues/'+encodeURIComponent(id)+'/append-beacon',payload);
+    if(accepted&&budget)budget.remaining-=payload.size;
+    return accepted;
+  }catch{return false}
+}
 function schedulePromptQueueServerSync(threadId){
   const id=String(threadId||'').trim();
   if(!id)return;
@@ -8103,20 +8535,25 @@ async function pushPromptQueueToServer(threadId){
         method:'PUT',
         headers:{'Content-Type':'application/json'},
         body,
+        // Allows the final queue sync to outlive a mobile page being backgrounded.
+        keepalive:true,
       });
       const data=await res.json().catch(()=>({}));
       if(res.status===409){
         const remote=Array.isArray(data.items)?data.items:[];
         const local=promptQueueFor(id);
-        const seen=new Set(local.map((item)=>String(item.id||'')));
-        const merged=[...local,...remote.filter((item)=>!seen.has(String(item?.id||'')))];
+        const dismissedItemIds=Array.isArray(data.dismissedItemIds)?data.dismissedItemIds:[];
+        const merged=mergePromptQueueSyncConflict(id,local,remote,dismissedItemIds);
         if(Number.isInteger(data.revision))promptQueueServerRevisions.set(id,data.revision);
+        acknowledgePromptQueueBeaconItems(id,remote);
+        acknowledgePromptQueueBeaconItemIds(id,dismissedItemIds);
         applyPromptQueueLocal(id,merged,{persist:true,render:true});
         promptQueueServerSyncPending.set(id,JSON.stringify({items:merged}));
         return;
       }
       if(!res.ok)throw new Error(data.error||res.statusText||'队列同步失败');
       if(Number.isInteger(data.revision))promptQueueServerRevisions.set(id,data.revision);
+      if(Array.isArray(data.items))acknowledgePromptQueueBeaconItems(id,data.items);
       // A newer local queue snapshot wins over an older request finishing late.
       if(Array.isArray(data.items)&&!promptQueueServerSyncPending.has(id))applyPromptQueueLocal(id,data.items,{persist:true,render:true});
     }catch(e){
@@ -8197,11 +8634,28 @@ async function pullPromptQueueFromServer(threadId,{render=true,preferServer=true
     const data=await res.json();
     if(Number.isInteger(data.revision))promptQueueServerRevisions.set(id,data.revision);
     const items=Array.isArray(data.items)?data.items.slice(0,50).map(normalizeQueuedPrompt).filter(Boolean):[];
+    const dismissedItemIds=Array.isArray(data.dismissedItemIds)?data.dismissedItemIds:[];
+    // A resumed page can observe the queue before its background beacon reaches
+    // the server. Keep those unacknowledged entries locally, then reconcile
+    // through the versioned PUT; the server filters consumed ids permanently.
+    const remoteIds=new Set(items.map((item)=>String(item?.id||'')));
+    const dismissedIds=new Set(dismissedItemIds.map((itemId)=>String(itemId||'').trim()).filter(Boolean));
+    const localItems=promptQueueFor(id);
+    const pending=promptQueueBeaconItemIds.get(id);
+    const hasMissingPending=Boolean(pending&&[...pending].some((itemId)=>!remoteIds.has(itemId)&&!dismissedIds.has(itemId)));
+    // In-memory beacon tracking disappears when mobile Safari discards a page.
+    // Local storage is therefore a durable outbox: any Web item absent from the
+    // server snapshot must be sent again after the page is restored.
+    const missingLocalWebItemIds=missingUnconfirmedWebPromptQueueItemIds(localItems,remoteIds,dismissedItemIds);
+    const merged=mergePromptQueueSyncConflict(id,localItems,items,dismissedItemIds,{preferRemoteOrder:missingLocalWebItemIds.length>0});
+    acknowledgePromptQueueBeaconItems(id,items);
+    acknowledgePromptQueueBeaconItemIds(id,dismissedItemIds);
     if(preferServer||!promptQueueFor(id).length){
       promptQueueRemoteSyncing=true;
-      try{applyPromptQueueLocal(id,items,{persist:true,render});}
+      try{applyPromptQueueLocal(id,merged,{persist:true,render});}
       finally{promptQueueRemoteSyncing=false;}
     }
+    if(hasMissingPending||missingLocalWebItemIds.length)schedulePromptQueueServerSync(id);
     return items;
   }catch{
     return null;
@@ -8243,7 +8697,7 @@ function applyRemotePromptQueueEvent(event){
 function createQueuedPrompt(message,attachments){return normalizeQueuedPrompt({
   id:makePromptQueueId(),message,attachments,provider:provider.value,model:model.value,
   reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,permissionMode:composerPermissionMode,sandbox:sandbox.value,
-  approval:approval.value,createdAt:new Date().toISOString(),source:'web',
+  approval:approval.value,createdAt:new Date().toISOString(),source:'web',autoDispatch:true,
 })}
 function queuedPromptPayload(item){return{
   message:item.message,attachments:item.attachments,provider:item.provider,model:item.model,
@@ -9655,7 +10109,7 @@ function renderPromptQueue(){
     const appOwned=isAppOwnedQueuedPrompt(item);
     const dispatching=index===0&&queueDispatchingThreads.has(threadId);
     const guiding=queueGuidingItems.has(item.id);
-    row.className='promptQueueRow'+(appOwned?' appOwned':'')+(dispatching||guiding?' sending':'')+(queueFailures.has(item.id)?' failed':'');
+    row.className='promptQueueRow'+(appOwned?' appOwned':'')+(dispatching||guiding?' sending':'')+(queueFailures.has(item.id)||item.dispatchState==='uncertain'?' failed':'');
     row.dataset.queueId=item.id;
     row.draggable=false;
     bindPromptQueueDrag(row,threadId,item.id);
@@ -9691,7 +10145,7 @@ function renderPromptQueue(){
     const edit=queueActionButton('pencil','编辑队列消息',()=>restoreQueuedPrompt(threadId,item.id));
     edit.disabled=busy;
     row.appendChild(edit);
-    const retryable=queueFailures.has(item.id)&&!appOwned;
+    const retryable=(queueFailures.has(item.id)||item.dispatchState==='uncertain')&&!appOwned;
     const guide=queueActionButton(retryable?'rotate-cw':'corner-down-left',retryable?'重试':'引导',()=>{
       if(retryable)dispatchNextQueuedPrompt(threadId,{force:true});else steerQueuedPrompt(threadId,item.id);
     },true);
@@ -9710,7 +10164,7 @@ function renderPromptQueue(){
       more.disabled=busy;
       row.appendChild(more);
     }
-    const error=queueFailures.get(item.id);
+    const error=queueFailures.get(item.id)||(item.dispatchState==='uncertain'?item.dispatchError||'上一次发送结果未确认，请检查会话后手动重试':'');
     if(error){
       const errorText=document.createElement('div');
       errorText.className='promptQueueError';
@@ -9726,8 +10180,15 @@ function enqueuePrompt(message,attachments){
   if(currentConversationSource!=='codex'||!currentConversationId)return false;
   const item=createQueuedPrompt(message,attachments);
   if(!item)return false;
-  const items=[...promptQueueFor(currentConversationId),item];
-  setPromptQueue(currentConversationId,items);
+  const threadId=currentConversationId;
+  const items=[...promptQueueFor(threadId),item];
+  setPromptQueue(threadId,items);
+  // Queue a one-item, idempotent write before a mobile browser has a chance to
+  // freeze this page. The normal PUT below still reconciles foreground state.
+  appendPromptQueueItemViaBeacon(threadId,item,{trackPending:true});
+  // Do not wait for the normal debounce: mobile browsers may suspend this page
+  // immediately after the user sends it to the background.
+  void flushPromptQueueToServer(threadId);
   input.value='';
   input.style.height='auto';
   clearPendingAttachments();
@@ -9917,7 +10378,7 @@ function beginPromptQueuePointerDrag(state){
   if(!state.row?.isConnected||!promptQueueRowCanReorder(state.row)||steerSubmitting||appQueueEditSaving){cancelPromptQueuePointerDrag();return;}
   state.movableIds=promptQueueMovableSegment(state.row);
   if(state.movableIds.size<2){cancelPromptQueuePointerDrag();return;}
-  state.scrollContainer=promptQueueList?.closest('.promptQueue')||null;
+  state.scrollContainer=promptQueueList||null;
   createPromptQueueDragGhost(state);
   state.active=true;
   state.row.classList.add('dragSource','promptQueueDropPlaceholder');
@@ -10134,9 +10595,25 @@ function settlePromptQueueTurn(threadId,turnId){
   if(locked)promptQueueTurnLocks.delete(id);
   return true;
 }
+function reconcilePromptQueueTurnLock(threadId,conversation){
+  const id=String(threadId||'');
+  const locked=promptQueueTurnLock(id);
+  const reportedActiveTurnId=String(conversation?.activeTurnId||'');
+  if(locked&&conversation?.status==='running'&&reportedActiveTurnId&&reportedActiveTurnId!==locked){
+    promptQueueTurnLocks.set(id,reportedActiveTurnId);
+    return {turnId:reportedActiveTurnId,terminal:false};
+  }
+  const turnId=locked||reportedActiveTurnId;
+  if(turnId&&nativeTerminalPersisted(conversation,turnId)){
+    if(locked)settlePromptQueueTurn(id,locked);
+    return {turnId:'',terminal:true};
+  }
+  return {turnId:locked,terminal:false};
+}
 function promptQueueTurnLocked(threadId){return Boolean(promptQueueTurnLock(threadId))}
 function schedulePromptQueueDispatch(threadId,delay=120){
-  if(!threadId||promptQueueTurnLocked(threadId)||!promptQueueFor(threadId).length||isAppOwnedQueuedPrompt(promptQueueFor(threadId)[0]))return;
+  const item=promptQueueFor(threadId)[0];
+  if(!threadId||promptQueueTurnLocked(threadId)||!item||isAppOwnedQueuedPrompt(item)||item.autoDispatch===false||item.dispatchState==='uncertain')return;
   setTimeout(()=>{if(!promptQueueTurnLocked(threadId))dispatchNextQueuedPrompt(threadId)},delay);
 }
 function showNativePromptOptimistically(item){
@@ -10261,6 +10738,7 @@ async function steerQueuedPrompt(threadId,itemId,preloadedItem=null){
 async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
   const item=promptQueueFor(threadId)[0];
   if(!item||isAppOwnedQueuedPrompt(item)||queueDispatchingThreads.has(threadId)||queueGuidingItems.has(item.id)||steerSubmitting)return false;
+  if((item.autoDispatch===false||item.dispatchState==='uncertain')&&!force)return false;
   const current=currentConversationSource==='codex'&&currentConversationId===threadId;
   if(current&&(webRunActive||promptQueueTurnLocked(threadId)||steerSubmitting))return false;
   if(queueFailures.has(item.id)&&!force)return false;
@@ -11830,6 +12308,7 @@ if(!composerMicBtn){
     }catch{}
   }
   enhanceComposerKeyboardLift();
+  enhanceComposerOverlayInset();
   keepComposerAboveKeyboard();
 }
 function settingsSectionTitle(text,icon){
@@ -13296,12 +13775,51 @@ async function applyGeneratedImageBackground(source,button){if(!source||button.d
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
 document.addEventListener('click',(event)=>{if(!event.target.closest('.msg.user, .msg.assistant, .msgActions'))clearMessageActionsOpen()});
 async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(selectRecent&&data.conversations.length){const saved=readActiveConversationPreference();const conversations=Array.isArray(data.conversations)?data.conversations:[];const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=match||conversations[0];if(target)await loadConversation(target.id,target.source||'codex');}await restoreSideChatIfNeeded()}
+function historyRefreshBlocked(){return historyRefreshPointerId!==null||activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')}
+function beginHistoryRefreshPointerLock(event){
+  if(event.button!==0||event.isPrimary===false||!event.target.closest?.('.hist'))return;
+  historyRefreshPointerId=event.pointerId;
+  if(historyRefreshReleaseTimer!==null){clearTimeout(historyRefreshReleaseTimer);historyRefreshReleaseTimer=null}
+}
+function releaseHistoryRefreshPointerLock(event){
+  if(historyRefreshPointerId===null||(event?.pointerId!==undefined&&event.pointerId!==historyRefreshPointerId))return;
+  const pointerId=historyRefreshPointerId;
+  if(historyRefreshReleaseTimer!==null)clearTimeout(historyRefreshReleaseTimer);
+  // Native click follows pointerup. Let it dispatch before rebuilding rows.
+  historyRefreshReleaseTimer=setTimeout(()=>{
+    if(historyRefreshPointerId!==pointerId)return;
+    historyRefreshPointerId=null;
+    historyRefreshReleaseTimer=null;
+    flushPendingHistoryRefresh();
+  },0);
+}
+function clearHistoryRefreshPointerLock(){
+  if(historyRefreshReleaseTimer!==null){clearTimeout(historyRefreshReleaseTimer);historyRefreshReleaseTimer=null}
+  if(historyRefreshPointerId===null)return;
+  historyRefreshPointerId=null;
+  flushPendingHistoryRefresh();
+}
+history?.addEventListener('pointerdown',beginHistoryRefreshPointerLock,true);
+window.addEventListener('pointerup',releaseHistoryRefreshPointerLock,true);
+window.addEventListener('pointercancel',releaseHistoryRefreshPointerLock,true);
+window.addEventListener('blur',clearHistoryRefreshPointerLock);
 function flushPendingHistoryRefresh(){
-  if(!historyRefreshPending||activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive)return;
+  if(!historyRefreshPending||historyRefreshBlocked())return;
   historyRefreshPending=false;
   queueMicrotask(()=>refreshHistory());
 }
-async function refreshHistory(){if(activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')){historyRefreshPending=true;return}historyRefreshPending=false;const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations)}
+async function refreshHistory(){
+  if(historyRefreshBlocked()){historyRefreshPending=true;return}
+  historyRefreshPending=false;
+  const res=await fetch('/api/config');
+  if(!res.ok)return;
+  const data=await res.json();
+  // A live-session refresh may have started just before the user pressed a row.
+  if(historyRefreshBlocked()){historyRefreshPending=true;return}
+  pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];
+  renderHistory(data.conversations);
+}
+function nativeRuntimeNeedsHistoryRefresh(type){return ['turn','turn-cleared','connection-error'].includes(String(type||''))}
 function composerModelItems(items,selected){const list=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];const selectedModel=String(selected||'').trim();if(selectedModel&&!list.includes(selectedModel))list.push(selectedModel);return list}
 function selectComposerModel(selected){const selectedModel=String(selected||'').trim();if(!selectedModel)return false;if(![...model.options].some((option)=>option.value===selectedModel)){const option=document.createElement('option');option.value=selectedModel;option.textContent=selectedModel;model.appendChild(option)}model.value=selectedModel;return true}
 function applyComposerModels(providerName,items,selected){const list=composerModelItems(items,selected);fillSelect(model,list,selected||list[0]||'');modelOptionsProvider=String(providerName||'')}
@@ -14210,6 +14728,7 @@ function storeHistoryCompletionState(key,state){
 function historyCompletionKey(item){return conversationKey(item?.source==='codex'?'codex':'web',item?.id)}
 function historyCompletionVersion(item){return String(item?.status||'')+'|'+String(item?.updatedAt||item?.recencyAt||item?.createdAt||'')}
 function isCompletedHistoryItem(item){return ['done','completed'].includes(String(item?.status||'').toLowerCase())}
+function isCompletedHistoryCompletionVersion(version){return ['done','completed'].includes(String(version||'').split('|',1)[0].toLowerCase())}
 function trackHistoryCompletionState(items){
   let seenChanged=false;
   let readChanged=false;
@@ -14232,8 +14751,15 @@ function trackHistoryCompletionState(items){
     historyCompletionSeen.set(key,version);
     seenChanged=true;
     if(isCompletedHistoryItem(item)){
-      historyCompletionRead.delete(key);
-      readChanged=true;
+      if(!isCompletedHistoryCompletionVersion(previous)){
+        historyCompletionRead.delete(key);
+        readChanged=true;
+      }else if(historyCompletionRead.get(key)===previous){
+        // A completed task can receive metadata updates after it was read.
+        // Keep its read marker aligned instead of treating that as a new completion.
+        historyCompletionRead.set(key,version);
+        readChanged=true;
+      }
     }
   }
   if(seenChanged)storeHistoryCompletionState(HISTORY_COMPLETION_SEEN_STORAGE_KEY,historyCompletionSeen);
@@ -15268,7 +15794,7 @@ function updateComposerOverlayInset(options={}){
   const maxHeight=document.body.classList.contains('keyboardOpen')
     ? Math.max(96,Math.round((chat?.clientHeight||visualHeight||800)-visibleOutput))
     : Math.round((viewportBottom||800)*0.72);
-  const height=Math.max(96, Math.min(measured + 8, maxHeight));
+  const height=Math.max(72, Math.min(measured + 8, maxHeight));
   document.body.style.setProperty('--composer-overlay-height', height+'px');
   document.body.dataset.composerOverlayHeight=String(height);
   if(options.scroll&&chat&&pinned&&Math.abs(height-prev)>2)scrollChatToLatest({force:false,updateInset:false});
@@ -15321,6 +15847,32 @@ function alignChatToBottomStable(maxRounds=12){
   };
   requestAnimationFrame(step);
 }
+function addNativeHistoryLoadButton(threadId,conversation){
+  const id=String(threadId||'').trim();
+  if(!id||!conversation?.hasEarlierMessages||!chat)return null;
+  const button=document.createElement('button');
+  button.type='button';
+  button.id='nativeHistoryLoadEarlier';
+  button.className='nativeHistoryLoadEarlier';
+  button.title='加载完整记录';
+  button.setAttribute('aria-label','加载完整记录');
+  setIconLabel(button,'history','加载完整记录');
+  button.addEventListener('click',async()=>{
+    if(button.disabled||currentConversationSource!=='codex'||currentConversationId!==id)return;
+    button.disabled=true;
+    button.setAttribute('aria-busy','true');
+    setIconLabel(button,'loader-circle','加载中…');
+    const loaded=await loadConversation(id,'codex',{fullHistory:true});
+    if(!loaded&&button.isConnected){
+      button.disabled=false;
+      button.removeAttribute('aria-busy');
+      setIconLabel(button,'history','重试加载完整记录');
+    }
+  });
+  chat.appendChild(button);
+  refreshIcons(button);
+  return button;
+}
 async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   const nextConversationSource=source==='codex'?'codex':'web';
@@ -15353,7 +15905,13 @@ async function loadConversation(id,source='web',options={}){
   let conversation=options.conversation||null;
   if(!conversation){
     const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
-    const requestUrl=endpoint+encodeURIComponent(id)+(currentConversationSource==='codex'?'?images=external':'');
+    // Rendering several hundred historical messages synchronously blocks the
+    // main thread. Show the current tail first; the explicit history control
+    // keeps the complete transcript available without delaying task switching.
+    const nativeHistoryQuery=currentConversationSource==='codex'
+      ? '?images=external'+(options.fullHistory?'':'&limit='+NATIVE_INITIAL_MESSAGE_LIMIT)
+      : '';
+    const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery;
     const res=await fetch(requestUrl);
     if(seq!==conversationLoadSeq)return false;
     if(!res.ok){statusEl.textContent='加载失败';return false}
@@ -15368,10 +15926,11 @@ async function loadConversation(id,source='web',options={}){
   try{window.__currentConversationCwd=String(conversation.metadata?.cwd||'')}catch{}
   nativeCursor=Number(conversation.cursor||0);
   nativeGeneration=Number(conversation.generation||0);
-  if(currentConversationSource==='codex'&&conversation.status==='running')markPromptQueueTurnRunning(currentConversationId,conversation.activeTurnId);
+  const promptQueueLock=reconcilePromptQueueTurnLock(currentConversationId,conversation);
+  if(currentConversationSource==='codex'&&conversation.status==='running'&&!promptQueueLock.terminal)markPromptQueueTurnRunning(currentConversationId,conversation.activeTurnId);
   const queueTurnId=promptQueueTurnLock(currentConversationId);
-  activeNativeTurnId=String(queueTurnId||conversation.activeTurnId||'');
-  webRunActive=currentConversationSource==='codex'&&(conversation.status==='running'||Boolean(queueTurnId));
+  activeNativeTurnId=String(queueTurnId||(!promptQueueLock.terminal&&conversation.activeTurnId)||'');
+  webRunActive=currentConversationSource==='codex'&&!promptQueueLock.terminal&&(conversation.status==='running'||Boolean(queueTurnId));
   if(!webRunActive||!nativeCancelPendingMatches(currentConversationId,activeNativeTurnId))clearNativeCancelPending();
   syncComposerContextWindow(conversation.contextWindow||null);
   if(currentConversationSource==='codex'){
@@ -15381,6 +15940,7 @@ async function loadConversation(id,source='web',options={}){
   applyConversationMode();
   updateActiveHistory();
   chat.innerHTML='';
+  if(currentConversationSource==='codex')addNativeHistoryLoadButton(currentConversationId,conversation);
   const messages=conversation.messages||[];
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
   const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
@@ -15538,8 +16098,24 @@ function refreshPromptQueueOnResume(){
   if(document.visibilityState&&document.visibilityState!=='visible')return;
   if(currentConversationSource==='codex'&&currentConversationId)void pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
 }
+function flushPromptQueuesBeforeBackground(event){
+  if(event?.type!=='pagehide'&&document.visibilityState==='visible')return;
+  const beaconBudget={remaining:PROMPT_QUEUE_BEACON_MAX_BYTES};
+  for(const threadId of Object.keys(promptQueues)){
+    const pending=promptQueueBeaconItemIds.get(threadId);
+    const webItems=promptQueueFor(threadId).filter((item)=>pending?.has(String(item?.id||''))&&!isAppOwnedQueuedPrompt(item));
+    if(!webItems.length)continue;
+    let needsFetchFallback=false;
+    for(const item of webItems){
+      if(!appendPromptQueueItemViaBeacon(threadId,item,{budget:beaconBudget}))needsFetchFallback=true;
+    }
+    if(needsFetchFallback)void flushPromptQueueToServer(threadId);
+  }
+}
 window.addEventListener('focus',refreshPromptQueueOnResume);
 document.addEventListener('visibilitychange',refreshPromptQueueOnResume);
+document.addEventListener('visibilitychange',flushPromptQueuesBeforeBackground);
+window.addEventListener('pagehide',flushPromptQueuesBeforeBackground);
 function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
@@ -15563,7 +16139,9 @@ function connectSessionEvents(){
   sessionEvents.addEventListener('native-runtime',(event)=>{
     let runtime={};
     try{runtime=JSON.parse(event.data||'{}')}catch(e){}
-    refreshHistory();
+    // Text deltas can arrive many times per second. Their persisted snapshot is already
+    // coalesced by the sessions listener, so only refresh the sidebar for lifecycle changes.
+    if(nativeRuntimeNeedsHistoryRefresh(runtime.type))void refreshHistory();
     if(runtime.threadId!==currentConversationId||currentConversationSource!=='codex')return;
     if(isCompletedNativeRuntimeTurn(runtime.turnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
     if(webRunActive&&activeNativeTurnId&&runtime.turnId&&String(runtime.turnId)!==String(activeNativeTurnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
@@ -15655,6 +16233,7 @@ function reconcileNativeResetMessage(message){
   if(message.at)existing.dataset.messageAt=String(message.at);
   if(existing._messageBody&&before!==after){
     if(message.role==='assistant')renderAssistantMarkdown(existing._messageBody,text);
+    else if(message.role==='user'&&existing.classList.contains('browserCommentSteering'))renderBrowserCommentMessageBody(existing._messageBody,text);
     else if(message.role==='user')renderMessageMarkdown(existing._messageBody,automationInstructionDisplayText(text));
   }
   if(message.role==='assistant'&&message.kind==='final_answer'){
@@ -15717,14 +16296,15 @@ async function syncCurrentNativeConversationOnce(){
   const wasRunning=webRunActive;
   const completingTurnId=activeNativeTurnId;
   const reportedActiveTurnId=String(conversation.activeTurnId||'');
-  if(conversation.status==='running')markPromptQueueTurnRunning(id,reportedActiveTurnId);
+  const promptQueueLock=reconcilePromptQueueTurnLock(id,conversation);
+  if(conversation.status==='running'&&!promptQueueLock.terminal)markPromptQueueTurnRunning(id,reportedActiveTurnId);
   const queueTurnId=promptQueueTurnLock(id);
-  const incomingActiveTurnId=String(queueTurnId||reportedActiveTurnId||activeNativeTurnId||'');
+  const incomingActiveTurnId=String(queueTurnId||(!promptQueueLock.terminal&&reportedActiveTurnId)||activeNativeTurnId||'');
   if(nativeCancelPending?.threadId===id&&(
     conversation.status!=='running'||reportedActiveTurnId!==nativeCancelPending.turnId
   ))clearNativeCancelPending(id);
   const nearBottom=captureNativeLiveFollowBottom();
-  if(conversation.status==='running'&&incomingActiveTurnId&&incomingActiveTurnId!==activeNativeTurnId){markPromptQueueTurnRunning(id,incomingActiveTurnId);activeNativeTurnId=incomingActiveTurnId;webRunActive=true}
+  if(!promptQueueLock.terminal&&conversation.status==='running'&&incomingActiveTurnId&&incomingActiveTurnId!==activeNativeTurnId){markPromptQueueTurnRunning(id,incomingActiveTurnId);activeNativeTurnId=incomingActiveTurnId;webRunActive=true}
   if(syncMessages.length){
     clearNativeOptimisticElements();
     removeNativeRunningElement();
@@ -15749,8 +16329,8 @@ async function syncCurrentNativeConversationOnce(){
   nativeCursor=Number(conversation.cursor||nativeCursor);
   nativeGeneration=Number(conversation.generation||nativeGeneration);
   const lockedTurnId=promptQueueTurnLock(id);
-  activeNativeTurnId=String(lockedTurnId||reportedActiveTurnId||'');
-  webRunActive=conversation.status==='running'||Boolean(lockedTurnId);
+  activeNativeTurnId=String(lockedTurnId||(!promptQueueLock.terminal&&reportedActiveTurnId)||'');
+  webRunActive=!promptQueueLock.terminal&&(conversation.status==='running'||Boolean(lockedTurnId));
   if(webRunActive){const activeStartedAt=conversation.activeTurnStartedAt||conversation.updatedAt;if(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(wasRunning&&!webRunActive){
     freezeTurnProcessElapsed(conversation.updatedAt,completingTurnId);
@@ -15768,6 +16348,7 @@ async function syncCurrentNativeConversationOnce(){
 function nativeTerminalPersisted(conversation,turnId){
   const id=String(turnId||'');
   if(!id)return false;
+  if(String(conversation?.terminalTurnId||'')===id&&['done','error','interrupted'].includes(String(conversation?.status||'')))return true;
   return (conversation.messages||[]).some((message)=>(
     message.turnId===id
     && message.role==='process'
@@ -16115,6 +16696,101 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
   if(inboxParsed.items.length)renderInboxItems(body,inboxParsed.items);
   if(parsed.comments.length)renderReviewComments(body,parsed.comments);
   if(memoryParsed.citations.length)renderMemoryCitations(body,memoryParsed.citations);
+}
+function browserAnnotationChangeMarkdown(text){
+  const source=String(text||'').replace(/\\r\\n/g,'\\n').trim();
+  const match=/^界面批注\\s*\\n([\\s\\S]+)$/.exec(source);
+  const changes=String(match?.[1]||'').trim();
+  return /^[-*]\\s+\\S/.test(changes)?changes:'';
+}
+let browserAnnotationPointerCard=null;
+let browserAnnotationPointerTrackingBound=false;
+let browserAnnotationPointerFrame=0;
+let browserAnnotationPointerPosition=null;
+function browserAnnotationRectContains(rect,x,y){
+  return Boolean(rect)&&x>=rect.left&&x<=rect.right&&y>=rect.top&&y<=rect.bottom;
+}
+function setBrowserAnnotationPointerCard(next){
+  if(next===browserAnnotationPointerCard)return;
+  browserAnnotationPointerCard?.classList.remove('browserAnnotationPointerOver');
+  browserAnnotationPointerCard=next;
+  browserAnnotationPointerCard?.classList.add('browserAnnotationPointerOver');
+}
+function browserAnnotationCardAtPointer(x,y){
+  for(const card of document.querySelectorAll('.browserAnnotationCard')){
+    const trigger=card.querySelector('.browserAnnotationTrigger');
+    if(browserAnnotationRectContains(trigger?.getBoundingClientRect(),x,y))return card;
+    if(card!==browserAnnotationPointerCard)continue;
+    const detail=card.querySelector('.browserAnnotationDetails');
+    if(browserAnnotationRectContains(detail?.getBoundingClientRect(),x,y))return card;
+  }
+  return null;
+}
+function queueBrowserAnnotationPointerUpdate(x,y){
+  browserAnnotationPointerPosition={x,y};
+  if(browserAnnotationPointerFrame)return;
+  browserAnnotationPointerFrame=requestAnimationFrame(()=>{
+    browserAnnotationPointerFrame=0;
+    const point=browserAnnotationPointerPosition;
+    browserAnnotationPointerPosition=null;
+    if(point)setBrowserAnnotationPointerCard(browserAnnotationCardAtPointer(point.x,point.y));
+  });
+}
+function clearBrowserAnnotationPointerCard(){
+  browserAnnotationPointerPosition=null;
+  if(browserAnnotationPointerFrame){
+    cancelAnimationFrame(browserAnnotationPointerFrame);
+    browserAnnotationPointerFrame=0;
+  }
+  setBrowserAnnotationPointerCard(null);
+}
+function ensureBrowserAnnotationPointerTracking(){
+  if(browserAnnotationPointerTrackingBound)return;
+  browserAnnotationPointerTrackingBound=true;
+  const updateFromPointer=(event)=>{
+    if(!matchMedia('(hover: hover) and (pointer: fine)').matches)return;
+    queueBrowserAnnotationPointerUpdate(event.clientX,event.clientY);
+  };
+  // Browser-side comment overlays can absorb CSS hover. Capture both event families
+  // and resolve the card from viewport coordinates instead of the event target.
+  window.addEventListener('pointermove',updateFromPointer,true);
+  window.addEventListener('mousemove',updateFromPointer,true);
+  window.addEventListener('blur',clearBrowserAnnotationPointerCard);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden)clearBrowserAnnotationPointerCard();
+  });
+}
+function renderBrowserAnnotationCard(body,changes){
+  body.classList.add('browserAnnotationSource');
+  const card=document.createElement('details');
+  card.className='browserAnnotationCard';
+  const summary=document.createElement('summary');
+  summary.className='browserAnnotationTrigger';
+  summary.title='查看注释';
+  summary.setAttribute('aria-label','查看注释');
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide','message-square');
+  icon.setAttribute('aria-hidden','true');
+  const label=document.createElement('span');
+  label.textContent='注释';
+  summary.append(icon,label);
+  const detail=document.createElement('div');
+  detail.className='browserAnnotationDetails';
+  renderMessageMarkdown(detail,changes);
+  card.append(summary,detail);
+  body.replaceChildren(card);
+  ensureBrowserAnnotationPointerTracking();
+}
+function renderBrowserCommentMessageBody(body,text){
+  const source=automationInstructionDisplayText(text);
+  const annotation=browserAnnotationChangeMarkdown(source);
+  body.classList.remove('browserAnnotationSource','markdownBody');
+  if(annotation){
+    renderBrowserAnnotationCard(body,annotation);
+    refreshIcons(body);
+    return;
+  }
+  renderMessageMarkdown(body,source);
 }
 function automationHeartbeatDisplayText(text){
   const original=String(text||'');
@@ -19030,7 +19706,8 @@ function addMsg(role,text,options={}){
   }else{
     const body=document.createElement('div');
     body.className='msgBody';
-    if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text);
+    if(browserCommentUser)renderBrowserCommentMessageBody(body,text);
+    else if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text);
     else if(role==='user')renderMessageMarkdown(body,automationInstructionDisplayText(text));
     else body.textContent=text;
     const actions=document.createElement('div');
@@ -19429,8 +20106,20 @@ function pumpNativeLiveRender(live){
 }
 function renderNativeLiveItem(live){
   live.element.dataset.messageText=live.text;
-  if(live.element._messageBody)renderAssistantMarkdown(live.element._messageBody,live.text);
+  // Markdown parsing also enhances links, images, code blocks, and embedded cards. During
+  // a typewriter stream, updating a text node is substantially cheaper; settle renders the
+  // authoritative Markdown once the item is complete.
+  if(live.element._messageBody){
+    live.markdownText=null;
+    live.element._messageBody.textContent=live.text;
+  }
   scheduleNativeLiveScroll(live);
+}
+function renderNativeLiveItemMarkdown(live){
+  const body=live?.element?._messageBody;
+  if(!body||live.markdownText===live.text)return;
+  renderAssistantMarkdown(body,live.text);
+  live.markdownText=live.text;
 }
 function nativeLiveDocumentHidden(){
   return typeof document!=='undefined'&&document.visibilityState==='hidden';
@@ -19454,6 +20143,7 @@ function flushNativeLiveItemsToTarget(){
   for(const live of [...nativeLiveItems.values()])renderNativeLiveItemImmediately(live);
 }
 function settleNativeLiveItem(live){
+  renderNativeLiveItemMarkdown(live);
   live.element.classList.remove('streaming');
   if(live.source==='snapshot'){
     nativeRenderedMessageKeys.add(live.key);
@@ -19643,7 +20333,7 @@ async function send(){
   }
 }
 </script>
-  <script src="/image-prompt.js?v=image-prompt-main-20260728a"></script>
+  <script src="/image-prompt.js?v=image-prompt-main-20260803a"></script>
   <script src="/effects.js?v=light-fx-20260802a"></script>
 </body>
 </html>`;

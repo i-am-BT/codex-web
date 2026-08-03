@@ -192,6 +192,45 @@ test('browser comment attachment cards cannot collapse inside the chat scroll co
   assert.match(uiStyles, /body \.chat > \.msg\.user\.browserCommentSteering > \.msgBody\.browserCommentSource > p\s*\{[^}]*margin:\s*0/s);
 });
 
+test('browser design annotations use hover on desktop and toggle on touch devices', () => {
+  const annotationSource = sourceBetween('function browserAnnotationChangeMarkdown', 'function renderBrowserAnnotationCard');
+  const { browserAnnotationChangeMarkdown } = new Function(`${annotationSource}; return { browserAnnotationChangeMarkdown };`)();
+  assert.equal(browserAnnotationChangeMarkdown('界面批注\n- margin-top: 0px → 20px'), '- margin-top: 0px → 20px');
+  assert.equal(browserAnnotationChangeMarkdown('界面批注'), '');
+  assert.equal(browserAnnotationChangeMarkdown('普通浏览器评论\n- margin-top: 0px → 20px'), '');
+  assert.match(inlineScript, /function queueBrowserAnnotationPointerUpdate\(x,y\)\{[\s\S]*?requestAnimationFrame\(\(\)=>\{[\s\S]*?browserAnnotationCardAtPointer\(point\.x,point\.y\)/s);
+  assert.match(inlineScript, /function clearBrowserAnnotationPointerCard\(\)\{[\s\S]*?cancelAnimationFrame\(browserAnnotationPointerFrame\);[\s\S]*?setBrowserAnnotationPointerCard\(null\);/s);
+  assert.match(inlineScript, /function ensureBrowserAnnotationPointerTracking\(\)\{[\s\S]*?queueBrowserAnnotationPointerUpdate\(event\.clientX,event\.clientY\);[\s\S]*?window\.addEventListener\('pointermove',updateFromPointer,true\);[\s\S]*?window\.addEventListener\('mousemove',updateFromPointer,true\);/s);
+  assert.match(inlineScript, /function renderBrowserAnnotationCard\(body,changes\)\{[\s\S]*?card\.className='browserAnnotationCard';[\s\S]*?summary\.className='browserAnnotationTrigger';[\s\S]*?label\.textContent='注释';[\s\S]*?detail\.className='browserAnnotationDetails'/s);
+  assert.match(inlineScript, /function renderBrowserCommentMessageBody\(body,text\)\{[\s\S]*?const annotation=browserAnnotationChangeMarkdown\(source\);[\s\S]*?body\.classList\.remove\('browserAnnotationSource','markdownBody'\);[\s\S]*?if\(annotation\)\{[\s\S]*?renderBrowserAnnotationCard\(body,annotation\);[\s\S]*?refreshIcons\(body\);[\s\S]*?renderMessageMarkdown\(body,source\)/s);
+  assert.match(inlineScript, /if\(browserCommentUser\)renderBrowserCommentMessageBody\(body,text\)/);
+  assert.match(inlineScript, /message\.role==='user'&&existing\.classList\.contains\('browserCommentSteering'\)\)renderBrowserCommentMessageBody\(existing\._messageBody,text\)/);
+  assert.match(uiStyles, /\.browserAnnotationDetails\s*\{[^}]*display:\s*block;[^}]*position:\s*absolute;[^}]*opacity:\s*0;[^}]*visibility:\s*hidden;[^}]*pointer-events:\s*none/s);
+  assert.match(uiStyles, /\.browserAnnotationDetails\s*\{[^}]*bottom:\s*100%/s);
+  assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[\s\S]*?\.browserAnnotationCard:hover > \.browserAnnotationDetails,[\s\S]*?\.browserAnnotationCard\.browserAnnotationPointerOver > \.browserAnnotationDetails,[\s\S]*?\.browserAnnotationTrigger:focus-visible \+ \.browserAnnotationDetails\s*\{[^}]*opacity:\s*1;[^}]*visibility:\s*visible/s);
+  const touchMediaIndex = uiStyles.indexOf('@media (hover: none), (pointer: coarse)');
+  const touchOpenIndex = uiStyles.indexOf('.browserAnnotationCard[open] > .browserAnnotationDetails');
+  assert.ok(touchMediaIndex >= 0 && touchOpenIndex > touchMediaIndex);
+  assert.match(uiStyles, /@media \(hover: none\), \(pointer: coarse\)\s*\{[\s\S]*?\.browserAnnotationTrigger\s*\{[^}]*min-height:\s*40px[\s\S]*?\.browserAnnotationCard\[open\] > \.browserAnnotationDetails\s*\{[^}]*pointer-events:\s*auto/s);
+  assert.match(uiStyles, /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.browserAnnotationDetails\s*\{[^}]*transition:\s*none/s);
+});
+
+test('runtime text deltas leave sidebar rebuilding to the coalesced session snapshot', () => {
+  const runtimeHistoryHelperSource = inlineScript.match(/function nativeRuntimeNeedsHistoryRefresh\(type\)\{[^}]*\}/)?.[0];
+  assert.ok(runtimeHistoryHelperSource, 'missing native runtime history refresh helper');
+  const runtimeHandlerSource = sourceBetween('function connectSessionEvents', 'function nativeMessageElementBySequence');
+  const { nativeRuntimeNeedsHistoryRefresh } = new Function(`${runtimeHistoryHelperSource}; return { nativeRuntimeNeedsHistoryRefresh };`)();
+
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('delta'), false);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('item-started'), false);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('item-completed'), false);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('turn'), true);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('turn-cleared'), true);
+  assert.equal(nativeRuntimeNeedsHistoryRefresh('connection-error'), true);
+  assert.match(runtimeHandlerSource, /try\{runtime=JSON\.parse\(event\.data\|\|'\{\}'\)\}catch\(e\)\{\}\s*\/\/ Text deltas[\s\S]*?if\(nativeRuntimeNeedsHistoryRefresh\(runtime\.type\)\)void refreshHistory\(\);/);
+  assert.doesNotMatch(runtimeHandlerSource, /try\{runtime=JSON\.parse\(event\.data\|\|'\{\}'\)\}catch\(e\)\{\}\s*refreshHistory\(\);/);
+});
+
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
   const activitySource = sourceBetween('function decodeEmbeddedToolString', 'function toolMessageTitle');
   const activityApi = new Function(`${activitySource}; return { toolActivityPresentations, nativeFileChangePresentations };`)();
@@ -420,6 +459,7 @@ test('terminal states remove only the ephemeral progress pill', () => {
 test('a stop request freezes visible streaming without unlocking the running turn', () => {
   const pauseSource = sourceBetween('function pauseNativeLivePresentationForCancel', 'let turnProcessElapsedFrozen');
   const immediate = [];
+  const finalized = [];
   const makeLive = (turnId, { text = 'visible', targetText = 'visible tail', complete = false } = {}) => {
     const classes = new Set(['streaming']);
     return {
@@ -429,6 +469,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
       complete,
       renderTimer: 7,
       element: {
+        _messageBody: { textContent: '' },
         classList: {
           add: (...names) => names.forEach((name) => classes.add(name)),
           remove: (...names) => names.forEach((name) => classes.delete(name)),
@@ -439,6 +480,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   };
   const api = new Function(
     'renderNativeLiveItemImmediately',
+    'renderNativeLiveItemMarkdown',
     `
       let currentConversationId = 'thread-a';
       let activeNativeTurnId = 'turn-a';
@@ -452,11 +494,14 @@ test('a stop request freezes visible streaming without unlocking the running tur
         resume: resumeNativeLivePresentationForCancel,
       };
     `,
-  )((live) => {
-    live.renderTimer = null;
-    live.text = live.targetText;
-    immediate.push(live.turnId);
-  });
+  )(
+    (live) => {
+      live.renderTimer = null;
+      live.text = live.targetText;
+      immediate.push(live.turnId);
+    },
+    (live) => finalized.push(live.text),
+  );
   const matching = makeLive('turn-a');
   const other = makeLive('turn-b');
   api.items.clear();
@@ -469,6 +514,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.equal(matching.element.classList.contains('streaming'), false);
   assert.equal(other.cancelVisualPaused, undefined);
   assert.deepEqual(immediate, ['turn-a']);
+  assert.deepEqual(finalized, ['visible tail'], 'the frozen text must receive its final Markdown render');
 
   matching.targetText = 'visible tail received while the stop request was pending';
   api.resume('thread-a', 'turn-a');
@@ -487,6 +533,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.match(deltaSource, /const cancelPending=nativeCancelPendingMatches\(currentConversationId,runtimeTurnId\);/);
   assert.match(deltaSource, /if\(!live&&cancelPending\)return;/);
   assert.match(deltaSource, /live\.targetText\+=delta;\s*if\(cancelPending\|\|live\.cancelVisualPaused\)return;/);
+  assert.match(pauseSource, /renderNativeLiveItemImmediately\(live\);\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(scheduleSource, /if\(live\?\.cancelVisualPaused\)return;/);
   assert.match(snapshotSource, /if\(live\.cancelVisualPaused&&nativeCancelPendingMatches\(currentConversationId,pausedTurnId\)\)\{/);
   assert.match(snapshotSource, /if\(cancelPending\)\{[\s\S]*?return null;/);
@@ -736,8 +783,8 @@ test('the prompt queue stays visible in Web while retaining its backing actions'
   assert.match(ruleBody('.promptQueueRow.sending'), /background:\s*transparent(?:;|$)/);
   assert.match(ruleBody('.promptQueueRow.failed'), /background:\s*transparent(?:;|$)/);
   assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.promptQueue\s*\{[^}]*border-color:/s);
-  assert.match(uiStyles, /@media \(max-width:\s*820px\)[\s\S]*?\.promptQueue,[\s\S]*?max-height:\s*calc\(3 \* 48px \+ 8px\);[^}]*scrollbar-width:\s*none;[^}]*overscroll-behavior:\s*contain/s);
-  assert.match(uiStyles, /\.promptQueue::-webkit-scrollbar\s*\{[^}]*display:\s*none/s);
+  assert.match(uiStyles, /@media \(max-width:\s*820px\)[\s\S]*?\.promptQueue,[\s\S]*?max-height:\s*calc\(3 \* 40px \+ 10px\);[^}]*overflow:\s*hidden;[\s\S]*?\.promptQueueList\s*\{[^}]*max-height:\s*calc\(3 \* 40px\);[^}]*overflow:\s*hidden auto;[^}]*scrollbar-width:\s*none;[^}]*overscroll-behavior:\s*contain/s);
+  assert.match(uiStyles, /\.promptQueueList::-webkit-scrollbar\s*\{[^}]*display:\s*none/s);
 
   assert.match(ruleBody('.promptQueueHead'), /display:\s*none(?:;|$)/);
   assert.match(
@@ -755,11 +802,13 @@ test('the prompt queue stays visible in Web while retaining its backing actions'
   assert.match(queueRenderer, /queueActionButton\('pencil','编辑队列消息'/);
   assert.match(queueRenderer, /queueActionButton\('ellipsis','队列操作'/);
   assert.match(queueRenderer, /bindPromptQueueDrag\(row,threadId,item\.id\)/);
+  assert.match(inlineScript, /state\.scrollContainer=promptQueueList\|\|null/);
   assert.match(queueRenderer, /body\.title='长按拖动调整顺序；使用编辑按钮修改消息'/);
   assert.doesNotMatch(queueRenderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
   assert.match(queueRenderer, /body\.disabled=busy/);
   assert.match(queueRenderer, /edit\.disabled=busy/);
-  assert.match(queueRenderer, /const retryable=queueFailures\.has\(item\.id\)&&!appOwned/);
+  assert.match(queueRenderer, /queueFailures\.has\(item\.id\)\|\|item\.dispatchState==='uncertain'/);
+  assert.match(queueRenderer, /const retryable=\(queueFailures\.has\(item\.id\)\|\|item\.dispatchState==='uncertain'\)&&!appOwned/);
   assert.match(queueRenderer, /guide\.disabled=busy\|\|\(!webRunActive&&!retryable\)/);
   assert.match(queueRenderer, /remove\.disabled=busy/);
   assert.match(queueRenderer, /more\.disabled=busy/);
@@ -767,6 +816,176 @@ test('the prompt queue stays visible in Web while retaining its backing actions'
     [...queueRenderer.matchAll(/row\.appendChild\((edit|guide|remove|more)\)/g)].map((match) => match[1]),
     ['edit', 'guide', 'remove', 'more'],
   );
+});
+
+test('mobile queue handoff uses an idempotent one-item beacon before backgrounding', async () => {
+  const beaconStart = inlineScript.indexOf('const promptQueueBeaconItemIds=new Map();');
+  const beaconEnd = inlineScript.indexOf('function schedulePromptQueueServerSync', beaconStart);
+  const enqueueStart = inlineScript.indexOf('function enqueuePrompt(');
+  const enqueueEnd = inlineScript.indexOf('async function deleteQueuedPrompt', enqueueStart);
+  const backgroundStart = inlineScript.indexOf('function flushPromptQueuesBeforeBackground(');
+  const backgroundEnd = inlineScript.indexOf('function connectSessionEvents', backgroundStart);
+  assert.ok(beaconStart >= 0 && beaconEnd > beaconStart, 'missing background queue beacon helper');
+  assert.ok(enqueueStart >= 0 && enqueueEnd > enqueueStart, 'missing queue enqueue helper');
+  assert.ok(backgroundStart >= 0 && backgroundEnd > backgroundStart, 'missing background queue flush helper');
+
+  const sent = [];
+  class BeaconBlob {
+    constructor(parts, options) {
+      this.text = parts.join('');
+      this.size = this.text.length;
+      this.type = options?.type || '';
+    }
+  }
+  const beaconApi = new Function(
+    'navigator',
+    'Blob',
+    'isAppOwnedQueuedPrompt',
+    `${inlineScript.slice(beaconStart, beaconEnd)}; return { appendPromptQueueItemViaBeacon, missingUnconfirmedWebPromptQueueItemIds, mergePromptQueueSyncConflict };`,
+  )(
+    { sendBeacon: (url, payload) => { sent.push({ url, payload }); return true; } },
+    BeaconBlob,
+    (item) => item?.source === 'codex-app',
+  );
+
+  assert.equal(beaconApi.appendPromptQueueItemViaBeacon('thread-a', { id: 'web-1', source: 'web', message: 'queued' }, { trackPending: true }), true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].url, '/api/prompt-queues/thread-a/append-beacon');
+  assert.equal(sent[0].payload.type, 'application/json');
+  assert.deepEqual(JSON.parse(sent[0].payload.text), { item: { id: 'web-1', source: 'web', message: 'queued' } });
+  assert.deepEqual(
+    beaconApi.mergePromptQueueSyncConflict(
+      'thread-a',
+      [{ id: 'web-1' }],
+      [{ id: 'other-client' }, { id: 'web-1' }],
+    ).map((item) => item.id),
+    ['other-client', 'web-1'],
+    'a beacon that reaches the server first cannot let a stale full sync reorder the queue',
+  );
+  assert.deepEqual(
+    beaconApi.mergePromptQueueSyncConflict(
+      'thread-a',
+      [{ id: 'already-consumed' }, { id: 'still-undelivered' }],
+      [{ id: 'other-client' }],
+      ['already-consumed'],
+    ).map((item) => item.id),
+    ['still-undelivered', 'other-client'],
+    'a server tombstone removes only the beacon item already consumed by the worker',
+  );
+  assert.deepEqual(
+    beaconApi.missingUnconfirmedWebPromptQueueItemIds(
+      [
+        { id: 'local-only', source: 'web' },
+        { id: 'server-known', source: 'web' },
+        { id: 'dismissed', source: 'web' },
+        { id: 'app-owned', source: 'codex-app' },
+      ],
+      new Set(['server-known']),
+      ['dismissed'],
+    ),
+    ['local-only'],
+    'a reloaded mobile page keeps a durable Web outbox even after its in-memory beacon tracking is gone',
+  );
+  const serverUncertain = beaconApi.mergePromptQueueSyncConflict(
+    'thread-status',
+    [{ id: 'uncertain-item', source: 'web', autoDispatch: true }],
+    [{ id: 'uncertain-item', source: 'web', autoDispatch: false, dispatchState: 'uncertain', dispatchError: 'request outcome unknown' }],
+  );
+  assert.deepEqual(serverUncertain, [{
+    id: 'uncertain-item', source: 'web', autoDispatch: false, dispatchState: 'uncertain', dispatchError: 'request outcome unknown',
+  }], 'the server-owned uncertain state replaces a stale optimistic browser copy');
+  assert.equal(beaconApi.appendPromptQueueItemViaBeacon('thread-a', { id: 'app-1', source: 'codex-app' }), false);
+  assert.equal(beaconApi.appendPromptQueueItemViaBeacon('thread-a', { id: 'large', source: 'web', message: 'x'.repeat(70 * 1024) }), false);
+  assert.equal(sent.length, 1, 'App-owned and oversized entries stay on the normal sync path');
+
+  const unavailableBeaconApi = new Function(
+    'navigator',
+    'Blob',
+    'isAppOwnedQueuedPrompt',
+    `${inlineScript.slice(beaconStart, beaconEnd)}; return { appendPromptQueueItemViaBeacon, promptQueueBeaconItemIds };`,
+  )(
+    {},
+    BeaconBlob,
+    (item) => item?.source === 'codex-app',
+  );
+  assert.equal(unavailableBeaconApi.appendPromptQueueItemViaBeacon('thread-b', { id: 'fallback-1', source: 'web', message: 'queued' }, { trackPending: true }), false);
+  assert.equal(unavailableBeaconApi.promptQueueBeaconItemIds.get('thread-b')?.has('fallback-1'), true, 'unsupported beacon transport still enters the background fetch fallback');
+
+  const enqueueSource = inlineScript.slice(enqueueStart, enqueueEnd);
+  const backgroundSource = inlineScript.slice(backgroundStart, backgroundEnd);
+  assert.ok(
+    enqueueSource.indexOf('appendPromptQueueItemViaBeacon(threadId,item,{trackPending:true})') < enqueueSource.indexOf('void flushPromptQueueToServer(threadId)'),
+    'a queued mobile message must enter the background-safe transport before the normal fetch reconciliation',
+  );
+  assert.match(backgroundSource, /event\?\.type!=='pagehide'&&document\.visibilityState==='visible'/);
+  assert.match(backgroundSource, /const beaconBudget=\{remaining:PROMPT_QUEUE_BEACON_MAX_BYTES\};\s*for\(const threadId of Object\.keys\(promptQueues\)\)/);
+  assert.match(backgroundSource, /pending\?\.has\(String\(item\?\.id\|\|''\)\)/);
+  assert.match(backgroundSource, /appendPromptQueueItemViaBeacon\(threadId,item,\{budget:beaconBudget\}\)/);
+  assert.match(backgroundSource, /if\(needsFetchFallback\)void flushPromptQueueToServer\(threadId\)/);
+  assert.match(inlineScript, /mergePromptQueueSyncConflict\(id,local,remote,dismissedItemIds\)/);
+  assert.match(inlineScript, /const missingLocalWebItemIds=missingUnconfirmedWebPromptQueueItemIds\(localItems,remoteIds,dismissedItemIds\)/);
+  assert.match(inlineScript, /mergePromptQueueSyncConflict\(id,localItems,items,dismissedItemIds,\{preferRemoteOrder:missingLocalWebItemIds\.length>0\}\)/);
+  assert.match(inlineScript, /if\(hasMissingPending\|\|missingLocalWebItemIds\.length\)schedulePromptQueueServerSync\(id\)/);
+  assert.match(inlineScript, /acknowledgePromptQueueBeaconItemIds\(id,dismissedItemIds\)/);
+
+  const fingerprintStart = inlineScript.indexOf('function promptQueueFingerprint(items){');
+  const fingerprintEnd = inlineScript.indexOf('function applyPromptQueueLocal', fingerprintStart);
+  assert.ok(fingerprintStart >= 0 && fingerprintEnd > fingerprintStart, 'missing queue state fingerprint');
+  const fingerprintApi = new Function(`${inlineScript.slice(fingerprintStart, fingerprintEnd)}; return { promptQueueFingerprint };`)();
+  assert.notEqual(
+    fingerprintApi.promptQueueFingerprint([{ id: 'uncertain-item', source: 'web', autoDispatch: true, dispatchState: '', dispatchError: '' }]),
+    fingerprintApi.promptQueueFingerprint([{ id: 'uncertain-item', source: 'web', autoDispatch: false, dispatchState: 'uncertain', dispatchError: 'request outcome unknown' }]),
+    'a server state change must not be discarded as an unchanged queue row',
+  );
+
+  const scheduleStart = inlineScript.indexOf('function schedulePromptQueueDispatch(');
+  const scheduleEnd = inlineScript.indexOf('function showNativePromptOptimistically', scheduleStart);
+  const dispatchStart = inlineScript.indexOf('async function dispatchNextQueuedPrompt(');
+  const dispatchEnd = inlineScript.indexOf('function closeComposerPopovers', dispatchStart);
+  assert.ok(scheduleStart >= 0 && scheduleEnd > scheduleStart, 'missing queue auto-dispatch gate');
+  assert.ok(dispatchStart >= 0 && dispatchEnd > dispatchStart, 'missing queue dispatch implementation');
+  assert.match(inlineScript.slice(scheduleStart, scheduleEnd), /item\.autoDispatch===false\|\|item\.dispatchState==='uncertain'/);
+  assert.match(inlineScript.slice(dispatchStart, dispatchEnd), /if\(\(item\.autoDispatch===false\|\|item\.dispatchState==='uncertain'\)&&!force\)return false/);
+
+  const pullStart = inlineScript.indexOf('async function pullPromptQueueFromServer(');
+  const pullEnd = inlineScript.indexOf('async function hydratePromptQueuesFromServer', pullStart);
+  assert.ok(pullStart >= 0 && pullEnd > pullStart, 'missing queue recovery pull');
+  const recoveredLocal = [{ id: 'survived-page-discard', source: 'web', message: 'must be sent after reload' }];
+  const applied = [];
+  const rescheduled = [];
+  const recoveredRevisions = new Map();
+  const recoveryApi = new Function(
+    'fetch',
+    'promptQueueServerRevisions',
+    'normalizeQueuedPrompt',
+    'promptQueueBeaconItemIds',
+    'promptQueueFor',
+    'missingUnconfirmedWebPromptQueueItemIds',
+    'mergePromptQueueSyncConflict',
+    'acknowledgePromptQueueBeaconItems',
+    'acknowledgePromptQueueBeaconItemIds',
+    'applyPromptQueueLocal',
+    'schedulePromptQueueServerSync',
+    'promptQueueRemoteSyncing',
+    `${inlineScript.slice(pullStart, pullEnd)}; return { pullPromptQueueFromServer };`,
+  )(
+    async () => ({ ok: true, json: async () => ({ revision: 17, items: [], dismissedItemIds: [] }) }),
+    recoveredRevisions,
+    (item) => item,
+    new Map(),
+    () => recoveredLocal,
+    beaconApi.missingUnconfirmedWebPromptQueueItemIds,
+    (_threadId, local, remote, _dismissed, options) => options?.preferRemoteOrder ? [...remote, ...local] : [...local, ...remote],
+    () => {},
+    () => {},
+    (threadId, items) => applied.push({ threadId, items }),
+    (threadId) => rescheduled.push(threadId),
+    false,
+  );
+  await recoveryApi.pullPromptQueueFromServer('thread-reload');
+  assert.deepEqual(applied, [{ threadId: 'thread-reload', items: recoveredLocal }]);
+  assert.deepEqual(rescheduled, ['thread-reload'], 'an item that survived a mobile page discard is PUT again without waiting for foreground dispatch');
+  assert.equal(recoveredRevisions.get('thread-reload'), 17);
 });
 
 test('persisted active commentary renders progressively and deduplicates by sequence', () => {
@@ -905,6 +1124,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.ok(first.text.length <= 64, 'persisted snapshot should advance in bounded steps');
   assert.equal(first.element.dataset.messageText, first.text);
   assert.equal(first.element.classList.contains('streaming'), true);
+  assert.equal(rendered.length, 0, 'typewriter ticks should not repeatedly parse the whole Markdown body');
   assert.deepEqual([...timers.values()].map((timer) => timer.delay).sort((a, b) => a - b), [60, 120]);
 
   const extended = { ...message, content: `${message.content}继续补充新的尾部。` };
@@ -917,6 +1137,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.equal(first.element.classList.contains('streaming'), false);
   assert.equal(api.state().nativeLiveItems.size, 0);
   assert.equal(api.state().nativeRenderedMessageKeys.size, 1);
+  assert.equal(rendered.length, 1, 'completed output should receive one authoritative Markdown render');
   assert.equal(rendered.at(-1), extended.content);
   assert.ok(chatScrollWrites > 0, 'near-bottom live output should follow with a coalesced scroll');
 
@@ -965,6 +1186,9 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.doesNotMatch(liveSource, /scrollChatToLatest\(/);
   assert.match(liveSource, /function nativeLiveDocumentHidden\(\)/);
   assert.match(liveSource, /if\(!nativeLiveTypewriterEnabled\(\)\)\{\s*renderNativeLiveItemImmediately\(live\);/);
+  assert.match(liveSource, /function renderNativeLiveItem\(live\)\{[\s\S]*?_messageBody\.textContent=live\.text/);
+  assert.match(liveSource, /function renderNativeLiveItemMarkdown\(live\)\{[\s\S]*?renderAssistantMarkdown\(body,live\.text\);/);
+  assert.match(liveSource, /function settleNativeLiveItem\(live\)\{\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(inlineScript, /function handleNativeVisibilityChange\(\)[\s\S]*?nativeSnapshotResumeCatchup=true;[\s\S]*?flushNativeLiveItemsToTarget\(\);/);
   assert.match(inlineScript, /if\(nearBottom&&syncMessages\.length\)scheduleNativeLiveScroll\(\)/);
 });
@@ -1193,12 +1417,14 @@ test('queued dispatch waits for the matching terminal turn', () => {
     'isAppOwnedQueuedPrompt',
     'dispatchNextQueuedPrompt',
     'setTimeout',
+    'nativeTerminalPersisted',
     `${queueGateSource}; return { markPromptQueueTurnRunning, settlePromptQueueTurn, promptQueueTurnLocked, schedulePromptQueueDispatch };`,
   )(
     () => [{ id: 'next-item' }],
     () => false,
     () => { dispatches += 1; },
     (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    () => false,
   );
 
   assert.equal(api.markPromptQueueTurnRunning('thread-a', 'turn-first'), true);
@@ -1221,7 +1447,44 @@ test('queued dispatch waits for the matching terminal turn', () => {
 
   assert.match(dispatchSource, /webRunActive\|\|promptQueueTurnLocked\(threadId\)\|\|steerSubmitting/);
   assert.match(inlineScript, /else if\(!settlePromptQueueTurn\(currentConversationId,runtimeTurnId\)\)return/);
-  assert.match(inlineScript, /webRunActive=conversation\.status==='running'\|\|Boolean\(lockedTurnId\)/);
+  assert.match(inlineScript, /webRunActive=!promptQueueLock\.terminal&&\(conversation\.status==='running'\|\|Boolean\(lockedTurnId\)\)/);
+});
+
+test('persisted terminal snapshots settle only their matching queue lock', () => {
+  const queueGateSource = sourceBetween('const promptQueueTurnLocks', 'function showNativePromptOptimistically');
+  const terminalSource = sourceBetween('function nativeTerminalPersisted', 'function clearNativeCompletionSync');
+  const nativeTerminalPersisted = new Function(`${terminalSource}; return nativeTerminalPersisted;`)();
+  const api = new Function(
+    'nativeTerminalPersisted',
+    `${queueGateSource}; return { markPromptQueueTurnRunning, promptQueueTurnLock, promptQueueTurnLocked, reconcilePromptQueueTurnLock };`,
+  )(nativeTerminalPersisted);
+  const terminal = (turnId) => ({
+    status: 'running',
+    activeTurnId: turnId,
+    messages: [{ turnId, role: 'process', kind: 'task_error' }],
+  });
+
+  api.markPromptQueueTurnRunning('thread-a', 'turn-old');
+  assert.deepEqual(api.reconcilePromptQueueTurnLock('thread-a', terminal('turn-old')), { turnId: '', terminal: true });
+  assert.equal(api.promptQueueTurnLocked('thread-a'), false, 'the exact persisted terminal record unlocks the queue');
+
+  api.markPromptQueueTurnRunning('thread-a', 'turn-old');
+  assert.deepEqual(api.reconcilePromptQueueTurnLock('thread-a', {
+    status: 'error',
+    terminalTurnId: 'turn-old',
+    messages: [],
+  }), { turnId: '', terminal: true });
+  assert.equal(api.promptQueueTurnLocked('thread-a'), false, 'the matching server-side terminal override survives a missed SSE event');
+
+  api.markPromptQueueTurnRunning('thread-a', 'turn-old');
+  const newerRunning = terminal('turn-old');
+  newerRunning.activeTurnId = 'turn-new';
+  assert.deepEqual(api.reconcilePromptQueueTurnLock('thread-a', newerRunning), { turnId: 'turn-new', terminal: false });
+  assert.equal(api.promptQueueTurnLock('thread-a'), 'turn-new', 'a newer active turn keeps the queue locked');
+
+  const noTerminalRecord = { status: 'done', activeTurnId: '', messages: [] };
+  assert.deepEqual(api.reconcilePromptQueueTurnLock('thread-a', noTerminalRecord), { turnId: 'turn-new', terminal: false });
+  assert.equal(api.promptQueueTurnLocked('thread-a'), true, 'an unscoped idle snapshot cannot unlock a queued turn');
 });
 
 test('queued prompts preserve the Fast service tier through dispatch and restore', () => {
@@ -1276,7 +1539,9 @@ test('Codex App queue entries keep their message ownership while Web can persist
   assert.match(restore, /const stillEditingDraft=appQueueEditDraft===draft/);
   assert.match(restore, /if\(stillEditingDraft&&currentConversationSource==='codex'&&currentConversationId===draft\.threadId\)/);
   assert.match(restore, /if\(appQueueEditDraft===draft&&currentConversationSource==='codex'&&currentConversationId===draft\.threadId\)/);
-  assert.match(schedule, /isAppOwnedQueuedPrompt\(promptQueueFor\(threadId\)\[0\]\)/);
+  assert.match(schedule, /const item=promptQueueFor\(threadId\)\[0\];/);
+  assert.match(schedule, /isAppOwnedQueuedPrompt\(item\)/);
+  assert.match(schedule, /item\.autoDispatch===false\|\|item\.dispatchState==='uncertain'/);
   assert.doesNotMatch(steer, /blockAppOwnedQueueAction/);
   assert.match(steer, /if\(isAppOwnedQueuedPrompt\(item\)\)\{statusEl\.textContent='任务运行时才可发送引导';return\}/);
   assert.match(steer, /dismiss:!isAppOwnedQueuedPrompt\(item\)/);
@@ -1286,6 +1551,18 @@ test('Codex App queue entries keep their message ownership while Web can persist
   assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) (?:30|28)px auto (?:30|28)px/s);
   assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueBody:disabled/);
   assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueLead/);
+});
+
+test('large native histories render the recent tail before full-history expansion', () => {
+  const historyControl = sourceBetween('function addNativeHistoryLoadButton', 'async function loadConversation');
+  const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+
+  assert.match(historyControl, /if\(!id\|\|!conversation\?\.hasEarlierMessages\|\|!chat\)return null/);
+  assert.match(historyControl, /button\.id='nativeHistoryLoadEarlier'/);
+  assert.match(historyControl, /await loadConversation\(id,'codex',\{fullHistory:true\}\)/);
+  assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external'\+\(options\.fullHistory\?'':'&limit='\+NATIVE_INITIAL_MESSAGE_LIMIT\)/);
+  assert.match(loadConversation, /chat\.innerHTML='';\s*if\(currentConversationSource==='codex'\)addNativeHistoryLoadButton\(currentConversationId,conversation\);\s*const messages=conversation\.messages\|\|\[\];/);
+  assert.match(uiStyles, /body \.nativeHistoryLoadEarlier\s*\{[^}]*display:\s*inline-flex;[^}]*background:\s*transparent;[^}]*cursor:\s*pointer/s);
 });
 
 test('queue reorder uses a long-press floating row and keeps active sends as boundaries', () => {
@@ -1458,8 +1735,12 @@ test('dynamic queue clearance keeps the latest message above the composer', () =
   assert.match(insetSource, /options\.scroll&&chat&&pinned/);
   assert.match(scrollSource, /chat\.scrollTop=chat\.scrollHeight/);
   assert.doesNotMatch(scrollSource, /scrollIntoView/);
+  assert.match(inlineScript, /enhanceComposerKeyboardLift\(\);\s*enhanceComposerOverlayInset\(\);\s*keepComposerAboveKeyboard\(\);/);
+  assert.match(insetSource, /const height=Math\.max\(72, Math\.min\(measured \+ 8, maxHeight\)\)/);
   assert.match(uiStyles, /body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /\.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*--composer-overlay-height/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.composer:has\(> \.box\.composerCollapsed\)\s*\{[^}]*padding-bottom:\s*calc\(env\(safe-area-inset-bottom, 0px\) \+ 16px\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(calc\(84px \+ env\(safe-area-inset-bottom, 0px\)\), calc\(var\(--composer-overlay-height, calc\(72px \+ env\(safe-area-inset-bottom, 0px\)\)\) \+ 12px\)\)/s);
 });
 
 test('mobile hidden live plan card does not reserve extra chat clearance', () => {

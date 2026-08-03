@@ -73,7 +73,7 @@
 }
 
 .codexWebUpdateButton--desktop {
-  margin-left: 28px;
+  margin-left: 0;
 }
 
 .codexWebUpdateToast {
@@ -125,6 +125,10 @@
 }
 
 @media (max-width: 639px) {
+  .codexWebUpdateButton--desktop {
+    display: none;
+  }
+
   .codexWebUpdateButton--mobile {
     display: inline-flex;
   }
