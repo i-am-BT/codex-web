@@ -680,6 +680,16 @@ body .subQuotaClose:hover {
   white-space: nowrap;
 }
 
+.subQuotaWindowHeadInline {
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+.subQuotaWindowHeadInline .subQuotaInlineStatus {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .subQuotaProgress {
   height: 6px;
   overflow: hidden;
@@ -723,6 +733,23 @@ body .subQuotaClose:hover {
   color: var(--text-subtle);
   font-size: 10px;
   line-height: 1.4;
+}
+
+.subQuotaMetaDeepSeek {
+  flex-wrap: nowrap;
+  align-items: baseline;
+}
+
+.subQuotaMetaDeepSeek > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaMetaDeepSeek .subQuotaMetaTrailing {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .subQuotaRefresh {
@@ -882,6 +909,66 @@ body .subQuotaReset:disabled {
   line-height: 1.4;
 }
 
+.deepSeekUsageCalibration {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}
+
+.deepSeekUsageCalibrationTitle {
+  margin: 0;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.deepSeekUsageCalibrationHint {
+  margin: 0;
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.deepSeekUsageCalibrationFields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.deepSeekUsageCalibrationFields input {
+  font-variant-numeric: tabular-nums;
+}
+
+.deepSeekUsageCalibrationActions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+body .deepSeekUsageCalibrationSubmit {
+  width: max-content;
+  min-width: 132px;
+}
+
+.deepSeekUsageCalibrationStatus {
+  min-height: 15px;
+  color: var(--danger);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.deepSeekUsageCalibrationStatus.success {
+  color: var(--success);
+}
+
+.subQuotaSettingsFooter {
+  display: grid;
+  gap: 8px;
+  padding-top: 2px;
+}
+
 .subQuotaSettingsSubmit {
   width: max-content;
   min-width: 132px;
@@ -890,7 +977,7 @@ body .subQuotaReset:disabled {
 
 .subQuotaSettingsStatus {
   min-height: 18px;
-  margin: -2px 0 0;
+  margin: 0;
 }
 
 .subQuotaSettingsStatus.success {
@@ -10823,6 +10910,10 @@ body .composer > .box:focus-within {
   .subQuotaSettingsDialog {
     width: 100%;
     max-height: calc(100dvh - 32px);
+  }
+
+  .deepSeekUsageCalibrationFields {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .settingsDialog {
