@@ -288,7 +288,7 @@ rg '"type":"turn_context"' "$latest" | tail -1
 
 ## Homepage 小组件
 
-设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Codex App 原生会话数、服务商数、默认服务商模型数和运行中任务数。请求必须携带 `X-API-Token` 请求头：
+设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Codex App 原生会话数、服务商数、默认服务商模型数、运行中任务数及当前任务名。接口同时返回按开始时间倒序排列的 `runningTasks`，可用于 Homepage 动态列表。请求必须携带 `X-API-Token` 请求头：
 
 ```bash
 curl -H "X-API-Token: $HOMEPAGE_API_TOKEN" http://localhost:36354/api/homepage/stats
@@ -301,25 +301,40 @@ Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
     - Codex Web:
         icon: codex-web.svg
         href: http://192.168.10.10:36354
-        widget:
-          type: customapi
-          url: http://192.168.10.10:36354/api/homepage/stats
-          headers:
-            X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
-          mappings:
-            - field: conversations
-              label: 会话
-              format: number
-            - field: providers
-              label: 供应商
-              format: number
-            - field: models
-              label: 模型
-              format: number
-            - field: running
-              label: 运行中
-              format: number
+        widgets:
+          - type: customapi
+            url: http://192.168.10.10:36354/api/homepage/stats
+            headers:
+              X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
+            mappings:
+              - field: conversations
+                label: 会话
+                format: number
+              - field: providers
+                label: 供应商
+                format: number
+              - field: models
+                label: 模型
+                format: number
+              - field: running
+                label: 运行中
+                format: number
+              - field: currentTask
+                label: 当前任务
+                format: text
+          - type: customapi
+            url: http://192.168.10.10:36354/api/homepage/stats
+            headers:
+              X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
+            display: dynamic-list
+            mappings:
+              items: runningTasks
+              name: name
+              label: status
+              limit: 5
 ```
+
+第一个小组件保留统计块并显示最近开始的任务名；第二个动态列表用于展示所有并发运行任务，效果接近 Emby “正在播放”。没有任务运行时，`currentTask` 为“空闲”，`runningTasks` 为空数组。任务数据仅包含名称、状态和开始时间，不包含工作目录、提示正文或会话 ID。
 
 模型数量按当前默认服务商的 `/models` 返回结果统计，并使用短期缓存，避免 Homepage 刷新时频繁访问上游。
 

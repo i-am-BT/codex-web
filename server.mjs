@@ -314,6 +314,7 @@ app.get('/api/homepage/stats', requireHomepageToken, async (req, res) => {
     const providers = readProviderDetails();
     const provider = providers.find((item) => item.name === DEFAULT_PROVIDER) || providers[0];
     const nativeSessionList = nativeSessionSummaries();
+    const taskStats = homepageRunningTaskStats(nativeSessionList);
     let models = 0;
     if (provider) {
       const now = Date.now();
@@ -330,7 +331,9 @@ app.get('/api/homepage/stats', requireHomepageToken, async (req, res) => {
       conversations: nativeSessionList.length,
       providers: providers.length,
       models,
-      running: nativeSessionList.filter((session) => session.status === 'running').length + (activeProcess ? 1 : 0),
+      running: taskStats.running,
+      currentTask: taskStats.currentTask,
+      runningTasks: taskStats.runningTasks,
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -2209,6 +2212,47 @@ function requireHomepageToken(req, res, next) {
   const token = String(req.get('X-API-Token') || '');
   if (!safeEqual(token, HOMEPAGE_API_TOKEN)) return res.status(401).json({ error: '无效的 API Token' });
   next();
+}
+
+function homepageTaskName(task) {
+  const title = String(task?.title || task?.preview || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  return title || '未命名任务';
+}
+
+function homepageRunningTaskStats(nativeSessionList = []) {
+  const runningTasks = [];
+  for (const session of nativeSessionList) {
+    if (session?.status !== 'running') continue;
+    const active = activeNativeTurns.get(session.id);
+    runningTasks.push({
+      name: homepageTaskName(session),
+      status: '执行中',
+      startedAt: String(active?.startedAt || session.updatedAt || session.createdAt || ''),
+    });
+  }
+
+  if (activeProcess) {
+    const conversation = conversations.find((item) => item.id === activeConversationId);
+    runningTasks.push({
+      name: homepageTaskName(conversation),
+      status: '执行中',
+      startedAt: String(conversation?.updatedAt || conversation?.createdAt || ''),
+    });
+  }
+
+  const timestamp = (task) => {
+    const value = Date.parse(task.startedAt || '');
+    return Number.isFinite(value) ? value : 0;
+  };
+  runningTasks.sort((left, right) => timestamp(right) - timestamp(left));
+  return {
+    running: runningTasks.length,
+    currentTask: runningTasks[0]?.name || '空闲',
+    runningTasks,
+  };
 }
 
 function requireConfigWrite(req, res, next) {
