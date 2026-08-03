@@ -24,11 +24,15 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
 
   const activeNativeTurns = new Map([['thread-a', { turnId: 'turn-current', status: 'running' }]]);
   const updates = [];
+  const timers = [];
+  const dispatches = [];
   const api = new Function(
     'activeNativeTurns',
     'cleanNativeThreadId',
     'nativeTurnStatus',
     'setNativeTurnState',
+    'clearPersistedTerminalNativeTurn',
+    'scheduleServerPromptQueueDispatch',
     'setTimeout',
     `${serverSource.slice(completionStart, completionEnd)}; return { recordNativeTurnCompletion };`,
   )(
@@ -39,7 +43,9 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
       updates.push({ threadId, state });
       activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state });
     },
-    () => ({ unref() {} }),
+    () => false,
+    (...args) => dispatches.push(args),
+    (callback) => { timers.push(callback); return { unref() {} }; },
   );
 
   assert.equal(api.recordNativeTurnCompletion('thread-a', {}), false);
@@ -48,6 +54,337 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
   assert.equal(updates.length, 0);
   assert.equal(api.recordNativeTurnCompletion('thread-a', { id: 'turn-current', status: 'completed' }), true);
   assert.deepEqual(updates, [{ threadId: 'thread-a', state: { turnId: 'turn-current', status: 'done' } }]);
+  assert.deepEqual(dispatches, [['thread-a', 160]], 'a durable server worker takes over the next queued prompt');
+  assert.equal(timers.length, 0, 'terminal state remains until the matching persisted turn record is observed');
+});
+
+test('a matching persisted terminal releases a running turn and schedules the Web queue', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const changeStart = serverSource.indexOf('function broadcastNativeSessionChange');
+  const changeEnd = serverSource.indexOf('\nfunction broadcastNativeRuntime', changeStart);
+  assert.ok(changeStart >= 0 && changeEnd > changeStart);
+
+  const activeNativeTurns = new Map([['thread-a', { turnId: 'turn-current', status: 'running' }]]);
+  const scheduled = [];
+  const runtimeEvents = [];
+  const api = new Function(
+    'sessionEventClients',
+    'writeNamedEvent',
+    'cleanNativeThreadId',
+    'serverPromptQueueHasDispatchableItem',
+    'nativeSessions',
+    'activeNativeTurns',
+    'scheduleServerPromptQueueDispatch',
+    'broadcastNativeRuntime',
+    `${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
+  )(
+    [],
+    () => {},
+    (value) => String(value || '').trim(),
+    () => true,
+    {
+      get: () => ({
+        status: 'done',
+        latestTurnId: 'turn-current',
+        messages: [{ turnId: 'turn-current', role: 'process', kind: 'task_complete' }],
+      }),
+    },
+    activeNativeTurns,
+    (...args) => scheduled.push(args),
+    (event) => runtimeEvents.push(event),
+  );
+
+  api.handleNativeSessionChange({ changedIds: ['thread-a'] });
+
+  assert.equal(activeNativeTurns.has('thread-a'), false, 'the persisted terminal must supersede a missing turn/completed notification');
+  assert.deepEqual(scheduled, [['thread-a', 160]], 'the server queue worker resumes without a foreground browser');
+  assert.deepEqual(runtimeEvents, [{ type: 'turn-cleared', threadId: 'thread-a', turnId: 'turn-current' }]);
+});
+
+test('a terminal record for another turn cannot release a running queue lock', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const changeStart = serverSource.indexOf('function broadcastNativeSessionChange');
+  const changeEnd = serverSource.indexOf('\nfunction broadcastNativeRuntime', changeStart);
+  assert.ok(changeStart >= 0 && changeEnd > changeStart);
+
+  const activeNativeTurns = new Map([['thread-a', { turnId: 'turn-current', status: 'running' }]]);
+  const scheduled = [];
+  const runtimeEvents = [];
+  const api = new Function(
+    'sessionEventClients',
+    'writeNamedEvent',
+    'cleanNativeThreadId',
+    'serverPromptQueueHasDispatchableItem',
+    'nativeSessions',
+    'activeNativeTurns',
+    'scheduleServerPromptQueueDispatch',
+    'broadcastNativeRuntime',
+    `${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
+  )(
+    [],
+    () => {},
+    (value) => String(value || '').trim(),
+    () => true,
+    {
+      get: () => ({
+        status: 'done',
+        latestTurnId: 'turn-other',
+        messages: [{ turnId: 'turn-other', role: 'process', kind: 'task_complete' }],
+      }),
+    },
+    activeNativeTurns,
+    (...args) => scheduled.push(args),
+    (event) => runtimeEvents.push(event),
+  );
+
+  api.handleNativeSessionChange({ changedIds: ['thread-a'] });
+
+  assert.equal(activeNativeTurns.get('thread-a')?.status, 'running');
+  assert.deepEqual(scheduled, [], 'an unrelated terminal must not send the queued prompt early');
+  assert.deepEqual(runtimeEvents, []);
+});
+
+test('native terminal overrides clear after their matching persisted record or a newer native turn', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const terminalStart = serverSource.indexOf('function nativeTurnHasPersistedTerminal');
+  const terminalEnd = serverSource.indexOf('\nfunction broadcastNativeRuntime', terminalStart);
+  assert.ok(terminalStart >= 0 && terminalEnd > terminalStart);
+
+  const activeNativeTurns = new Map([
+    ['thread-a', { turnId: 'turn-current', status: 'error' }],
+    ['thread-b', { turnId: 'turn-current', status: 'interrupted' }],
+    ['thread-c', { turnId: 'turn-current', status: 'error' }],
+  ]);
+  const cleared = [];
+  const terminalApi = new Function(
+    'activeNativeTurns',
+    'cleanNativeThreadId',
+    'nativeSessions',
+    'broadcastNativeRuntime',
+    `${serverSource.slice(terminalStart, terminalEnd)}; return { clearPersistedTerminalNativeTurns };`,
+  )(
+    activeNativeTurns,
+    (value) => String(value || '').trim(),
+    {
+      get: (threadId) => threadId === 'thread-a'
+        ? { messages: [{ turnId: 'turn-current', role: 'process', kind: 'task_error' }] }
+        : threadId === 'thread-c'
+          ? { status: 'running', latestTurnId: 'turn-next', messages: [] }
+          : { messages: [{ turnId: 'turn-other', role: 'process', kind: 'turn_aborted' }] },
+    },
+    (event) => cleared.push(event),
+  );
+
+  terminalApi.clearPersistedTerminalNativeTurns({ changedIds: ['thread-a', 'thread-b', 'thread-c'] });
+  assert.equal(activeNativeTurns.has('thread-a'), false);
+  assert.equal(activeNativeTurns.has('thread-b'), true, 'a terminal record for another turn cannot clear the active override');
+  assert.equal(activeNativeTurns.has('thread-c'), false, 'a newer raw running turn must take over a stale terminal override');
+  assert.deepEqual(cleared, [
+    { type: 'turn-cleared', threadId: 'thread-a', turnId: 'turn-current' },
+    { type: 'turn-cleared', threadId: 'thread-c', turnId: 'turn-current' },
+  ]);
+});
+
+test('terminal completion clears an already persisted terminal without another watcher change', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const terminalStart = serverSource.indexOf('function nativeTurnHasPersistedTerminal');
+  const terminalEnd = serverSource.indexOf('\nfunction broadcastNativeRuntime', terminalStart);
+  const completionStart = serverSource.indexOf('function recordNativeTurnCompletion');
+  const completionEnd = serverSource.indexOf('\nfunction currentNativeTurnId', completionStart);
+  assert.ok(terminalStart >= 0 && terminalEnd > terminalStart);
+  assert.ok(completionStart >= 0 && completionEnd > completionStart);
+
+  const activeNativeTurns = new Map([['thread-a', { turnId: 'turn-current', status: 'running' }]]);
+  const events = [];
+  const dispatches = [];
+  const api = new Function(
+    'activeNativeTurns',
+    'cleanNativeThreadId',
+    'nativeSessions',
+    'broadcastNativeRuntime',
+    'nativeTurnStatus',
+    'setNativeTurnState',
+    'scheduleServerPromptQueueDispatch',
+    `${serverSource.slice(terminalStart, terminalEnd)}; ${serverSource.slice(completionStart, completionEnd)}; return { recordNativeTurnCompletion };`,
+  )(
+    activeNativeTurns,
+    (value) => String(value || '').trim(),
+    {
+      get: () => ({
+        status: 'done',
+        latestTurnId: 'turn-current',
+        messages: [{ turnId: 'turn-current', role: 'process', kind: 'task_complete' }],
+      }),
+    },
+    (event) => events.push(event),
+    (value) => String(value || '').toLowerCase() === 'failed' ? 'error' : 'done',
+    (threadId, state) => activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state }),
+    (...args) => dispatches.push(args),
+  );
+
+  assert.equal(api.recordNativeTurnCompletion('thread-a', { id: 'turn-current', status: 'completed' }), true);
+  assert.equal(activeNativeTurns.has('thread-a'), false, 'a prior watcher refresh must not leave a permanent override');
+  assert.deepEqual(events, [{ type: 'turn-cleared', threadId: 'thread-a', turnId: 'turn-current' }]);
+  assert.deepEqual(dispatches, [['thread-a', 160]]);
+});
+
+test('server-owned Web queues retry only while native state is settling', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const retryStart = serverSource.indexOf('const SERVER_PROMPT_QUEUE_SETTLING_RETRY_LIMIT');
+  const retryEnd = serverSource.indexOf('\nfunction scheduleIdleServerPromptQueueDispatches', retryStart);
+  const workerStart = serverSource.indexOf('async function dispatchNextServerQueuedPrompt');
+  const workerEnd = serverSource.indexOf('\nfunction broadcastPromptQueueChange', workerStart);
+  assert.ok(retryStart >= 0 && retryEnd > retryStart);
+  assert.ok(workerStart >= 0 && workerEnd > workerStart);
+
+  const timers = [];
+  const cleared = [];
+  const refreshes = [];
+  const retries = new Map();
+  const api = new Function(
+    'serverPromptQueueDispatchTimers',
+    'serverPromptQueueDispatchRetries',
+    'cleanNativeThreadId',
+    'getPromptQueueItems',
+    'isAppSourcedQueueItem',
+    'clearTimeout',
+    'setTimeout',
+    'nativeAppErrorStatus',
+    'nativeSessions',
+    'console',
+    `${serverSource.slice(retryStart, retryEnd)}; return { isServerPromptQueueDispatchSettlingError, retryServerPromptQueueDispatchAfterSettling };`,
+  )(
+    new Map(),
+    retries,
+    (value) => String(value || '').trim(),
+    () => [{ id: 'web-queue-item', source: 'web', autoDispatch: true }],
+    () => false,
+    (timer) => cleared.push(timer),
+    (callback, delay) => {
+      const timer = { callback, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    (error) => Number(error?.statusCode || 502),
+    { scheduleRefresh: () => refreshes.push(true) },
+    { warn: () => {} },
+  );
+
+  assert.equal(api.isServerPromptQueueDispatchSettlingError({ statusCode: 409 }), true);
+  assert.equal(api.isServerPromptQueueDispatchSettlingError({ statusCode: 409 }, { startAttempted: true }), false);
+  assert.equal(api.isServerPromptQueueDispatchSettlingError({ message: 'already running' }), false);
+  assert.equal(api.isServerPromptQueueDispatchSettlingError({ statusCode: 502 }), false);
+  assert.equal(api.retryServerPromptQueueDispatchAfterSettling('thread-a'), true);
+  assert.equal(retries.get('thread-a'), 1);
+  assert.equal(timers.at(-1).delay, 240);
+  assert.equal(api.retryServerPromptQueueDispatchAfterSettling('thread-a'), true);
+  assert.equal(retries.get('thread-a'), 2);
+  assert.equal(timers.at(-1).delay, 480);
+  assert.equal(cleared.length, 1, 'the latest retry owns the only queued timer');
+  assert.equal(refreshes.length, 2);
+  assert.equal(api.retryServerPromptQueueDispatchAfterSettling('thread-a'), true);
+  assert.equal(api.retryServerPromptQueueDispatchAfterSettling('thread-a'), true);
+  assert.equal(api.retryServerPromptQueueDispatchAfterSettling('thread-a'), false);
+  assert.equal(retries.has('thread-a'), false, 'the bounded retry chain must stop without a later event');
+
+  const workerSource = serverSource.slice(workerStart, workerEnd);
+  assert.match(workerSource, /if \(serverPromptQueueDispatchingThreads\.has\(id\) \|\| nativeTurnReservations\.has\(id\)\) return false/);
+  assert.match(workerSource, /if \(conversation\.status === 'running'\) \{\s*retryServerPromptQueueDispatchAfterSettling\(id, \{ quiet: true \}\);/);
+  assert.match(workerSource, /retryAfterSettling = isServerPromptQueueDispatchSettlingError\(error, \{ startAttempted \}\)/);
+
+  const queueItem = { id: 'web-queue-item', source: 'web', autoDispatch: true };
+  const dispatching = new Set();
+  const reservations = new Set();
+  const activeTurns = new Map();
+  const retryCalls = [];
+  const resetCalls = [];
+  const consumed = [];
+  const released = [];
+  let refreshed = 0;
+  let conversation = { status: 'running', metadata: {} };
+  let continueTurn = async () => ({ turnId: 'unexpected' });
+  const dispatchApi = new Function(
+    'cleanNativeThreadId',
+    'serverPromptQueueDispatchingThreads',
+    'nativeTurnReservations',
+    'nativeSessions',
+    'activeNativeTurns',
+    'getPromptQueueItems',
+    'isAppSourcedQueueItem',
+    'resetServerPromptQueueDispatchRetries',
+    'retryServerPromptQueueDispatchAfterSettling',
+    'reservePromptQueueItem',
+    'serverQueuedPromptToNativeTurn',
+    'continueNativeTurn',
+    'consumePromptQueueReservation',
+    'releasePromptQueueReservation',
+    'isServerPromptQueueDispatchSettlingError',
+    'markServerPromptQueueItemUncertain',
+    'console',
+    `${workerSource}; return { dispatchNextServerQueuedPrompt };`,
+  )(
+    (value) => String(value || '').trim(),
+    dispatching,
+    reservations,
+    { get: () => conversation, scheduleRefresh: () => { refreshed += 1; } },
+    activeTurns,
+    () => [queueItem],
+    () => false,
+    (threadId) => resetCalls.push(threadId),
+    (threadId) => retryCalls.push(threadId),
+    () => ({ item: queueItem }),
+    (item) => item,
+    (...args) => continueTurn(...args),
+    (reservation) => consumed.push(reservation),
+    (reservation) => released.push(reservation),
+    (error, { startAttempted = false } = {}) => Number(error?.statusCode || 502) === 409 && !startAttempted,
+    (threadId, item, error) => {
+      queueItem.autoDispatch = false;
+      queueItem.dispatchState = 'uncertain';
+      queueItem.dispatchError = String(error?.message || 'unknown dispatch result');
+    },
+    { warn: () => {} },
+  );
+
+  assert.equal(await dispatchApi.dispatchNextServerQueuedPrompt('thread-a'), false);
+  assert.deepEqual(retryCalls, ['thread-a'], 'a still-running snapshot is rechecked without starting a turn');
+  assert.equal(consumed.length, 0);
+
+  reservations.add('thread-a');
+  assert.equal(await dispatchApi.dispatchNextServerQueuedPrompt('thread-a'), false);
+  assert.deepEqual(retryCalls, ['thread-a'], 'an in-flight caller owns the result and must not be retried');
+  reservations.delete('thread-a');
+
+  conversation = { status: 'done', metadata: {} };
+  continueTurn = async () => { throw { statusCode: 409 }; };
+  assert.equal(await dispatchApi.dispatchNextServerQueuedPrompt('thread-a'), false);
+  assert.deepEqual(retryCalls, ['thread-a'], 'a post-start 409 is not safe to replay automatically');
+  assert.equal(consumed.length, 0);
+  assert.deepEqual(
+    { autoDispatch: queueItem.autoDispatch, dispatchState: queueItem.dispatchState },
+    { autoDispatch: false, dispatchState: 'uncertain' },
+    'a post-start conflict is preserved for explicit retry',
+  );
+  queueItem.autoDispatch = true;
+  queueItem.dispatchState = '';
+
+  continueTurn = async () => { throw { statusCode: 502 }; };
+  assert.equal(await dispatchApi.dispatchNextServerQueuedPrompt('thread-a'), false);
+  assert.deepEqual(retryCalls, ['thread-a'], 'an uncertain upstream failure is never automatically replayed');
+  assert.deepEqual(
+    { autoDispatch: queueItem.autoDispatch, dispatchState: queueItem.dispatchState },
+    { autoDispatch: false, dispatchState: 'uncertain' },
+    'an unknown post-start result remains visible for explicit retry instead of being replayed automatically',
+  );
+
+  continueTurn = async () => ({ turnId: 'turn-next' });
+  assert.equal(await dispatchApi.dispatchNextServerQueuedPrompt('thread-a'), false, 'an uncertain item is never started by the background worker');
+  queueItem.autoDispatch = true;
+  queueItem.dispatchState = '';
+  assert.equal(await dispatchApi.dispatchNextServerQueuedPrompt('thread-a'), true);
+  assert.equal(consumed.length, 1);
+  assert.equal(refreshed, 1);
+  assert.ok(released.length >= 3);
 });
 
 test('playground refresh preserves browser streaming preferences and completed Agent images', async () => {
@@ -71,14 +408,22 @@ test('playground refresh preserves browser streaming preferences and completed A
   assert.match(playgroundOverrides, /font-size:\s*16px/);
   assert.match(playgroundOverrides, /> \.collapse-section\s*\{[^}]*grid-template-rows:\s*0fr/s);
   assert.match(playgroundOverrides, /\.codexWebUpdateButton\s*\{/);
-  assert.match(playgroundOverrides, /\.codexWebUpdateButton--desktop\s*\{[^}]*margin-left:\s*28px/s);
+  assert.match(playgroundOverrides, /\.codexWebUpdateButton--desktop\s*\{[^}]*margin-left:\s*0/s);
   assert.match(playgroundOverrides, /\.codexWebUpdateButton--mobile\s*\{[^}]*display:\s*none/s);
   assert.match(
     playgroundOverrides,
     /@media \(max-width:\s*639px\)[\s\S]*\.codexWebUpdateButton--mobile\s*\{[^}]*display:\s*inline-flex/s,
   );
+  assert.match(
+    playgroundOverrides,
+    /@media \(max-width:\s*639px\)[\s\S]*\.codexWebUpdateButton--desktop\s*\{[^}]*display:\s*none/s,
+  );
   assert.match(playgroundIntegration, /\/api\/playground-update\/status/);
   assert.match(playgroundIntegration, /method:\s*'POST'/);
+  assert.match(playgroundIntegration, /const actions\s*=\s*settings\?\.parentElement\?\.parentElement/);
+  assert.match(playgroundIntegration, /actions\.prepend\(createButton\('desktop'\)\)/);
+  assert.match(playgroundIntegration, /actions\.prepend\(createButton\('mobile'\)\)/);
+  assert.doesNotMatch(playgroundIntegration, /const brandRow=/);
   assert.match(playgroundIntegration, /setInterval\(scheduleEnsureButtons, 1500\)/);
   assert.match(playgroundIntegration, /if \(reloadWhenIdleTimer\) return/);
   assert.match(playgroundIntegration, /setTimeout\(reloadWhenGenerationEnds, 900\)/);
@@ -98,6 +443,10 @@ test('playground refresh preserves browser streaming preferences and completed A
     path.join(ROOT, 'vendor', 'gpt-image-playground', 'patches', 'codex-web-v0.7.2.patch'),
     'utf8',
   );
+  const playgroundV073PatchSource = await readFile(
+    path.join(ROOT, 'vendor', 'gpt-image-playground', 'patches', 'codex-web-v0.7.3.patch'),
+    'utf8',
+  );
 
   assert.match(playgroundPatchSource, /streamImages: typeof existing\?\.streamImages === 'boolean'/);
   assert.match(playgroundPatchSource, /streamPartialImages: typeof existing\?\.streamPartialImages === 'number'/);
@@ -110,6 +459,7 @@ test('playground refresh preserves browser streaming preferences and completed A
   assert.match(playgroundPatchSource, /status: 'done',\s*\n\+\s*error: null/);
   assert.match(playgroundV072PatchSource, /imageProfile,\s*\n\+\s*params: imageParams/);
   assert.match(playgroundV072PatchSource, /normalizeParamsForSettings\(imageParams, imageRequestSettings/);
+  assert.match(playgroundV073PatchSource, /normalizeParamsForSettings\(imageParams, imageRequestSettings/);
   assert.match(playgroundAssetScript, /streamImages:typeof\(w==null\?void 0:w\.streamImages\)=="boolean"\?w\.streamImages:I\.streamImages/);
   assert.match(playgroundAssetScript, /streamPartialImages:typeof\(w==null\?void 0:w\.streamPartialImages\)=="number"\?w\.streamPartialImages:I\.streamPartialImages/);
   assert.match(
@@ -959,6 +1309,22 @@ if (args[0] === 'app-server') {
               turnId
             }
           });
+          const nonRetryErrorText = String(control.nonRetryErrorText || '');
+          if (nonRetryErrorText && text.includes(nonRetryErrorText)) {
+            const sendNonRetryError = (errorTurnId) => send({
+              method: 'error',
+              params: {
+                error: { message: 'controlled non-retry turn error' },
+                willRetry: false,
+                threadId: message.params.threadId,
+                turnId: errorTurnId,
+              },
+            });
+            const wrongTurnId = String(control.nonRetryErrorWrongTurnId || '');
+            if (wrongTurnId) sendNonRetryError(wrongTurnId);
+            const delayMs = Number(control.nonRetryErrorDelayMs || 0);
+            setTimeout(() => sendNonRetryError(turnId), Number.isFinite(delayMs) ? Math.max(0, delayMs) : 0);
+          }
           if (text.includes('needs approval')) {
             send({
               id: 'approval-1',
@@ -1249,7 +1615,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body\[data-theme="light"\] \.box,\s*body\[data-theme="light"\] \.box:focus-within\s*\{[^}]*background:\s*#ffffff/s);
     assert.match(uiStyles, /body \.composer > \.box,\s*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*var\(--surface\);[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.main\s*\{[^}]*position:\s*relative;[^}]*height:\s*100dvh/s);
-    assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\)/s);
+    assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(132px, calc\(var\(--composer-overlay-height, 132px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(132px, calc\(var\(--composer-overlay-height, 132px\) \+ 12px\)\)/s);
     assert.match(uiStyles, /\.liveProcessPanel\s*\{[^}]*margin:\s*0 0 18px/s);
     assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.composer\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*auto 0 0;[^}]*background:\s*transparent;[^}]*pointer-events:\s*none/s);
     assert.match(uiStyles, /body \.composer > \*\s*\{[^}]*pointer-events:\s*auto/s);
@@ -1905,7 +2271,7 @@ updated_at = 1784422800000
     assert.match(page, /src="\/vendor\/purify\.js"/);
     assert.match(page, /href="\/ui\.css\?v=login-theme-20260802c"/);
     assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
-    assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260728a"/);
+    assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
     assert.match(page, /function createDreamSkinGenerator/);
@@ -1984,10 +2350,11 @@ updated_at = 1784422800000
     assert.match(page, /function runningActivityVerb/);
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
     assert.match(page, /NATIVE_INITIAL_MESSAGE_LIMIT=60/);
-    assert.match(page, /const requestUrl=endpoint\+encodeURIComponent\(id\)\+\(currentConversationSource==='codex'\?'\?images=external':''\)/);
+    assert.match(page, /const nativeHistoryQuery=currentConversationSource==='codex'\s*\? '\?images=external'\+\(options\.fullHistory\?'':'&limit='\+NATIVE_INITIAL_MESSAGE_LIMIT\)\s*:\s*'';/);
+    assert.match(page, /function addNativeHistoryLoadButton\(threadId,conversation\)/);
+    assert.match(page, /await loadConversation\(id,'codex',\{fullHistory:true\}\)/);
     assert.doesNotMatch(page, /fastNativeLoad/);
-    assert.doesNotMatch(page, /function addNativeHistoryLoadButton/);
-    assert.doesNotMatch(page, /加载完整近期记录/);
+    assert.match(page, /加载完整记录/);
     assert.match(page, /function scheduleNativeCompletionSync/);
     assert.match(page, /function reconcileNativeCompletion/);
     assert.match(page, /runtime\.type==='connection-error'/);
@@ -2014,7 +2381,8 @@ updated_at = 1784422800000
     assert.match(page, /function renameHistoryProject/);
     assert.match(page, /'pencil','重命名项目'/);
     assert.match(page, /historyProjectName\(item\.cwd\)/);
-    assert.match(page, /async function refreshHistory\(\)\{if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\)\{historyRefreshPending=true;return\}/);
+    assert.match(page, /function historyRefreshBlocked\(\)\{return historyRefreshPointerId!==null\|\|activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive/);
+    assert.match(page, /async function refreshHistory\(\)\{\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}[\s\S]*const data=await res\.json\(\);[\s\S]*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}/);
     assert.match(page, /\/api\/native-projects\/archive/);
     assert.match(page, /function extractMemoryCitations/);
     assert.match(page, /function renderMemoryCitations/);
@@ -4738,6 +5106,69 @@ updated_at = 1784422800000
     assert.equal(interruptedConcurrentTurn.status, 200);
     await writeFile(appServerControlFile, '{}');
 
+    const nonRetryErrorThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa742';
+    const wrongNonRetryErrorTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa743';
+    const nonRetryErrorMessage = 'controlled terminal retry exhaustion';
+    await writeFile(appServerControlFile, JSON.stringify({
+      threadStartId: nonRetryErrorThreadId,
+      nonRetryErrorText: nonRetryErrorMessage,
+      nonRetryErrorWrongTurnId: wrongNonRetryErrorTurnId,
+      nonRetryErrorDelayMs: 280,
+    }));
+    const nonRetryStarted = await fetch(`${baseUrl}/api/native-sessions`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: nonRetryErrorMessage,
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(nonRetryStarted.status, 202);
+    const nonRetryStartedPayload = await nonRetryStarted.json();
+    assert.equal(nonRetryStartedPayload.threadId, nonRetryErrorThreadId);
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const wrongTurnStillLocked = await fetch(`${baseUrl}/api/native-sessions/${nonRetryErrorThreadId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'must remain blocked after a different turn error',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(wrongTurnStillLocked.status, 409);
+
+    await new Promise((resolve) => setTimeout(resolve, 280));
+    const resumedAfterMatchingError = await fetch(`${baseUrl}/api/native-sessions/${nonRetryErrorThreadId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'resume after matching terminal error',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    assert.equal(resumedAfterMatchingError.status, 202);
+    const resumedAfterMatchingErrorPayload = await resumedAfterMatchingError.json();
+    const cleanupResumedTurn = await fetch(`${baseUrl}/api/native-sessions/${nonRetryErrorThreadId}/interrupt`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turnId: resumedAfterMatchingErrorPayload.turnId }),
+    });
+    assert.equal(cleanupResumedTurn.status, 200);
+    await writeFile(appServerControlFile, '{}');
+
     const appOwnedQueue = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
       headers: { Cookie: cookie },
     });
@@ -5269,12 +5700,56 @@ updated_at = 1784422800000
       .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
     assert.equal(appQueueTraceAfterRemoval, appQueueTraceBefore);
 
+    const backgroundBeaconThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa739';
+    const backgroundBeaconFirst = {
+      id: 'background-beacon-first',
+      message: 'persist while the phone is backgrounded',
+      createdAt: '2026-08-03T01:00:00.000Z',
+      source: 'web',
+    };
+    const backgroundBeaconSecond = {
+      id: 'background-beacon-second',
+      message: 'keep the server order intact',
+      createdAt: '2026-08-03T01:00:01.000Z',
+      source: 'web',
+    };
+    const appendBackgroundBeacon = (item) => fetch(
+      `${baseUrl}/api/prompt-queues/${backgroundBeaconThreadId}/append-beacon`,
+      {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item }),
+      },
+    );
+    assert.equal((await appendBackgroundBeacon(backgroundBeaconFirst)).status, 204);
+    assert.equal((await appendBackgroundBeacon(backgroundBeaconSecond)).status, 204);
+    assert.equal((await appendBackgroundBeacon(backgroundBeaconFirst)).status, 204, 'a delayed duplicate beacon is harmless');
+    const backgroundBeaconQueue = await fetch(`${baseUrl}/api/prompt-queues/${backgroundBeaconThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(backgroundBeaconQueue.status, 200);
+    const backgroundBeaconPayload = await backgroundBeaconQueue.json();
+    assert.deepEqual(backgroundBeaconPayload.items.map((item) => item.id), [
+      backgroundBeaconFirst.id,
+      backgroundBeaconSecond.id,
+    ]);
+    assert.ok(backgroundBeaconPayload.items.every((item) => item.source === 'web' && item.autoDispatch === true));
+    const rejectedAppBeacon = await appendBackgroundBeacon({
+      id: 'spoofed-app-item',
+      message: 'must not take over Codex App queue ownership',
+      source: 'codex-app',
+    });
+    assert.equal(rejectedAppBeacon.status, 400);
+    const rejectedIdlessBeacon = await appendBackgroundBeacon({ message: 'must have a stable id', source: 'web' });
+    assert.equal(rejectedIdlessBeacon.status, 400);
+
     const queueItemA = {
       id: 'queue-client-a',
       message: 'same queue prompt',
       serviceTier: 'priority',
       createdAt: '2026-07-26T10:00:00.000Z',
       source: 'web',
+      autoDispatch: false,
     };
     const queueItemB = {
       id: 'queue-client-b',
@@ -5282,6 +5757,7 @@ updated_at = 1784422800000
       serviceTier: null,
       createdAt: '2026-07-26T10:00:01.000Z',
       source: 'web',
+      autoDispatch: false,
     };
     const queueBaseline = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
       headers: { Cookie: cookie },
@@ -5336,6 +5812,7 @@ updated_at = 1784422800000
     });
     const queueAfterTurnPayload = await queueAfterTurn.json();
     assert.deepEqual(queueAfterTurnPayload.items.map((item) => item.id), [queueItemB.id]);
+    assert.deepEqual(queueAfterTurnPayload.dismissedItemIds, [queueItemA.id]);
     const staleQueueAfterConsume = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -5344,6 +5821,7 @@ updated_at = 1784422800000
     assert.equal(staleQueueAfterConsume.status, 409);
     const staleAfterConsumePayload = await staleQueueAfterConsume.json();
     assert.deepEqual(staleAfterConsumePayload.items.map((item) => item.id), [queueItemB.id]);
+    assert.deepEqual(staleAfterConsumePayload.dismissedItemIds, [queueItemA.id]);
     const retriedQueueAfterConsume = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -5357,6 +5835,7 @@ updated_at = 1784422800000
       message: 'steer queue prompt',
       createdAt: '2026-07-26T10:00:01.500Z',
       source: 'web',
+      autoDispatch: false,
     };
     const queuedSteerItem = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
       method: 'PUT',
@@ -5495,6 +5974,7 @@ updated_at = 1784422800000
       message: 'fail side chat second stage',
       createdAt: '2026-07-26T10:00:02.000Z',
       source: 'web',
+      autoDispatch: false,
     };
     const queuedFailedSideChat = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
       method: 'PUT',
@@ -5934,8 +6414,8 @@ updated_at = 1784422800000
         .length,
       createdDeleteCountBeforeBulkRace,
     );
-    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 6);
-    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 7);
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 7);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 9);
     const switchedProviderResume = protocolMessages.find((message) => (
       message.method === 'thread/resume'
       && message.params.modelProvider === 'custom'
@@ -6335,9 +6815,10 @@ function startServer({
   env.GROK2API_BASE_URL = '';
   env.GROK2API_ADMIN_PASSWORD = '';
   env.GROK2API_API_KEY = '';
-  delete env.DEEPSEEK_BASE_URL;
-  delete env.DEEPSEEK_API_KEY;
-  delete env.SUB_QUOTA_ORDER;
+  // Keep repository-level .env values out of the isolated quota fixture.
+  env.DEEPSEEK_BASE_URL = '';
+  env.DEEPSEEK_API_KEY = '';
+  env.SUB_QUOTA_ORDER = '';
   env.SUB_QUOTA_SOURCES = '';
   env.SUB_QUOTA_PROVIDER = 'cpa-codex';
   if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;

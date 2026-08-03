@@ -352,8 +352,23 @@ test('archived standalone tasks keep a separate task group and filter', () => {
 
 test('history refreshes deferred while a project menu or preview is open', () => {
   assert.match(inlineScript, /let historyRefreshPending=false/);
+  assert.match(inlineScript, /let historyRefreshPointerId=null/);
+  assert.match(inlineScript, /function historyRefreshBlocked\(\)\{return historyRefreshPointerId!==null\|\|activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\}/);
+  assert.match(inlineScript, /function beginHistoryRefreshPointerLock\(event\)\{[\s\S]*event\.button!==0\|\|event\.isPrimary===false\|\|!event\.target\.closest\?\.\('\.hist'\)[\s\S]*historyRefreshPointerId=event\.pointerId/);
+  assert.match(inlineScript, /history\?\.addEventListener\('pointerdown',beginHistoryRefreshPointerLock,true\)/);
+  assert.match(inlineScript, /window\.addEventListener\('pointerup',releaseHistoryRefreshPointerLock,true\)/);
+  assert.match(inlineScript, /window\.addEventListener\('pointercancel',releaseHistoryRefreshPointerLock,true\)/);
+  assert.match(inlineScript, /window\.addEventListener\('blur',clearHistoryRefreshPointerLock\)/);
+  const pointerLockSource = sourceBetween('function beginHistoryRefreshPointerLock', 'function flushPendingHistoryRefresh');
+  assert.doesNotMatch(pointerLockSource, /loadConversation\(|preventDefault\(/);
   assert.match(inlineScript, /function flushPendingHistoryRefresh/);
-  assert.match(inlineScript, /if\(activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\)\{historyRefreshPending=true;return\}/);
+  assert.match(inlineScript, /if\(!historyRefreshPending\|\|historyRefreshBlocked\(\)\)return/);
+  assert.match(inlineScript, /async function refreshHistory\(\)\{\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}[\s\S]*const data=await res\.json\(\);\s*\/\/ A live-session refresh may have started just before the user pressed a row\.\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}\s*pinnedThreadIds=/);
+  const rowSource = sourceBetween('function createHistoryRow', 'function updateActiveHistory');
+  assert.match(rowSource, /row\.addEventListener\('click',openConversation\)/);
+  assert.match(rowSource, /open\.addEventListener\('click',\(e\)=>\{e\.stopPropagation\(\);openConversation\(\)\}\)/);
+  assert.match(rowSource, /rename\.addEventListener\('click',\(e\)=>\{e\.preventDefault\(\);e\.stopPropagation\(\);beginHistoryRename/);
+  assert.match(rowSource, /del\.addEventListener\('click',\(e\)=>\{e\.stopPropagation\(\);deleteConversation/);
   assert.match(inlineScript, /flushPendingHistoryRefresh\(\)/);
 });
 

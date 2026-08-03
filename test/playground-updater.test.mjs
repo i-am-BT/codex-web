@@ -244,6 +244,7 @@ test('playground updater helpers accept only ordered stable versions and inject 
   const twice = injectIntegrationAssets(once);
   assert.equal((twice.match(/codex-web-overrides\.css/g) || []).length, 1);
   assert.equal((twice.match(/codex-web-integration\.js/g) || []).length, 1);
+  assert.match(twice, /v=20260803-1/);
 });
 
 test('playground updater requires a patch made for the target version', async () => {

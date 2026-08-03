@@ -182,7 +182,7 @@
       </div>
       <div id="imagePromptPlaygroundPanel" class="imagePromptPlaygroundPanel hidden" role="tabpanel" aria-labelledby="imagePromptPlaygroundView">
         <div id="imagePromptPlaygroundLoading" class="imagePromptPlaygroundLoading"><span class="spinner"></span> 正在载入生图工作台</div>
-        <iframe id="imagePromptPlaygroundFrame" class="imagePromptPlaygroundFrame" data-src="/playground/?v=fix2" title="GPT Image Playground 生图工作台" allow="clipboard-read; clipboard-write"></iframe>
+        <iframe id="imagePromptPlaygroundFrame" class="imagePromptPlaygroundFrame" data-src="/playground/?v=fix3" title="GPT Image Playground 生图工作台" allow="clipboard-read; clipboard-write"></iframe>
       </div>
       <div id="imagePromptToast" class="imagePromptToast" role="status" aria-live="polite"></div>
     `;

@@ -38,17 +38,12 @@
   function ensureButtons() {
     ensureFrame = 0;
     const header = document.querySelector('header');
-    const heading = header?.querySelector('h1');
-    const brandRow = heading?.parentElement;
-    if (brandRow && !brandRow.querySelector(`.${BUTTON_CLASS}--desktop`)) {
-      const tools = [...brandRow.children].find((child) => child !== heading && child.tagName === 'DIV');
-      if (tools) tools.prepend(createButton('desktop'));
-    }
-
     const settings = header?.querySelector('button[aria-label="\u8bbe\u7f6e"]');
     const actions = settings?.parentElement?.parentElement;
-    if (actions && !actions.querySelector(`.${BUTTON_CLASS}--mobile`)) {
-      actions.prepend(createButton('mobile'));
+    if (actions) {
+      // The upstream title row changes often; its stable action cluster is the reliable anchor.
+      if (!actions.querySelector(`.${BUTTON_CLASS}--desktop`)) actions.prepend(createButton('desktop'));
+      if (!actions.querySelector(`.${BUTTON_CLASS}--mobile`)) actions.prepend(createButton('mobile'));
     }
     applyStatus(status);
   }

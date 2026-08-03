@@ -27,7 +27,7 @@ test('running output can jump back to the latest item without joining the compos
   assert.match(serverSource, /jumpToLatest\?\.addEventListener\('click',scrollToLatestOutput\)/);
   assert.match(serverSource, /function updateJumpToLatestButton\(\)[\s\S]*?activeMainView==='chat'[\s\S]*?currentConversationSource==='codex'[\s\S]*?webRunActive[\s\S]*?!nativeLiveFollowBottom/s);
   assert.match(serverSource, /function scrollToLatestOutput\(\)[\s\S]*?chat\.scrollTo\(\{top:chat\.scrollHeight,behavior:reducedMotion\?'auto':'smooth'\}\)/);
-  assert.match(uiStyles, /body \.main > \.jumpToLatest\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*9;[^}]*bottom:\s*calc\(var\(--composer-overlay-height, 156px\) \+ 16px\);[^}]*width:\s*40px;[^}]*height:\s*40px;[^}]*box-shadow:\s*none/s);
+  assert.match(uiStyles, /body \.main > \.jumpToLatest\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*9;[^}]*bottom:\s*calc\(var\(--composer-overlay-height, 132px\) \+ 16px\);[^}]*width:\s*40px;[^}]*height:\s*40px;[^}]*box-shadow:\s*none/s);
   assert.match(uiStyles, /body \.main > \.jumpToLatest \.jumpToLatestDot\s*\{[^}]*width:\s*4px;[^}]*height:\s*4px;[^}]*background:\s*currentColor/s);
   assert.match(uiStyles, /body \.main > \.jumpToLatest:not\(\.hidden\) \.jumpToLatestDot\s*\{[^}]*animation:\s*jumpToLatestDotFloat 720ms/s);
   assert.match(uiStyles, /@keyframes jumpToLatestDotFloat\s*\{[\s\S]*?transform:\s*translateY\(-2px\)/);
@@ -95,7 +95,7 @@ test('composer project row and queued prompts share the native visual surface', 
   );
   assert.match(
     uiStyles,
-    /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(156px, calc\(var\(--composer-overlay-height, 156px\) \+ 12px\)\)/s,
+    /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(132px, calc\(var\(--composer-overlay-height, 132px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(132px, calc\(var\(--composer-overlay-height, 132px\) \+ 12px\)\)/s,
   );
   assert.match(
     uiStyles,

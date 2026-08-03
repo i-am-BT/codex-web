@@ -4750,6 +4750,40 @@ body .msg.assistant .markdownBody li + li {
   margin-top: 3px;
 }
 
+body .nativeHistoryLoadEarlier {
+  align-self: center;
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 4px 9px;
+  font-size: 12px;
+  font-weight: 560;
+  cursor: pointer;
+}
+
+body .nativeHistoryLoadEarlier:hover,
+body .nativeHistoryLoadEarlier:focus-visible {
+  background: var(--surface-hover);
+  color: var(--text);
+  outline: none;
+}
+
+body .nativeHistoryLoadEarlier:disabled {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+body .nativeHistoryLoadEarlier .lucide {
+  width: 14px;
+  height: 14px;
+}
+
 .markdownBody a {
   color: var(--primary);
 }
@@ -7199,8 +7233,8 @@ body .chat {
 
 /* Dynamic bottom inset: JS sets --composer-overlay-height from live composer+queue height. */
 body .chat {
-  padding-bottom: max(156px, calc(var(--composer-overlay-height, 156px) + 12px));
-  scroll-padding-bottom: max(156px, calc(var(--composer-overlay-height, 156px) + 12px));
+  padding-bottom: max(132px, calc(var(--composer-overlay-height, 132px) + 12px));
+  scroll-padding-bottom: max(132px, calc(var(--composer-overlay-height, 132px) + 12px));
 }
 
 body .chat > :is(
@@ -10191,8 +10225,8 @@ body .composer > .box:focus-within {
   }
 
   body .chat {
-    padding-bottom: max(156px, calc(var(--composer-overlay-height, 156px) + 12px));
-    scroll-padding-bottom: max(156px, calc(var(--composer-overlay-height, 156px) + 12px));
+    padding-bottom: max(132px, calc(var(--composer-overlay-height, 132px) + 12px));
+    scroll-padding-bottom: max(132px, calc(var(--composer-overlay-height, 132px) + 12px));
   }
 
   body .main:has(> .composer > .editedFilesResult.live.withPlan) > .chat {
@@ -10217,8 +10251,8 @@ body .composer > .box:focus-within {
   }
 
   body.keyboardOpen .chat {
-    padding-bottom: max(calc(156px + var(--keyboard-inset, 0px)), calc(var(--composer-overlay-height, 156px) + var(--keyboard-inset, 0px) + 12px));
-    scroll-padding-bottom: max(calc(156px + var(--keyboard-inset, 0px)), calc(var(--composer-overlay-height, 156px) + var(--keyboard-inset, 0px) + 12px));
+    padding-bottom: max(calc(132px + var(--keyboard-inset, 0px)), calc(var(--composer-overlay-height, 132px) + var(--keyboard-inset, 0px) + 12px));
+    scroll-padding-bottom: max(calc(132px + var(--keyboard-inset, 0px)), calc(var(--composer-overlay-height, 132px) + var(--keyboard-inset, 0px) + 12px));
   }
 
   body .composer > * {
@@ -10527,8 +10561,8 @@ body .composer > .box:focus-within {
 
   /* Float composer over chat with transparent rail so session wallpaper/bg shows through. */
   body .chat {
-    padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
-    scroll-padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
+    padding-bottom: max(calc(84px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, calc(72px + env(safe-area-inset-bottom, 0px))) + 12px));
+    scroll-padding-bottom: max(calc(84px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, calc(72px + env(safe-area-inset-bottom, 0px))) + 12px));
   }
 
   body .composer {
@@ -10550,10 +10584,19 @@ body .composer > .box:focus-within {
     padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
   }
 
+  /* The compact mobile capsule needs only its 16px rail plus the device safe area. */
+  body .composer:has(> .box.composerCollapsed) {
+    padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
+  }
+
+  body.keyboardOpen .composer:has(> .box.composerCollapsed) {
+    padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+  }
+
   body.keyboardOpen .chat {
     /* --composer-overlay-height already includes any unresized keyboard clearance. */
-    padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
-    scroll-padding-bottom: max(calc(132px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, 132px) + env(safe-area-inset-bottom, 0px) + 12px));
+    padding-bottom: max(calc(84px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, calc(72px + env(safe-area-inset-bottom, 0px))) + 12px));
+    scroll-padding-bottom: max(calc(84px + env(safe-area-inset-bottom, 0px)), calc(var(--composer-overlay-height, calc(72px + env(safe-area-inset-bottom, 0px))) + 12px));
   }
 
   body .composer > * {
@@ -10618,16 +10661,22 @@ body .composer > .box:focus-within {
   body .composer > .promptQueue {
     width: min(calc(var(--composer-width) - 40px), calc(100% - 84px));
     max-width: min(calc(var(--composer-width) - 40px), calc(100% - 84px));
-    /* Three standard queue rows remain visible; additional rows retain touch scrolling. */
-    max-height: calc(3 * 48px + 8px);
+    /* The list owns scrolling, so the panel keeps its 4px padding and 1px border on each edge. */
+    max-height: calc(3 * 40px + 10px);
     margin: 0 auto 10px;
+    overflow: hidden;
+  }
+
+  .promptQueueList {
+    max-height: calc(3 * 40px);
+    overflow: hidden auto;
     scrollbar-width: none;
     -ms-overflow-style: none;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
   }
 
-  .promptQueue::-webkit-scrollbar {
+  .promptQueueList::-webkit-scrollbar {
     display: none;
   }
 
@@ -12528,7 +12577,7 @@ body[data-theme] .msg.image:not(.inputImage) img {
 body .main > .jumpToLatest {
   position: absolute;
   z-index: 9;
-  bottom: calc(var(--composer-overlay-height, 156px) + 16px);
+  bottom: calc(var(--composer-overlay-height, 132px) + 16px);
   left: 50%;
   display: grid;
   width: 40px;

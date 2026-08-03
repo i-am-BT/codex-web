@@ -19,7 +19,7 @@ const DEFAULT_RELEASE_API = 'https://api.github.com/repos/CookSleep/gpt_image_pl
 const STABLE_TAG_PATTERN = /^v?(\d+)\.(\d+)\.(\d+)$/;
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/i;
 const LATEST_CACHE_MS = 10 * 60 * 1000;
-const INTEGRATION_ASSET_VERSION = '20260730-1';
+const INTEGRATION_ASSET_VERSION = '20260803-1';
 
 export class PlaygroundUpdater {
   constructor(options = {}) {
