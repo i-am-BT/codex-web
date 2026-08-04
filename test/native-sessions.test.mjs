@@ -2449,6 +2449,52 @@ function jsonl(records) {
   return records.map((record) => JSON.stringify(record)).join('\n') + '\n';
 }
 
+test('preserves large inline tool images while limiting ordinary tool output', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-tool-image-limit-'));
+  const id = '019fbc4d-0e8d-7a3b-9f3b-5f4ef0a8b5d1';
+  const sessionDir = path.join(temporary, 'sessions', '2026', '08', '03');
+  const sessionFile = path.join(sessionDir, `rollout-2026-08-03T10-00-00-${id}.jsonl`);
+  const imageData = `data:image/webp;base64,${'A'.repeat(12000)}`;
+  const ordinaryOutput = 'x'.repeat(12000);
+  await mkdir(sessionDir, { recursive: true });
+  await writeFile(sessionFile, jsonl([
+    {
+      timestamp: '2026-08-03T10:00:00.000Z',
+      type: 'session_meta',
+      payload: { id, cwd: temporary, source: 'vscode' },
+    },
+    {
+      timestamp: '2026-08-03T10:00:00.001Z',
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call_output',
+        output: { image_url: imageData },
+      },
+    },
+    {
+      timestamp: '2026-08-03T10:00:00.002Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call_output',
+        output: ordinaryOutput,
+      },
+    },
+  ]));
+
+  const store = new NativeSessionStore(temporary, { watchChanges: false });
+  try {
+    const toolMessages = store.get(id).messages.filter((message) => message.role === 'tool');
+    assert.equal(toolMessages.length, 2);
+    assert.ok(toolMessages[0].content.includes(imageData));
+    assert.ok(toolMessages[0].content.length > 8000);
+    assert.ok(toolMessages[1].content.length < ordinaryOutput.length);
+    assert.equal(toolMessages[1].content.includes(ordinaryOutput), false);
+  } finally {
+    store.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('exposes active thread goals from goals_1.sqlite and thread_goal_updated events', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-thread-goal-'));
   const sessionsDir = path.join(temporary, 'sessions', '2026', '07', '29');

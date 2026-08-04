@@ -613,6 +613,66 @@ test('server-owned Web queues retry only while native state is settling', async 
   assert.ok(released.length >= 3);
 });
 
+test('native session terminal state clears a stale in-memory running turn', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function nativeActiveTurnFor');
+  const helperEnd = serverSource.indexOf('\nfunction nativeSessionSummaries', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeNativeTurns = new Map([
+    ['thread-done', { turnId: 'turn-done', status: 'running' }],
+    ['thread-new-turn', { turnId: 'turn-new', status: 'running' }],
+    ['thread-running', { turnId: 'turn-running', status: 'running' }],
+  ]);
+  const api = new Function(
+    'activeNativeTurns',
+    'cleanNativeThreadId',
+    `${serverSource.slice(helperStart, helperEnd)}; return { nativeActiveTurnFor };`,
+  )(
+    activeNativeTurns,
+    (value) => String(value || '').trim(),
+  );
+
+  assert.equal(api.nativeActiveTurnFor('thread-done', {
+    status: 'done',
+    latestTurnId: 'turn-done',
+  }), null);
+  assert.equal(activeNativeTurns.has('thread-done'), false);
+
+  const newTurn = api.nativeActiveTurnFor('thread-new-turn', {
+    status: 'done',
+    latestTurnId: 'turn-old',
+  });
+  assert.equal(newTurn.status, 'running');
+  assert.equal(activeNativeTurns.has('thread-new-turn'), true);
+
+  const stillRunning = api.nativeActiveTurnFor('thread-running', {
+    status: 'running',
+    latestTurnId: 'turn-running',
+  });
+  assert.equal(stillRunning.status, 'running');
+  assert.equal(activeNativeTurns.has('thread-running'), true);
+});
+
+test('native tool image output falls back to embedded data after its source file is gone', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function decodeNativeToolImageOutput');
+  const helperEnd = serverSource.indexOf('\nasync function continueNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const api = new Function(
+    'TOOL_IMAGE_MAX_BYTES',
+    `${serverSource.slice(helperStart, helperEnd)}; return { decodeNativeToolImageOutput };`,
+  )(25 * 1024 * 1024);
+  const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+  const result = api.decodeNativeToolImageOutput({
+    content: JSON.stringify({
+      output: [{ type: 'input_image', image_url: `data:image/png;base64,${imageData}` }],
+    }),
+  });
+  assert.equal(result.type, 'image/png');
+  assert.deepEqual(result.data, Buffer.from(imageData, 'base64'));
+});
+
 test('playground refresh preserves browser streaming preferences and completed Agent images', async () => {
   const playgroundPage = await readFile(
     path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'index.html'),
@@ -771,6 +831,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const imagePromptFetchFixture = path.join(temporary, 'image-prompt-fetch-fixture.mjs');
   const webEnv = path.join(temporary, 'web.env');
   const toolImagePath = path.join(temporary, 'tool-preview.png');
+  let externalImageRoot = '';
+  let externalImagePath = '';
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
   const nativeFirstTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa780';
   const nativeSecondTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa781';
@@ -1035,11 +1097,14 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     customProviderBaseUrl = `http://127.0.0.1:${customProviderServer.address().port}`;
     await mkdir(runtime, { recursive: true });
     await mkdir(codexHome, { recursive: true });
+    externalImageRoot = await mkdtemp(path.join(tmpdir(), 'codex-web-image-root-'));
+    externalImagePath = path.join(externalImageRoot, 'gallery-preview.png');
     await writeFile(appServerControlFile, '{}');
     await writeFile(
       toolImagePath,
       Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
     );
+    await writeFile(externalImagePath, await readFile(toolImagePath));
     await writeFile(imagePromptFetchFixture, `
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (input, options) => {
@@ -1647,6 +1712,7 @@ if (args[0] === 'app-server') {
       desktopIpcSocket: desktopIpc.socketPath,
       desktopIpcTimeoutMs: '5000',
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
+      localImageRoots: externalImageRoot,
       sub2ApiBaseUrl: providerBaseUrl,
       sub2ApiKey: 'test-sub-key',
     });
@@ -4815,6 +4881,12 @@ updated_at = 1784422800000
     );
     assert.equal(inCwdLocalImage.status, 200);
     assert.equal(inCwdLocalImage.headers.get('content-type'), 'image/png');
+    const configuredRootLocalImage = await fetch(
+      `${baseUrl}/api/local-image?${new URLSearchParams({ path: externalImagePath, cwd: temporary })}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(configuredRootLocalImage.status, 200);
+    assert.equal(configuredRootLocalImage.headers.get('content-type'), 'image/png');
     // ...but must reject an absolute path outside both the session cwd and the OS temp
     // dir, or any authenticated user could read arbitrary image files on the host that
     // have nothing to do with the current Codex session.
@@ -6829,6 +6901,7 @@ updated_at = 1784422800000
       traceFile,
       appServerTraceFile,
       webEnv,
+      localImageRoots: externalImageRoot,
       sub2ApiBaseUrl: providerBaseUrl,
     });
     port = await waitForServer(child, runtime);
@@ -6852,6 +6925,7 @@ updated_at = 1784422800000
       customProviderServer.closeAllConnections?.();
       await new Promise((resolve) => customProviderServer.close(resolve));
     }
+    if (externalImageRoot) await rm(externalImageRoot, { recursive: true, force: true });
     await rm(temporary, { recursive: true, force: true });
   }
 });
@@ -7044,6 +7118,7 @@ function startServer({
   desktopIpcSocket = '',
   desktopIpcTimeoutMs = '',
   playgroundProxyAllowedOrigins = '',
+  localImageRoots = '',
   fetchFixture = '',
   sub2ApiBaseUrl,
   sub2ApiKey,
@@ -7069,6 +7144,7 @@ function startServer({
     CODEX_DESKTOP_IPC_ENABLED: desktopIpcEnabled,
     CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,
     PLAYGROUND_PROXY_ALLOWED_ORIGINS: playgroundProxyAllowedOrigins,
+    CODEX_WEB_LOCAL_IMAGE_ROOTS: localImageRoots,
     PLAYGROUND_PROXY_HEARTBEAT_MS: '20',
     HOMEPAGE_API_TOKEN: '',
     IMAGE_PROMPT_AUTO_SYNC: 'false',
