@@ -8368,7 +8368,7 @@ function rememberQueueDismissed(threadId,itemOrItems){
     if(!item)continue;
     const itemId=String(item.id||'').trim();
     if(itemId){set.add('id:'+itemId);continue}
-    const message=String(item.message||item.text||'').replace(/\s+/g,' ').trim();
+    const message=String(item.message||item.text||'').replace(/\\s+/g,' ').trim();
     if(message){
       set.add('msg:'+message);
       const createdAt=String(item.createdAt||'').trim();
@@ -8381,7 +8381,7 @@ function isQueueItemLocallyDismissed(threadId,item){
   if(!set.size||!item)return false;
   const itemId=String(item.id||'').trim();
   if(itemId)return set.has('id:'+itemId);
-  const message=String(item.message||item.text||'').replace(/\s+/g,' ').trim();
+  const message=String(item.message||item.text||'').replace(/\\s+/g,' ').trim();
   if(message&&set.has('msg:'+message))return true;
   const createdAt=String(item.createdAt||'').trim();
   if(message&&createdAt&&set.has('msg:'+message+'||'+createdAt))return true;
@@ -8903,7 +8903,7 @@ function getSideChatTab(threadId){
   return sideChatOpenTabs.find((tab)=>tab.threadId===String(threadId||''))||null;
 }
 function normalizeConversationTitle(value,fallback='新任务'){
-  return String(value||fallback).trim().replace(/\s+/g,' ').slice(0,80)||fallback;
+  return String(value||fallback).trim().replace(/\\s+/g,' ').slice(0,80)||fallback;
 }
 function topConversationTitle(){
   if(activeMainView==='archive')return'已归档任务';
@@ -9739,7 +9739,7 @@ function editCurrentThreadGoal(){
   if(!goal||threadGoalSaving)return;
   const value=prompt('编辑目标',goal.objective);
   if(value===null)return;
-  const objective=String(value||'').replace(/\s+/g,' ').trim();
+  const objective=String(value||'').replace(/\\s+/g,' ').trim();
   if(!objective){statusEl.textContent='目标内容不能为空';return}
   if(objective===goal.objective)return;
   void updateCurrentThreadGoal(
@@ -10663,14 +10663,14 @@ function removeQueuedPromptLocal(threadId,item,{persist=true,dismiss=true}={}){
   if(!threadId||!item)return promptQueueFor(threadId);
   if(dismiss)rememberQueueDismissed(threadId,item);
   const targetId=String(item.id||'').trim();
-  const targetMessage=String(item.message||'').replace(/\s+/g,' ').trim();
+  const targetMessage=String(item.message||'').replace(/\\s+/g,' ').trim();
   const targetCreatedAt=String(item.createdAt||'').trim();
   const next=promptQueueFor(threadId).filter((entry)=>{
     const entryId=String(entry.id||'').trim();
     if(targetId){
       if(entryId===targetId)return false;
     }else{
-      const entryMessage=String(entry.message||'').replace(/\s+/g,' ').trim();
+      const entryMessage=String(entry.message||'').replace(/\\s+/g,' ').trim();
       const entryCreatedAt=String(entry.createdAt||'').trim();
       if(targetMessage&&entryMessage===targetMessage&&(!targetCreatedAt||entryCreatedAt===targetCreatedAt))return false;
     }
@@ -11592,7 +11592,7 @@ function humanizePluginTitle(name,title){
   if(!source)return "插件";
   if(/[一-鿿]/.test(source))return source;
   const acronyms={ai:"AI",api:"API",pdf:"PDF",ui:"UI",url:"URL",ux:"UX"};
-  return source.split(/[-_./\s]+/).filter(Boolean).map((part)=>{
+  return source.split(/[-_./\\s]+/).filter(Boolean).map((part)=>{
     const key=part.toLowerCase();
     if(acronyms[key])return acronyms[key];
     if(key==="pdf")return "PDF";
@@ -13493,7 +13493,7 @@ function formatSubQuotaDateTimeFull(value){const date=new Date(value);return Num
 function formatSubQuotaTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
 function subQuotaStaleMetaText(quota){
   const staleTime=formatSubQuotaTime(quota?.fetchedAt);
-  const warning=String(quota?.warning||quota?.error||'').trim().replace(/^刷新失败[：:]\s*/,'').slice(0,120);
+  const warning=String(quota?.warning||quota?.error||'').trim().replace(/^刷新失败[：:]\\s*/,'').slice(0,120);
   const message=staleTime?'刷新失败，显示 '+staleTime+' 的上次数据':'刷新失败，显示上次数据';
   return warning?message+' · '+warning:message;
 }
@@ -17046,7 +17046,7 @@ function insertTextIntoComposer(text){
   const end=Number.isInteger(input.selectionEnd)?input.selectionEnd:start;
   const before=input.value.slice(0,start);
   const after=input.value.slice(end);
-  const needsSpace=before&&!/\s$/.test(before);
+  const needsSpace=before&&!/\\s$/.test(before);
   const inserted=(needsSpace?' ':'')+value;
   input.value=before+inserted+after;
   const cursor=before.length+inserted.length;
