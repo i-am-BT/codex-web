@@ -11100,7 +11100,7 @@ function setComposerExpanded(expanded,{focus=false,force=false}={}){
     composerMicBtn.classList.remove('hidden');
   }
   if(next&&focus&&input&&!input.disabled&&document.activeElement!==input){
-    // Focus synchronously inside the user gesture so mobile keyboards open on the first tap.
+    // Focus synchronously inside the user gesture so mobile keyboards open without a delayed reflow.
     try{input.focus({preventScroll:true})}catch{input.focus()}
     if(document.activeElement!==input){
       if(window.__composerFocusRaf)cancelAnimationFrame(window.__composerFocusRaf);
@@ -12279,34 +12279,55 @@ function enhanceComposer(){
   dropZone.addEventListener('click',(event)=>{
     const guard=window.__composerExpandClickGuard;
     if(!guard)return;
-    if(guard.pointerId!==null&&typeof event.pointerId==='number'&&event.pointerId!==guard.pointerId)return;
+    const suppressClick=guard.suppressClick===true;
+    if(!suppressClick&&guard.pointerId!==null&&typeof event.pointerId==='number'&&event.pointerId!==guard.pointerId)return;
     window.__composerExpandClickGuard=null;
     window.clearTimeout(window.__composerExpandClickGuardTimer);
-    if(event.target===guard.target||guard.target?.contains?.(event.target))return;
+    if(!suppressClick&&(event.target===guard.target||guard.target?.contains?.(event.target)))return;
     // The capsule grows during pointerdown. Ignore a trailing click that would
     // otherwise land on a newly revealed toolbar control after that reflow.
     event.preventDefault();
     event.stopImmediatePropagation();
   },true);
   dropZone.addEventListener('pointerdown',(event)=>{
-    // Keep buttons/menus from stealing the keyboard path; textarea/input still get focus:true.
+    const wasCollapsed=dropZone.classList.contains('composerCollapsed');
+    if(!wasCollapsed&&window.__composerExpandClickGuard){
+      window.__composerExpandClickGuard=null;
+      window.clearTimeout(window.__composerExpandClickGuardTimer);
+    }
+    // Keep the collapsed capsule geometry stable while its edge controls are tapped.
+    // Expanding here would move the permission/model controls under the same finger,
+    // so the trailing click could activate the wrong button on mobile browsers.
     if(event.target.closest('button,a,select,label,.composerPopover')){
-      expandComposer();
+      if(!wasCollapsed)expandComposer();
       return;
     }
-    const wasCollapsed=dropZone.classList.contains('composerCollapsed');
-    expandComposer({focus:true});
+    if(wasCollapsed){
+      // The first mobile tap is only an expansion gesture. Prevent the browser's
+      // default textarea focus so the keyboard opens on the deliberate second tap.
+      event.preventDefault();
+      expandComposer();
+    }else{
+      expandComposer({focus:true});
+    }
     if(wasCollapsed&&dropZone.classList.contains('composerExpanded')){
       window.__composerExpandClickGuard={
         pointerId:typeof event.pointerId==='number'?event.pointerId:null,
         target:event.target,
+        suppressClick:true,
       };
       window.clearTimeout(window.__composerExpandClickGuardTimer);
       window.__composerExpandClickGuardTimer=window.setTimeout(()=>{window.__composerExpandClickGuard=null},500);
     }
   });
   dropZone.addEventListener('click',(event)=>{
-    if((event.target===dropZone||event.target===input||event.target.closest('textarea'))&&document.activeElement!==input)expandComposer({focus:true});
+    if(!(event.target===dropZone||event.target===input||event.target.closest('textarea'))||document.activeElement===input)return;
+    // A fallback click can still arrive on mobile when the browser does not
+    // expose pointer events. The first tap remains an expansion gesture and
+    // must not focus the textarea; only a later tap on the expanded composer
+    // may open the keyboard.
+    if(dropZone.classList.contains('composerCollapsed'))expandComposer();
+    else expandComposer({focus:true});
   });
   document.addEventListener('click',(event)=>{
     if(composerChromeContains(event.target))return;
@@ -12398,7 +12419,10 @@ function ensureComposerSpeechRecognition(){
   return rec;
 }
 function toggleComposerSpeech(){
-  expandComposer({focus:true});
+  // Voice input should not steal focus from a mobile toolbar tap. The
+  // recognition API does not require the textarea to be focused, and keeping
+  // it unfocused prevents a transient keyboard from appearing beside the mic.
+  expandComposer();
   if(composerSpeechListening){
     stopComposerSpeech();
     if(statusEl)statusEl.textContent='已停止语音输入';
