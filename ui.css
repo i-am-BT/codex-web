@@ -10671,6 +10671,23 @@ body .composer > .box:focus-within {
     padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
   }
 
+  /* WebKit keeps 100dvh at the layout height when its keyboard covers the page. */
+  body.keyboardOpen .app,
+  body.keyboardOpen .main {
+    height: var(--composer-visual-viewport-bottom, 100dvh);
+  }
+
+  /* The main chat now ends at the visible viewport, so do not lift twice. */
+  body.keyboardOpen .main:not(.sideChatOpen) > .composer {
+    bottom: 0;
+    transition: none;
+  }
+
+  body.keyboardOpen .main.sideChatOpen > .composer {
+    bottom: 0 !important;
+    transition: none;
+  }
+
   /* The compact mobile capsule needs only its 16px rail plus the device safe area. */
   body .composer:has(> .box.composerCollapsed) {
     padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);

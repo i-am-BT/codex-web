@@ -1729,10 +1729,12 @@ test('dynamic queue clearance keeps the latest message above the composer', () =
   const observerSource = sourceBetween('function enhanceComposerOverlayInset', 'function enhanceComposerKeyboardLift');
   const insetSource = sourceBetween('function updateComposerOverlayInset', 'function scrollChatToLatest');
   const scrollSource = sourceBetween('function scrollChatToLatest', 'async function loadConversation');
-  assert.match(observerSource, /updateComposerOverlayInset\(\{scroll:true\}\)/);
+  assert.match(observerSource, /const schedule=\(\)=>scheduleComposerOverlayInset\(\{scroll:true\}\)/);
+  assert.match(observerSource, /const scheduleViewport=\(\)=>scheduleComposerViewportSync\(\)/);
   assert.match(observerSource, /composer\?\.addEventListener\('transitionend',\(event\)=>\{if\(event\.propertyName==='bottom'\)schedule\(\)\}\)/);
   assert.match(insetSource, /const pinned=distance<=Math\.max\(72,prev\+48\)/);
-  assert.match(insetSource, /options\.scroll&&chat&&pinned/);
+  assert.match(insetSource, /const shouldFollowLatest=options\.followLatest===true\|\|pinned/);
+  assert.match(insetSource, /options\.scroll&&chat&&shouldFollowLatest/);
   assert.match(scrollSource, /chat\.scrollTop=chat\.scrollHeight/);
   assert.doesNotMatch(scrollSource, /scrollIntoView/);
   assert.match(inlineScript, /enhanceComposerKeyboardLift\(\);\s*enhanceComposerOverlayInset\(\);\s*keepComposerAboveKeyboard\(\);/);
@@ -1875,8 +1877,14 @@ test('composer capsule inherits session wallpaper on mobile and desktop', () => 
 });
 
 test('mobile keyboard opens on first composer tap', () => {
+  const expandedSource = sourceBetween('function setComposerExpanded', 'function scheduleComposerKeyboardFocusSync');
+  const clickSource = sourceBetween("dropZone\\.addEventListener\\('click'", "document\\.addEventListener\\('click'");
   assert.match(inlineScript, /Focus synchronously inside the user gesture so mobile keyboards open on the first tap/);
   assert.match(inlineScript, /try\{input\.focus\(\{preventScroll:true\}\)\}catch\{input\.focus\(\)\}/);
+  assert.match(expandedSource, /if\(next&&focus&&input&&!input\.disabled&&document\.activeElement!==input\)/);
+  assert.match(clickSource, /document\.activeElement!==input/);
+  assert.match(inlineScript, /__composerExpandClickGuard[\s\S]{0,520}event\.stopImmediatePropagation\(\)/);
+  assert.match(inlineScript, /const wasCollapsed=dropZone\.classList\.contains\('composerCollapsed'\)/);
   assert.match(inlineScript, /event\.target\.closest\('button,a,select,label,\.composerPopover'\)/);
   assert.doesNotMatch(inlineScript, /event\.target\.closest\('button,a,input,select,textarea,label,\.composerPopover'\)/);
   assert.match(uiStyles, /Keep caret visible so the first mobile tap can open the keyboard immediately/);
@@ -1884,13 +1892,21 @@ test('mobile keyboard opens on first composer tap', () => {
 
 test('keyboard lift keeps composer above the soft keyboard', () => {
   const overlaySource = sourceBetween('function updateComposerOverlayInset', 'function chatHasLayout');
+  const visualViewportSource = sourceBetween('function composerVisualViewportBottom', 'function keepComposerAboveKeyboard');
   assert.match(inlineScript, /function keepComposerAboveKeyboard/);
+  assert.match(visualViewportSource, /function composerVisualViewportBottom\(\)/);
+  assert.match(visualViewportSource, /function syncComposerVisualViewport\(\)/);
   assert.match(inlineScript, /function composerKeyboardInset/);
   assert.match(inlineScript, /function enhanceComposerKeyboardLift/);
   assert.match(inlineScript, /visualViewport/);
   assert.match(inlineScript, /--keyboard-inset/);
-  assert.match(inlineScript, /__composerOverlayInsetKeyboardRaf=requestAnimationFrame\(\(\)=>updateComposerOverlayInset\(\{scroll:true\}\)\)/);
+  assert.match(inlineScript, /--composer-visual-viewport-bottom/);
+  assert.match(inlineScript, /function scheduleComposerKeyboardFocusSync\(\)/);
+  assert.match(inlineScript, /function scheduleComposerOverlayInset\(options=\{\}\)/);
+  assert.match(inlineScript, /function scheduleComposerViewportSync\(\)/);
+  assert.match(inlineScript, /__composerOverlayInsetOptions=\{/);
   assert.match(inlineScript, /__composerOverlayInsetSettleTimer=window\.setTimeout\(\(\)=>updateComposerOverlayInset\(\{scroll:true\}\),160\)/);
+  assert.match(inlineScript, /followLatest:wasFollowing/);
   assert.match(overlaySource, /const chatBottom=chatRect&&chat\.clientHeight>0\?chatRect\.top\+chat\.clientHeight:viewportBottom/);
   assert.match(overlaySource, /const visibleOutput=Math\.max\(112,Math\.min\(180,Math\.round\(visualHeight\*0\.18\)\)\)/);
   assert.match(overlaySource, /document\.body\.classList\.contains\('keyboardOpen'\)/);
@@ -1898,7 +1914,28 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   assert.match(uiStyles, /body\.keyboardOpen \.composer/);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.doesNotMatch(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.chat\s*\{[^}]*var\(--keyboard-inset/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.app,\s*body\.keyboardOpen \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main:not\(\.sideChatOpen\) > \.composer\s*\{[^}]*bottom:\s*0;[^}]*transition:\s*none/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main\.sideChatOpen > \.composer\s*\{[^}]*bottom:\s*0 !important;[^}]*transition:\s*none/s);
   assert.match(serverSource, /interactive-widget=resizes-content/);
+
+  const visualStyles = new Map();
+  let visualViewportWrites = 0;
+  const syncVisualViewport = new Function(
+    'document',
+    'window',
+    `${visualViewportSource}; return syncComposerVisualViewport;`,
+  )(
+    { body: { style: {
+      getPropertyValue: (name) => visualStyles.get(name) || '',
+      setProperty: (name, value) => { visualViewportWrites += 1; visualStyles.set(name, value); },
+    } } },
+    { innerHeight: 852, visualViewport: { offsetTop: 20, height: 506 } },
+  );
+  assert.equal(syncVisualViewport(), 526);
+  assert.equal(visualStyles.get('--composer-visual-viewport-bottom'), '526px');
+  assert.equal(syncVisualViewport(), 526);
+  assert.equal(visualViewportWrites, 1);
 
   const makeOverlayHarness = (chatHeight) => {
     const styles = new Map([['--composer-overlay-height', '0']]);
@@ -1944,48 +1981,182 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   assert.ok(unresized.chatHeight - unresized.height >= 112);
 });
 
+test('keyboard viewport resize keeps a following long chat pinned to its latest output', () => {
+  const overlaySource = sourceBetween('function updateComposerOverlayInset', 'function chatHasLayout');
+  const styles = new Map([['--composer-overlay-height', '190']]);
+  let scrollCalls = 0;
+  const body = {
+    classList: { contains: (name) => name === 'keyboardOpen' },
+    dataset: {},
+    style: {
+      getPropertyValue: (name) => styles.get(name) || '',
+      setProperty: (name, value) => styles.set(name, value),
+    },
+  };
+  const chat = {
+    clientHeight: 470,
+    scrollHeight: 3000,
+    scrollTop: 2000,
+    getBoundingClientRect: () => ({ top: 56 }),
+  };
+  const composer = {
+    offsetHeight: 182,
+    getBoundingClientRect: () => ({ top: 344 }),
+  };
+  const update = new Function(
+    'document',
+    'dropZone',
+    'chat',
+    'window',
+    'scrollChatToLatest',
+    `${overlaySource}; return updateComposerOverlayInset;`,
+  )(
+    { body, querySelector: () => null },
+    { parentElement: composer },
+    chat,
+    { innerHeight: 852, visualViewport: { offsetTop: 0, height: 526 } },
+    () => { scrollCalls += 1; },
+  );
+
+  assert.equal(update({ scroll: true }), 190);
+  assert.equal(scrollCalls, 0);
+  assert.equal(update({ scroll: true, followLatest: true }), 190);
+  assert.equal(scrollCalls, 1);
+});
+
 test('mobile keyboard lift coalesces repeated viewport callbacks', () => {
   const keyboardSource = sourceBetween('function keepComposerAboveKeyboard', 'function enhanceComposerOverlayInset');
+  const focusSyncSource = sourceBetween('function scheduleComposerKeyboardFocusSync', 'function scheduleComposerOverlayInset');
+  const overlayRafSource = sourceBetween('function scheduleComposerOverlayInset', 'function scheduleComposerViewportSync');
+  const viewportSyncSource = sourceBetween('function scheduleComposerViewportSync', 'function composerVisualViewportBottom');
+  const overlayEnhancerSource = sourceBetween('function enhanceComposerOverlayInset', 'function enhanceComposerKeyboardLift');
+  const keyboardLiftSource = sourceBetween('function enhanceComposerKeyboardLift', 'function expandComposer');
   assert.match(keyboardSource, /const previousInset=Number\.isFinite\(Number\(window\.__composerKeyboardInsetValue\)\)/);
-  assert.match(keyboardSource, /if\(next===previousInset&&active===previousActive\)return/);
-  assert.match(keyboardSource, /if\(next>0&&!hadKeyboard&&dropZone\)/);
+  assert.match(keyboardSource, /if\(next===previousInset&&active===previousActive\)\{/);
+  assert.match(keyboardSource, /syncComposerVisualViewport\(\);/);
+  assert.match(keyboardSource, /const wasFollowing=distance<=Math\.max\(72,previousOverlay\+48\)/);
+  assert.match(keyboardSource, /scheduleComposerOverlayInset\(\{scroll:true,followLatest:wasFollowing\}\)/);
+  assert.match(keyboardSource, /scheduleComposerOverlayInset\(\{scroll:true,followLatest:true\}\)/);
+  assert.match(viewportSyncSource, /if\(window\.__composerViewportSyncRaf\)return/);
+  assert.match(overlayEnhancerSource, /window\.visualViewport\?\.addEventListener\('resize', scheduleViewport/);
+  assert.doesNotMatch(keyboardLiftSource, /visualViewport\?\.addEventListener/);
+  assert.doesNotMatch(keyboardSource, /scrollIntoView/);
+
+  const scheduled = new Map();
+  const updates = [];
+  let nextRaf = 0;
+  const scheduleOverlayInset = new Function(
+    'window',
+    'requestAnimationFrame',
+    'updateComposerOverlayInset',
+    `${overlayRafSource}; return scheduleComposerOverlayInset;`,
+  )(
+    {},
+    (callback) => { const id = ++nextRaf; scheduled.set(id, callback); return id; },
+    (options) => { updates.push(options); },
+  );
+  scheduleOverlayInset({ scroll: true });
+  scheduleOverlayInset({ scroll: true, followLatest: true });
+  assert.equal(scheduled.size, 1);
+  scheduled.get(1)();
+  assert.deepEqual(updates, [{ scroll: true, followLatest: true }]);
+
+  const focusRafs = new Map();
+  const focusTimers = new Map();
+  const cancelledFocusRafs = [];
+  const clearedFocusTimers = [];
+  const focusSyncCalls = [];
+  let nextFocusTask = 0;
+  const focusedInput = {};
+  const scheduleFocusSync = new Function(
+    'window',
+    'input',
+    'document',
+    'requestAnimationFrame',
+    'cancelAnimationFrame',
+    'keepComposerAboveKeyboard',
+    `${focusSyncSource}; return scheduleComposerKeyboardFocusSync;`,
+  )(
+    {
+      clearTimeout: (id) => { if(id){ clearedFocusTimers.push(id); focusTimers.delete(id); } },
+      setTimeout: (callback) => { const id = ++nextFocusTask; focusTimers.set(id, callback); return id; },
+    },
+    focusedInput,
+    { activeElement: focusedInput },
+    (callback) => { const id = ++nextFocusTask; focusRafs.set(id, callback); return id; },
+    (id) => { cancelledFocusRafs.push(id); focusRafs.delete(id); },
+    (options) => { focusSyncCalls.push(options); },
+  );
+  scheduleFocusSync();
+  scheduleFocusSync();
+  assert.deepEqual(cancelledFocusRafs, [1]);
+  assert.deepEqual(clearedFocusTimers, [2]);
+  assert.equal(focusRafs.size, 1);
+  assert.equal(focusTimers.size, 1);
+  focusRafs.get(3)();
+  focusTimers.get(4)();
+  assert.deepEqual(focusSyncCalls, [{ force: true }, { force: true }]);
 
   const styles = new Map();
   let scrollCalls = 0;
   let refreshCalls = 0;
+  let visualViewportSyncs = 0;
+  let followLatest = null;
   const body = {
     classList: { toggle: () => {} },
-    style: { setProperty: (name, value) => styles.set(name, value) },
+    style: {
+      getPropertyValue: (name) => styles.get(name) || '',
+      setProperty: (name, value) => styles.set(name, value),
+    },
   };
   const input = {};
   const keepComposerAboveKeyboard = new Function(
     'document',
     'dropZone',
+    'chat',
     'window',
     'composerKeyboardInset',
     'composerChromeContains',
     'input',
-    'requestAnimationFrame',
-    'cancelAnimationFrame',
-    'updateComposerOverlayInset',
+    'syncComposerVisualViewport',
+    'scheduleComposerOverlayInset',
     `${keyboardSource}; return keepComposerAboveKeyboard;`,
   )(
     { body, activeElement: input },
     { parentElement: {}, scrollIntoView: () => { scrollCalls += 1; } },
+    { clientHeight: 400, scrollHeight: 1200, scrollTop: 800 },
     { clearTimeout: () => {}, setTimeout: () => 1 },
     () => 280,
     () => false,
     input,
-    (callback) => { callback(); return 1; },
-    () => {},
-    () => { refreshCalls += 1; },
+    () => { visualViewportSyncs += 1; },
+    (options) => { refreshCalls += 1; followLatest = options.followLatest; },
   );
 
   keepComposerAboveKeyboard({ force: true });
   keepComposerAboveKeyboard({ force: true });
   assert.equal(styles.get('--keyboard-inset'), '280px');
-  assert.equal(scrollCalls, 1);
+  assert.equal(scrollCalls, 0);
   assert.equal(refreshCalls, 1);
+  assert.equal(followLatest, true);
+  assert.equal(visualViewportSyncs, 2);
+});
+
+test('composer typing avoids full conversation redraws and stale command menu renders', () => {
+  const inputListenerSource = sourceBetween("sendBtn\\?\\.addEventListener\\('click', send\\);", "attachFile\\?\\.addEventListener\\('click'");
+  const inputStateSource = sourceBetween('function syncComposerInputState', 'function applyConversationMode');
+  const slashSource = sourceBetween('async function syncComposerSlashMenuFromInput', 'function handleComposerSlashKeydown');
+  const atSource = sourceBetween('async function syncComposerAtMenuFromInput', 'function handleComposerAtKeydown');
+
+  assert.match(inputListenerSource, /syncComposerInputState\(\);syncComposerSlashMenuFromInput\(\);syncComposerAtMenuFromInput\(\)/);
+  assert.doesNotMatch(inputListenerSource, /applyConversationMode\(\)/);
+  assert.match(inputStateSource, /sendBtn\.disabled=/);
+  assert.doesNotMatch(inputStateSource, /renderPromptQueue|renderThreadGoalBar|syncComposerChrome|updateComposerOverlayInset/);
+  assert.match(slashSource, /const syncRevision=\+\+composerSlashSyncRevision/);
+  assert.match(slashSource, /if\(composerSlashLoadedAt&&Date\.now\(\)-composerSlashLoadedAt<15000\)return/);
+  assert.match(slashSource, /if\(syncRevision!==composerSlashSyncRevision\|\|!composerSlashMenuOpen\(\)\)return/);
+  assert.match(atSource, /const syncRevision=\+\+composerAtSyncRevision/);
+  assert.match(atSource, /if\(syncRevision!==composerAtSyncRevision\|\|!composerAtMenuOpen\(\)\)return/);
 });
 
 test('model toggle stays chromeless without a pill background', () => {

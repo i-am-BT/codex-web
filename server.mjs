@@ -7812,6 +7812,7 @@ let composerSlashQuery = '';
 let composerSlashLoading = false;
 let composerSlashLoadPromise = null;
 let composerSlashLoadedAt = 0;
+let composerSlashSyncRevision = 0;
 let composerAtPanel = null;
 let composerAtList = null;
 let composerAtStatus = null;
@@ -7822,6 +7823,7 @@ let composerAtQuery = '';
 let composerAtLoading = false;
 let composerAtLoadPromise = null;
 let composerAtLoadedAt = 0;
+let composerAtSyncRevision = 0;
 let nativeComposerOverride = null;
 let nativeComposerSettingsQueue = Promise.resolve();
 let nativeComposerSettingsWriteId = 0;
@@ -11015,73 +11017,129 @@ function composerShouldStayExpanded(){
 function setComposerExpanded(expanded,{focus=false,force=false}={}){
   if(!dropZone)return;
   const next=force?Boolean(expanded):Boolean(expanded||composerShouldStayExpanded());
-  dropZone.classList.toggle('composerCollapsed',!next);
-  dropZone.classList.toggle('composerExpanded',next);
-  dropZone.dataset.composerState=next?'expanded':'collapsed';
+  const stateChanged=next
+    ? !dropZone.classList.contains('composerExpanded')||dropZone.classList.contains('composerCollapsed')
+    : !dropZone.classList.contains('composerCollapsed')||dropZone.classList.contains('composerExpanded');
+  if(stateChanged){
+    dropZone.classList.toggle('composerCollapsed',!next);
+    dropZone.classList.toggle('composerExpanded',next);
+    dropZone.dataset.composerState=next?'expanded':'collapsed';
+  }
   // Mic stays visible in both capsule and expanded toolbars (reference UI).
-  if(composerMicBtn){
+  if(composerMicBtn&&(composerMicBtn.hidden||composerMicBtn.classList.contains('hidden'))){
     composerMicBtn.hidden=false;
     composerMicBtn.classList.remove('hidden');
   }
-  if(next&&focus&&input&&!input.disabled){
+  if(next&&focus&&input&&!input.disabled&&document.activeElement!==input){
     // Focus synchronously inside the user gesture so mobile keyboards open on the first tap.
     try{input.focus({preventScroll:true})}catch{input.focus()}
-    requestAnimationFrame(()=>{
-      if(document.activeElement!==input){
+    if(document.activeElement!==input){
+      if(window.__composerFocusRaf)cancelAnimationFrame(window.__composerFocusRaf);
+      window.__composerFocusRaf=requestAnimationFrame(()=>{
+        window.__composerFocusRaf=0;
+        if(document.activeElement===input)return;
         try{input.focus({preventScroll:true})}catch{input.focus()}
-      }
-      keepComposerAboveKeyboard({force:true});
-    });
-  }else if(next){
+      });
+    }
+  }else if(next&&stateChanged&&document.activeElement!==input){
     keepComposerAboveKeyboard();
   }
 }
-function composerKeyboardInset(){
+function scheduleComposerKeyboardFocusSync(){
+  if(!input)return;
+  if(window.__composerKeyboardFocusSyncRaf)cancelAnimationFrame(window.__composerKeyboardFocusSyncRaf);
+  window.__composerKeyboardFocusSyncRaf=requestAnimationFrame(()=>{
+    window.__composerKeyboardFocusSyncRaf=0;
+    if(document.activeElement===input)keepComposerAboveKeyboard({force:true});
+  });
+  window.clearTimeout(window.__composerKeyboardFocusSyncTimer);
+  window.__composerKeyboardFocusSyncTimer=window.setTimeout(()=>{
+    window.__composerKeyboardFocusSyncTimer=0;
+    if(document.activeElement===input)keepComposerAboveKeyboard({force:true});
+  },180);
+}
+function scheduleComposerOverlayInset(options={}){
+  const pending=window.__composerOverlayInsetOptions||{};
+  window.__composerOverlayInsetOptions={
+    scroll:Boolean(pending.scroll||options.scroll),
+    followLatest:Boolean(pending.followLatest||options.followLatest),
+  };
+  if(window.__composerOverlayInsetRaf)return;
+  window.__composerOverlayInsetRaf=requestAnimationFrame(()=>{
+    window.__composerOverlayInsetRaf=0;
+    const queued=window.__composerOverlayInsetOptions||{};
+    window.__composerOverlayInsetOptions=null;
+    updateComposerOverlayInset(queued);
+  });
+}
+function scheduleComposerViewportSync(){
+  if(window.__composerViewportSyncRaf)return;
+  window.__composerViewportSyncRaf=requestAnimationFrame(()=>{
+    window.__composerViewportSyncRaf=0;
+    keepComposerAboveKeyboard({force:document.activeElement===input||composerChromeContains(document.activeElement)});
+    scheduleComposerOverlayInset({scroll:true});
+  });
+}
+function composerVisualViewportBottom(){
   const viewport=window.visualViewport;
-  if(!viewport)return 0;
+  return Math.round((viewport?.offsetTop||0)+(viewport?.height||window.innerHeight||0));
+}
+function syncComposerVisualViewport(){
+  if(!document.body)return 0;
+  const bottom=composerVisualViewportBottom();
+  const value=bottom+'px';
+  if(document.body.style.getPropertyValue('--composer-visual-viewport-bottom')!==value){
+    document.body.style.setProperty('--composer-visual-viewport-bottom',value);
+  }
+  return bottom;
+}
+function composerKeyboardInset(){
+  if(!window.visualViewport)return 0;
   // Distance from the layout bottom to the visible viewport bottom (keyboard / browser chrome).
-  const inset=Math.max(0, window.innerHeight-(viewport.height+viewport.offsetTop));
-  return Math.round(inset);
+  return Math.max(0,Math.round(window.innerHeight-composerVisualViewportBottom()));
 }
 function keepComposerAboveKeyboard({force=false}={}){
   const composer=dropZone?.parentElement;
   if(!composer||!document.body)return;
+  // WebKit keeps the layout viewport at full height while its visual viewport
+  // shrinks for the keyboard. Sync this before the coalescing early return.
+  const visualViewportBottom=syncComposerVisualViewport();
+  const previousVisualViewportBottom=Number(window.__composerVisualViewportBottom);
+  const visualViewportChanged=Number.isFinite(previousVisualViewportBottom)
+    && visualViewportBottom!==previousVisualViewportBottom;
+  window.__composerVisualViewportBottom=visualViewportBottom;
   const inset=composerKeyboardInset();
   const active=force||document.activeElement===input||composerChromeContains(document.activeElement);
   const next=active?Math.max(0,inset):0;
+  const previousOverlay=Number.parseFloat(document.body.style.getPropertyValue('--composer-overlay-height'))||0;
+  const distance=chat?Math.max(0,chat.scrollHeight-chat.scrollTop-chat.clientHeight):Number.POSITIVE_INFINITY;
+  const wasFollowing=distance<=Math.max(72,previousOverlay+48);
   const previousInset=Number.isFinite(Number(window.__composerKeyboardInsetValue))
     ? Number(window.__composerKeyboardInsetValue)
     : 0;
   const previousActive=Boolean(window.__composerKeyboardActive);
-  if(next===previousInset&&active===previousActive)return;
-  const hadKeyboard=previousInset>0;
+  if(next===previousInset&&active===previousActive){
+    if(visualViewportChanged&&wasFollowing&&document.body.classList.contains('keyboardOpen')){
+      scheduleComposerOverlayInset({scroll:true,followLatest:true});
+    }
+    return;
+  }
   window.__composerKeyboardInsetValue=next;
   window.__composerKeyboardActive=active;
   document.body.style.setProperty('--keyboard-inset', next+'px');
   document.body.classList.toggle('keyboardOpen', next>0);
-  if(window.__composerOverlayInsetKeyboardRaf)cancelAnimationFrame(window.__composerOverlayInsetKeyboardRaf);
-  window.__composerOverlayInsetKeyboardRaf=requestAnimationFrame(()=>updateComposerOverlayInset({scroll:true}));
+  scheduleComposerOverlayInset({scroll:true,followLatest:wasFollowing});
   window.clearTimeout(window.__composerOverlayInsetSettleTimer);
   window.__composerOverlayInsetSettleTimer=window.setTimeout(()=>updateComposerOverlayInset({scroll:true}),160);
-  if(next>0&&!hadKeyboard&&dropZone){
-    // A viewport scroll can re-fire this handler. Anchor only when the keyboard opens,
-    // otherwise mobile browsers may repeatedly scroll and reflow a long conversation.
-    requestAnimationFrame(()=>{
-      if(Number(window.__composerKeyboardInsetValue)<=0)return;
-      try{dropZone.scrollIntoView({block:'end',inline:'nearest',behavior:'auto'})}catch{dropZone.scrollIntoView(false)}
-    });
-  }
 }
 function enhanceComposerOverlayInset(){
   if(window.__composerOverlayInsetBound)return;
   window.__composerOverlayInsetBound=true;
-  const schedule=()=>{
-    if(window.__composerOverlayInsetRaf)cancelAnimationFrame(window.__composerOverlayInsetRaf);
-    window.__composerOverlayInsetRaf=requestAnimationFrame(()=>updateComposerOverlayInset({scroll:true}));
-  };
-  window.addEventListener('resize', schedule, {passive:true});
-  window.visualViewport?.addEventListener('resize', schedule, {passive:true});
-  window.visualViewport?.addEventListener('scroll', schedule, {passive:true});
+  const schedule=()=>scheduleComposerOverlayInset({scroll:true});
+  const scheduleViewport=()=>scheduleComposerViewportSync();
+  window.addEventListener('resize', scheduleViewport, {passive:true});
+  window.visualViewport?.addEventListener('resize', scheduleViewport, {passive:true});
+  window.visualViewport?.addEventListener('scroll', scheduleViewport, {passive:true});
   const composer=dropZone?.parentElement||document.querySelector('.composer');
   composer?.addEventListener('transitionend',(event)=>{if(event.propertyName==='bottom')schedule()});
   if(typeof ResizeObserver==='function'){
@@ -11097,17 +11155,12 @@ function enhanceComposerOverlayInset(){
 function enhanceComposerKeyboardLift(){
   if(window.__composerKeyboardLiftBound)return;
   window.__composerKeyboardLiftBound=true;
-  const sync=()=>keepComposerAboveKeyboard({force:document.activeElement===input||composerChromeContains(document.activeElement)});
-  window.visualViewport?.addEventListener('resize',sync);
-  window.visualViewport?.addEventListener('scroll',sync);
-  window.addEventListener('resize',sync);
-  window.addEventListener('orientationchange',()=>setTimeout(sync,120));
-  input?.addEventListener('focus',()=>{
-    keepComposerAboveKeyboard({force:true});
-    setTimeout(()=>keepComposerAboveKeyboard({force:true}),80);
-    setTimeout(()=>keepComposerAboveKeyboard({force:true}),240);
+  window.addEventListener('orientationchange',()=>setTimeout(scheduleComposerViewportSync,120));
+  input?.addEventListener('focus',scheduleComposerKeyboardFocusSync);
+  input?.addEventListener('blur',()=>{
+    window.clearTimeout(window.__composerKeyboardBlurTimer);
+    window.__composerKeyboardBlurTimer=window.setTimeout(()=>keepComposerAboveKeyboard(),180);
   });
-  input?.addEventListener('blur',()=>setTimeout(()=>keepComposerAboveKeyboard(),180));
 }
 function expandComposer(options={}){
   window.clearTimeout(composerCollapseTimer);
@@ -11146,6 +11199,7 @@ function ensureComposerSlashPanel(){
 }
 function hideComposerSlashMenu(){
   if(!composerSlashPanel)return;
+  composerSlashSyncRevision+=1;
   composerSlashPanel.classList.add('hidden');
   composerSlashActiveIndex=0;
   composerSlashQuery='';
@@ -11198,7 +11252,7 @@ function composerSlashCommandCatalog(){
 async function loadComposerSkills(options){
   const force=Boolean(options&&options.force);
   const now=Date.now();
-  if(!force&&composerSlashSkills.length&&now-composerSlashLoadedAt<15000)return composerSlashSkills;
+  if(!force&&composerSlashLoadedAt&&now-composerSlashLoadedAt<15000)return composerSlashSkills;
   if(composerSlashLoadPromise)return composerSlashLoadPromise;
   composerSlashLoading=true;
   if(composerSlashStatus)composerSlashStatus.textContent='加载中…';
@@ -11471,11 +11525,15 @@ async function syncComposerSlashMenuFromInput(){
   composerSlashFiltered=filterComposerSlashItems(composerSlashQuery);
   if(composerSlashActiveIndex>=composerSlashFiltered.length)composerSlashActiveIndex=0;
   renderComposerSlashMenu();
+  const syncRevision=++composerSlashSyncRevision;
+  if(composerSlashLoadedAt&&Date.now()-composerSlashLoadedAt<15000)return;
   try{
     await loadComposerSkills();
   }catch(error){
-    if(composerSlashStatus)composerSlashStatus.textContent=error.message||'技能加载失败';
+    if(syncRevision===composerSlashSyncRevision&&composerSlashStatus)composerSlashStatus.textContent=error.message||'技能加载失败';
+    return;
   }
+  if(syncRevision!==composerSlashSyncRevision||!composerSlashMenuOpen())return;
   composerSlashFiltered=filterComposerSlashItems(composerSlashQuery);
   if(composerSlashActiveIndex>=composerSlashFiltered.length)composerSlashActiveIndex=0;
   while(composerSlashFiltered[composerSlashActiveIndex]?.disabled && composerSlashActiveIndex<composerSlashFiltered.length-1)composerSlashActiveIndex+=1;
@@ -11550,6 +11608,7 @@ function ensureComposerAtPanel(){
 }
 function hideComposerAtMenu(){
   if(!composerAtPanel)return;
+  composerAtSyncRevision+=1;
   composerAtPanel.classList.add("hidden");
   composerAtActiveIndex=0;
   composerAtQuery="";
@@ -11560,7 +11619,7 @@ function composerAtMenuOpen(){
 async function loadComposerPlugins(options){
   const force=Boolean(options&&options.force);
   const now=Date.now();
-  if(!force&&composerAtPlugins.length&&now-composerAtLoadedAt<15000)return composerAtPlugins;
+  if(!force&&composerAtLoadedAt&&now-composerAtLoadedAt<15000)return composerAtPlugins;
   if(composerAtLoadPromise)return composerAtLoadPromise;
   composerAtLoading=true;
   if(composerAtStatus)composerAtStatus.textContent="加载中...";
@@ -11853,8 +11912,12 @@ async function syncComposerAtMenuFromInput(){
   composerAtQuery=token.slice(1);
   expandComposer();
   composerAtPanel.classList.remove("hidden");
+  composerAtItems=filterComposerAtItems(composerAtQuery);
   renderComposerAtMenu();
-  try{ await loadComposerPlugins(); }catch(error){ if(composerAtStatus)composerAtStatus.textContent=error.message||"加载失败"; }
+  const syncRevision=++composerAtSyncRevision;
+  if(composerAtLoadedAt&&Date.now()-composerAtLoadedAt<15000)return;
+  try{ await loadComposerPlugins(); }catch(error){ if(syncRevision===composerAtSyncRevision&&composerAtStatus)composerAtStatus.textContent=error.message||"加载失败"; return; }
+  if(syncRevision!==composerAtSyncRevision||!composerAtMenuOpen())return;
   composerAtItems=filterComposerAtItems(composerAtQuery);
   if(composerAtActiveIndex>=composerAtItems.length)composerAtActiveIndex=0;
   while(composerAtItems[composerAtActiveIndex]&&composerAtItems[composerAtActiveIndex].disabled&&composerAtActiveIndex<composerAtItems.length-1)composerAtActiveIndex+=1;
@@ -12144,16 +12207,37 @@ function enhanceComposer(){
   ensureComposerSlashPanel();
   dropZone.addEventListener('focusin',()=>expandComposer());
   dropZone.addEventListener('focusout',scheduleComposerCollapse);
+  dropZone.addEventListener('click',(event)=>{
+    const guard=window.__composerExpandClickGuard;
+    if(!guard)return;
+    if(guard.pointerId!==null&&typeof event.pointerId==='number'&&event.pointerId!==guard.pointerId)return;
+    window.__composerExpandClickGuard=null;
+    window.clearTimeout(window.__composerExpandClickGuardTimer);
+    if(event.target===guard.target||guard.target?.contains?.(event.target))return;
+    // The capsule grows during pointerdown. Ignore a trailing click that would
+    // otherwise land on a newly revealed toolbar control after that reflow.
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  },true);
   dropZone.addEventListener('pointerdown',(event)=>{
     // Keep buttons/menus from stealing the keyboard path; textarea/input still get focus:true.
     if(event.target.closest('button,a,select,label,.composerPopover')){
       expandComposer();
       return;
     }
+    const wasCollapsed=dropZone.classList.contains('composerCollapsed');
     expandComposer({focus:true});
+    if(wasCollapsed&&dropZone.classList.contains('composerExpanded')){
+      window.__composerExpandClickGuard={
+        pointerId:typeof event.pointerId==='number'?event.pointerId:null,
+        target:event.target,
+      };
+      window.clearTimeout(window.__composerExpandClickGuardTimer);
+      window.__composerExpandClickGuardTimer=window.setTimeout(()=>{window.__composerExpandClickGuard=null},500);
+    }
   });
   dropZone.addEventListener('click',(event)=>{
-    if(event.target===dropZone||event.target===input||event.target.closest('textarea'))expandComposer({focus:true});
+    if((event.target===dropZone||event.target===input||event.target.closest('textarea'))&&document.activeElement!==input)expandComposer({focus:true});
   });
   document.addEventListener('click',(event)=>{
     if(composerChromeContains(event.target))return;
@@ -13645,7 +13729,7 @@ chatBackground?.addEventListener('change',handleChatBackgroundChange);
 chatBackgroundFile?.addEventListener('change',()=>handleCustomBackground(chatBackgroundFile.files?.[0]));
 deleteBackground?.addEventListener('click',deleteSelectedBackground);
 fxEnabledInput?.addEventListener('change',async()=>{if(fxEnabledInput)await saveAppearance({fxEnabled:fxEnabledInput.checked})});
-sendBtn?.addEventListener('click', send);input?.addEventListener('keydown',(e)=>{if(handleComposerAtKeydown(e)||handleComposerSlashKeydown(e))return;if(e.key!=='Enter'||e.shiftKey||e.isComposing||e.keyCode===229)return;e.preventDefault();if(!e.repeat)send()});input?.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';applyConversationMode();syncComposerSlashMenuFromInput();syncComposerAtMenuFromInput()});
+sendBtn?.addEventListener('click', send);input?.addEventListener('keydown',(e)=>{if(handleComposerAtKeydown(e)||handleComposerSlashKeydown(e))return;if(e.key!=='Enter'||e.shiftKey||e.isComposing||e.keyCode===229)return;e.preventDefault();if(!e.repeat)send()});input?.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,180)+'px';syncComposerInputState();syncComposerSlashMenuFromInput();syncComposerAtMenuFromInput()});
 attachFile?.addEventListener('click',()=>fileInput?.click());
 fileInput?.addEventListener('change',()=>{handleAttachmentFiles(fileInput.files);fileInput.value=''});
 dropZone?.addEventListener('dragover',(e)=>{if(hasFileDrag(e)){e.preventDefault();dropZone.classList.add('drag')}});
@@ -15582,6 +15666,14 @@ function restoreSidebarState(){sidebarPreferredWidth=sidebarWidthPreference();re
 function toggleMenu(){if(desktopSidebarMedia.matches){const collapsed=app.classList.toggle('sideCollapsed');storeSidebarCollapsed(collapsed)}else{app.classList.toggle('menuOpen')}syncMenuButton()}
 function closeMenu(){if(!desktopSidebarMedia.matches)app.classList.remove('menuOpen');syncMenuButton()}
 function toggleSettings(){if(settingsOverlay?.classList.contains('hidden'))openSettings();else closeSettings()}
+function syncComposerInputState(){
+  const native=currentConversationSource==='codex';
+  const legacyLocked=webRunActive&&!native;
+  const queueStarting=native&&Boolean(currentConversationId)&&queueDispatchingThreads.has(currentConversationId);
+  const cancelPending=nativeCancelPendingMatches();
+  sendBtn.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||(!input.value.trim()&&!pendingAttachments.length);
+  if(dropZone&&dropZone.classList.contains('composerCollapsed')&&composerShouldStayExpanded())setComposerExpanded(true);
+}
 function applyConversationMode(){
   const native=currentConversationSource==='codex';
   const legacyLocked=webRunActive&&!native;
@@ -15797,7 +15889,8 @@ function updateComposerOverlayInset(options={}){
   const height=Math.max(72, Math.min(measured + 8, maxHeight));
   document.body.style.setProperty('--composer-overlay-height', height+'px');
   document.body.dataset.composerOverlayHeight=String(height);
-  if(options.scroll&&chat&&pinned&&Math.abs(height-prev)>2)scrollChatToLatest({force:false,updateInset:false});
+  const shouldFollowLatest=options.followLatest===true||pinned;
+  if(options.scroll&&chat&&shouldFollowLatest&&(options.followLatest===true||Math.abs(height-prev)>2))scrollChatToLatest({force:false,updateInset:false});
   return height;
 }
 function chatHasLayout(){
