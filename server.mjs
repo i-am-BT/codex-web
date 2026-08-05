@@ -81,6 +81,11 @@ const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const CODEX_PROCESS_HOME = resolveLocalPath(process.env.CODEX_PROCESS_HOME || homedir(), homedir());
+const LOCAL_IMAGE_ROOTS = String(process.env.CODEX_WEB_LOCAL_IMAGE_ROOTS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
+  .map((value) => resolveLocalPath(value, homedir()));
 
 loadEnv(CODEX_ENV_FILE, false);
 
@@ -1079,7 +1084,14 @@ app.get('/api/native-sessions/:id/tool-images/:seq/:index', requireAuth, (req, r
 
     const message = conversation.messages.find((item) => item.seq === sequence);
     const imagePath = extractNativeToolImagePaths(message)[imageIndex - 1];
-    const image = readNativeToolImage(imagePath, conversation.metadata?.cwd);
+    const adjacentOutput = conversation.messages.find((item) => (
+      item.seq === sequence + 1
+      && item.role === 'tool'
+      && item.kind === 'custom_tool_call_output'
+    ));
+    const image = readNativeToolImage(imagePath, conversation.metadata?.cwd)
+      || decodeNativeToolImageOutput(message, imageIndex)
+      || decodeNativeToolImageOutput(adjacentOutput, imageIndex);
     if (!image) return res.status(404).json({ error: '工具图片不存在或不受支持' });
     res.setHeader('Cache-Control', 'private, max-age=300');
     res.type(image.type).send(image.data);
@@ -1111,7 +1123,9 @@ app.get('/api/local-image', requireAuth, (req, res) => {
 app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
-  if (activeNativeTurns.get(threadId)?.status === 'running') {
+  const source = nativeSessions.get(threadId);
+  const active = nativeActiveTurnFor(threadId, source);
+  if (active?.status === 'running') {
     return res.status(409).json({ error: '会话任务正在运行，不能创建历史分支' });
   }
 
@@ -1121,7 +1135,6 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
   }
 
   try {
-    const source = nativeSessions.get(threadId);
     if (!source) return res.status(404).json({ error: 'Codex App 会话不存在' });
     const target = source.messages.find((message) => (
       message.seq === messageSeq
@@ -1258,7 +1271,9 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
 app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
-  if (nativeTurnReservations.has(threadId) || activeNativeTurns.get(threadId)?.status === 'running') {
+  const baseline = nativeSessions.get(threadId);
+  const active = nativeActiveTurnFor(threadId, baseline);
+  if (nativeTurnReservations.has(threadId) || active?.status === 'running') {
     return res.status(409).json({ error: '该 Codex App 会话已有任务正在运行' });
   }
   nativeTurnReservations.add(threadId);
@@ -1266,7 +1281,7 @@ app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
   let startAttempted = false;
 
   try {
-    const current = nativeSessions.get(threadId);
+    const current = nativeSessions.get(threadId) || baseline;
     const settingsOptions = Object.hasOwn(current?.metadata || {}, 'serviceTier')
       ? { fallbackServiceTier: current.metadata.serviceTier }
       : {};
@@ -1294,6 +1309,7 @@ app.post('/api/native-sessions/:id/turns', requireAuth, async (req, res) => {
 app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
+  const active = nativeActiveTurnFor(threadId, nativeSessions.get(threadId));
   let queueReservation = null;
   let steerAccepted = false;
   let restoredQueue = null;
@@ -1310,7 +1326,7 @@ app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
       }
     }
     if (!steer) steer = parseNativeSteerPayload(req.body || {});
-    const expectedTurnId = String(req.body?.turnId || activeNativeTurns.get(threadId)?.turnId || '').trim();
+    const expectedTurnId = String(req.body?.turnId || active?.turnId || '').trim();
     const result = await steerNativeTurn(threadId, steer, expectedTurnId);
     const turnId = String(result?.turnId || expectedTurnId);
     if (!turnId) throw promptQueueConflict('该会话没有可引导的运行中任务');
@@ -1626,14 +1642,16 @@ app.delete('/api/native-sessions/:id/goal', requireAuth, async (req, res) => {
 app.delete('/api/native-sessions/:id', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
-  if (activeNativeTurns.get(threadId)?.status === 'running') {
+  const conversation = nativeSessions.get(threadId);
+  const active = nativeActiveTurnFor(threadId, conversation);
+  if (active?.status === 'running') {
     try {
       await stopNativeTurnForArchive(threadId);
     } catch (err) {
       return res.status(409).json({ error: `会话任务正在运行，自动停止失败：${err.message}` });
     }
   }
-  const threadCwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
+  const threadCwd = conversation?.metadata?.cwd || DEFAULT_CWD;
 
   try {
     await appServerClient.request('thread/archive', { threadId });
@@ -3715,14 +3733,13 @@ function recordNativeTurnCompletion(threadId, turn = {}) {
 }
 
 function currentNativeTurnId(threadId) {
-  const active = activeNativeTurns.get(threadId);
-  if (active?.status === 'running' && active.turnId) return String(active.turnId);
+  let conversation = null;
   try {
-    const conversation = nativeSessions.get(threadId);
-    return conversation?.status === 'running' ? String(conversation.latestTurnId || '') : '';
-  } catch {
-    return '';
-  }
+    conversation = nativeSessions.get(threadId);
+  } catch {}
+  const active = nativeActiveTurnFor(threadId, conversation);
+  if (active?.status === 'running' && active.turnId) return String(active.turnId);
+  return conversation?.status === 'running' ? String(conversation.latestTurnId || '') : '';
 }
 
 function nativeTurnStatus(status) {
@@ -3733,12 +3750,33 @@ function nativeTurnStatus(status) {
   return 'done';
 }
 
+// A completed JSONL turn is authoritative once it is the same turn that the
+// in-memory runtime still reports as running. A different turn may have just
+// started and not reached the session store yet, so keep that active state.
+function nativeActiveTurnFor(threadId, conversation = null) {
+  const cleanId = cleanNativeThreadId(threadId);
+  const active = cleanId ? activeNativeTurns.get(cleanId) : null;
+  const persistedTurnId = String(conversation?.latestTurnId || '');
+  if (
+    active?.status === 'running'
+    && conversation?.status
+    && conversation.status !== 'running'
+    && active.turnId
+    && persistedTurnId
+    && String(active.turnId) === persistedTurnId
+  ) {
+    activeNativeTurns.delete(cleanId);
+    return null;
+  }
+  return active;
+}
+
 function nativeSessionSummaries(includeIds = [], options = {}) {
   const includeSideChat = options.includeSideChat === true;
   return nativeSessions.list(NATIVE_SESSION_MAX_ITEMS, { includeIds })
     .filter((session) => includeSideChat || !nativeSessions.isSideChatThread?.(session.id))
     .map((session) => {
-    const active = activeNativeTurns.get(session.id);
+    const active = nativeActiveTurnFor(session.id, session);
     const summary = {
       ...session,
       status: active?.status === 'running'
@@ -3950,9 +3988,9 @@ function isPathWithinRoot(targetPath, rootPath) {
 // referenced in markdown/tool output). Without this check any authenticated user could
 // pass an unrelated absolute path and read arbitrary image files reachable by this
 // process, not just images tied to the current Codex session. Absolute paths are only
-// allowed inside the resolved session cwd or the OS temp dir (common for automation
-// screenshots); relative paths are unaffected since readNativeToolImage always resolves
-// them against cwd.
+// allowed inside the resolved session cwd, the OS temp dir (common for automation
+// screenshots), or an explicitly configured local image root. Relative paths are
+// unaffected since readNativeToolImage always resolves them against cwd.
 function isLocalImagePathAllowed(filePath, cwd) {
   if (!path.isAbsolute(filePath)) return true;
   try {
@@ -3962,14 +4000,21 @@ function isLocalImagePathAllowed(filePath, cwd) {
         if (isPathWithinRoot(resolved, realpathSync(cwd))) return true;
       } catch {}
     }
-    return isPathWithinRoot(resolved, realpathSync(tmpdir()));
+    if (isPathWithinRoot(resolved, realpathSync(tmpdir()))) return true;
+    return LOCAL_IMAGE_ROOTS.some((root) => {
+      try {
+        return isPathWithinRoot(resolved, realpathSync(root));
+      } catch {
+        return false;
+      }
+    });
   } catch {
     return false;
   }
 }
 
 function decorateNativeConversation(conversation, { externalizeImages = false } = {}) {
-  const active = activeNativeTurns.get(conversation.id);
+  const active = nativeActiveTurnFor(conversation.id, conversation);
   // Local runtime overrides stale JSONL "running" after interrupt/restart losses.
   const forcedTerminal = active && active.status && active.status !== 'running'
     ? (active.status === 'error' ? 'error' : active.status === 'interrupted' ? 'interrupted' : 'done')
@@ -4019,9 +4064,33 @@ function externalizeNativeImage(conversation, message) {
 
 function decodeNativeImage(message) {
   if (message?.role !== 'image') return null;
-  const match = String(message.content || '').match(/^data:(image\/(?:png|jpe?g|webp|gif|avif));base64,([A-Za-z0-9+/=]+)$/i);
+  return decodeNativeImageDataUrl(message.content);
+}
+
+function decodeNativeToolImageOutput(message, imageIndex = 1) {
+  const source = String(message?.content || '');
+  let found = 0;
+  for (const match of source.matchAll(/"image_url"\s*:\s*"((?:\\.|[^"\\])*)"/g)) {
+    let dataUrl = '';
+    try {
+      dataUrl = JSON.parse(`"${match[1]}"`);
+    } catch {
+      continue;
+    }
+    const image = decodeNativeImageDataUrl(dataUrl);
+    if (!image) continue;
+    found += 1;
+    if (found === imageIndex) return image;
+  }
+  return null;
+}
+
+function decodeNativeImageDataUrl(value) {
+  const match = String(value || '').match(/^data:(image\/(?:png|jpe?g|webp|gif|avif));base64,([A-Za-z0-9+/=]+)$/i);
   if (!match) return null;
-  return { type: match[1].toLowerCase(), data: Buffer.from(match[2], 'base64') };
+  const data = Buffer.from(match[2], 'base64');
+  if (data.length < 1 || data.length > TOOL_IMAGE_MAX_BYTES) return null;
+  return { type: match[1].toLowerCase(), data };
 }
 
 async function continueNativeTurn(threadId, turn) {

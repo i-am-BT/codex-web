@@ -2226,7 +2226,8 @@ function isBrowserEvidenceBoilerplate(paragraph) {
 }
 
 function appendNativeMessage(cache, role, content, record, maxMessages, kind, metadata = null) {
-  const limit = role === 'image'
+  const hasInlineImage = role === 'tool' && /"image_url"\s*:/.test(String(content || ''));
+  const limit = role === 'image' || hasInlineImage
     ? IMAGE_URL_LIMIT
     : role === 'user' || role === 'assistant'
       ? MESSAGE_TEXT_LIMIT
@@ -2685,7 +2686,11 @@ function formatToolText(name, value) {
   } else if (value !== undefined && value !== null) {
     detail = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
   }
-  return limitText(detail ? `${name}\n${detail}` : name, DETAIL_TEXT_LIMIT);
+  const formatted = detail ? `${name}\n${detail}` : name;
+  // Tool outputs can contain inline image data URLs. Keep those intact so the
+  // tool-image endpoint can decode them after the original temporary file is gone.
+  const limit = /"image_url"\s*:/.test(formatted) ? IMAGE_URL_LIMIT : DETAIL_TEXT_LIMIT;
+  return limitText(formatted, limit);
 }
 
 function formatWebSearch(action) {
