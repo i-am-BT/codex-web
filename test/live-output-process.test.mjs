@@ -1876,18 +1876,24 @@ test('composer capsule inherits session wallpaper on mobile and desktop', () => 
   assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box/);
 });
 
-test('mobile keyboard opens on first composer tap', () => {
+test('mobile composer expands before opening the keyboard', () => {
   const expandedSource = sourceBetween('function setComposerExpanded', 'function scheduleComposerKeyboardFocusSync');
   const clickSource = sourceBetween("dropZone\\.addEventListener\\('click'", "document\\.addEventListener\\('click'");
-  assert.match(inlineScript, /Focus synchronously inside the user gesture so mobile keyboards open on the first tap/);
+  assert.match(inlineScript, /Focus synchronously inside the user gesture so mobile keyboards open without a delayed reflow/);
   assert.match(inlineScript, /try\{input\.focus\(\{preventScroll:true\}\)\}catch\{input\.focus\(\)\}/);
   assert.match(expandedSource, /if\(next&&focus&&input&&!input\.disabled&&document\.activeElement!==input\)/);
-  assert.match(clickSource, /document\.activeElement!==input/);
+  assert.match(clickSource, /document\.activeElement===input/);
   assert.match(inlineScript, /__composerExpandClickGuard[\s\S]{0,520}event\.stopImmediatePropagation\(\)/);
   assert.match(inlineScript, /const wasCollapsed=dropZone\.classList\.contains\('composerCollapsed'\)/);
+  assert.match(inlineScript, /const wasCollapsed=dropZone\.classList\.contains\('composerCollapsed'\);[\s\S]{0,520}if\(event\.target\.closest\('button,a,select,label,\.composerPopover'\)\)\{[\s\S]{0,120}if\(!wasCollapsed\)expandComposer\(\)/);
+  assert.match(inlineScript, /if\(wasCollapsed\)\{[\s\S]{0,220}event\.preventDefault\(\);[\s\S]{0,120}expandComposer\(\);[\s\S]{0,80}\}else\{[\s\S]{0,100}expandComposer\(\{focus:true\}\)/);
+  assert.match(inlineScript, /suppressClick:true/);
+  assert.match(inlineScript, /if\(dropZone\.classList\.contains\('composerCollapsed'\)\)expandComposer\(\);[\s\S]{0,100}else expandComposer\(\{focus:true\}\)/);
+  assert.match(inlineScript, /function toggleComposerSpeech\(\)\{[\s\S]{0,260}expandComposer\(\);/);
   assert.match(inlineScript, /event\.target\.closest\('button,a,select,label,\.composerPopover'\)/);
   assert.doesNotMatch(inlineScript, /event\.target\.closest\('button,a,input,select,textarea,label,\.composerPopover'\)/);
-  assert.match(uiStyles, /Keep caret visible so the first mobile tap can open the keyboard immediately/);
+  assert.match(uiStyles, /Keep the caret available for the deliberate input tap after expansion/);
+  assert.match(uiStyles, /pointer-events: none/);
 });
 
 test('keyboard lift keeps composer above the soft keyboard', () => {

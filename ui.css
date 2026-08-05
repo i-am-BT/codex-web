@@ -7868,8 +7868,10 @@ body[data-theme] .box.composerCollapsed textarea {
   padding: 8px 10px !important;
   font-size: 15px !important;
   line-height: 20px !important;
-  pointer-events: auto;
-  /* Keep caret visible so the first mobile tap can open the keyboard immediately. */
+  /* Let the capsule handle the first tap without giving the textarea a chance
+     to invoke the mobile keyboard before the composer has expanded. */
+  pointer-events: none;
+  /* Keep the caret available for the deliberate input tap after expansion. */
   caret-color: auto;
 }
 
