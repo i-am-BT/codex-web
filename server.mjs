@@ -13435,9 +13435,15 @@ function renderSubQuota(data){
       detailCount+=appendSubQuotaWindow(source,'Build 可调用',{used:Math.max(0,(stats.total||0)-(stats.available||0)),limit:stats.total,remaining:stats.available},unit)?1:0;
       const meta=document.createElement('div');
       meta.className='subQuotaMeta';
+      if(Number.isFinite(Number(stats.normalAvailable))&&Number(stats.normalAvailable)>0)appendSubQuotaMeta(meta,'正常账号 '+Number(stats.normalAvailable).toLocaleString('zh-CN'));
+      if(Number(stats.risk||0)>0)appendSubQuotaMeta(meta,'风控 '+Number(stats.risk).toLocaleString('zh-CN'));
+      if(Number(stats.attention||0)>0)appendSubQuotaMeta(meta,'需关注 '+Number(stats.attention).toLocaleString('zh-CN'));
       if(Number(stats.abnormal||0)>0)appendSubQuotaMeta(meta,'异常 '+Number(stats.abnormal||0).toLocaleString('zh-CN'));
-      if(Number(stats.waitingReset||0)>0)appendSubQuotaMeta(meta,'等待重置 '+Number(stats.waitingReset).toLocaleString('zh-CN'));
       if(Number(stats.recovering||0)>0)appendSubQuotaMeta(meta,'恢复中 '+Number(stats.recovering).toLocaleString('zh-CN'));
+      if(Number(stats.waitingReset||0)>0)appendSubQuotaMeta(meta,'等待重置 '+Number(stats.waitingReset).toLocaleString('zh-CN'));
+      if(Number(stats.cooldown||0)>0)appendSubQuotaMeta(meta,'冷却 '+Number(stats.cooldown).toLocaleString('zh-CN'));
+      if(Number(stats.disabled||0)>0)appendSubQuotaMeta(meta,'禁用 '+Number(stats.disabled).toLocaleString('zh-CN'));
+      if(Number(stats.probing||0)>0)appendSubQuotaMeta(meta,'探测中 '+Number(stats.probing).toLocaleString('zh-CN'));
       if(Number(stats.reauthRequired||0)>0)appendSubQuotaMeta(meta,'需重登 '+Number(stats.reauthRequired).toLocaleString('zh-CN'));
       if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
       if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
