@@ -1319,6 +1319,13 @@ test('normalizes Grok2API account summary into callable and abnormal stats', () 
   assert.equal(quota.accountStats.total, 4);
   assert.equal(quota.accountStats.available, 2);
   assert.equal(quota.accountStats.abnormal, 2);
+  assert.equal(quota.accountStats.normalAvailable, 7);
+  assert.equal(quota.accountStats.totalAccounts, 10);
+  assert.equal(quota.accountStats.risk, 0);
+  assert.equal(quota.accountStats.attention, 1);
+  assert.equal(quota.accountStats.disabled, 1);
+  assert.equal(quota.accountStats.cooldown, 0);
+  assert.equal(quota.accountStats.probing, 0);
   assert.equal(quota.accountStats.providers.grok_web.available, 5);
   assert.equal(quota.quota.remaining, 2);
 });

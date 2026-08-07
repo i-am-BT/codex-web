@@ -766,6 +766,8 @@ export function normalizeGrok2ApiSummary(data) {
       recovering,
       attention,
       risk,
+      normalAvailable: nonNegativeInteger(data.available) ?? 0,
+      totalAccounts: nonNegativeInteger(data.total) ?? 0,
       disabled,
       reauthRequired,
       waitingReset,
