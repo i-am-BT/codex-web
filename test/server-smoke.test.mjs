@@ -3357,10 +3357,11 @@ updated_at = 1784422800000
     assert.match(page, /function runningActivityVerb/);
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
     assert.match(page, /NATIVE_INITIAL_MESSAGE_LIMIT=60/);
-    assert.match(page, /const nativeHistoryQuery=currentConversationSource==='codex'\s*\? '\?images=external&limit='\+NATIVE_INITIAL_MESSAGE_LIMIT\s*:\s*'';/);
-    assert.doesNotMatch(page, /addNativeHistoryLoadButton|nativeHistoryLoadEarlier/);
+    assert.match(page, /const nativeHistoryQuery=currentConversationSource==='codex'\s*\? '\?images=external'\+\(options\.fullHistory\?'':'&limit='\+NATIVE_INITIAL_MESSAGE_LIMIT\)\s*:\s*'';/);
+    assert.match(page, /function addNativeHistoryLoadButton\(threadId,conversation\)/);
+    assert.match(page, /await loadConversation\(id,'codex',\{fullHistory:true\}\)/);
     assert.doesNotMatch(page, /fastNativeLoad/);
-    assert.doesNotMatch(page, /加载完整记录/);
+    assert.match(page, /加载完整记录/);
     assert.match(page, /function scheduleNativeCompletionSync/);
     assert.match(page, /function reconcileNativeCompletion/);
     assert.match(page, /runtime\.type==='connection-error'/);
