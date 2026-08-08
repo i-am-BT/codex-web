@@ -17724,32 +17724,6 @@ function alignChatToBottomStable(maxRounds=12){
   };
   requestAnimationFrame(step);
 }
-function addNativeHistoryLoadButton(threadId,conversation){
-  const id=String(threadId||'').trim();
-  if(!id||!conversation?.hasEarlierMessages||!chat)return null;
-  const button=document.createElement('button');
-  button.type='button';
-  button.id='nativeHistoryLoadEarlier';
-  button.className='nativeHistoryLoadEarlier';
-  button.title='加载完整记录';
-  button.setAttribute('aria-label','加载完整记录');
-  setIconLabel(button,'history','加载完整记录');
-  button.addEventListener('click',async()=>{
-    if(button.disabled||currentConversationSource!=='codex'||currentConversationId!==id)return;
-    button.disabled=true;
-    button.setAttribute('aria-busy','true');
-    setIconLabel(button,'loader-circle','加载中…');
-    const loaded=await loadConversation(id,'codex',{fullHistory:true});
-    if(!loaded&&button.isConnected){
-      button.disabled=false;
-      button.removeAttribute('aria-busy');
-      setIconLabel(button,'history','重试加载完整记录');
-    }
-  });
-  chat.appendChild(button);
-  refreshIcons(button);
-  return button;
-}
 async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   const nextConversationSource=source==='codex'?'codex':'web';
@@ -17785,10 +17759,9 @@ async function loadConversation(id,source='web',options={}){
   if(!conversation){
     const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
     // Rendering several hundred historical messages synchronously blocks the
-    // main thread. Show the current tail first; the explicit history control
-    // keeps the complete transcript available without delaying task switching.
+    // main thread, so show the recent tail without adding an obstructive control.
     const nativeHistoryQuery=currentConversationSource==='codex'
-      ? '?images=external'+(options.fullHistory?'':'&limit='+NATIVE_INITIAL_MESSAGE_LIMIT)
+      ? '?images=external&limit='+NATIVE_INITIAL_MESSAGE_LIMIT
       : '';
     const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery;
     const res=await fetch(requestUrl);
@@ -17820,7 +17793,6 @@ async function loadConversation(id,source='web',options={}){
   applyConversationMode();
   updateActiveHistory();
   chat.innerHTML='';
-  if(currentConversationSource==='codex')addNativeHistoryLoadButton(currentConversationId,conversation);
   const messages=conversation.messages||[];
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
   const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';

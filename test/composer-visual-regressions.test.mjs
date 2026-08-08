@@ -320,15 +320,15 @@ test('permission picker mirrors native approval profiles and preserves custom co
 
   assert.match(
     uiStyles,
-    /\.composerPermissionPanel\s*\{[^}]*width:\s*min\(320px, calc\(100vw - 24px\)\);[^}]*max-height:\s*min\(410px, calc\(100dvh - 96px\)\)/s,
+    /\.composerPermissionPanel\s*\{[^}]*bottom:\s*56px;[^}]*width:\s*min\(300px, calc\(100vw - 32px\)\);[^}]*max-height:\s*min\(370px, calc\(100dvh - 120px\)\)/s,
   );
   assert.match(
     uiStyles,
-    /\.composerPermissionOption\s*\{[^}]*min-height:\s*50px;[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 18px/s,
+    /\.composerPermissionOption\s*\{[^}]*min-height:\s*44px;[^}]*grid-template-columns:\s*20px minmax\(0, 1fr\) 16px/s,
   );
   assert.match(uiStyles, /\.composerPermissionOption\[aria-checked="true"\] \.composerPermissionCheck\s*\{[^}]*opacity:\s*1/s);
   assert.match(uiStyles, /\.composerPermissionOption\[data-permission-mode="full"\]\[aria-checked="true"\][^}]*#f2773d/s);
-  assert.match(uiStyles, /@media \(max-width: 520px\)[\s\S]*\.composerPermissionPanel\s*\{[^}]*width:\s*min\(360px, calc\(100vw - 20px\)\)/s);
+  assert.match(uiStyles, /@media \(max-width: 520px\)[\s\S]*\.composerPermissionPanel\s*\{[^}]*bottom:\s*58px;[^}]*width:\s*min\(330px, calc\(100vw - 32px\)\);[^}]*max-height:\s*min\(64dvh, 340px\)/s);
 });
 
 test('mid-conversation model switches require confirmation and roll back on cancel', () => {
