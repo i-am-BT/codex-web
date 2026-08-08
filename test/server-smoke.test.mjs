@@ -3357,9 +3357,23 @@ updated_at = 1784422800000
     assert.match(page, /function runningActivityVerb/);
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
     assert.doesNotMatch(page, /NATIVE_INITIAL_MESSAGE_LIMIT/);
-    assert.match(page, /const nativeHistoryQuery=currentConversationSource==='codex'\s*\? '\?images=external'\s*:\s*'';/);
-    assert.match(page, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external'\)/);
-    assert.match(page, /const url='\/api\/native-sessions\/'\+encodeURIComponent\(id\)\+'\?images=external&after='\+nativeCursor\+'&generation='\+nativeGeneration;/);
+    assert.match(page, /const NATIVE_HISTORY_PAGE_SIZE = 60;/);
+    assert.match(page, /const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;/);
+    assert.match(page, /const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;/);
+    assert.match(page, /function nativeHistoryViewportFilled\(container\)/);
+    assert.match(page, /function historyNodeHasLayout\(node\)/);
+    assert.match(page, /const nativeHistoryQuery=currentConversationSource==='codex'\s*\? '\?images=external&history=page&limit='\+nativeHistoryPageLimit\s*:\s*'';/);
+    assert.match(page, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&limit='\+historyLimit\)/);
+    assert.match(page, /async function loadEarlierNativeHistoryPage\(options=\{\}\)/);
+    assert.match(page, /const requestedLimit=lastSuccessfulLimit\+NATIVE_HISTORY_PAGE_SIZE\*batchCount/);
+    assert.match(page, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\)/);
+    assert.match(page, /loadEarlierNativeHistoryPage\(\{fillViewport:true\}\)/);
+    assert.match(page, /fillInitialSideChatHistoryPage\(\)/);
+    assert.match(page, /function scheduleDeferredNativeHistorySync\(threadId\)/);
+    assert.match(page, /if\(deferNativeSyncForHistoryPage\(\)\)return/);
+    assert.match(page, /if\(sameConversation&&syncDeferred\)scheduleDeferredNativeHistorySync\(id\)/);
+    assert.match(page, /historyPageLimit:nativeHistoryPageLimit,\s*historyScrollAnchor,/);
+    assert.match(page, /const url='\/api\/native-sessions\/'\+encodeURIComponent\(id\)\+'\?images=external&history=page&limit='\+nativeHistoryPageLimit\+'&after='\+nativeCursor\+'&generation='\+nativeGeneration;/);
     assert.doesNotMatch(page, /addNativeHistoryLoadButton|nativeHistoryLoadEarlier/);
     assert.doesNotMatch(page, /fastNativeLoad/);
     assert.doesNotMatch(page, /加载完整记录/);
@@ -3543,7 +3557,7 @@ updated_at = 1784422800000
     assert.match(page, /function setCurrentConversationTitle\(value,fallback='新任务'\)/);
     assert.match(page, /function setMainView\(view\)\{[\s\S]*?renderTopConversationTitle\(\);\s*\}/);
     assert.match(page, /function setSideChatView\(view\)\{[\s\S]*?renderSideChatTabs\(\);\s*renderTopConversationTitle\(\)/);
-    assert.match(page, /async function syncSideChatConversation\(\)\{[\s\S]*?if\(tab\)tab\.title=title;\s*renderTopConversationTitle\(\)/);
+    assert.match(page, /async function syncSideChatConversation\(options=\{\}\)\{[\s\S]*?if\(tab\)\{[\s\S]*?tab\.title=title;[\s\S]*?renderTopConversationTitle\(\)/);
     assert.match(page, /async function renameConversation\(id,title,source='codex'\)\{[\s\S]*?currentConversationId===id[\s\S]*?setCurrentConversationTitle\(clean\)/);
     assert.match(page, /function newChat\(\)\{[^\n]*setCurrentConversationTitle\('新任务'\)/);
     assert.match(page, /async function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(conversation\.title\|\|'Chat','Chat'\)/);
@@ -3569,7 +3583,7 @@ updated_at = 1784422800000
     assert.match(page, /function createTurnResultArtifacts/);
     assert.match(page, /function createEditedFilesResultCard/);
     assert.match(page, /function revealExpandedEditedFilesCard/);
-    assert.match(page, /const delta=cardRect\.top-visibleTop;\s*if\(delta<=1\)return;\s*setNativeLiveFollowBottom\(false\)/);
+    assert.match(page, /const delta=cardRect\.top-visibleTop;\s*if\(delta<=1\)return;\s*setNativeLiveReadingHistory\(true\)/);
     assert.match(page, /if\(!live\)card\.addEventListener\('toggle'/);
     assert.match(page, /status\.className='turnResultStatus';\s*status\.textContent='已完成'/);
     assert.match(page, /function createWebPreviewResultCard/);
@@ -3638,7 +3652,7 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*if\(deferNativeSyncForHistoryPage\(\)\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -4925,7 +4939,7 @@ updated_at = 1784422800000
     const revealFollowStates = [];
     const revealExpandedEditedFilesCard = new Function(
       'chat',
-      'setNativeLiveFollowBottom',
+      'setNativeLiveReadingHistory',
       revealEditedFilesHelper + '; return revealExpandedEditedFilesCard;',
     )(
       {
@@ -4941,7 +4955,7 @@ updated_at = 1784422800000
       getBoundingClientRect: () => ({ top: 520 }),
     };
     revealExpandedEditedFilesCard(expandedEditedCard);
-    assert.deepEqual(revealFollowStates, [false]);
+    assert.deepEqual(revealFollowStates, [true]);
     assert.deepEqual(revealScrollCalls, [{ top: 808, behavior: 'smooth' }]);
     expandedEditedCard.open = false;
     revealExpandedEditedFilesCard(expandedEditedCard);
@@ -5620,6 +5634,18 @@ updated_at = 1784422800000
     assert.match(externalizedImage.content, new RegExp(
       `^/api/native-sessions/${nativeSessionId}/images/${externalizedImage.seq}\\?generation=\\d+$`,
     ));
+
+    const historyPageNativeSession = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}?limit=3&history=page`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(historyPageNativeSession.status, 200);
+    const historyPageNativeConversation = (await historyPageNativeSession.json()).conversation;
+    assert.deepEqual(
+      historyPageNativeConversation.messages.map((message) => message.seq),
+      nativeConversation.messages.slice(-3).map((message) => message.seq),
+    );
+    assert.equal(historyPageNativeConversation.hasEarlierMessages, true);
 
     const externalizedNativeSession = await fetch(
       `${baseUrl}/api/native-sessions/${nativeSessionId}?images=external`,

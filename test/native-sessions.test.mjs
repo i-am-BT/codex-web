@@ -89,6 +89,17 @@ test('native session store keeps the complete transcript by default', { timeout:
     assert.equal(userMessages.length, 360);
     assert.equal(userMessages[0], 'history-user-000');
     assert.equal(userMessages.at(-1), 'history-user-359');
+
+    const firstPage = store.get(id, { limit: 60, historyPage: true });
+    const secondPage = store.get(id, { limit: 120, historyPage: true });
+    const completePage = store.get(id, { limit: conversation.messages.length + 60, historyPage: true });
+    assert.deepEqual(firstPage.messages, conversation.messages.slice(-60));
+    assert.deepEqual(secondPage.messages, conversation.messages.slice(-120));
+    assert.ok(secondPage.messages[0].seq < firstPage.messages[0].seq);
+    assert.equal(firstPage.hasEarlierMessages, true);
+    assert.equal(secondPage.hasEarlierMessages, true);
+    assert.deepEqual(completePage.messages, conversation.messages);
+    assert.equal(completePage.hasEarlierMessages, false);
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });

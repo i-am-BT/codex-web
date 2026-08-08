@@ -1138,6 +1138,7 @@ app.get('/api/native-sessions/:id', requireAuth, async (req, res) => {
       after: req.query.after,
       generation: req.query.generation,
       limit,
+      historyPage: req.query.history === 'page',
     });
     if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
     await reconcileNativeTurnStatusFromAppServer(conversation.id, conversation);
@@ -8568,6 +8569,17 @@ let grok2ApiConsoleRequestSeq = 0;
 let conversationLoadSeq = 0;
 let nativeCursor = 0;
 let nativeGeneration = 0;
+const NATIVE_HISTORY_PAGE_SIZE = 60;
+const NATIVE_HISTORY_SCROLL_THRESHOLD = 96;
+const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;
+const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;
+const NATIVE_HISTORY_PAGE_OVERFLOW = 24;
+let nativeHistoryPageLimit = NATIVE_HISTORY_PAGE_SIZE;
+let nativeHistoryHasEarlierMessages = false;
+let nativeHistoryPageLoading = false;
+let nativeHistoryLoadReady = false;
+let nativeHistorySyncDeferred = false;
+let nativeHistoryDeferredSyncTimer = null;
 let sessionEvents = null;
 let nativeSyncTimer = null;
 let nativeCompletionSync = null;
@@ -8589,6 +8601,8 @@ let nativeRuntimeStreamTurnIds = new Set();
 let nativeRenderedMessageKeys = new Set();
 let nativeLiveScrollTimer = null;
 let nativeLiveFollowBottom = true;
+let nativeLiveReadingHistory = false;
+let nativeLiveTowardLatestUntil = 0;
 let nativeLiveScrollTrackingBound = false;
 let nativeLiveWasBackgrounded = false;
 let nativeSnapshotResumeCatchup = false;
@@ -8763,7 +8777,7 @@ let sideChatCursor = 0;
 let sideChatGeneration = 0;
 let sideChatTabs = null;
 let sideChatView = 'side';
-/** @type {{threadId:string,sourceThreadId:string,title:string,running?:boolean}[]} */
+/** @type {{threadId:string,sourceThreadId:string,title:string,running?:boolean,historyLimit?:number,hasEarlierMessages?:boolean,historyLoading?:boolean}[]} */
 let sideChatOpenTabs = [];
 let sideChatActiveTurnId = '';
 const syncCurrentNativeConversation = createTrailingSingleFlight(syncCurrentNativeConversationOnce);
@@ -9808,6 +9822,92 @@ function sideChatTabLabel(title){
   const clean=String(title||sideChatTitle?.textContent||'Side chat').trim()||'Side chat';
   return clean.length>22?clean.slice(0,21)+'…':clean;
 }
+function normalizeNativeHistoryPageLimit(value){
+  const number=Number(value);
+  if(!Number.isInteger(number)||number<NATIVE_HISTORY_PAGE_SIZE)return NATIVE_HISTORY_PAGE_SIZE;
+  return Math.ceil(number/NATIVE_HISTORY_PAGE_SIZE)*NATIVE_HISTORY_PAGE_SIZE;
+}
+function nativeHistoryViewportFilled(container){
+  const height=Number(container?.clientHeight)||0;
+  return height>0&&container.scrollHeight>height+NATIVE_HISTORY_PAGE_OVERFLOW;
+}
+function nativeHistoryPageGrowthTarget(container){
+  const height=Number(container?.clientHeight)||720;
+  return Math.max(320,Math.round(Math.min(height,1200)*0.9));
+}
+function clearNativeHistoryDeferredSync(){
+  if(nativeHistoryDeferredSyncTimer)clearTimeout(nativeHistoryDeferredSyncTimer);
+  nativeHistoryDeferredSyncTimer=null;
+}
+function deferNativeSyncForHistoryPage(){
+  if(!nativeHistoryPageLoading&&!nativeHistoryDeferredSyncTimer)return false;
+  nativeHistorySyncDeferred=true;
+  return true;
+}
+function scheduleDeferredNativeHistorySync(threadId){
+  const id=String(threadId||'');
+  clearNativeHistoryDeferredSync();
+  if(!id)return;
+  nativeHistoryDeferredSyncTimer=setTimeout(()=>{
+    nativeHistoryDeferredSyncTimer=null;
+    if(currentConversationSource!=='codex'||currentConversationId!==id)return;
+    if(nativeHistoryPageLoading){nativeHistorySyncDeferred=true;return}
+    void syncCurrentNativeConversation();
+  },600);
+}
+function historyNodeHasLayout(node){
+  if(!node||!node.getClientRects().length)return false;
+  const rect=node.getBoundingClientRect();
+  return rect.width>0&&rect.height>0;
+}
+function historySequenceNode(container,sequence){
+  const target=Number(sequence);
+  if(!container||!Number.isInteger(target)||target<1)return null;
+  const matches=[...container.querySelectorAll('[data-native-message-seq]')]
+    .filter((node)=>Number(node.dataset.nativeMessageSeq)===target);
+  return matches.find(historyNodeHasLayout)||null;
+}
+function captureHistoryScrollAnchor(container){
+  if(!container)return null;
+  const containerRect=container.getBoundingClientRect();
+  const nodes=[...container.querySelectorAll('[data-native-message-seq]')].filter(historyNodeHasLayout);
+  const visible=nodes.map((node)=>({node,rect:node.getBoundingClientRect()})).filter(({node,rect})=>{
+    const sequence=Number(node.dataset.nativeMessageSeq);
+    if(!Number.isInteger(sequence)||sequence<1)return false;
+    return rect.bottom>=containerRect.top+1&&rect.top<=containerRect.bottom-1;
+  }).sort((left,right)=>left.rect.top-right.rect.top)[0]?.node;
+  const node=visible||nodes.find((item)=>Number.isInteger(Number(item.dataset.nativeMessageSeq)));
+  const sequence=Number(node?.dataset?.nativeMessageSeq);
+  return{
+    sequence:Number.isInteger(sequence)&&sequence>0?sequence:0,
+    offset:node?node.getBoundingClientRect().top-containerRect.top:0,
+    scrollTop:container.scrollTop,
+    scrollHeight:container.scrollHeight,
+  };
+}
+function restoreHistoryScrollAnchor(container,anchor){
+  if(!container||!anchor)return Promise.resolve();
+  const align=()=>{
+    const node=historySequenceNode(container,anchor.sequence);
+    if(node){
+      const offset=node.getBoundingClientRect().top-container.getBoundingClientRect().top;
+      const delta=offset-Number(anchor.offset||0);
+      if(Number.isFinite(delta)&&Math.abs(delta)>0.5)container.scrollTop+=delta;
+      return;
+    }
+    const delta=container.scrollHeight-Number(anchor.scrollHeight||0);
+    container.scrollTop=Math.max(0,Number(anchor.scrollTop||0)+delta);
+  };
+  return new Promise((resolve)=>{
+    requestAnimationFrame(()=>{
+      align();
+      requestAnimationFrame(align);
+      setTimeout(align,80);
+      setTimeout(align,180);
+      setTimeout(()=>{align();resolve()},320);
+    });
+  });
+}
 function upsertSideChatTab(options={}){
   const {threadId,sourceThreadId='',title=''}=options;
   const id=String(threadId||'').trim();
@@ -9818,6 +9918,9 @@ function upsertSideChatTab(options={}){
     if(title)existing.title=String(title).trim()||existing.title;
     if(sourceThreadId)existing.sourceThreadId=String(sourceThreadId);
     if(hasServiceTier)existing.serviceTier=normalizeComposerServiceTier(options.serviceTier);
+    existing.historyLimit=Number.isInteger(existing.historyLimit)&&existing.historyLimit>0?existing.historyLimit:60;
+    existing.hasEarlierMessages=Boolean(existing.hasEarlierMessages);
+    existing.historyLoading=Boolean(existing.historyLoading);
     return existing;
   }
   const tab={
@@ -9826,6 +9929,9 @@ function upsertSideChatTab(options={}){
     title:String(title||'临时侧聊').trim()||'临时侧聊',
     serviceTier:hasServiceTier?normalizeComposerServiceTier(options.serviceTier):null,
     running:false,
+    historyLimit:60,
+    hasEarlierMessages:false,
+    historyLoading:false,
   };
   sideChatOpenTabs.push(tab);
   return tab;
@@ -9980,6 +10086,19 @@ function ensureSideChatPane(){
   head.append(copy,actions);
   sideChatMessages=document.createElement('div');
   sideChatMessages.className='sideChatMessages';
+  sideChatMessages.addEventListener('wheel',(event)=>{
+    if(event.deltaY<0&&sideChatMessages.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD)void loadEarlierSideChatHistoryPage();
+  },{passive:true});
+  let sideChatHistoryTouchStartY=0;
+  sideChatMessages.addEventListener('touchstart',(event)=>{
+    sideChatHistoryTouchStartY=Number(event.touches?.[0]?.clientY)||0;
+  },{passive:true});
+  sideChatMessages.addEventListener('touchmove',(event)=>{
+    const currentY=Number(event.touches?.[0]?.clientY)||0;
+    if(currentY-sideChatHistoryTouchStartY<28||sideChatMessages.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD)return;
+    sideChatHistoryTouchStartY=currentY;
+    void loadEarlierSideChatHistoryPage();
+  },{passive:true});
   const foot=document.createElement('form');
   foot.className='sideChatComposer';
   foot.addEventListener('submit',(event)=>{
@@ -10041,6 +10160,9 @@ function readSideChatState(){
         title:String(tab?.title||'临时侧聊').trim()||'临时侧聊',
         serviceTier:normalizeComposerServiceTier(tab?.serviceTier),
         running:false,
+        historyLimit:NATIVE_HISTORY_PAGE_SIZE,
+        hasEarlierMessages:false,
+        historyLoading:false,
       })).filter((tab)=>tab.threadId);
       if(!tabs.length)return null;
       const activeThreadId=String(parsed.activeThreadId||parsed.threadId||tabs[0].threadId).trim();
@@ -10049,7 +10171,7 @@ function readSideChatState(){
     const threadId=String(parsed.threadId||'').trim();
     if(!threadId)return null;
     return {
-      tabs:[{threadId,sourceThreadId:String(parsed.sourceThreadId||'').trim(),title:'临时侧聊',serviceTier:normalizeComposerServiceTier(parsed.serviceTier),running:false}],
+      tabs:[{threadId,sourceThreadId:String(parsed.sourceThreadId||'').trim(),title:'临时侧聊',serviceTier:normalizeComposerServiceTier(parsed.serviceTier),running:false,historyLimit:NATIVE_HISTORY_PAGE_SIZE,hasEarlierMessages:false,historyLoading:false}],
       activeThreadId:threadId,
       view:'side',
     };
@@ -10313,7 +10435,7 @@ function renderSideChatMessages(messages,context={}){
     empty.className='sideChatEmpty';
     empty.textContent='Side chat 已就绪';
     sideChatMessages.appendChild(empty);
-    return;
+    return Promise.resolve();
   }
   const renderContext={
     threadId:String(context.threadId||sideChatThreadId||''),
@@ -10453,13 +10575,22 @@ function renderSideChatMessages(messages,context={}){
     if(deferIcons)endDeferredIconRefresh(sideChatMessages);
   }
   if(!deferIcons)refreshIcons(sideChatMessages);
-  sideChatMessages.scrollTop=sideChatMessages.scrollHeight;
+  if(context.historyScrollAnchor)return restoreHistoryScrollAnchor(sideChatMessages,context.historyScrollAnchor);
+  if(context.followBottom!==false)sideChatMessages.scrollTop=sideChatMessages.scrollHeight;
+  return Promise.resolve();
 }
-async function syncSideChatConversation(){
-  if(!sideChatThreadId)return;
+async function syncSideChatConversation(options={}){
+  if(!sideChatThreadId)return false;
   const syncId=sideChatThreadId;
+  const currentTab=getSideChatTab(syncId);
+  if(currentTab?.historyLoading&&!options.historyScrollAnchor)return false;
+  const historyLimit=normalizeNativeHistoryPageLimit(currentTab?.historyLimit);
+  const followBottom=sideChatMessages
+    ? sideChatMessages.scrollHeight-sideChatMessages.scrollTop-sideChatMessages.clientHeight<=140
+    : true;
+  const historyScrollAnchor=options.historyScrollAnchor||(!followBottom?captureHistoryScrollAnchor(sideChatMessages):null);
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external');
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external&history=page&limit='+historyLimit);
     const data=await res.json().catch(()=>({}));
     if(!res.ok)throw new Error(data.error||'Side chat 同步失败');
     if(sideChatThreadId!==syncId)return;
@@ -10468,7 +10599,11 @@ async function syncSideChatConversation(){
     if(sideChatTitle)sideChatTitle.textContent=title;
     if(sideChatPane)sideChatPane.setAttribute('aria-label','Side chat · '+title);
     const tab=getSideChatTab(syncId);
-    if(tab)tab.title=title;
+    if(tab){
+      tab.title=title;
+      tab.historyLimit=historyLimit;
+      tab.hasEarlierMessages=Boolean(conversation.hasEarlierMessages);
+    }
     renderTopConversationTitle();
     const metadata=conversation.metadata&&typeof conversation.metadata==='object'?conversation.metadata:{};
     if(tab&&Object.hasOwn(metadata,'serviceTier'))tab.serviceTier=normalizeComposerServiceTier(metadata.serviceTier);
@@ -10482,11 +10617,13 @@ async function syncSideChatConversation(){
       || Boolean(conversation.activeTurnId)
     );
     sideChatActiveTurnId=String(conversation.activeTurnId||'');
-    renderSideChatMessages(messages,{
+    await renderSideChatMessages(messages,{
       threadId:syncId,
       activeTurnId:sideChatActiveTurnId,
       running:sideChatRunning,
       startedAt:conversation.activeTurnStartedAt||conversation.updatedAt||'',
+      historyScrollAnchor,
+      followBottom:Object.hasOwn(options,'followBottom')?Boolean(options.followBottom):followBottom,
     });
     if(tab)tab.running=sideChatRunning;
     const lastAssistant=[...messages].reverse().find((message)=>message.role==='assistant'&&String(message.content||'').trim());
@@ -10513,9 +10650,50 @@ async function syncSideChatConversation(){
     sideChatCursor=Number(conversation.cursor||messages.length||0)||0;
     sideChatGeneration=Number(conversation.generation||0)||0;
     persistSideChatState();
+    return true;
   }catch(error){
     if(sideChatThreadId===syncId&&sideChatStatus)sideChatStatus.textContent=error.message||'Side chat 同步失败';
+    return false;
   }
+}
+async function loadEarlierSideChatHistoryPage(options={}){
+  const fillViewport=options.fillViewport===true;
+  const id=String(sideChatThreadId||'');
+  const tab=getSideChatTab(id);
+  if(!id||!tab||tab.historyLoading||!tab.hasEarlierMessages||!sideChatMessages)return false;
+  if(!sideChatMessages.clientHeight||(!fillViewport&&sideChatMessages.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD))return false;
+  const anchor=captureHistoryScrollAnchor(sideChatMessages);
+  const previousLimit=normalizeNativeHistoryPageLimit(tab.historyLimit);
+  const initialHeight=sideChatMessages.scrollHeight;
+  const growthTarget=nativeHistoryPageGrowthTarget(sideChatMessages);
+  let lastSuccessfulLimit=previousLimit;
+  let loadedAny=false;
+  let loadedBatches=0;
+  const maxBatches=fillViewport?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_PAGE_MAX_BATCHES;
+  tab.historyLoading=true;
+  sideChatMessages.setAttribute('aria-busy','true');
+  try{
+    while(tab.hasEarlierMessages&&loadedBatches<maxBatches&&sideChatThreadId===id){
+      const growth=Math.max(0,sideChatMessages.scrollHeight-initialHeight);
+      if(loadedAny&&(fillViewport?nativeHistoryViewportFilled(sideChatMessages):growth>=growthTarget))break;
+      const batchCount=1;
+      tab.historyLimit=lastSuccessfulLimit+NATIVE_HISTORY_PAGE_SIZE*batchCount;
+      const loaded=await syncSideChatConversation({historyScrollAnchor:anchor,followBottom:false});
+      if(!loaded)break;
+      loadedAny=true;
+      loadedBatches+=batchCount;
+      lastSuccessfulLimit=normalizeNativeHistoryPageLimit(tab.historyLimit);
+    }
+    return loadedAny;
+  }finally{
+    tab.historyLimit=lastSuccessfulLimit;
+    tab.historyLoading=false;
+    sideChatMessages.removeAttribute('aria-busy');
+  }
+}
+async function fillInitialSideChatHistoryPage(){
+  if(!sideChatMessages||nativeHistoryViewportFilled(sideChatMessages))return false;
+  return loadEarlierSideChatHistoryPage({fillViewport:true});
 }
 function updateSideChatHeadState(status=''){
   if(!sideChatPane||!sideChatStatus)return;
@@ -10558,6 +10736,8 @@ async function activateSideChatTab(threadId,{force=false}={}){
   setSideChatOpen(true);
   persistSideChatState();
   await syncSideChatConversation();
+  await new Promise((resolve)=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  if(sideChatThreadId===id)await fillInitialSideChatHistoryPage();
   scheduleSideChatSync(500);
   sideChatInput?.focus();
 }
@@ -10608,6 +10788,25 @@ async function openQueuedPromptInSideChat(threadId,itemId){
     statusEl.textContent=error.message||'打开 side chat 失败';
     if(!sideChatOpenTabs.length)setSideChatOpen(false);
   }
+}
+function sideChatMessageNode(message){
+  const role=String(message.role||'assistant');
+  const text=String(message.content||message.text||message.message||'');
+  const row=document.createElement('article');
+  row.className='msg sideChatMsg '+role;
+  const body=document.createElement('div');
+  body.className='msgBody sideChatMsgBody';
+  row.appendChild(body);
+  if(!text.trim()){
+    body.textContent=role==='user'?'（附件消息）':'（空）';
+  }else if(role==='assistant'||role==='thinking'){
+    try{renderAssistantMarkdown(body,text)}catch(err){body.classList.remove('markdownBody');body.textContent=text}
+  }else if(role==='user'){
+    try{renderMessageMarkdown(body,text)}catch(err){body.classList.remove('markdownBody');body.textContent=text}
+  }else{
+    body.textContent=text;
+  }
+  return row;
 }
 async function sendSideChatMessage(){
   if(!sideChatThreadId||!sideChatInput||sideChatSend?.disabled)return;
@@ -10690,7 +10889,13 @@ async function restoreSideChatIfNeeded(){
   const saved=readSideChatState();
   if(!saved?.tabs?.length)return;
   try{
-    sideChatOpenTabs=saved.tabs.map((tab)=>({...tab,running:false}));
+    sideChatOpenTabs=saved.tabs.map((tab)=>({
+      ...tab,
+      running:false,
+      historyLimit:NATIVE_HISTORY_PAGE_SIZE,
+      hasEarlierMessages:false,
+      historyLoading:false,
+    }));
     sideChatView=saved.view==='main'?'main':'side';
     const active=saved.activeThreadId||sideChatOpenTabs[0].threadId;
     await activateSideChatTab(active,{force:true});
@@ -11827,6 +12032,7 @@ function schedulePromptQueueDispatch(threadId,delay=120){
   setTimeout(()=>{if(!promptQueueTurnLocked(threadId))dispatchNextQueuedPrompt(threadId)},delay);
 }
 function showNativePromptOptimistically(item){
+  resumeNativeLiveFollowBottom();
   clearNativeOptimisticElements();
   nativeOptimisticElements.push(addMsg('user',item.message||'请分析上传的附件。'));
   for(const attachment of item.attachments||[]){
@@ -11838,6 +12044,7 @@ function showNativePromptOptimistically(item){
 }
 function showNativeSteerOptimistically(item){
   if(currentConversationSource!=='codex')return null;
+  resumeNativeLiveFollowBottom();
   if(!collectingTurnProcess)beginTurnProcessCollection(item.createdAt);
   const expected=String(item.message||'请分析上传的附件。').trim();
   const existing=[
@@ -15136,6 +15343,9 @@ function appendSubQuotaProgress(parent,percent,{availabilityOnly=false,displayUs
   parent.appendChild(progress);
 }
 function appendSubQuotaWindow(parent,label,windowData,unit,options={}){
+  if(!windowData)return false;
+  const used=finiteSubQuotaNumber(windowData.used);
+  const limit=finiteSubQuotaNumber(windowData.limit);
   const remaining=finiteSubQuotaNumber(windowData.remaining);
   const available=windowData.availability==='available';
   const availabilityOnly=available&&used===null&&limit===null&&remaining===null;
@@ -17563,7 +17773,7 @@ function syncNativeComposerSettings(changes={}){
   nativeComposerSettingsQueue=queued.catch(()=>false);
   return queued;
 }
-function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -17692,6 +17902,7 @@ function scrollChatToLatest(options={}){
   let hiddenRetries=0;
   const run=()=>{
     if(!chat)return;
+    if(currentConversationSource==='codex'&&nativeLiveReadingHistory&&!nativeLiveTowardLatestIntentActive())return;
     // A hidden or zero-size chat cannot scroll meaningfully. Skip the write and retry
     // briefly so a late layout cannot expose the conversation at the top first.
     if(!chatHasLayout()){
@@ -17709,13 +17920,14 @@ function scrollChatToLatest(options={}){
   });
   if(force)setTimeout(run,80);
 }
-function alignChatToBottomStable(maxRounds=12){
+function alignChatToBottomStable(maxRounds=12,expectedLoadSeq=null){
   if(!chat)return;
+  const guardedLoadSeq=Number.isInteger(expectedLoadSeq)?expectedLoadSeq:null;
   if(typeof updateComposerOverlayInset==='function')updateComposerOverlayInset({scroll:false});
   let rounds=0;
   let lastHeight=-1;
   const step=()=>{
-    if(!chat||rounds>=maxRounds)return;
+    if(!chat||(guardedLoadSeq!==null&&guardedLoadSeq!==conversationLoadSeq)||rounds>=maxRounds)return;
     rounds+=1;
     if(!chatHasLayout()){requestAnimationFrame(step);return}
     const height=chat.scrollHeight;
@@ -17729,10 +17941,94 @@ function alignChatToBottomStable(maxRounds=12){
   };
   requestAnimationFrame(step);
 }
+async function loadEarlierNativeHistoryPage(options={}){
+  const fillViewport=options.fillViewport===true;
+  if(
+    currentConversationSource!=='codex'
+    ||!currentConversationId
+    ||!nativeHistoryLoadReady
+    ||nativeHistoryPageLoading
+    ||!nativeHistoryHasEarlierMessages
+    ||!chat
+    ||!chat.clientHeight
+    ||(!fillViewport&&chat.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD)
+  )return false;
+  const id=currentConversationId;
+  const preserveFollowBottom=fillViewport&&!nativeLiveReadingHistory&&nativeLiveFollowBottom;
+  if(!preserveFollowBottom)setNativeLiveReadingHistory(true);
+  const anchor=captureHistoryScrollAnchor(chat);
+  const previousLimit=nativeHistoryPageLimit;
+  const initialHeight=chat.scrollHeight;
+  const growthTarget=nativeHistoryPageGrowthTarget(chat);
+  let lastSuccessfulLimit=previousLimit;
+  let loadedAny=false;
+  let loadedBatches=0;
+  const maxBatches=fillViewport?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_PAGE_MAX_BATCHES;
+  nativeHistoryPageLoading=true;
+  nativeHistoryLoadReady=false;
+  nativeHistorySyncDeferred=true;
+  clearNativeHistoryDeferredSync();
+  chat.setAttribute('aria-busy','true');
+  try{
+    while(
+      nativeHistoryHasEarlierMessages
+      &&loadedBatches<maxBatches
+      &&currentConversationSource==='codex'
+      &&currentConversationId===id
+    ){
+      const growth=Math.max(0,chat.scrollHeight-initialHeight);
+      if(loadedAny&&(fillViewport?nativeHistoryViewportFilled(chat):growth>=growthTarget))break;
+      const batchCount=1;
+      const requestedLimit=lastSuccessfulLimit+NATIVE_HISTORY_PAGE_SIZE*batchCount;
+      const loaded=await loadConversation(id,'codex',{
+        historyPageLimit:requestedLimit,
+        historyScrollAnchor:anchor,
+        preserveHistoryFollowBottom:preserveFollowBottom,
+        skipPromptQueueSync:true,
+      });
+      if(!loaded)break;
+      loadedAny=true;
+      loadedBatches+=batchCount;
+      lastSuccessfulLimit=nativeHistoryPageLimit;
+    }
+    return loadedAny;
+  }finally{
+    const sameConversation=currentConversationSource==='codex'&&currentConversationId===id;
+    const syncDeferred=nativeHistorySyncDeferred;
+    nativeHistorySyncDeferred=false;
+    if(sameConversation){
+      nativeHistoryPageLimit=lastSuccessfulLimit;
+      nativeHistoryLoadReady=true;
+    }
+    nativeHistoryPageLoading=false;
+    chat.removeAttribute('aria-busy');
+    if(sameConversation&&syncDeferred)scheduleDeferredNativeHistorySync(id);
+  }
+}
 async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   const nextConversationSource=source==='codex'?'codex':'web';
   const conversationChanged=id!==currentConversationId||nextConversationSource!==currentConversationSource;
+  const requestedHistoryLimit=Number(options.historyPageLimit);
+  const hasRequestedHistoryLimit=Number.isInteger(requestedHistoryLimit)&&requestedHistoryLimit>0;
+  if(nextConversationSource==='codex'){
+    if(conversationChanged)nativeHistoryPageLimit=hasRequestedHistoryLimit?normalizeNativeHistoryPageLimit(requestedHistoryLimit):NATIVE_HISTORY_PAGE_SIZE;
+    else if(hasRequestedHistoryLimit)nativeHistoryPageLimit=normalizeNativeHistoryPageLimit(requestedHistoryLimit);
+    nativeHistoryLoadReady=false;
+    if(conversationChanged){
+      clearNativeHistoryDeferredSync();
+      nativeHistoryHasEarlierMessages=false;
+      nativeHistoryPageLoading=false;
+      nativeHistorySyncDeferred=false;
+    }
+  }else{
+    nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;
+    nativeHistoryHasEarlierMessages=false;
+    nativeHistoryPageLoading=false;
+    nativeHistoryLoadReady=false;
+    nativeHistorySyncDeferred=false;
+    clearNativeHistoryDeferredSync();
+  }
   if(conversationChanged){clearNativeCancelPending();resetComposerProviderChange()}
   if(conversationChanged&&appQueueEditSaving){statusEl.textContent='正在保存队列修改，请稍后切换会话';return false}
   if(conversationChanged&&appQueueEditDraft){appQueueEditDraft=null;input.value='';input.style.height='auto';clearPendingAttachments()}
@@ -17761,11 +18057,16 @@ async function loadConversation(id,source='web',options={}){
   updateActiveHistory();
   statusEl.textContent='Loading...';
   let conversation=options.conversation||null;
+  if(conversation&&nextConversationSource==='codex'){
+    const suppliedMessages=Array.isArray(conversation.messages)?conversation.messages:[];
+    if(suppliedMessages.length>nativeHistoryPageLimit){
+      conversation={...conversation,messages:suppliedMessages.slice(-nativeHistoryPageLimit),hasEarlierMessages:true};
+    }
+  }
   if(!conversation){
     const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
-    // Keep native transcripts aligned with Codex App instead of hiding older turns.
     const nativeHistoryQuery=currentConversationSource==='codex'
-      ? '?images=external'
+      ? '?images=external&history=page&limit='+nativeHistoryPageLimit
       : '';
     const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery;
     const res=await fetch(requestUrl);
@@ -17782,6 +18083,7 @@ async function loadConversation(id,source='web',options={}){
   try{window.__currentConversationCwd=String(conversation.metadata?.cwd||'')}catch{}
   nativeCursor=Number(conversation.cursor||0);
   nativeGeneration=Number(conversation.generation||0);
+  nativeHistoryHasEarlierMessages=currentConversationSource==='codex'&&Boolean(conversation.hasEarlierMessages);
   const promptQueueLock=reconcilePromptQueueTurnLock(currentConversationId,conversation);
   if(currentConversationSource==='codex'&&conversation.status==='running'&&!promptQueueLock.terminal)markPromptQueueTurnRunning(currentConversationId,conversation.activeTurnId);
   const queueTurnId=promptQueueTurnLock(currentConversationId);
@@ -17796,6 +18098,9 @@ async function loadConversation(id,source='web',options={}){
   }
   applyConversationMode();
   updateActiveHistory();
+  const preserveHistoryFollowBottom=Boolean(options.historyScrollAnchor)&&options.preserveHistoryFollowBottom===true;
+  if(options.historyScrollAnchor&&!preserveHistoryFollowBottom)setNativeLiveReadingHistory(true);
+  else resumeNativeLiveFollowBottom();
   chat.innerHTML='';
   const messages=conversation.messages||[];
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
@@ -17821,8 +18126,23 @@ async function loadConversation(id,source='web',options={}){
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
   closeMenu();
   persistActiveConversation(currentConversationId,currentConversationSource);
-  scrollChatToLatest({force:true});
-  alignChatToBottomStable();
+  bindNativeLiveScrollTracking();
+  if(options.historyScrollAnchor){
+    await restoreHistoryScrollAnchor(chat,options.historyScrollAnchor);
+    if(preserveHistoryFollowBottom)resumeNativeLiveFollowBottom();
+    else setNativeLiveReadingHistory(true);
+    nativeHistoryLoadReady=true;
+  }else{
+    scrollChatToLatest({force:true});
+    alignChatToBottomStable(12,seq);
+    const readyId=currentConversationId;
+    const readySource=currentConversationSource;
+    setTimeout(()=>{
+      if(currentConversationId!==readyId||currentConversationSource!==readySource)return;
+      nativeHistoryLoadReady=readySource==='codex';
+      if(readySource==='codex'&&!nativeHistoryViewportFilled(chat))void loadEarlierNativeHistoryPage({fillViewport:true});
+    },180);
+  }
   return true;
 }
 function updateConversationStatus(conversation){
@@ -18147,26 +18467,34 @@ function nativeResetMessagesForIncrementalSync(conversation){
 }
 async function syncCurrentNativeConversationOnce(){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
+  if(deferNativeSyncForHistoryPage())return;
   const renderSnapshotImmediately=nativeLiveDocumentHidden()||nativeSnapshotResumeCatchup;
   const id=currentConversationId;
   const seq=conversationLoadSeq;
-  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&after='+nativeCursor+'&generation='+nativeGeneration;
+  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&history=page&limit='+nativeHistoryPageLimit+'&after='+nativeCursor+'&generation='+nativeGeneration;
   const res=await fetch(url);
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
   const data=await res.json();
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
+  if(deferNativeSyncForHistoryPage())return;
   const conversation=data.conversation;
   currentNativeRunStatus=String(conversation.status||'');
   await applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
+  if(deferNativeSyncForHistoryPage())return;
   syncComposerContextWindow(conversation.contextWindow||null);
   syncComposerChrome();
   let syncMessages=conversation.messages||[];
   if(conversation.reset){
     syncMessages=nativeResetMessagesForIncrementalSync(conversation);
     if(!syncMessages){
-      await loadConversation(id,'codex');
+      const historyScrollAnchor=nativeLiveFollowBottom&&nativeLiveNearBottom()?null:captureHistoryScrollAnchor(chat);
+      await loadConversation(id,'codex',{
+        historyPageLimit:nativeHistoryPageLimit,
+        historyScrollAnchor,
+        skipPromptQueueSync:true,
+      });
       if(renderSnapshotImmediately)nativeSnapshotResumeCatchup=false;
       return;
     }
@@ -21080,7 +21408,7 @@ function revealExpandedEditedFilesCard(card){
   const visibleTop=chatRect.top+12;
   const delta=cardRect.top-visibleTop;
   if(delta<=1)return;
-  setNativeLiveFollowBottom(false);
+  setNativeLiveReadingHistory(true);
   const nextTop=Math.max(0,chat.scrollTop+delta);
   if(typeof chat.scrollTo==='function')chat.scrollTo({top:nextTop,behavior:'smooth'});
   else chat.scrollTop=nextTop;
@@ -21967,17 +22295,34 @@ function updateJumpToLatestButton(){
 }
 function scrollToLatestOutput(){
   if(!chat)return;
+  resumeNativeLiveFollowBottom(2400);
   const reducedMotion=Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
   if(typeof chat.scrollTo==='function'){
     chat.scrollTo({top:chat.scrollHeight,behavior:reducedMotion?'auto':'smooth'});
-    if(reducedMotion)setNativeLiveFollowBottom(true);
     return;
   }
   chat.scrollTop=chat.scrollHeight;
+}
+function nativeLiveTowardLatestIntentActive(){
+  return nativeLiveTowardLatestUntil>Date.now();
+}
+function markNativeLiveTowardLatestIntent(duration=1400){
+  nativeLiveTowardLatestUntil=Date.now()+Math.max(0,Number(duration)||0);
+}
+function setNativeLiveReadingHistory(reading){
+  nativeLiveReadingHistory=Boolean(reading);
+  if(nativeLiveReadingHistory){
+    nativeLiveTowardLatestUntil=0;
+    setNativeLiveFollowBottom(false);
+  }
+}
+function resumeNativeLiveFollowBottom(duration=1800){
+  nativeLiveReadingHistory=false;
+  markNativeLiveTowardLatestIntent(duration);
   setNativeLiveFollowBottom(true);
 }
 function setNativeLiveFollowBottom(follow){
-  nativeLiveFollowBottom=Boolean(follow);
+  nativeLiveFollowBottom=Boolean(follow)&&!nativeLiveReadingHistory;
   for(const live of nativeLiveItems.values())live.followBottom=nativeLiveFollowBottom;
   if(!nativeLiveFollowBottom&&nativeLiveScrollTimer){
     clearTimeout(nativeLiveScrollTimer);
@@ -21988,11 +22333,53 @@ function setNativeLiveFollowBottom(follow){
 function bindNativeLiveScrollTracking(){
   if(nativeLiveScrollTrackingBound||!chat)return;
   nativeLiveScrollTrackingBound=true;
-  chat.addEventListener('scroll',()=>setNativeLiveFollowBottom(nativeLiveNearBottom()),{passive:true});
+  const loadEarlierFromTop=()=>{
+    if(typeof loadEarlierNativeHistoryPage==='function')void loadEarlierNativeHistoryPage();
+  };
+  chat.addEventListener('scroll',()=>{
+    const nearBottom=nativeLiveNearBottom();
+    if(!nearBottom){
+      if(!nativeLiveTowardLatestIntentActive())setNativeLiveReadingHistory(true);
+      else setNativeLiveFollowBottom(false);
+      return;
+    }
+    if(nativeLiveTowardLatestIntentActive())nativeLiveReadingHistory=false;
+    setNativeLiveFollowBottom(nearBottom);
+  },{passive:true});
+  chat.addEventListener('wheel',(event)=>{
+    if(event.deltaY<0){
+      setNativeLiveReadingHistory(true);
+      if(chat.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD)loadEarlierFromTop();
+    }else if(event.deltaY>0){
+      markNativeLiveTowardLatestIntent();
+    }
+  },{passive:true});
+  let historyTouchStartY=0;
+  let historyTouchLastY=0;
+  chat.addEventListener('touchstart',(event)=>{
+    historyTouchStartY=Number(event.touches?.[0]?.clientY)||0;
+    historyTouchLastY=historyTouchStartY;
+  },{passive:true});
+  chat.addEventListener('touchmove',(event)=>{
+    const currentY=Number(event.touches?.[0]?.clientY)||0;
+    const step=currentY-historyTouchLastY;
+    if(Math.abs(step)<1)return;
+    historyTouchLastY=currentY;
+    if(step>0){
+      setNativeLiveReadingHistory(true);
+      if(currentY-historyTouchStartY>=28&&chat.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD){
+        historyTouchStartY=currentY;
+        loadEarlierFromTop();
+      }
+    }else{
+      historyTouchStartY=currentY;
+      markNativeLiveTowardLatestIntent();
+    }
+  },{passive:true});
 }
 function captureNativeLiveFollowBottom(){
   bindNativeLiveScrollTracking();
-  const follow=nativeLiveNearBottom();
+  const follow=!nativeLiveReadingHistory&&nativeLiveNearBottom();
   setNativeLiveFollowBottom(follow);
   return follow;
 }

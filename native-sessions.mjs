@@ -3139,6 +3139,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
   const requestedGeneration = Number(options.generation);
   const requestedLimit = Number(options.limit);
   const hasAfter = Number.isInteger(after) && after >= 0;
+  const historyPage = options.historyPage === true;
   const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
     ? Math.min(requestedLimit, cache.messages.length)
     : 0;
@@ -3150,7 +3151,9 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     : cache.messages;
   const visibleMessages = availableMessages.filter((message) => !shouldHideHandoffMessage(message));
   const messages = limit && (!hasAfter || reset)
-    ? selectRecentNativeMessages(visibleMessages, limit)
+    ? historyPage
+      ? visibleMessages.slice(-limit)
+      : selectRecentNativeMessages(visibleMessages, limit)
     : visibleMessages;
 
   return {
