@@ -10604,6 +10604,25 @@ async function openQueuedPromptInSideChat(threadId,itemId){
     if(!sideChatOpenTabs.length)setSideChatOpen(false);
   }
 }
+function sideChatMessageNode(message){
+  const role=String(message.role||'assistant');
+  const text=String(message.content||message.text||message.message||'');
+  const row=document.createElement('article');
+  row.className='msg sideChatMsg '+role;
+  const body=document.createElement('div');
+  body.className='msgBody sideChatMsgBody';
+  row.appendChild(body);
+  if(!text.trim()){
+    body.textContent=role==='user'?'（附件消息）':'（空）';
+  }else if(role==='assistant'||role==='thinking'){
+    try{renderAssistantMarkdown(body,text)}catch(err){body.classList.remove('markdownBody');body.textContent=text}
+  }else if(role==='user'){
+    try{renderMessageMarkdown(body,text)}catch(err){body.classList.remove('markdownBody');body.textContent=text}
+  }else{
+    body.textContent=text;
+  }
+  return row;
+}
 async function sendSideChatMessage(){
   if(!sideChatThreadId||!sideChatInput||sideChatSend?.disabled)return;
   const text=String(sideChatInput.value||'').trim();
@@ -15131,6 +15150,9 @@ function appendSubQuotaProgress(parent,percent,{availabilityOnly=false,displayUs
   parent.appendChild(progress);
 }
 function appendSubQuotaWindow(parent,label,windowData,unit,options={}){
+  if(!windowData)return false;
+  const used=finiteSubQuotaNumber(windowData.used);
+  const limit=finiteSubQuotaNumber(windowData.limit);
   const remaining=finiteSubQuotaNumber(windowData.remaining);
   const available=windowData.availability==='available';
   const availabilityOnly=available&&used===null&&limit===null&&remaining===null;
