@@ -117,8 +117,8 @@ const DEFAULT_CWD = process.env.DEFAULT_CWD || homedir();
 const DEFAULT_SANDBOX = process.env.DEFAULT_SANDBOX || 'read-only';
 const DEFAULT_APPROVAL = process.env.DEFAULT_APPROVAL || 'never';
 const FORCE_FULL_ACCESS = parseBoolean(process.env.FORCE_FULL_ACCESS, false);
-const NATIVE_SESSION_MAX_READ_MB = Number(process.env.NATIVE_SESSION_MAX_READ_MB || 32);
-const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAGES || 700);
+const NATIVE_SESSION_MAX_READ_MB = Number(process.env.NATIVE_SESSION_MAX_READ_MB ?? 0);
+const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAGES ?? 0);
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
 const NATIVE_SESSION_POLL_MS = Number(process.env.NATIVE_SESSION_POLL_MS || 3000);
 const APP_SERVER_REQUEST_TIMEOUT_MS = Number(process.env.APP_SERVER_REQUEST_TIMEOUT_MS || 30000);
@@ -8847,7 +8847,10 @@ let historyRenameActive=false;
 let historyProjectPreview=null;
 let historyProjectPreviewAnchor=null;
 let nativeForkMarkers=readNativeForkMarkers();
-function refreshIcons(root=document){if(!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
+let deferredIconRefreshDepth=0;
+function refreshIcons(root=document){if(deferredIconRefreshDepth>0||!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
+function beginDeferredIconRefresh(){deferredIconRefreshDepth+=1}
+function endDeferredIconRefresh(root=document){deferredIconRefreshDepth=Math.max(0,deferredIconRefreshDepth-1);if(deferredIconRefreshDepth===0)refreshIcons(root)}
 function setIconLabel(element,name,label,showLabel=true){if(!element)return;element.replaceChildren();const icon=document.createElement('i');icon.setAttribute('data-lucide',name);icon.setAttribute('aria-hidden','true');element.appendChild(icon);if(showLabel){const text=document.createElement('span');text.className='buttonLabel';text.textContent=label;element.appendChild(text)}if(label&&!element.getAttribute('aria-label'))element.setAttribute('aria-label',label);refreshIcons(element)}
 function createComposerMirrorField(panel,labelText,ariaLabel){
   const field=document.createElement('label');
@@ -10320,6 +10323,8 @@ function renderSideChatMessages(messages,context={}){
   };
   const savedAnnotations=responseAnnotationsByTurn;
   responseAnnotationsByTurn=new Map();
+  const deferIcons=list.length>240;
+  if(deferIcons)beginDeferredIconRefresh();
   let state=null;
   let latestUser=null;
   const ensureState=(message)=>{
@@ -10445,8 +10450,9 @@ function renderSideChatMessages(messages,context={}){
     }
   }finally{
     responseAnnotationsByTurn=savedAnnotations;
+    if(deferIcons)endDeferredIconRefresh(sideChatMessages);
   }
-  refreshIcons(sideChatMessages);
+  if(!deferIcons)refreshIcons(sideChatMessages);
   sideChatMessages.scrollTop=sideChatMessages.scrollHeight;
 }
 async function syncSideChatConversation(){
@@ -17795,10 +17801,16 @@ async function loadConversation(id,source='web',options={}){
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
   const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
   beginTurnProcessCollection();
-  messages.forEach((msg,index)=>{
-    if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
-    addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
-  });
+  const deferHistoryIcons=messages.length>240;
+  if(deferHistoryIcons)beginDeferredIconRefresh();
+  try{
+    messages.forEach((msg,index)=>{
+      if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
+      addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
+    });
+  }finally{
+    if(deferHistoryIcons)endDeferredIconRefresh(chat);
+  }
   if(currentConversationSource==='codex')renderNativeForkDivider(messages);
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(!messages.length&&!webRunActive&&!nativeForkMarkers[currentConversationId])chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';

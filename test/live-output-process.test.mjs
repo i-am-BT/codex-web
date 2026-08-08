@@ -1754,6 +1754,9 @@ test('native histories load the complete transcript without an obstructive histo
   const syncSideChatConversation = sourceBetween('async function syncSideChatConversation', 'function updateSideChatHeadState');
   const syncCurrentNativeConversationOnce = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
 
+  assert.match(inlineScript, /let deferredIconRefreshDepth=0;/);
+  assert.match(inlineScript, /function refreshIcons\(root=document\)\{if\(deferredIconRefreshDepth>0\|\|/);
+  assert.match(loadConversation, /const deferHistoryIcons=messages\.length>240;[\s\S]*?beginDeferredIconRefresh\(\);[\s\S]*?finally\{[\s\S]*?endDeferredIconRefresh\(chat\)/);
   assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external'/);
   assert.doesNotMatch(loadConversation, /NATIVE_INITIAL_MESSAGE_LIMIT|[?&]limit=/);
   assert.match(syncSideChatConversation, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external'\)/);

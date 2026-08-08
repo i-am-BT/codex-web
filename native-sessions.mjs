@@ -17,10 +17,10 @@ import { DatabaseSync } from 'node:sqlite';
 const SESSION_ID_PATTERN = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 const READ_CHUNK_BYTES = 256 * 1024;
 const FIRST_RECORD_LIMIT_BYTES = 2 * 1024 * 1024;
-const DEFAULT_MAX_READ_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_READ_BYTES = 0;
 const DEFAULT_TURN_START_SCAN_BYTES = 32 * 1024 * 1024;
 const TURN_START_RECORD_LIMIT_BYTES = 256 * 1024;
-const DEFAULT_MAX_MESSAGES = 700;
+const DEFAULT_MAX_MESSAGES = 0;
 const DEFAULT_MAX_SESSIONS = 100;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_RUNNING_WINDOW_MS = 6 * 60 * 60 * 1000;
@@ -45,12 +45,12 @@ export class NativeSessionStore extends EventEmitter {
     this.deepSeekUsageFile = String(options.deepSeekUsageFile || '').trim();
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.goalsDbFile = path.resolve(options.goalsDbFile || path.join(this.codexHome, 'goals_1.sqlite'));
-    this.maxReadBytes = positiveNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
+    this.maxReadBytes = nonNegativeNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
     this.turnStartScanBytes = positiveNumber(
       options.turnStartScanBytes,
       Math.max(DEFAULT_TURN_START_SCAN_BYTES, this.maxReadBytes),
     );
-    this.maxMessages = positiveNumber(options.maxMessages, DEFAULT_MAX_MESSAGES);
+    this.maxMessages = nonNegativeNumber(options.maxMessages, DEFAULT_MAX_MESSAGES);
     this.maxSessions = positiveNumber(options.maxSessions, DEFAULT_MAX_SESSIONS);
     this.pollIntervalMs = positiveNumber(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
     this.runningWindowMs = positiveNumber(options.runningWindowMs, DEFAULT_RUNNING_WINDOW_MS);
@@ -1158,7 +1158,10 @@ function pruneSessionMetadataCache(cache, entries) {
 }
 
 function createDetailCache(entry, options) {
-  const startOffset = Math.max(0, entry.size - options.maxReadBytes);
+  const maxReadBytes = Number(options.maxReadBytes);
+  const startOffset = Number.isFinite(maxReadBytes) && maxReadBytes > 0
+    ? Math.max(0, entry.size - maxReadBytes)
+    : 0;
   const cache = {
     id: entry.id,
     filePath: entry.filePath,
@@ -3220,6 +3223,11 @@ function equalStringArrays(left, right) {
 function positiveNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
+function nonNegativeNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
 }
 
 function timestampMs(value) {
