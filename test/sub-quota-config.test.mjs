@@ -185,6 +185,36 @@ if (process.argv[2] === 'app-server') {
     assert.match(persisted, /^SUB2API_API_KEY="sub-key"$/m);
     assert.match(persisted, /^DEEPSEEK_API_KEY="deepseek-key"$/m);
 
+    const visibilityOnlySave = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        codexAppVisible: true,
+        sources: [
+          { provider: 'cpa-codex', baseUrl: '', apiKey: '', visible: true },
+          { provider: 'sub2api', baseUrl: '', apiKey: '', visible: true },
+          { provider: 'deepseek', baseUrl: '', apiKey: '', visible: false },
+        ],
+      }),
+    });
+    assert.equal(visibilityOnlySave.status, 200);
+    const visibilityOnlyPayload = await visibilityOnlySave.json();
+    assert.equal(visibilityOnlyPayload.configuredCount, 3);
+    assert.deepEqual(
+      visibilityOnlyPayload.sources.map((source) => [source.provider, source.configured, source.visible]),
+      [
+        ['sub2api', true, true],
+        ['deepseek', true, false],
+        ['cpa-codex', true, true],
+        ['grok2api', false, true],
+      ],
+    );
+    const persistedAfterVisibilityOnlySave = await readFile(envFile, 'utf8');
+    assert.match(persistedAfterVisibilityOnlySave, /^CPA_QUOTA_API_KEY="cpa-key"$/m);
+    assert.match(persistedAfterVisibilityOnlySave, /^SUB2API_API_KEY="sub-key"$/m);
+    assert.match(persistedAfterVisibilityOnlySave, /^DEEPSEEK_API_KEY="deepseek-key"$/m);
+    assert.match(persistedAfterVisibilityOnlySave, /^DEEPSEEK_QUOTA_VISIBLE="false"$/m);
+
     await new Promise((resolve) => provider.close(resolve));
     provider = null;
     const savedWhileOffline = await fetch(`${baseUrl}/api/sub-quota-config`, {

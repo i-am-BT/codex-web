@@ -42,6 +42,7 @@ export class NativeSessionStore extends EventEmitter {
     this.sideChatStateFile = path.resolve(
       options.sideChatStateFile || path.join(this.codexHome, 'codex-web-side-chat.json'),
     );
+    this.deepSeekUsageFile = String(options.deepSeekUsageFile || '').trim();
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.goalsDbFile = path.resolve(options.goalsDbFile || path.join(this.codexHome, 'goals_1.sqlite'));
     this.maxReadBytes = positiveNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
@@ -778,6 +779,35 @@ export class NativeSessionStore extends EventEmitter {
     };
   }
 
+  accumulateDeepSeekUsage(cache, payload) {
+    if (!this.deepSeekUsageFile) return;
+    const model = String(cache?.metadata?.model || '').trim().toLowerCase();
+    if (!model.startsWith('deepseek')) return;
+    const usage = cache?.currentTurnTokenUsage;
+    const total = Number(usage?.totalTokens);
+    if (!Number.isFinite(total) || total <= 0) return;
+    const turnKey = `${String(cache?.id || '')}:${String(payload?.turn_id || payload?.turnId || cache?.latestTurnId || '')}`;
+    if (!turnKey || turnKey.endsWith(':')) return;
+    try {
+      const current = readDeepSeekUsageStatsFile(this.deepSeekUsageFile) || {};
+      const counted = Array.isArray(current.countedTurns) ? current.countedTurns : [];
+      if (counted.includes(turnKey)) return;
+      const input = Math.max(0, Number(usage.inputTokens) || 0);
+      const cached = Math.max(0, Number(usage.cachedInputTokens) || 0);
+      const output = Math.max(0, Number(usage.outputTokens) || 0);
+      const next = {
+        totalTokens: (Number(current.totalTokens) || 0) + total,
+        inputTokens: (Number(current.inputTokens) || 0) + input,
+        outputTokens: (Number(current.outputTokens) || 0) + output,
+        cachedInputTokens: (Number(current.cachedInputTokens) || 0) + cached,
+        requests: (Number(current.requests) || 0) + 1,
+        updatedAt: new Date().toISOString(),
+        countedTurns: [...counted.slice(-999), turnKey],
+      };
+      writeFileSync(this.deepSeekUsageFile, JSON.stringify(next, null, 2));
+    } catch {}
+  }
+
   getConversationFromEntries(id, options = {}, subagent = false) {
     const entries = () => (subagent ? this.subagentEntries : this.entries);
     let entry = entries().get(id);
@@ -816,7 +846,7 @@ export class NativeSessionStore extends EventEmitter {
       this.details.set(id, cache);
     }
 
-    readSessionUpdates(cache, entry, this.maxMessages);
+    readSessionUpdates(cache, entry, this.maxMessages, this);
     this.applyPersistedThreadSettings(cache, entry);
     if (cache.status === 'running' && cache.latestTurnId && !cache.currentTurnStartedAt && !cache.turnStartScanComplete) {
       cache.currentTurnStartedAt = findTurnStartedAtBeforeOffset(
@@ -945,6 +975,17 @@ function findSubagentEntry(entries, parentId, agentRef) {
       || entry.agentPath === ref
       || entry.agentPath.split('/').filter(Boolean).at(-1) === leaf
     )) || null;
+}
+
+function readDeepSeekUsageStatsFile(file) {
+  try {
+    if (!file || !existsSync(file)) return null;
+    const data = JSON.parse(readFileSync(file, 'utf8'));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    return data;
+  } catch {
+    return null;
+  }
 }
 
 export function readSessionIndex(file) {
@@ -1134,6 +1175,7 @@ function createDetailCache(entry, options) {
     messagesTruncated: startOffset > 0,
     calls: new Map(),
     pendingGoalUpdates: new Map(),
+    responseAnnotationsByTurn: new Map(),
     metadata: { workspaceKind: entry.workspaceKind || '' },
     goal: null,
     currentTurnId: '',
@@ -1186,7 +1228,7 @@ function readFirstRecord(file) {
   return null;
 }
 
-function readSessionUpdates(cache, entry, maxMessages) {
+function readSessionUpdates(cache, entry, maxMessages, store) {
   if (entry.size < cache.offset) return;
   if (entry.size === cache.offset) {
     cache.size = entry.size;
@@ -1207,7 +1249,7 @@ function readSessionUpdates(cache, entry, maxMessages) {
       const data = cache.remainder.length
         ? Buffer.concat([cache.remainder, chunk.subarray(0, bytesRead)])
         : chunk.subarray(0, bytesRead);
-      cache.remainder = consumeJsonlBuffer(cache, data, maxMessages);
+      cache.remainder = consumeJsonlBuffer(cache, data, maxMessages, store);
     }
     cache.offset = position;
     cache.size = entry.size;
@@ -1327,7 +1369,7 @@ function findTurnStartedAtBeforeOffset(filePath, turnId, boundaryOffset, fileSiz
   }
 }
 
-function consumeJsonlBuffer(cache, data, maxMessages) {
+function consumeJsonlBuffer(cache, data, maxMessages, store) {
   let start = 0;
   if (cache.skipFirstPartial) {
     const newline = data.indexOf(10);
@@ -1344,13 +1386,13 @@ function consumeJsonlBuffer(cache, data, maxMessages) {
     start = newline + 1;
     if (!line.length) continue;
     try {
-      applyNativeRecord(cache, JSON.parse(line.toString('utf8')), maxMessages);
+      applyNativeRecord(cache, JSON.parse(line.toString('utf8')), maxMessages, store);
     } catch {}
   }
   return start < data.length ? Buffer.from(data.subarray(start)) : Buffer.alloc(0);
 }
 
-function applyNativeRecord(cache, record, maxMessages) {
+function applyNativeRecord(cache, record, maxMessages, store) {
   if (!record || typeof record !== 'object') return;
   if (record.timestamp) cache.lastTimestamp = String(record.timestamp);
 
@@ -1373,6 +1415,7 @@ function applyNativeRecord(cache, record, maxMessages) {
   const payload = record.payload || {};
   if (record.type === 'event_msg') {
     applyEventRecord(cache, record, payload, maxMessages);
+    if (payload.type === 'task_complete') store?.accumulateDeepSeekUsage(cache, payload);
     return;
   }
   if (record.type !== 'response_item') return;
@@ -1535,6 +1578,15 @@ function applyEventRecord(cache, record, payload, maxMessages) {
       appendNativeMessage(cache, 'process', '任务开始', record, maxMessages, payload.type);
       break;
     case 'task_complete': {
+      const errorMessage = nativeEventErrorMessage(payload.error);
+      if (errorMessage) {
+        cache.status = 'error';
+        restoreRolledBackRetryAssistant(cache, maxMessages);
+        appendNativeMessage(cache, 'process', errorMessage, record, maxMessages, 'task_error', {
+          ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+        });
+        break;
+      }
       cache.status = 'done';
       restoreRolledBackRetryAssistant(cache, maxMessages);
       // Promote the latest unphased assistant bubble of this turn to final_answer so Web history
@@ -1561,12 +1613,30 @@ function applyEventRecord(cache, record, payload, maxMessages) {
       if (contextWindowTokens !== null) cache.contextWindowTokens = contextWindowTokens;
       break;
     }
-    case 'task_error':
     case 'turn_aborted':
+      cache.status = 'interrupted';
+      restoreRolledBackRetryAssistant(cache, maxMessages);
+      appendNativeMessage(
+        cache,
+        'process',
+        payload.message || nativeEventErrorMessage(payload.error, '任务已暂停'),
+        record,
+        maxMessages,
+        payload.type,
+      );
+      break;
+    case 'task_error':
     case 'error':
       cache.status = 'error';
       restoreRolledBackRetryAssistant(cache, maxMessages);
-      appendNativeMessage(cache, 'process', payload.message || payload.error || '任务中断', record, maxMessages, payload.type);
+      appendNativeMessage(
+        cache,
+        'process',
+        payload.message || nativeEventErrorMessage(payload.error, '任务中断'),
+        record,
+        maxMessages,
+        payload.type,
+      );
       break;
     case 'thread_rolled_back':
       cache.pendingThreadRollbackTurnId = cache.currentTurnId || cache.latestTurnId || '';
@@ -1587,6 +1657,19 @@ function applyEventRecord(cache, record, payload, maxMessages) {
     default:
       break;
   }
+}
+
+function nativeEventErrorMessage(error, fallback = '') {
+  if (typeof error === 'string') return error.trim() || fallback;
+  if (error && typeof error === 'object') {
+    const direct = error.message ?? error.error ?? error.detail;
+    if (typeof direct === 'string' && direct.trim()) return direct.trim();
+    try {
+      const serialized = JSON.stringify(error, null, 2);
+      if (serialized && serialized !== '{}') return serialized;
+    } catch {}
+  }
+  return fallback;
 }
 
 function applyCompactedRecord(cache, record, maxMessages) {
@@ -1718,6 +1801,16 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   const text = contentText(payload.content);
   const images = contentImages(payload.content);
   if (!text && !images.length) return;
+  const turnId = String(
+    payload.internal_chat_message_metadata_passthrough?.turn_id
+    || payload.internal_chat_message_metadata_passthrough?.turnId
+    || cache.currentTurnId
+    || '',
+  );
+  if (payload.role === 'user') {
+    const responseAnnotations = responseAnnotationsFromText(text);
+    if (turnId && responseAnnotations.length) cache.responseAnnotationsByTurn.set(turnId, responseAnnotations);
+  }
   const browserComments = payload.role === 'user' && isBrowserCommentsMessage(text);
   const browserCommentMeta = browserComments ? browserCommentsMetadata(text) : null;
   const contexts = payload.role === 'user' ? normalizeInjectedContexts(text) : [];
@@ -1730,7 +1823,6 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
     messageKind = isProgressStyleText(displayText) ? 'commentary' : 'message';
   }
   if (payload.role === 'user' && !contexts.length && (displayText || images.length)) {
-    const turnId = String(payload.internal_chat_message_metadata_passthrough?.turn_id || '');
     if (cache.displayUserMessagesInTurn === 0) {
       if (turnId && turnId === cache.currentTurnId) {
         collapseRolledBackRetryTurn(cache, displayText, images.length > 0);
@@ -1741,7 +1833,12 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
     }
     if (browserComments) {
       messageKind = 'steering_browser_comment';
-    } else if (turnId && turnId === cache.currentTurnId && cache.displayUserMessagesInTurn > 0) {
+    } else if (
+      turnId
+      && turnId === cache.currentTurnId
+      && cache.displayUserMessagesInTurn > 0
+      && !isAutomationHeartbeatMessage(displayText)
+    ) {
       messageKind = 'steering_user';
     }
     cache.displayUserMessagesInTurn += 1;
@@ -1753,7 +1850,12 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   } else if (displayText && payload.role === 'assistant' && isHandoffSummaryText(displayText)) {
     // Internal agent handoff must not surface in the Web chat UI.
   } else if (displayText) {
-    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind, browserCommentMeta);
+    const responseAnnotations = payload.role === 'assistant' && /:codex-annotation\{index=/.test(displayText)
+      ? cache.responseAnnotationsByTurn.get(turnId || cache.currentTurnId)
+      : null;
+    const messageMetadata = browserCommentMeta
+      || (responseAnnotations?.length ? { responseAnnotations: responseAnnotations.map((item) => ({ ...item })) } : null);
+    appendNativeMessage(cache, payload.role, displayText, record, maxMessages, messageKind, messageMetadata);
   }
   const imageKind = payload.role === 'user'
     ? ['steering_user', 'steering_browser_comment'].includes(messageKind) ? 'steering_input_image' : 'input_image'
@@ -1842,6 +1944,11 @@ function isBrowserCommentsMessage(text) {
   return String(text || '').replace(/\r\n/g, '\n').trimStart().startsWith('# Browser comments:');
 }
 
+function isAutomationHeartbeatMessage(text) {
+  const value = String(text || '').trim();
+  return value.startsWith('<heartbeat') && value.includes('</heartbeat>');
+}
+
 function browserCommentsMetadata(text) {
   const source = String(text || '').replace(/\r\n/g, '\n');
   const headings = source.match(/^## (?:User )?Comment \d+\s*$/gm) || [];
@@ -1854,12 +1961,46 @@ function browserCommentsMetadata(text) {
   };
 }
 
+function responseAnnotationsFromText(text) {
+  const source = String(text || '').replace(/\r\n/g, '\n');
+  const match = /<response-annotations>\s*([\s\S]*?)\s*<\/response-annotations>/i.exec(source);
+  if (!match) return [];
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item) => ({
+      text: limitText(String(item?.text || '').trim(), DETAIL_TEXT_LIMIT),
+      annotation: limitText(String(item?.annotation || '').trim(), DETAIL_TEXT_LIMIT),
+    })).filter((item) => item.text || item.annotation);
+  } catch {
+    return [];
+  }
+}
+
+function responseAnnotationRequestText(text) {
+  const source = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!/^# Response annotations:\s*$/im.test(source)) return null;
+  if (!/<response-annotations>[\s\S]*?<\/response-annotations>/i.test(source)) return null;
+  const markers = [...source.matchAll(/^## My request(?: for Codex)?:\s*$/gim)];
+  const marker = markers.at(-1);
+  return marker?.index == null ? '' : source.slice(marker.index + marker[0].length);
+}
+
+function matchWorkspaceInstructionsPrefix(text) {
+  const source = String(text || '').replace(/\r\n/g, '\n').trimStart();
+  const match = /^# AGENTS\.md instructions(?: for ([^\n]+))?\s*\n+<INSTRUCTIONS>\n?[\s\S]*?<\/INSTRUCTIONS>/.exec(source);
+  if (!match) return null;
+  return {
+    source: match[0],
+    workspace: String(match[1] || '').trim(),
+  };
+}
+
 function isInjectedWorkspaceInstructions(role, text) {
   if (role !== 'user') return false;
   const normalized = String(text || '').replace(/\r\n/g, '\n').trimStart();
-  const workspaceInstructions = normalized.startsWith('# AGENTS.md instructions for ')
-    && normalized.includes('\n\n<INSTRUCTIONS>\n')
-    && normalized.includes('\n</INSTRUCTIONS>');
+  const workspace = matchWorkspaceInstructionsPrefix(normalized);
+  const workspaceInstructions = Boolean(workspace && !normalized.slice(workspace.source.length).trim());
   const skillInstructions = normalized.startsWith('<skill>')
     && normalized.includes('<name>')
     && normalized.includes('</skill>');
@@ -1939,6 +2080,11 @@ function peelCompositeInjectedContexts(normalized) {
   if (workspace) {
     contexts.push(workspace.context);
     remaining = workspace.remaining.trim();
+  } else {
+    const standaloneWorkspace = matchWorkspaceInstructionsPrefix(remaining);
+    if (standaloneWorkspace) {
+      remaining = remaining.slice(standaloneWorkspace.source.length).trim();
+    }
   }
 
   const environment = remaining.match(/^<environment_context>\s*([\s\S]*?)\s*<\/environment_context>\s*$/);
@@ -1964,7 +2110,7 @@ function takeWorkspaceInjectedPrefix(normalized) {
     pluginSource = taggedPlugins[1];
     afterPlugins = normalized.slice(taggedPlugins[0].length).replace(/^\n+/, '').trimStart();
   } else {
-    const agentsAt = normalized.search(/\n# AGENTS\.md instructions for /);
+    const agentsAt = normalized.search(/\n# AGENTS\.md instructions(?: for [^\n]+)?\s*\n/);
     const envAt = normalized.search(/\n<environment_context>/);
     let cut = normalized.length;
     if (agentsAt >= 0) cut = Math.min(cut, agentsAt);
@@ -1973,9 +2119,7 @@ function takeWorkspaceInjectedPrefix(normalized) {
     afterPlugins = normalized.slice(cut).replace(/^\n+/, '').trimStart();
   }
 
-  const workspaceMatch = afterPlugins.match(
-    /^# AGENTS\.md instructions for ([^\n]+)\n\n<INSTRUCTIONS>\n[\s\S]*?\n<\/INSTRUCTIONS>/,
-  );
+  const workspaceMatch = matchWorkspaceInstructionsPrefix(afterPlugins);
   if (taggedPlugins && afterPlugins && !workspaceMatch && !afterPlugins.startsWith('<environment_context>')) {
     return null;
   }
@@ -1985,7 +2129,7 @@ function takeWorkspaceInjectedPrefix(normalized) {
 
   let remaining = afterPlugins;
   if (workspaceMatch) {
-    remaining = afterPlugins.slice(workspaceMatch[0].length).replace(/^\n+/, '').trimStart();
+    remaining = afterPlugins.slice(workspaceMatch.source.length).replace(/^\n+/, '').trimStart();
   }
 
   if (remaining && !remaining.startsWith('<environment_context>')) return null;
@@ -1994,7 +2138,7 @@ function takeWorkspaceInjectedPrefix(normalized) {
   const lines = [];
   if (pluginCount) lines.push('推荐插件 ' + pluginCount);
   else lines.push('推荐插件列表已同步');
-  const workspace = String(workspaceMatch?.[1] || '').trim();
+  const workspace = String(workspaceMatch?.workspace || '').trim();
   if (workspace) lines.push('工作区规则 ' + workspace);
   return {
     context: {
@@ -2120,8 +2264,12 @@ function contextTagValues(source, tag) {
 
 function normalizeUserDisplayText(text) {
   const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
-  const requestMarker = '## My request for Codex:';
-  const requestIndex = normalized.indexOf(requestMarker);
+  const responseAnnotationRequest = responseAnnotationRequestText(normalized);
+  if (responseAnnotationRequest !== null) return cleanUserRequest(responseAnnotationRequest);
+  const requestMarkers = [...normalized.matchAll(/^## My request(?: for Codex)?:\s*$/gm)];
+  const requestMarker = requestMarkers.at(-1);
+  const requestIndex = requestMarker?.index ?? -1;
+  const requestStart = requestIndex === -1 ? -1 : requestIndex + requestMarker[0].length;
   // A design annotation has the same browser-comment envelope as a regular
   // comment, but only its changed declarations belong in the visible history.
   const standaloneAnnotation = browserAnnotationDisplayText(normalized);
@@ -2129,11 +2277,11 @@ function normalizeUserDisplayText(text) {
     return standaloneAnnotation;
   }
   if (!normalized.startsWith('# Browser comments:')) {
-    return cleanUserRequest(requestIndex === -1 ? normalized : normalized.slice(requestIndex + requestMarker.length));
+    return cleanUserRequest(requestIndex === -1 ? normalized : normalized.slice(requestStart));
   }
 
   const commentsBlock = requestIndex === -1 ? normalized : normalized.slice(0, requestIndex);
-  const requestBlock = requestIndex === -1 ? '' : normalized.slice(requestIndex + requestMarker.length);
+  const requestBlock = requestIndex === -1 ? '' : normalized.slice(requestStart);
   const parts = [];
   const pushPart = (value) => {
     const clean = String(value || '').trim();
@@ -2144,7 +2292,7 @@ function normalizeUserDisplayText(text) {
   let match;
   while ((match = commentPattern.exec(commentsBlock))) pushPart(match[1]);
 
-  const sectionPattern = /^## (?:User Comment|Comment|Requested annotation) \d+\s*$([\s\S]*?)(?=^## (?:User Comment|Comment|Requested annotation) \d+\s*$|^## My request for Codex:|^<in-app-browser-context\b|$(?![\s\S]))/gm;
+  const sectionPattern = /^## (?:User Comment|Comment|Requested annotation) \d+\s*$([\s\S]*?)(?=^## (?:User Comment|Comment|Requested annotation) \d+\s*$|^## My request(?: for Codex)?:\s*$|^<in-app-browser-context\b|$(?![\s\S]))/gm;
   while ((match = sectionPattern.exec(commentsBlock))) {
     const section = String(match[1] || '');
     const annotation = browserAnnotationDisplayText(section);

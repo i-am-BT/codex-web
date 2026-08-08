@@ -19,7 +19,7 @@ test('side chat queue menu and pane helpers are present', () => {
     'let sideChatOpenTabs = []',
     "SIDE_CHAT_STORAGE_KEY='codexWeb.sideChat.v1'",
     "textContent='主会话'",
-    "className='msg sideChatMsg '",
+    'function createConversationMessageElement',
     'Open in side chat',
     'promptQueueMenu',
     'restoreSideChatIfNeeded',
@@ -31,9 +31,14 @@ test('side chat queue menu and pane helpers are present', () => {
     'isSideChatThread',
     'async function steerQueuedPrompt',
     'applyServerPromptQueue(threadId,data.queue)',
-    'renderAssistantMarkdown(body,text)',
+    'renderAssistantMarkdown(body,text,options.turnId)',
     'toolActivityPresentations',
     'createActivityBatch',
+    'createActivityCluster',
+    'appendActivityBatchToCluster',
+    'organizeTurnArtifactsForCompletion',
+    'createCompletionMessage',
+    'sideChatRenderUnfinishedTurn',
     'progressCommentary',
     "/steer",
     '运行中可发送引导',
@@ -71,6 +76,57 @@ test('side chat queue menu and pane helpers are present', () => {
   ]) {
     assert.ok(server.includes(needle), needle);
   }
+});
+
+test('side chat projects tools through the same folded timeline components as the main chat', () => {
+  const server = fs.readFileSync(path.join(root, 'server.mjs'), 'utf8');
+  const css = fs.readFileSync(path.join(root, 'ui.css'), 'utf8');
+  const renderStart = server.indexOf('function renderSideChatMessages(messages,context={})');
+  const renderEnd = server.indexOf('async function syncSideChatConversation()', renderStart);
+  const renderer = server.slice(renderStart, renderEnd);
+  const toolStart = server.indexOf('function sideChatAppendToolBatch(');
+  const toolEnd = server.indexOf('function sideChatAppendToolMessage(', toolStart);
+  const toolProjection = server.slice(toolStart, toolEnd);
+  const completionStart = server.indexOf('function sideChatFinalizeTurn(');
+  const completionEnd = server.indexOf('function sideChatRenderUnfinishedTurn(', completionStart);
+  const completionProjection = server.slice(completionStart, completionEnd);
+
+  assert.ok(renderStart >= 0 && renderEnd > renderStart, 'side chat renderer');
+  assert.match(renderer, /createConversationMessageElement\(role,text,/);
+  assert.match(renderer, /sideChatAppendToolMessage\(turn,message,renderContext\)/);
+  assert.doesNotMatch(renderer, /sideChatMessages\.appendChild\(createActivityBatch/);
+  assert.match(toolProjection, /state\.currentCluster=createActivityCluster\('tools',state\.pendingReasoning\)/);
+  assert.match(toolProjection, /appendActivityBatchToCluster\(state\.currentCluster,batch\)/);
+  assert.match(completionProjection, /organizeTurnArtifactsForCompletion\(state\.artifacts,anchor\)/);
+  assert.match(completionProjection, /createCompletionMessage\(text,organized\.processElements,state\.turnId/);
+  assert.match(server, /panel\.className='liveProcessPanel'/);
+  assert.match(server, /timeline\.className='completionTimeline liveProcessTimeline'/);
+  assert.match(css, /\.sideChatMessages > :is\([\s\S]*?\.activityCluster,[\s\S]*?\.liveProcessPanel,[\s\S]*?\.turnResultArtifacts[\s\S]*?\)\s*\{[^}]*width:\s*min\(var\(--composer-width\), 100%\);[^}]*max-width:\s*var\(--composer-width\)/s);
+  assert.match(css, /\.sideChatMessages > \.msg\.user,[^}]*max-width:\s*min\(var\(--conversation-width\), 77%\)/s);
+});
+
+test('mobile navigation drawer fully covers side chat without hiding its close control', () => {
+  const css = fs.readFileSync(path.join(root, 'ui.css'), 'utf8');
+
+  assert.match(css, /body \.side \{\s*z-index: 50;/);
+  assert.match(css, /body \.scrim \{\s*z-index: 40;/);
+  assert.match(
+    css,
+    /body \.app\.menuOpen \.side,[\s\S]*?padding-top: calc\(env\(safe-area-inset-top, 0px\) \+ 68px\);[\s\S]*?background: var\(--surface\);/,
+  );
+  assert.match(
+    css,
+    /body \.app\.menuOpen \.main > \.top \{[\s\S]*?z-index: 60;[\s\S]*?background: transparent !important;[\s\S]*?backdrop-filter: none;[\s\S]*?pointer-events: none;/,
+  );
+  assert.match(css, /body \.app\.menuOpen \.main > \.top \.menuBtn \{\s*pointer-events: auto;/);
+  assert.match(
+    css,
+    /body \.app\.menuOpen \.main > \.sideChatTabs \{[\s\S]*?visibility: hidden;[\s\S]*?pointer-events: none;/,
+  );
+  assert.match(
+    css,
+    /\.main\.sideChatOpen\.sideChatViewMain > \.composer,\s*\.main\.sideChatOpen:has\(> \.sideChatPane\.hidden\) > \.composer\s*\{[^}]*overflow:\s*visible;/s,
+  );
 });
 
 test('side chat follow-up service tier stays isolated per tab', () => {

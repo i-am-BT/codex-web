@@ -575,11 +575,34 @@ body .subQuotaClose:hover {
   height: 15px;
 }
 
-.subQuotaStatus {
+.subQuotaStatusRow {
+  display: flex;
+  min-width: 0;
   min-height: 18px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.subQuotaStatus {
+  min-width: 0;
+  min-height: 18px;
+  flex: 1 1 auto;
   color: var(--text-muted);
   font-size: 11px;
   line-height: 1.45;
+}
+
+.subQuotaPrimarySource {
+  min-width: 0;
+  flex: 0 0 auto;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .subQuotaStatus:empty {
@@ -595,6 +618,12 @@ body .subQuotaClose:hover {
   font-size: 11px;
   line-height: 1.4;
   font-weight: 500;
+}
+
+.subQuotaEmpty {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .subQuotaContent {
@@ -632,6 +661,64 @@ body .subQuotaClose:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.subQuotaCreditsGrid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.subQuotaCredits {
+  display: grid;
+  min-width: 0;
+  align-content: end;
+  gap: 2px;
+  padding: 2px 12px 2px 0;
+}
+
+.subQuotaCredits + .subQuotaCredits {
+  border-left: 1px solid var(--border);
+  padding: 2px 0 2px 12px;
+  text-align: right;
+}
+
+.subQuotaCredits > span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.subQuotaCredits > strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaCodexPreviewProgress {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.subQuotaCodexPreviewProgressHead {
+  display: flex;
+  min-width: 0;
+  justify-content: flex-end;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+
+.subQuotaCodexPreviewProgress .subQuotaProgress {
+  width: 100%;
 }
 
 .subQuotaExpiry {
@@ -785,7 +872,8 @@ body .subQuotaClose:hover {
   gap: 8px;
 }
 
-body .subQuotaReset {
+body .subQuotaReset,
+body .subQuotaConsole {
   display: inline-flex;
   min-height: 30px;
   align-items: center;
@@ -800,7 +888,8 @@ body .subQuotaReset {
   font-weight: 650;
 }
 
-body .subQuotaReset:hover {
+body .subQuotaReset:hover,
+body .subQuotaConsole:hover {
   border-color: var(--border-strong);
   background: var(--surface-hover);
   color: var(--text);
@@ -811,7 +900,8 @@ body .subQuotaReset:disabled {
   cursor: wait;
 }
 
-.subQuotaReset .lucide {
+.subQuotaReset .lucide,
+.subQuotaConsole .lucide {
   width: 14px;
   height: 14px;
 }
@@ -834,79 +924,445 @@ body .subQuotaReset:disabled {
   color: var(--danger);
 }
 
-.subQuotaSettingsDescription {
-  margin: -3px 0 10px;
+.grok2ApiConsoleOverlay {
+  z-index: 92;
+}
+
+.grok2ApiConsoleDialog {
+  display: grid;
+  width: min(860px, calc(100vw - 32px));
+  max-height: min(84dvh, 760px);
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
+}
+
+.grok2ApiConsoleHeadActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+body .grok2ApiConsoleIconButton {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
   color: var(--text-muted);
+  padding: 0;
+}
+
+body .grok2ApiConsoleIconButton:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+body .grok2ApiConsoleIconButton:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.grok2ApiConsoleIconButton .lucide {
+  width: 15px;
+  height: 15px;
+}
+
+.grok2ApiConsoleBody {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 16px 18px 18px;
+}
+
+.grok2ApiConsoleStatus {
+  min-height: 16px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.grok2ApiConsoleStatus[data-state="error"] {
+  color: var(--danger);
+}
+
+.grok2ApiConsoleOutput {
+  min-height: 260px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0d1218;
+  color: #d7e3ee;
+  padding: 12px;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.grok2ApiConsoleOutput:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.subQuotaSettingsTitleWrap h2 .lucide {
+  width: 18px;
+  height: 18px;
+}
+
+.subQuotaSettingsDescription {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  padding: 9px 11px;
   font-size: 11px;
   line-height: 1.5;
 }
 
+.subQuotaSettingsDescription .lucide {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  color: var(--success);
+}
+
 .subQuotaSettingsForm {
   display: grid;
+  min-width: 0;
   gap: 14px;
 }
 
+.subQuotaSettingsSourceList {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
 .subQuotaSettingsForm .field {
+  min-width: 0;
   margin: 0;
+}
+
+.subQuotaSettingsForm .field > span {
+  font-size: 11px;
+  font-weight: 650;
 }
 
 .subQuotaSettingsSource {
   display: grid;
-  gap: 10px;
   min-width: 0;
-  padding: 0 0 14px;
-  border-bottom: 1px solid var(--border);
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  padding: 13px;
+  transition: border-color 140ms var(--ease), background 140ms var(--ease), opacity 140ms var(--ease);
 }
 
-.subQuotaSettingsSourceTitle {
-  margin: 0;
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 700;
-  line-height: 1.35;
+.subQuotaSettingsSource.isHidden {
+  border-style: dashed;
+  background: color-mix(in srgb, var(--surface-raised) 72%, transparent);
 }
 
 .subQuotaSettingsSourceHead {
   display: flex;
+  min-width: 0;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+}
+
+.subQuotaSettingsSourceIdentity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.subQuotaSettingsSourceIcon {
+  display: inline-grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--primary);
+}
+
+.subQuotaSettingsSourceIcon .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.subQuotaSettingsSourceCopy {
+  min-width: 0;
+}
+
+.subQuotaSettingsSourceTitleRow {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.subQuotaSettingsSourceTitle {
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 720;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaSettingsSourceState {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-subtle);
+  padding: 1px 5px;
+  font-size: 9px;
+  font-weight: 680;
+  line-height: 1.45;
+}
+
+.subQuotaSettingsSourceState[data-state="ready"],
+.subQuotaSettingsSourceState[data-state="builtin"] {
+  border-color: color-mix(in srgb, var(--success) 35%, var(--border));
+  background: color-mix(in srgb, var(--success) 10%, transparent);
+  color: var(--success);
+}
+
+.subQuotaSettingsSourceState[data-state="partial"] {
+  border-color: color-mix(in srgb, var(--thinking) 35%, var(--border));
+  color: var(--thinking);
+}
+
+.subQuotaSettingsSourceDetail {
+  overflow: hidden;
+  margin: 2px 0 0;
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaSettingsSourceActions {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
   gap: 8px;
+}
+
+.subQuotaVisibilityToggle {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 3px 2px 3px 5px;
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.subQuotaVisibilityToggle:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.subQuotaVisibilityToggle:focus-visible,
+.subQuotaMoveButton:focus-visible,
+.subQuotaCodexRefresh:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.subQuotaVisibilityTrack {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 18px;
+  flex: 0 0 32px;
+  border-radius: 999px;
+  background: var(--surface-active);
+  box-shadow: inset 0 0 0 1px var(--border);
+  transition: background 140ms var(--ease), box-shadow 140ms var(--ease);
+}
+
+.subQuotaVisibilityThumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-subtle);
+  transition: transform 140ms var(--ease), background 140ms var(--ease);
+}
+
+.subQuotaVisibilityToggle[aria-checked="true"] .subQuotaVisibilityTrack {
+  background: var(--primary);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 72%, #000);
+}
+
+.subQuotaVisibilityToggle[aria-checked="true"] .subQuotaVisibilityThumb {
+  background: #fff;
+  transform: translateX(14px);
 }
 
 .subQuotaMoveButtons {
   display: inline-flex;
-  gap: 4px;
   flex: none;
+  gap: 3px;
 }
 
-.subQuotaMoveButton {
+.subQuotaMoveButton,
+.subQuotaCodexRefresh {
   display: inline-flex;
+  width: 26px;
+  height: 26px;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: transparent;
+  background: var(--surface);
   color: var(--text-subtle);
+  padding: 0;
   cursor: pointer;
 }
 
-.subQuotaMoveButton:hover:not(:disabled) {
+.subQuotaMoveButton:hover:not(:disabled),
+.subQuotaCodexRefresh:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
   color: var(--text);
-  border-color: var(--accent);
 }
 
-.subQuotaMoveButton:disabled {
-  opacity: 0.35;
+.subQuotaMoveButton:disabled,
+.subQuotaCodexRefresh:disabled {
+  opacity: 0.4;
   cursor: default;
+}
+
+.subQuotaMoveButton .lucide,
+.subQuotaCodexRefresh .lucide {
+  width: 14px;
+  height: 14px;
+}
+
+.subQuotaSettingsFields {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  gap: 10px;
 }
 
 .subQuotaCredentialHint {
   color: var(--text-subtle);
   font-size: 10px;
   line-height: 1.4;
+}
+
+.subQuotaSettingsBuiltinSource {
+  border-color: color-mix(in srgb, var(--primary) 32%, var(--border));
+}
+
+.subQuotaCodexSummary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.subQuotaCodexBalances {
+  display: grid;
+  flex: 1 1 260px;
+  min-width: 0;
+  max-width: 320px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.subQuotaCodexBalance {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.subQuotaCodexBalance + .subQuotaCodexBalance {
+  border-left: 1px solid var(--border);
+  padding-left: 12px;
+}
+
+.subQuotaCodexBalance > span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.subQuotaCodexBalance > strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaCodexProgress {
+  min-width: 120px;
+  flex: 1 1 180px;
+}
+
+.subQuotaCodexProgress .subQuotaProgress {
+  width: 100%;
+}
+
+.subQuotaCodexMeta {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.45;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaCodexMeta[data-state="success"] {
+  color: var(--success);
+}
+
+.subQuotaCodexMeta[data-state="error"] {
+  color: var(--danger);
 }
 
 .deepSeekUsageCalibration {
@@ -971,11 +1427,12 @@ body .deepSeekUsageCalibrationSubmit {
 
 .subQuotaSettingsSubmit {
   width: max-content;
-  min-width: 132px;
-  justify-self: end;
+  min-width: 126px;
+  flex: none;
 }
 
 .subQuotaSettingsStatus {
+  min-width: 0;
   min-height: 18px;
   margin: 0;
 }
@@ -986,8 +1443,8 @@ body .deepSeekUsageCalibrationSubmit {
 
 .subQuotaSettingsDialog {
   display: flex;
-  width: min(520px, calc(100vw - 32px));
-  max-height: min(86vh, 680px);
+  width: min(660px, calc(100vw - 32px));
+  max-height: min(88vh, 780px);
   flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -1000,13 +1457,9 @@ body .deepSeekUsageCalibrationSubmit {
 .subQuotaSettingsBody {
   display: grid;
   min-width: 0;
-  gap: 10px;
+  gap: 14px;
   padding: 18px;
   overflow-y: auto;
-}
-
-.subQuotaSettingsBody .subQuotaSettingsDescription {
-  margin: 0;
 }
 
 
@@ -4837,40 +5290,6 @@ body .msg.assistant .markdownBody li + li {
   margin-top: 3px;
 }
 
-body .nativeHistoryLoadEarlier {
-  align-self: center;
-  display: inline-flex;
-  min-height: 30px;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-muted);
-  padding: 4px 9px;
-  font-size: 12px;
-  font-weight: 560;
-  cursor: pointer;
-}
-
-body .nativeHistoryLoadEarlier:hover,
-body .nativeHistoryLoadEarlier:focus-visible {
-  background: var(--surface-hover);
-  color: var(--text);
-  outline: none;
-}
-
-body .nativeHistoryLoadEarlier:disabled {
-  cursor: progress;
-  opacity: 0.72;
-}
-
-body .nativeHistoryLoadEarlier .lucide {
-  width: 14px;
-  height: 14px;
-}
-
 .markdownBody a {
   color: var(--primary);
 }
@@ -5397,6 +5816,37 @@ body[data-theme] .msg.process {
   font-size: 11px;
 }
 
+body[data-theme] .msg.process.nativeConnectionStatus,
+body[data-theme] .msg.process[data-message-kind="task_error"],
+body[data-theme] .msg.process[data-message-kind="error"] {
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+  border-left: 2px solid var(--danger);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 7%, transparent);
+  color: var(--text);
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+body[data-theme] .msg.process.nativeConnectionStatus.streaming {
+  border-left-color: var(--border-strong);
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+}
+
+body[data-theme] .msg.process.nativeConnectionStatus > .msgBody,
+body[data-theme] .msg.process[data-message-kind="task_error"] > .msgBody,
+body[data-theme] .msg.process[data-message-kind="error"] > .msgBody {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 body .msg.process.completionSummary {
   width: 100%;
   max-width: 100%;
@@ -5879,9 +6329,9 @@ body .msg.user.browserCommentSteering::after {
 body .msg.user.steeringUser.browserCommentSteering .userAttachmentStack,
 body .msg.user.steeringUser.browserCommentSteering.hasInputImage .userAttachmentStack,
 .browserCommentSteering .userAttachmentStack {
-  width: 100px;
+  width: min(220px, 100%);
   max-width: 100%;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
   margin: 0;
   align-self: flex-end;
@@ -7498,6 +7948,130 @@ body .msg.user.browserCommentSteering .browserAnnotationDetails.markdownBody li 
   }
 }
 
+body .msg.assistant .responseAnnotationCard {
+  position: relative;
+  display: inline-block;
+  margin: 0 2px;
+  vertical-align: baseline;
+}
+
+body .msg.assistant .responseAnnotationTrigger {
+  appearance: none;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--primary);
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  font-size: 0.88em;
+  font-weight: 600;
+  line-height: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--primary) 48%, transparent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+body .msg.assistant .responseAnnotationTrigger:hover {
+  color: color-mix(in srgb, var(--primary) 82%, var(--text));
+  text-decoration-color: currentColor;
+}
+
+body .msg.assistant .responseAnnotationTrigger:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+}
+
+body .msg.assistant .responseAnnotationDetails {
+  display: block;
+  position: absolute;
+  z-index: 12;
+  left: 0;
+  bottom: calc(100% + 8px);
+  width: max-content;
+  max-width: min(340px, calc(100vw - 28px));
+  max-height: min(52vh, 300px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised, var(--surface));
+  color: var(--text);
+  box-shadow: 0 10px 28px color-mix(in srgb, #000 16%, transparent);
+  padding: 11px 12px;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity 140ms var(--ease), visibility 140ms var(--ease), transform 140ms var(--ease);
+}
+
+body .msg.assistant .responseAnnotationField {
+  display: block;
+  min-width: min(260px, calc(100vw - 54px));
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+body .msg.assistant .responseAnnotationField + .responseAnnotationField {
+  margin-top: 9px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  padding-top: 9px;
+}
+
+body .msg.assistant .responseAnnotationLabel {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+body .msg.assistant .responseAnnotationText {
+  display: block;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  body .msg.assistant .responseAnnotationCard:hover > .responseAnnotationDetails,
+  body .msg.assistant .responseAnnotationCard.browserAnnotationPointerOver > .responseAnnotationDetails,
+  body .msg.assistant .responseAnnotationTrigger:focus-visible + .responseAnnotationDetails {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  body .msg.assistant .responseAnnotationTrigger {
+    min-height: 36px;
+    padding: 6px 0;
+  }
+
+  body .msg.assistant .responseAnnotationCard.open > .responseAnnotationDetails {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  body .msg.assistant .responseAnnotationDetails {
+    max-width: calc(100vw - 28px);
+  }
+
+  body .msg.assistant .responseAnnotationField {
+    min-width: min(240px, calc(100vw - 54px));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body .msg.assistant .responseAnnotationDetails {
+    transition: none;
+  }
+}
+
 body .msg.assistant > .msgBody > :not(.memoryCitations),
 body[data-theme] .msg.process,
 body[data-theme] .activityBatch,
@@ -8236,10 +8810,15 @@ body[data-theme] .box .attachBtn {
 .composerContextRing {
   --context-progress: 0%;
   position: relative;
-  width: 15px;
-  height: 15px;
+  /*
+   * Keep the ring on an even pixel box so the 24px control centers it on
+   * integer coordinates. A fractional 15px box made the top and bottom
+   * anti-aliasing rows render with visibly different weights.
+   */
+  width: 16px;
+  height: 16px;
   display: block;
-  flex: 0 0 15px;
+  flex: 0 0 16px;
   border-radius: 50%;
   background: conic-gradient(
     currentColor var(--context-progress),
@@ -8249,7 +8828,7 @@ body[data-theme] .box .attachBtn {
 
 .composerContextRing::after {
   position: absolute;
-  inset: 2.5px;
+  inset: 2px;
   border-radius: inherit;
   background: var(--surface);
   content: "";
@@ -8672,10 +9251,6 @@ body[data-theme="dark"] .threadGoalBar {
   background: transparent;
 }
 
-.promptQueueRow.appOwned {
-  grid-template-columns: 22px minmax(0, 1fr) 30px auto 30px;
-}
-
 body[data-theme="dark"] .promptQueue {
   border-color: color-mix(in srgb, #454545 70%, transparent);
   background: color-mix(in srgb, var(--surface) 90%, transparent);
@@ -8693,9 +9268,34 @@ body[data-theme="dark"] .promptQueue {
   -webkit-user-select: none;
   flex: 0 0 auto;
 }
+.promptQueueBody {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
 .promptQueueLead svg {
   width: 14px;
   height: 14px;
+}
+.promptQueueLead.promptQueueLeadLocked {
+  cursor: default;
+  opacity: 0.55;
+}
+.promptQueueToggle {
+  align-self: end;
+  min-width: 64px;
+  padding: 6px 10px;
+  border-radius: 9px;
+  background: #1b2533;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 700;
+}
+.promptQueueToggle[aria-pressed="true"] {
+  color: #9ee8b5;
+  border-color: #254a33;
+  background: #0f1f16;
 }
 
 .promptQueueList.dragging {
@@ -9001,13 +9601,14 @@ body .attachmentChip button .lucide {
 }
 
 .composerPermissionPanel {
+  bottom: 56px;
   left: 38px;
   display: block;
-  width: min(320px, calc(100vw - 24px));
-  max-height: min(410px, calc(100dvh - 96px));
+  width: min(300px, calc(100vw - 32px));
+  max-height: min(370px, calc(100dvh - 120px));
   overflow: auto;
-  border-radius: 12px;
-  padding: 6px;
+  border-radius: 11px;
+  padding: 5px;
   overscroll-behavior: contain;
 }
 
@@ -9018,12 +9619,12 @@ body .attachmentChip button .lucide {
 }
 
 .composerPermissionHead {
-  min-height: 34px;
+  min-height: 30px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 5px 8px 4px;
+  gap: 8px;
+  padding: 4px 7px 3px;
 }
 
 .composerPermissionHead strong {
@@ -9036,7 +9637,7 @@ body .attachmentChip button .lucide {
 .composerPermissionHead a {
   flex: 0 0 auto;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 10px;
   text-decoration: underline;
   text-decoration-color: color-mix(in srgb, currentColor 55%, transparent);
   text-underline-offset: 2px;
@@ -9055,16 +9656,16 @@ body .attachmentChip button .lucide {
 .composerPermissionOption {
   position: relative;
   width: 100%;
-  min-height: 50px;
+  min-height: 44px;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) 18px;
+  grid-template-columns: 20px minmax(0, 1fr) 16px;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 7px;
   background: transparent;
   color: var(--text);
-  padding: 6px 8px;
+  padding: 5px 7px;
   text-align: left;
   transition: background 150ms var(--ease), color 150ms var(--ease);
 }
@@ -9080,33 +9681,33 @@ body .attachmentChip button .lucide {
 }
 
 .composerPermissionOption[data-permission-mode="custom"] {
-  margin-top: 3px;
+  margin-top: 2px;
   border-top: 1px solid var(--border);
-  border-radius: 0 0 8px 8px;
+  border-radius: 0 0 7px 7px;
 }
 
 .composerPermissionOptionIcon,
 .composerPermissionCheck {
-  width: 17px;
-  height: 17px;
+  width: 16px;
+  height: 16px;
   color: var(--text-muted);
 }
 
 .composerPermissionCopy {
   min-width: 0;
   display: grid;
-  gap: 2px;
+  gap: 1px;
 }
 
 .composerPermissionCopy strong {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 610;
   line-height: 1.25;
 }
 
 .composerPermissionCopy small {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 400;
   line-height: 1.3;
   white-space: normal;
@@ -9129,17 +9730,18 @@ body .attachmentChip button .lucide {
 }
 
 .composerPermissionRunHint {
-  margin: 4px 8px 3px;
+  margin: 3px 7px 2px;
   color: var(--text-subtle);
-  font-size: 10px;
+  font-size: 9px;
   line-height: 1.4;
 }
 
 @media (max-width: 520px) {
   .composerPermissionPanel {
+    bottom: 58px;
     left: 50%;
-    width: min(360px, calc(100vw - 20px));
-    max-height: min(70dvh, 380px);
+    width: min(330px, calc(100vw - 32px));
+    max-height: min(64dvh, 340px);
     transform: translateX(-50%);
   }
 }
@@ -10445,7 +11047,12 @@ body .composer > .box:focus-within {
     height: 100dvh;
   }
 
+  body .main {
+    --header-height: 64px;
+  }
+
   body .side {
+    z-index: 50;
     width: min(88vw, 326px);
     padding-top: calc(env(safe-area-inset-top, 0px) + 12px);
     box-shadow: 20px 0 54px rgba(0, 0, 0, 0.28);
@@ -10456,14 +11063,55 @@ body .composer > .box:focus-within {
   }
 
   body .scrim {
+    z-index: 40;
     background: rgba(0, 0, 0, 0.5);
     backdrop-filter: blur(2px);
   }
 
+  /* The mobile drawer must cover side-chat tabs and content completely. */
+  body .app.menuOpen .side,
+  body[data-chat-bg="skin"] .app.menuOpen .side,
+  body[data-chat-bg="custom"] .app.menuOpen .side {
+    padding-top: calc(env(safe-area-inset-top, 0px) + 68px);
+    background: var(--surface);
+    background-image: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  body .app.menuOpen .main > .top {
+    z-index: 60;
+    border-color: transparent;
+    background: transparent !important;
+    box-shadow: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    pointer-events: none;
+  }
+
+  body .app.menuOpen .main > .top > :not(.menuBtn) {
+    visibility: hidden;
+  }
+
+  body .app.menuOpen .main > .top .menuBtn {
+    pointer-events: auto;
+    background: var(--surface-raised);
+  }
+
+  body .app.menuOpen .main > .sideChatTabs {
+    visibility: hidden;
+    pointer-events: none;
+  }
+
   body .top {
-    min-height: 56px;
-    height: 56px;
-    padding: calc(env(safe-area-inset-top, 0px) + 6px) 12px 6px;
+    min-height: 64px;
+    height: auto;
+    padding: calc(env(safe-area-inset-top, 0px) + 12px) 16px 12px;
+    gap: 14px;
+  }
+
+  body .top .title {
+    line-height: 1.4;
   }
 
   body .menuBtn {
@@ -10475,7 +11123,9 @@ body .composer > .box:focus-within {
   }
 
   body .chat {
-    padding: 16px 13px 20px;
+    margin-top: 10px;
+    padding: 22px 16px 20px;
+    scroll-padding-top: 32px;
   }
 
   .archiveViewInner {
@@ -10728,8 +11378,8 @@ body .composer > .box:focus-within {
     border-color: color-mix(in srgb, #e1e3e6 88%, transparent);
     background: color-mix(in srgb, #ffffff 88%, transparent);
     box-shadow: 0 10px 28px rgba(31, 35, 41, 0.10);
-    backdrop-filter: blur(16px) saturate(1.06);
-    -webkit-backdrop-filter: blur(16px) saturate(1.06);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 
   body[data-theme="dark"] .composer > .box,
@@ -10739,8 +11389,8 @@ body .composer > .box:focus-within {
     border-color: color-mix(in srgb, #454545 88%, transparent);
     background: color-mix(in srgb, var(--surface) 86%, transparent);
     box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
-    backdrop-filter: blur(16px) saturate(1.06);
-    -webkit-backdrop-filter: blur(16px) saturate(1.06);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 
   body[data-chat-bg="skin"] .composer > .box,
@@ -10749,8 +11399,8 @@ body .composer > .box:focus-within {
     border-color: var(--primary-line);
     background: color-mix(in srgb, var(--skin-surface-strong) 78%, transparent);
     box-shadow: 0 10px 28px var(--skin-accent-glow);
-    backdrop-filter: blur(18px) saturate(1.1);
-    -webkit-backdrop-filter: blur(18px) saturate(1.1);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 
   body[data-chat-bg="custom"] .composer > .box,
@@ -10759,8 +11409,8 @@ body .composer > .box:focus-within {
     border-color: color-mix(in srgb, var(--border) 70%, transparent);
     background: color-mix(in srgb, var(--surface) 72%, transparent);
     box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
-    backdrop-filter: blur(18px) saturate(1.08);
-    -webkit-backdrop-filter: blur(18px) saturate(1.08);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 
   .promptQueue,
@@ -10903,6 +11553,27 @@ body .composer > .box:focus-within {
     padding: 8px;
   }
 
+  .grok2ApiConsoleOverlay {
+    place-items: center;
+    padding: 12px;
+  }
+
+  .grok2ApiConsoleDialog {
+    width: 100%;
+    max-height: calc(100dvh - 24px);
+  }
+
+  .grok2ApiConsoleBody {
+    gap: 8px;
+    padding: 12px;
+  }
+
+  .grok2ApiConsoleOutput {
+    min-height: 180px;
+    padding: 10px;
+    font-size: 10px;
+  }
+
   .archiveConfirmOverlay {
     place-items: end center;
     padding: 8px;
@@ -10929,6 +11600,67 @@ body .composer > .box:focus-within {
   .subQuotaSettingsDialog {
     width: 100%;
     max-height: calc(100dvh - 32px);
+  }
+
+  .subQuotaSettingsBody {
+    padding: 14px;
+  }
+
+  .subQuotaSettingsSource {
+    padding: 12px;
+  }
+
+  .subQuotaSettingsSourceHead {
+    align-items: flex-start;
+  }
+
+  .subQuotaSettingsSourceActions {
+    gap: 5px;
+  }
+
+  .subQuotaVisibilityLabel {
+    display: none;
+  }
+
+  .subQuotaVisibilityToggle {
+    padding-inline: 2px;
+  }
+
+  .subQuotaSettingsFields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .subQuotaCodexSummary {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 10px;
+  }
+
+  .subQuotaCodexBalances {
+    width: 100%;
+    max-width: none;
+    flex: none;
+  }
+
+  .subQuotaCodexProgress {
+    width: 100%;
+    min-width: 0;
+    flex: none;
+  }
+
+  .subQuotaCodexMeta {
+    text-align: left;
+    white-space: normal;
+  }
+
+  .subQuotaSettingsFooter {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .subQuotaSettingsSubmit {
+    width: 100%;
   }
 
   .deepSeekUsageCalibrationFields {
@@ -11145,13 +11877,13 @@ body .composer > .box:focus-within {
   }
 
   .promptQueueRow {
-    grid-template-columns: 22px minmax(0, 1fr) 28px auto 28px 28px;
+    grid-template-columns: 22px minmax(0, 1fr) auto 28px 28px;
     gap: 2px;
     padding-inline: 8px 5px;
   }
 
-  .promptQueueRow.appOwned {
-    grid-template-columns: 22px minmax(0, 1fr) 28px auto 28px;
+  .promptQueueEditButton {
+    display: none;
   }
 
   .promptQueueGuide {
@@ -11189,9 +11921,10 @@ body .composer > .box:focus-within {
   }
 
   .composerPermissionPanel {
+    bottom: 58px;
     left: 50%;
-    width: min(360px, calc(100vw - 20px));
-    max-height: min(70dvh, 380px);
+    width: min(330px, calc(100vw - 32px));
+    max-height: min(64dvh, 340px);
     transform: translateX(-50%);
   }
 
@@ -11797,7 +12530,8 @@ body .composer > .box:focus-within {
 .sideChatMessages > .msg.user,
 .sideChatMessages > .sideChatMsg.user {
   align-self: flex-end;
-  max-width: min(var(--conversation-width), 92%);
+  max-width: min(var(--conversation-width), 77%);
+  margin-right: 0;
 }
 
 .sideChatMessages > .msg.assistant,
@@ -11943,27 +12677,16 @@ body[data-chat-bg="skin"] .sideChatSend {
   cursor: not-allowed;
 }
 
-/* Side chat reuses main .msg / .activityBatch / .progressCommentary rules.
-   Only layout containment here — no separate typography. */
-.sideChatMessages > .msg.activityBatch,
-.sideChatMessages > .msg.process,
-.sideChatMessages > .msg.progressCommentary {
-  align-self: stretch;
-  width: 100%;
-  max-width: 100%;
-  margin: 0;
-}
-
-.sideChatLiveHint {
-  align-self: stretch;
-  margin-top: 4px;
-  border: 1px dashed color-mix(in srgb, var(--primary) 35%, var(--border));
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--primary) 8%, transparent);
-  color: var(--text-muted);
-  font-size: 11px;
-  line-height: 1.45;
-  padding: 8px 12px;
+/* Use the same conversation rail and artifact sizing as the main transcript. */
+.sideChatMessages > :is(
+  .msg:not(.user):not(.inputImage),
+  .activityCluster,
+  .liveProcessPanel,
+  .turnResultArtifacts
+) {
+  width: min(var(--composer-width), 100%);
+  max-width: var(--composer-width);
+  align-self: center;
 }
 
 
@@ -12102,6 +12825,11 @@ body[data-chat-bg="skin"] .sideChatSend {
     -webkit-backdrop-filter: none;
   }
 
+  .main.sideChatOpen > .sideChatPane .sideChatComposerBox {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
   body.keyboardOpen .main.sideChatOpen > .sideChatPane > .sideChatComposer {
     padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
   }
@@ -12116,6 +12844,13 @@ body[data-chat-bg="skin"] .sideChatSend {
     --composer-width: 100%;
     --conversation-width: 100%;
   }
+
+  /* A retained Side Chat tab must not clip mobile run-pill details in main view. */
+  .main.sideChatOpen.sideChatViewMain > .composer,
+  .main.sideChatOpen:has(> .sideChatPane.hidden) > .composer {
+    overflow: visible;
+  }
+
   .main.sideChatOpen > .composer > *,
   .main.sideChatOpen > .composer > .box,
   .main.sideChatOpen > .composer > .promptQueue {

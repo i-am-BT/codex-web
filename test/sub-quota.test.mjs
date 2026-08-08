@@ -1299,8 +1299,8 @@ test('rejects unknown upstream when neither provider responds', async () => {
 
 test('normalizes Grok2API account summary into callable and abnormal stats', () => {
   const quota = normalizeGrok2ApiSummary({
-    total: 10,
-    available: 7,
+    total: 13,
+    available: 10,
     recovering: 2,
     attention: 1,
     risk: 0,
@@ -1309,25 +1309,34 @@ test('normalizes Grok2API account summary into callable and abnormal stats', () 
     providers: {
       grok_web: { total: 6, available: 5 },
       grok_build: { total: 4, available: 2 },
+      grok_console: { total: 3, available: 1 },
     },
   });
   assert.equal(quota.mode, 'grok2api_accounts');
   assert.equal(quota.unit, 'accounts');
   assert.equal(quota.supportsReset, true);
-  assert.equal(quota.planName, 'Grok2API Build');
-  assert.equal(quota.accountStats.pool, 'grok_build');
-  assert.equal(quota.accountStats.total, 4);
-  assert.equal(quota.accountStats.available, 2);
-  assert.equal(quota.accountStats.abnormal, 2);
-  assert.equal(quota.accountStats.normalAvailable, 7);
-  assert.equal(quota.accountStats.totalAccounts, 10);
+  assert.equal(quota.planName, 'Build + Console');
+  assert.equal(quota.accountStats.pool, 'grok_build+grok_console');
+  assert.equal(quota.accountStats.total, 7);
+  assert.equal(quota.accountStats.available, 3);
+  assert.equal(quota.accountStats.abnormal, 4);
+  assert.equal(quota.accountStats.pools.build.available, 2);
+  assert.equal(quota.accountStats.pools.console.pool, 'grok_console');
+  assert.equal(quota.accountStats.pools.console.total, 3);
+  assert.equal(quota.accountStats.pools.console.available, 1);
+  assert.equal(quota.accountStats.pools.console.abnormal, 2);
+  assert.equal(quota.accountStats.normalAvailable, 10);
+  assert.equal(quota.accountStats.totalAccounts, 13);
   assert.equal(quota.accountStats.risk, 0);
   assert.equal(quota.accountStats.attention, 1);
   assert.equal(quota.accountStats.disabled, 1);
   assert.equal(quota.accountStats.cooldown, 0);
   assert.equal(quota.accountStats.probing, 0);
   assert.equal(quota.accountStats.providers.grok_web.available, 5);
-  assert.equal(quota.quota.remaining, 2);
+  assert.equal(quota.rateLimits[1].id, 'grok-console-accounts');
+  assert.equal(quota.rateLimits[1].remaining, 1);
+  assert.equal(quota.remaining, 3);
+  assert.equal(quota.quota.remaining, 3);
 });
 
 test('fetches Grok2API summary with admin login and can reset quotas', async () => {
@@ -1358,6 +1367,7 @@ test('fetches Grok2API summary with admin login and can reset quotas', async () 
           providers: {
             grok_web: { total: 4, available: 3 },
             grok_build: { total: 5, available: 4 },
+            grok_console: { total: 2, available: 2 },
           },
         },
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -1390,10 +1400,13 @@ test('fetches Grok2API summary with admin login and can reset quotas', async () 
   const listed = await service.list({ refresh: true });
   assert.equal(listed.count, 1);
   assert.equal(listed.quotas[0].provider, 'grok2api');
-  assert.equal(listed.quotas[0].accountStats.pool, 'grok_build');
-  assert.equal(listed.quotas[0].accountStats.available, 4);
+  assert.equal(listed.quotas[0].accountStats.pool, 'grok_build+grok_console');
+  assert.equal(listed.quotas[0].accountStats.available, 6);
   assert.equal(listed.quotas[0].accountStats.abnormal, 1);
-  assert.equal(listed.quotas[0].accountStats.total, 5);
+  assert.equal(listed.quotas[0].accountStats.total, 7);
+  assert.equal(listed.quotas[0].remaining, 6);
+  assert.equal(listed.quotas[0].accountStats.pools.console.available, 2);
+  assert.equal(listed.quotas[0].accountStats.pools.console.total, 2);
   assert.doesNotMatch(JSON.stringify(listed), /secret|grok-token/);
 
   const reset = await service.resetGrok2ApiQuota(service.sources[0]);

@@ -134,6 +134,7 @@ test('a read completion stays read when its completed metadata changes', () => {
      const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v2';
      let historyCompletionRead=new Map();
      let historyCompletionSeen=new Map();
+     let historyCompletionPushTimer=null;
      ${completionStateSource}
      return { trackHistoryCompletionState, historyCompletionUnread };`,
   )(localStorage, (source, id) => `${source}:${id}`, () => {});
