@@ -720,49 +720,95 @@ export function normalizeGrok2ApiSummary(data) {
     }
   }
 
-  // Callable quota is intentionally scoped to the grok_build pool only.
   const buildPool = providers.grok_build || providers.grokBuild || {
     total: 0,
     available: 0,
     abnormal: 0,
   };
+  const consolePool = providers.grok_console || providers.grokConsole || null;
   const total = nonNegativeInteger(buildPool.total) ?? 0;
   const available = nonNegativeInteger(buildPool.available) ?? 0;
   const abnormal = Math.max(0, total - available);
   const used = Math.max(0, total - available);
   const usagePercent = total > 0 ? Math.min(100, Math.max(0, (used / total) * 100)) : 0;
-
-  return {
-    valid: true,
-    mode: 'grok2api_accounts',
-    status: available > 0 ? 'active' : (total > 0 ? 'quota_exhausted' : 'no_access'),
-    planName: 'Grok2API Build',
-    unit: 'accounts',
-    remaining: available,
-    balance: available,
-    quota: {
-      ...quotaWindow(used, total, available),
-      unit: 'accounts',
+  const consoleTotal = nonNegativeInteger(consolePool?.total) ?? 0;
+  const consoleAvailable = nonNegativeInteger(consolePool?.available) ?? 0;
+  const consoleAbnormal = Math.max(0, consoleTotal - consoleAvailable);
+  const consoleUsed = Math.max(0, consoleTotal - consoleAvailable);
+  const consoleUsagePercent = consoleTotal > 0
+    ? Math.min(100, Math.max(0, (consoleUsed / consoleTotal) * 100))
+    : 0;
+  const trackedTotal = total + consoleTotal;
+  const trackedAvailable = available + consoleAvailable;
+  const trackedAbnormal = abnormal + consoleAbnormal;
+  const trackedUsed = used + consoleUsed;
+  const trackedUsagePercent = trackedTotal > 0
+    ? Math.min(100, Math.max(0, (trackedUsed / trackedTotal) * 100))
+    : 0;
+  const pools = {
+    build: {
+      pool: 'grok_build',
+      total,
+      available,
+      abnormal,
+      usagePercent,
     },
-    subscription: null,
-    rateLimits: total > 0 ? [{
+    ...(consolePool ? {
+      console: {
+        pool: 'grok_console',
+        total: consoleTotal,
+        available: consoleAvailable,
+        abnormal: consoleAbnormal,
+        usagePercent: consoleUsagePercent,
+      },
+    } : {}),
+  };
+  const rateLimits = [];
+  if (total > 0) {
+    rateLimits.push({
       id: 'grok-build-accounts',
       window: '30d',
       used,
       limit: total,
       remaining: available,
       resetAt: '',
-    }] : [],
+    });
+  }
+  if (consolePool && consoleTotal > 0) {
+    rateLimits.push({
+      id: 'grok-console-accounts',
+      window: '30d',
+      used: consoleUsed,
+      limit: consoleTotal,
+      remaining: consoleAvailable,
+      resetAt: '',
+    });
+  }
+
+  return {
+    valid: true,
+    mode: 'grok2api_accounts',
+    status: trackedAvailable > 0 ? 'active' : (trackedTotal > 0 ? 'quota_exhausted' : 'no_access'),
+    planName: 'Build + Console',
+    unit: 'accounts',
+    remaining: trackedAvailable,
+    balance: trackedAvailable,
+    quota: {
+      ...quotaWindow(trackedUsed, trackedTotal, trackedAvailable),
+      unit: 'accounts',
+    },
+    subscription: null,
+    rateLimits,
     expiresAt: '',
     daysUntilExpiry: null,
     today: null,
     total: null,
     supportsReset: true,
     accountStats: {
-      pool: 'grok_build',
-      total,
-      available,
-      abnormal,
+      pool: consolePool ? 'grok_build+grok_console' : 'grok_build',
+      total: trackedTotal,
+      available: trackedAvailable,
+      abnormal: trackedAbnormal,
       recovering,
       attention,
       risk,
@@ -771,7 +817,8 @@ export function normalizeGrok2ApiSummary(data) {
       waitingReset,
       probing,
       cooldown,
-      usagePercent,
+      usagePercent: trackedUsagePercent,
+      pools,
       providers,
     },
   };

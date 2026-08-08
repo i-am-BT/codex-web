@@ -247,7 +247,11 @@ test('composer context window uses real session data with an accessible progress
   );
   assert.match(
     uiStyles,
-    /\.composerContextRing\s*\{[^}]*width:\s*15px;[^}]*height:\s*15px;[^}]*conic-gradient/s,
+    /\.composerContextRing\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;[^}]*flex:\s*0 0 16px;[^}]*conic-gradient/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.composerContextRing::after\s*\{[^}]*inset:\s*2px;/s,
   );
   assert.match(
     uiStyles,
@@ -325,4 +329,15 @@ test('permission picker mirrors native approval profiles and preserves custom co
   assert.match(uiStyles, /\.composerPermissionOption\[aria-checked="true"\] \.composerPermissionCheck\s*\{[^}]*opacity:\s*1/s);
   assert.match(uiStyles, /\.composerPermissionOption\[data-permission-mode="full"\]\[aria-checked="true"\][^}]*#f2773d/s);
   assert.match(uiStyles, /@media \(max-width: 520px\)[\s\S]*\.composerPermissionPanel\s*\{[^}]*width:\s*min\(360px, calc\(100vw - 20px\)\)/s);
+});
+
+test('mid-conversation model switches require confirmation and roll back on cancel', () => {
+  assert.match(serverSource, /function composerModelSwitchConfirm\(previous,next\)\{/);
+  assert.match(serverSource, /if\(!currentConversationId\|\|!chat\.querySelector\('\.msg'\)\)return true/);
+  assert.match(serverSource, /当前会话已有多轮对话,中途切换模型将从「'/);
+  assert.match(serverSource, /window\.confirm\(message\)/);
+  assert.match(serverSource, /model\.value=oldModel;[\s\S]*?composerModelSelect\.value=oldModel;/);
+  assert.match(serverSource, /composerModelSelect\.addEventListener\('change',\(\)=>\{[\s\S]*?const previous=model\.value;[\s\S]*?composerModelSwitchConfirm\(previous,model\.value\)/);
+  assert.match(serverSource, /model\?\.addEventListener\('focus',\(\)=>\{composerModelValueBeforeChange=model\.value\}\)/);
+  assert.match(serverSource, /model\?\.addEventListener\('change',\(\)=>\{[\s\S]*?composerModelSwitchConfirm\(composerModelValueBeforeChange,model\.value\)/);
 });

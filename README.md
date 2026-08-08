@@ -175,6 +175,7 @@ cp .env.example .env
 | `DEEPSEEK_API_KEY` | DeepSeek 官方 API Key；设置后启用 DeepSeek 官方余额监控，仅保存在服务端本地 `.env` |
 | `SUB_QUOTA_TIMEOUT_MS` | 额度请求超时，默认 10000 毫秒 |
 | `SUB_QUOTA_CACHE_SECONDS` | 额度结果缓存时间，默认 30 秒 |
+| `CODEX_APP_CREDIT_LIMIT` | 可选的 Codex App 点数总额基准；仅用于把当前剩余点数换算成递减到 0% 的进度条 |
 | `IMAGE_PROMPT_AUTO_SYNC` | 启动时及定时检查 `awesome-gpt-image-2` 更新，默认开启 |
 | `IMAGE_PROMPT_SYNC_INTERVAL_MINUTES` | 提示词库自动检查间隔，默认 360 分钟 |
 | `IMAGE_PROMPT_SYNC_TIMEOUT_MS` | 单次 GitHub 请求超时，默认 20000 毫秒 |
@@ -187,6 +188,7 @@ cp .env.example .env
 | `PORT` | 固定监听端口，示例为 `36354` |
 | `CODEX_BIN` | Codex CLI 路径；初始化脚本会优先发现 ChatGPT/Codex App 内置版本 |
 | `CODEX_HOME` | Codex 配置、索引和原生会话目录，默认 `$HOME/.codex` |
+| `CODEX_WEB_LOCAL_IMAGE_ROOTS` | 可选的绝对图片根目录白名单，多个目录用英文逗号分隔；用于显示助手消息中来自其他项目的本地图片 |
 | `APP_SERVER_REQUEST_TIMEOUT_MS` | `codex app-server` 单次协议请求超时，默认 30000 毫秒 |
 | `CODEX_DESKTOP_IPC_ENABLED` | macOS/Windows 默认开启；续聊优先交给当前打开任务的 Codex App 窗口 |
 | `CODEX_DESKTOP_IPC_TIMEOUT_MS` | Codex App 桌面 IPC 请求超时，默认 20000 毫秒 |
@@ -200,7 +202,7 @@ cp .env.example .env
 
 ### 额度监控
 
-左侧额度入口可同时查询本地 CLIProxyAPI（CPA）Codex 账号额度、Sub2API 额度、Grok2API 账号池与 DeepSeek 官方余额。悬停额度图标显示各渠道只读额度卡，点击图标可分别填写各组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与 API Key 限速窗口；Grok2API 通过管理面板汇总账号池。可选设置 `SUB2API_ADMIN_API_KEY` 后，服务端还会读取 `/api/v1/admin/accounts` 中缓存的 Codex 提供商账号 5 小时/7 天使用百分比；管理 Key 不会发送到浏览器。
+左侧额度入口可同时查询本地 CLIProxyAPI（CPA）Codex 账号额度、Sub2API 额度、Grok2API 账号池与 DeepSeek 官方余额。悬停额度图标显示各渠道只读额度卡，点击图标可分别填写各组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与 API Key 限速窗口；Grok2API 通过管理面板分别汇总 Build 与 Console 账号池。可选设置 `SUB2API_ADMIN_API_KEY` 后，服务端还会读取 `/api/v1/admin/accounts` 中缓存的 Codex 提供商账号 5 小时/7 天使用百分比；管理 Key 不会发送到浏览器。
 
 **DeepSeek 官方额度**：余额通过官方 `GET https://api.deepseek.com/user/balance` 实时查询；官方 API 未开放累计消费/用量查询接口，因此累计 Token 与累计消费由本服务根据每次实际 API 调用返回的 `usage` 本地累计，消费金额按官方单价统计（缓存命中按缓存价），仅供参考。统计文件保存在 `runtime/deepseek-usage.json`。
 
@@ -214,6 +216,7 @@ GROK2API_BASE_URL=http://127.0.0.1:8100
 GROK2API_ADMIN_PASSWORD=<optional-grok2api-admin-password>
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_API_KEY=<replace-with-deepseek-api-key>
+CODEX_APP_CREDIT_LIMIT=<optional-total-credit-baseline>
 SUB_QUOTA_PROVIDER=multi
 ```
 

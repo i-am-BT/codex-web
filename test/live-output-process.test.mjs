@@ -176,8 +176,10 @@ test('steering stays chronological and input image helpers avoid duplicate uploa
   assert.match(inlineScript, /if\(!completedSteeringTimeline\)activateTurnProcessElement\(el\)/);
   assert.doesNotMatch(inlineScript, /pinSteeringMessageToBottom|pinOpenSteeringMessages|ensureSteeringPinObserver/);
   assert.match(inlineScript, /Rebind either direction instead of creating a second copy/);
-  assert.match(inlineScript, /const singleImageInput=userElement\.classList\.contains\('steeringUser'\)[\s\S]*?browserCommentSteering/);
+  assert.match(inlineScript, /const singleImageInput=userElement\.classList\.contains\('steeringUser'\);/);
+  assert.doesNotMatch(inlineScript, /const singleImageInput=userElement\.classList\.contains\('steeringUser'\)[\s\S]{0,100}browserCommentSteering/);
   assert.match(inlineScript, /if\(singleImageInput&&stack\.children\.length>=1\)/);
+  assert.match(inlineScript, /function cleanSteeringMessageDuplicates\(element\)\{[\s\S]*?const singleImageInput=element\.classList\.contains\('steeringUser'\);[\s\S]*?if\(stack&&singleImageInput\)/s);
   assert.match(inlineScript, /Keep historical user\/steer bubbles in the main chat stream/);
   assert.doesNotMatch(inlineScript, /if\(browserCommentUser\)[\s\S]{0,120}classList\.add\('steeringUser'\)/);
 });
@@ -185,6 +187,8 @@ test('steering stays chronological and input image helpers avoid duplicate uploa
 test('browser comment attachment cards cannot collapse inside the chat scroll column', () => {
   assert.match(uiStyles, /body \.msg\.user\.browserCommentSteering\s*,\s*body \.msg\.user\.hasInputImage\.browserCommentSteering\s*\{[^}]*display:\s*flex;[^}]*flex:\s*0 0 auto/s);
   assert.match(uiStyles, /body \.chat > \.msg\.user\.browserCommentSteering,[\s\S]*?body \.chat > \.msg\.user\.hasInputImage\.browserCommentSteering\s*\{[^}]*width:\s*fit-content;[^}]*max-width:\s*min\(280px, 88%\)/s);
+  assert.match(uiStyles, /\.browserCommentSteering \.userAttachmentStack\s*\{[^}]*width:\s*min\(220px, 100%\);[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
+  assert.match(uiStyles, /\.browserCommentSteering \.userAttachmentStack\.single\s*\{[^}]*width:\s*100px;[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/s);
   const railRuleIndex = uiStyles.indexOf('body .chat > :is(.msg.user, .msg.image.inputImage)');
   const browserOverrideIndex = uiStyles.indexOf('body .chat > .msg.user.browserCommentSteering');
   assert.ok(railRuleIndex >= 0 && browserOverrideIndex > railRuleIndex);
@@ -215,6 +219,88 @@ test('browser design annotations use hover on desktop and toggle on touch device
   assert.match(uiStyles, /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.browserAnnotationDetails\s*\{[^}]*transition:\s*none/s);
 });
 
+test('response annotations render as hover details and touch toggles', () => {
+  const annotationSource = sourceBetween('function responseAnnotationItemsFromText', 'function browserAnnotationChangeMarkdown');
+  const { responseAnnotationItemsFromText, normalizeResponseAnnotationItems } = new Function(
+    `${annotationSource}; return { responseAnnotationItemsFromText, normalizeResponseAnnotationItems };`,
+  )();
+  const replacementSource = sourceBetween('function responseAnnotationReplacementFragment', 'function removeEmptyResponseAnnotationWrappers');
+  const fakeDocument = {
+    createDocumentFragment() {
+      return {
+        childNodes: [],
+        appendChild(node) {
+          this.childNodes.push(node);
+          return node;
+        },
+      };
+    },
+    createTextNode(value) {
+      return { nodeType: 3, textContent: value };
+    },
+  };
+  const responseAnnotationReplacementFragment = new Function(
+    'document',
+    'createResponseAnnotationCard',
+    `${replacementSource}; return responseAnnotationReplacementFragment;`,
+  )(
+    fakeDocument,
+    (index, item) => ({ nodeType: 1, className: 'responseAnnotationCard', index, item }),
+  );
+  const source = [
+    '普通上下文',
+    '<response-annotations>',
+    '[{"text":"已同步当前会话","annotation":"这里指的是开始和暂停状态"}]',
+    '</response-annotations>',
+  ].join('\n');
+  assert.deepEqual(responseAnnotationItemsFromText(source), [
+    { text: '已同步当前会话', annotation: '这里指的是开始和暂停状态' },
+  ]);
+  assert.deepEqual(responseAnnotationItemsFromText('<response-annotations>{bad}</response-annotations>'), []);
+  assert.deepEqual(responseAnnotationItemsFromText('<response-annotations>{}</response-annotations>'), []);
+  assert.deepEqual(normalizeResponseAnnotationItems([{ text: '  已同步  ', annotation: '  已暂停  ' }]), [
+    { text: '已同步', annotation: '已暂停' },
+  ]);
+  const missing = responseAnnotationReplacementFragment(':codex-annotation{index="1"} 还没有完成重启。', []);
+  assert.equal(missing.replaced, false);
+  assert.deepEqual(missing.fragment.childNodes.map((node) => node.textContent), [' 还没有完成重启。']);
+  assert.doesNotMatch(missing.fragment.childNodes.map((node) => node.textContent).join(''), /codex-annotation/);
+  const outOfRange = responseAnnotationReplacementFragment('前文 :codex-annotation{index=2} 后文', [
+    { text: '已同步当前会话', annotation: '这里指的是开始和暂停状态' },
+  ]);
+  assert.equal(outOfRange.replaced, false);
+  assert.deepEqual(outOfRange.fragment.childNodes.map((node) => node.textContent), ['前文 ', ' 后文']);
+  const valid = responseAnnotationReplacementFragment('已修复。:codex-annotation{index="1"} 后续说明', [
+    { text: '已同步当前会话', annotation: '这里指的是开始和暂停状态' },
+  ]);
+  assert.equal(valid.replaced, true);
+  assert.equal(valid.fragment.childNodes[1].className, 'responseAnnotationCard');
+  assert.equal(valid.fragment.childNodes[1].index, 1);
+  assert.equal(valid.fragment.childNodes[2].textContent, ' 后续说明');
+  assert.match(inlineScript, /let responseAnnotationsByTurn\s*=\s*new Map\(\)/);
+  assert.match(inlineScript, /function rememberResponseAnnotationItems\(turnId,items\)\{[\s\S]*?responseAnnotationsByTurn\.set\(key,normalized\);[\s\S]*?message\.dataset\.turnId!==key[\s\S]*?renderAssistantMarkdown\(message\._messageBody,message\.dataset\.messageText\|\|''\)/s);
+  assert.match(inlineScript, /function rememberResponseAnnotations\(turnId,text\)\{\s*return rememberResponseAnnotationItems\(turnId,responseAnnotationItemsFromText\(text\)\);/s);
+  assert.match(inlineScript, /function createResponseAnnotationCard\(index,item\)\{[\s\S]*?card\.className='responseAnnotationCard';[\s\S]*?trigger\.className='responseAnnotationTrigger';[\s\S]*?trigger\.textContent='注释 '\+index;[\s\S]*?appendField\('所选文本',item\?\.text\);[\s\S]*?appendField\('用户评论',item\?\.annotation\)/s);
+  assert.match(inlineScript, /function enhanceResponseAnnotationDirectives\(body,annotations\)\{\s*if\(!body\)return;\s*const items=Array\.isArray\(annotations\)\?annotations:\[\];/s);
+  assert.match(inlineScript, /function enhanceResponseAnnotationDirectives\(body,annotations\)\{[\s\S]*?querySelectorAll\('code'\)[\s\S]*?responseAnnotationReplacementFragment\(source,items\)[\s\S]*?createTreeWalker\(body,NodeFilter\.SHOW_TEXT\)[\s\S]*?responseAnnotationReplacementFragment\(node\.nodeValue,items\)/s);
+  assert.match(inlineScript, /function removeEmptyResponseAnnotationWrappers\(node,body\)\{[\s\S]*?current\.remove\(\)/s);
+  assert.doesNotMatch(inlineScript, /function enhanceResponseAnnotationDirectives\(body,annotations\)\{\s*if\(!body\|\|!Array\.isArray\(annotations\)\|\|!annotations\.length\)return/);
+  assert.match(inlineScript, /function renderAssistantMarkdown\(body,text,turnId=''\)\{[\s\S]*?const messageTurnId=String\(turnId\|\|body\?\.closest\?\.\('\.msg'\)\?\.dataset\?\.turnId\|\|''\);[\s\S]*?enhanceResponseAnnotationDirectives\(body,responseAnnotationsForTurn\(messageTurnId\)\);/s);
+  assert.match(inlineScript, /function addMsg\(role,text,options=\{\}\)\{[\s\S]*?if\(role==='user'\)rememberResponseAnnotations\(options\.turnId,text\);[\s\S]*?if\(options\.responseAnnotations\)rememberResponseAnnotationItems\(options\.turnId,options\.responseAnnotations\);/s);
+  assert.match(inlineScript, /function reconcileNativeResetMessage\(message\)\{[\s\S]*?if\(message\.role==='user'\)rememberResponseAnnotations\(message\.turnId,text\);[\s\S]*?if\(message\.responseAnnotations\)rememberResponseAnnotationItems\(message\.turnId,message\.responseAnnotations\);/s);
+  assert.equal((inlineScript.match(/responseAnnotations:msg\.responseAnnotations/g) || []).length, 2);
+  assert.match(inlineScript, /responseAnnotations:message\.responseAnnotations/);
+  assert.match(inlineScript, /function adoptRuntimeLiveForSnapshotMessage\(message\)\{[\s\S]*?rememberResponseAnnotationItems\(pausedTurnId,message\.responseAnnotations\)/s);
+  assert.match(inlineScript, /addMsg\('assistant','',\{streaming:true,kind:'live_progress',turnId:runtimeTurnId,autoScroll:false\}\)/);
+  assert.match(inlineScript, /function newChat\(\)[\s\S]*?responseAnnotationsByTurn=new Map\(\)/);
+  assert.match(inlineScript, /function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?clearNativeLiveItems\(\);\s*responseAnnotationsByTurn=new Map\(\);/s);
+  assert.match(inlineScript, /document\.querySelectorAll\('\.browserAnnotationCard,\.responseAnnotationCard'\)/);
+  assert.match(uiStyles, /\.responseAnnotationDetails\s*\{[^}]*position:\s*absolute;[^}]*bottom:\s*calc\(100% \+ 8px\);[^}]*max-width:\s*min\(340px, calc\(100vw - 28px\)\);[^}]*opacity:\s*0;[^}]*visibility:\s*hidden/s);
+  assert.match(uiStyles, /@media \(hover: hover\) and \(pointer: fine\)\s*\{[\s\S]*?\.responseAnnotationCard:hover > \.responseAnnotationDetails,[\s\S]*?\.responseAnnotationCard\.browserAnnotationPointerOver > \.responseAnnotationDetails,[\s\S]*?\.responseAnnotationTrigger:focus-visible \+ \.responseAnnotationDetails\s*\{[^}]*opacity:\s*1;[^}]*visibility:\s*visible/s);
+  assert.match(uiStyles, /@media \(hover: none\), \(pointer: coarse\)\s*\{[\s\S]*?\.responseAnnotationCard\.open > \.responseAnnotationDetails\s*\{[^}]*pointer-events:\s*auto/s);
+  assert.match(uiStyles, /@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\.responseAnnotationDetails\s*\{[^}]*transition:\s*none/s);
+});
+
 test('runtime text deltas leave sidebar rebuilding to the coalesced session snapshot', () => {
   const runtimeHistoryHelperSource = inlineScript.match(/function nativeRuntimeNeedsHistoryRefresh\(type\)\{[^}]*\}/)?.[0];
   assert.ok(runtimeHistoryHelperSource, 'missing native runtime history refresh helper');
@@ -227,8 +313,32 @@ test('runtime text deltas leave sidebar rebuilding to the coalesced session snap
   assert.equal(nativeRuntimeNeedsHistoryRefresh('turn'), true);
   assert.equal(nativeRuntimeNeedsHistoryRefresh('turn-cleared'), true);
   assert.equal(nativeRuntimeNeedsHistoryRefresh('connection-error'), true);
-  assert.match(runtimeHandlerSource, /try\{runtime=JSON\.parse\(event\.data\|\|'\{\}'\)\}catch\(e\)\{\}\s*\/\/ Text deltas[\s\S]*?if\(nativeRuntimeNeedsHistoryRefresh\(runtime\.type\)\)void refreshHistory\(\);/);
+  assert.match(runtimeHandlerSource, /\/\/ Text deltas[\s\S]*?if\(nativeRuntimeNeedsHistoryRefresh\(runtime\.type\)\)void refreshHistory\(\);/);
   assert.doesNotMatch(runtimeHandlerSource, /try\{runtime=JSON\.parse\(event\.data\|\|'\{\}'\)\}catch\(e\)\{\}\s*refreshHistory\(\);/);
+});
+
+test('native connection retries and terminal upstream errors render inside the conversation', () => {
+  const textSource = sourceBetween('function nativeConnectionStatusText', 'function clearNativeConnectionStatus');
+  const { nativeConnectionStatusText } = new Function(
+    `${textSource}; return { nativeConnectionStatusText };`,
+  )();
+  const runtimeHandlerSource = sourceBetween('function connectSessionEvents', 'function nativeMessageElementBySequence');
+
+  assert.equal(
+    nativeConnectionStatusText({ willRetry: true, message: 'Reconnecting... 5/5' }),
+    '正在重新连接 5/5',
+  );
+  assert.equal(
+    nativeConnectionStatusText({
+      willRetry: false,
+      message: 'unexpected status 405, url: http://127.0.0.1:8090/v1/responses',
+    }),
+    'unexpected status 405, url: http://127.0.0.1:8090/v1/responses',
+  );
+  assert.match(inlineScript, /let nativeConnectionStatusElement = null;/);
+  assert.match(runtimeHandlerSource, /runtime\.type==='connection-error'[\s\S]*?upsertNativeConnectionStatus\(runtime\)/);
+  assert.match(inlineScript, /if\(terminalProcess\)clearNativeConnectionStatus\(options\.turnId\)/);
+  assert.match(uiStyles, /\.msg\.process\.nativeConnectionStatus[\s\S]*?white-space:\s*pre-wrap/s);
 });
 
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
@@ -789,18 +899,34 @@ test('the prompt queue stays visible in Web while retaining its backing actions'
   assert.match(ruleBody('.promptQueueHead'), /display:\s*none(?:;|$)/);
   assert.match(
     uiStyles,
-    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 28px auto 28px 28px;[^}]*gap:\s*2px[^}]*\}\s*\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 28px auto 28px/s,
+    /\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) 30px auto 30px 30px;[^}]*gap:\s*4px/s,
   );
+  assert.match(
+    uiStyles,
+    /@media \(max-width:\s*820px\)[\s\S]*?\.promptQueueRow\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) auto 28px 28px;[^}]*gap:\s*2px/s,
+  );
+  assert.match(
+    uiStyles,
+    /@media \(max-width:\s*820px\)[\s\S]*?\.promptQueueEditButton\s*\{[^}]*display:\s*none/s,
+  );
+  assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:/s);
 
   const queueStart = inlineScript.indexOf('function renderPromptQueue(){');
   const queueEnd = inlineScript.indexOf('function enqueuePrompt', queueStart);
   assert.ok(queueStart >= 0 && queueEnd > queueStart, 'missing prompt queue renderer source');
   const queueRenderer = inlineScript.slice(queueStart, queueEnd);
+  const queueMenu = sourceBetween('function openPromptQueueMenu', 'function ensureSideChatTabs');
   assert.match(queueRenderer, /const showInWeb=Boolean\(threadId&&items\.length\)/);
   assert.match(queueRenderer, /classList\.toggle\('hidden',!showInWeb\)/);
   assert.match(queueRenderer, /if\(!showInWeb\)/);
   assert.match(queueRenderer, /queueActionButton\('pencil','编辑队列消息'/);
+  assert.match(queueRenderer, /edit\.classList\.add\('promptQueueEditButton'\)/);
   assert.match(queueRenderer, /queueActionButton\('ellipsis','队列操作'/);
+  assert.match(queueMenu, /menu\.appendChild\(promptQueueMenuItem\('编辑消息',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)\)/);
+  assert.ok(
+    queueMenu.indexOf("menu.appendChild(promptQueueMenuItem('编辑消息'") < queueMenu.indexOf('if(!isAppOwnedQueuedPrompt(item))'),
+    'mobile menu editing must also be available for Codex App queue rows',
+  );
   assert.match(queueRenderer, /bindPromptQueueDrag\(row,threadId,item\.id\)/);
   assert.match(inlineScript, /state\.scrollContainer=promptQueueList\|\|null/);
   assert.match(queueRenderer, /body\.title='长按拖动调整顺序；使用编辑按钮修改消息'/);
@@ -886,6 +1012,18 @@ test('mobile queue handoff uses an idempotent one-item beacon before backgroundi
     ['local-only'],
     'a reloaded mobile page keeps a durable Web outbox even after its in-memory beacon tracking is gone',
   );
+  assert.deepEqual(
+    beaconApi.mergePromptQueueSyncConflict(
+      'thread-a',
+      [
+        { id: 'stale-app', source: 'codex-app' },
+        { id: 'offline-web', source: 'web' },
+      ],
+      [],
+    ).map((item) => item.id),
+    ['offline-web'],
+    'an App-owned mirror absent from the server must not survive in mobile local storage',
+  );
   const serverUncertain = beaconApi.mergePromptQueueSyncConflict(
     'thread-status',
     [{ id: 'uncertain-item', source: 'web', autoDispatch: true }],
@@ -927,6 +1065,7 @@ test('mobile queue handoff uses an idempotent one-item beacon before backgroundi
   assert.match(inlineScript, /mergePromptQueueSyncConflict\(id,localItems,items,dismissedItemIds,\{preferRemoteOrder:missingLocalWebItemIds\.length>0\}\)/);
   assert.match(inlineScript, /if\(hasMissingPending\|\|missingLocalWebItemIds\.length\)schedulePromptQueueServerSync\(id\)/);
   assert.match(inlineScript, /acknowledgePromptQueueBeaconItemIds\(id,dismissedItemIds\)/);
+  assert.match(inlineScript, /sessionEvents\.addEventListener\('open',async\(\)=>\{[\s\S]*?pullPromptQueueFromServer\(currentConversationId,\{render:true,preferServer:true\}\)/s);
 
   const fingerprintStart = inlineScript.indexOf('function promptQueueFingerprint(items){');
   const fingerprintEnd = inlineScript.indexOf('function applyPromptQueueLocal', fingerprintStart);
@@ -1182,7 +1321,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.match(inlineScript, /loadConversation[\s\S]*hydrating:true/);
   assert.match(inlineScript, /nativeRuntimeStreamTurnIds\.has\(String\(msg\.turnId\|\|''\)\)/);
   assert.doesNotMatch(inlineScript, /nativeLiveItems\.size&&\['assistant','thinking'\]/);
-  assert.match(liveSource, /kind:'live_progress',autoScroll:false/);
+  assert.match(liveSource, /kind:'live_progress',turnId:runtimeTurnId,autoScroll:false/);
   assert.doesNotMatch(liveSource, /scrollChatToLatest\(/);
   assert.match(liveSource, /function nativeLiveDocumentHidden\(\)/);
   assert.match(liveSource, /if\(!nativeLiveTypewriterEnabled\(\)\)\{\s*renderNativeLiveItemImmediately\(live\);/);
@@ -1385,13 +1524,19 @@ test('streaming output uses the faster balanced render pace', () => {
   assert.match(inlineScript, /function nativeLiveRenderStep\(live,remaining\)\{\s*if\(live\.source==='snapshot'\)return remaining>1200\?64:remaining>480\?25:remaining>160\?11:remaining>60\?6:2;\s*return remaining>1500\?128:remaining>600\?54:remaining>180\?20:remaining>60\?9:4;/);
 });
 
-test('queue send and explicit guide are mutually exclusive', () => {
+test('running composer queues follow-ups and keeps steer as an explicit queue action', () => {
   const sendStart = inlineScript.indexOf('async function send(){');
   assert.ok(sendStart >= 0, 'missing send source');
   const sendSource = inlineScript.slice(sendStart);
+  const submitSource = sourceBetween('function syncComposerSubmitControl', 'function syncComposerInputState');
   const steerSource = sourceBetween('async function steerQueuedPrompt', 'async function dispatchNextQueuedPrompt');
   const dispatchSource = sourceBetween('async function dispatchNextQueuedPrompt', 'function closeComposerPopovers');
-  assert.match(sendSource, /if\(existingId&&webRunActive\)\{\s*enqueuePrompt\(text,attachments\);\s*return;/);
+  assert.match(sendSource, /if\(existingId&&webRunActive\)\{\s*enqueuePrompt\(text,attachments\);\s*return;\s*\}/);
+  assert.doesNotMatch(sendSource, /sendNativeSteer\(existingId/);
+  assert.match(submitSource, /const action=webRunActive&&native\?'queue':resumeInterrupted\?'resume':'send'/);
+  assert.match(submitSource, /const label=action==='queue'\?'加入队列':action==='resume'\?'继续队列':'发送'/);
+  assert.match(inlineScript, /webRunActive&&native\?'排队消息':'向 Codex 提问'/);
+  assert.doesNotMatch(inlineScript, /async function sendNativeSteer/);
   assert.doesNotMatch(sendSource, /promptQueueMode|steerQueuedPrompt\(existingId/);
   assert.doesNotMatch(inlineScript, /PROMPT_QUEUE_MODE_KEY|setPromptQueueMode|readPromptQueueMode/);
   assert.match(steerSource, /queueItemId:item\.id/);
@@ -1405,6 +1550,56 @@ test('queue send and explicit guide are mutually exclusive', () => {
   assert.match(dispatchSource, /queueGuidingItems\.has\(item\.id\)\|\|steerSubmitting/);
   assert.match(inlineScript, /Array\.isArray\(data\.items\)&&!promptQueueServerSyncPending\.has\(id\)/);
   assert.match(inlineScript, /while\(promptQueueServerSyncInflight\.has\(id\)\)await promptQueueServerSyncInflight\.get\(id\)/);
+});
+
+test('interrupted Codex App queues resume in place without sending a synthetic turn', () => {
+  const resumeSource = sourceBetween('function hasInterruptedAppQueue', 'function syncComposerSubmitControl');
+  const makeResumeCheck = (source, id, active, draft, items) => new Function(
+    'currentConversationSource',
+    'currentConversationId',
+    'webRunActive',
+    'appQueueEditDraft',
+    'promptQueueFor',
+    'isAppOwnedQueuedPrompt',
+    `${resumeSource}; return canResumeInterruptedNativeTask;`,
+  )(source, id, active, draft, () => items, (item) => item?.source === 'codex-app');
+  const interruptedQueue = [{ source: 'codex-app', pauseState: 'interrupted' }];
+  assert.equal(makeResumeCheck('codex', 'thread-a', false, null, interruptedQueue)(), true);
+  assert.equal(makeResumeCheck('codex', 'thread-a', true, null, interruptedQueue)(), false);
+  assert.equal(makeResumeCheck('codex', 'thread-a', false, {}, interruptedQueue)(), false);
+  assert.equal(makeResumeCheck('codex', 'thread-a', false, null, [{ source: 'codex-app', pauseState: '' }])(), false);
+  assert.equal(makeResumeCheck('codex', 'thread-a', false, null, [{ source: 'web', pauseState: 'interrupted' }])(), false);
+  assert.equal(makeResumeCheck('web', 'thread-a', false, null, interruptedQueue)(), false);
+
+  const submitSource = sourceBetween('function syncComposerSubmitControl', 'function syncComposerInputState');
+  const resumeActionSource = sourceBetween('async function resumeInterruptedAppQueue', 'function syncComposerSubmitControl');
+  const loadSource = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  const statusSource = sourceBetween('function updateConversationStatus', 'async function applyNativeConversationMetadata');
+  const runtimeStart = inlineScript.indexOf("sessionEvents.addEventListener('native-runtime'");
+  const runtimeEnd = inlineScript.indexOf("sessionEvents.addEventListener('native-request'", runtimeStart);
+  assert.ok(runtimeStart >= 0 && runtimeEnd > runtimeStart, 'missing native runtime listener source');
+  const runtimeSource = inlineScript.slice(runtimeStart, runtimeEnd);
+  const sendStart = inlineScript.indexOf('async function send(){');
+  const sendSource = inlineScript.slice(sendStart);
+  assert.match(submitSource, /const resumeInterrupted=canResumeInterruptedNativeTask\(\)&&!hasPayload/);
+  assert.match(submitSource, /action==='resume'\?'继续队列':'发送'/);
+  assert.match(submitSource, /const icon=action==='resume'\?'play':'arrow-up'/);
+  assert.match(submitSource, /sendBtn\.disabled=blocked\|\|\(!hasPayload&&!resumeInterrupted\)/);
+  assert.match(resumeActionSource, /\/api\/prompt-queues\/'\+encodeURIComponent\(threadId\)\+'\/resume-interrupted/);
+  assert.match(resumeActionSource, /applyServerPromptQueue\(threadId,data\)/);
+  assert.match(resumeActionSource, /队列已继续，等待启动/);
+  assert.match(loadSource, /currentNativeRunStatus=currentConversationSource==='codex'\?String\(conversation\.status\|\|''\):''/);
+  assert.match(statusSource, /conversation\.status==='interrupted'\?'已暂停'/);
+  assert.match(runtimeSource, /currentNativeRunStatus=String\(runtime\.status\|\|''\)/);
+  assert.match(runtimeSource, /runtime\.status==='interrupted'\?'Codex App · 已暂停'/);
+  assert.match(sendSource, /const resumeInterrupted=canResumeInterruptedNativeTask\(\)&&!text&&!attachments\.length/);
+  assert.match(sendSource, /if\(resumeInterrupted\)\{await resumeInterruptedAppQueue\(\);return\}/);
+  assert.doesNotMatch(sendSource, /resumeInterrupted\?'继续'/);
+  assert.ok(
+    sendSource.indexOf('if(resumeInterrupted){await resumeInterruptedAppQueue();return}') < sendSource.indexOf('waitForLatestComposerProviderChange'),
+    'queue resume must bypass model loading and turn creation',
+  );
+  assert.match(sendSource, /JSON\.stringify\(\{message,attachments,provider:/);
 });
 
 test('queued dispatch waits for the matching terminal turn', () => {
@@ -1516,11 +1711,11 @@ test('Codex App queue entries keep their message ownership while Web can persist
   assert.match(inlineScript, /function isAppOwnedQueuedPrompt\(item\)\{return item\?\.source==='codex-app'\}/);
   assert.match(renderer, /const appOwned=isAppOwnedQueuedPrompt\(item\)/);
   assert.match(renderer, /bindPromptQueueDrag\(row,threadId,item\.id\)/);
-  assert.match(renderer, /meta\.textContent='Codex App'/);
+  assert.match(renderer, /meta\.textContent=item\.pauseState==='interrupted'\?'Codex App · 已暂停':'Codex App'/);
   assert.match(renderer, /body\.title='长按拖动调整顺序；使用编辑按钮修改消息'/);
   assert.doesNotMatch(renderer, /body\.addEventListener\('click',\(\)=>restoreQueuedPrompt\(threadId,item\.id\)\)/);
   assert.match(renderer, /const busy=dispatching\|\|guiding\|\|steerSubmitting\|\|appQueueEditSaving/);
-  assert.match(renderer, /row\.appendChild\(edit\);[\s\S]*?row\.appendChild\(guide\);\s*row\.appendChild\(remove\);\s*if\(!appOwned\)\{/);
+  assert.match(renderer, /row\.appendChild\(edit\);[\s\S]*?row\.appendChild\(guide\);\s*row\.appendChild\(remove\);[\s\S]*?row\.appendChild\(more\);/);
   assert.doesNotMatch(renderer, /if\(appOwned\)\{\s*promptQueueList\.appendChild\(row\);\s*return;/);
   assert.match(applyQueue, /if\(appQueueEditDraft\?\.threadId===threadId&&!appQueueEditSaving&&!clean\.some\(\(item\)=>item\.id===appQueueEditDraft\.itemId\)\)\{/);
   assert.match(applyQueue, /appQueueEditDraft=null;[\s\S]*?input\.value='';[\s\S]*?clearPendingAttachments\(\);[\s\S]*?该队列消息已在 Codex App 处理/);
@@ -1529,7 +1724,8 @@ test('Codex App queue entries keep their message ownership while Web can persist
   assert.match(remove, /if\(firstId===itemId&&!webRunActive&&!isAppOwnedQueuedPrompt\(victim\)\)schedulePromptQueueDispatch\(threadId,100\)/);
   assert.doesNotMatch(move, /blockAppOwnedQueueAction/);
   assert.match(move, /void persistPromptQueueOrder\(threadId,items\)/);
-  assert.match(sideChat, /if\(blockAppOwnedQueueAction\(item\)\)return/);
+  assert.doesNotMatch(sideChat, /blockAppOwnedQueueAction/);
+  assert.match(sideChat, /body:JSON\.stringify\(\{\.\.\.queuedPromptPayload\(item\),sideChat:true,sourceThreadId:threadId\}\)/);
   assert.doesNotMatch(restore, /blockAppOwnedQueueAction/);
   assert.match(restore, /if\(isAppOwnedQueuedPrompt\(item\)\)\{[\s\S]*?appQueueEditDraft=\{threadId,itemId,originalMessage:item\.message\}[\s\S]*?return;/);
   assert.ok(restore.indexOf('if(isAppOwnedQueuedPrompt(item))') < restore.indexOf('consumeQueuedPromptOnServer(threadId,itemId)'));
@@ -1548,7 +1744,7 @@ test('Codex App queue entries keep their message ownership while Web can persist
   assert.match(dispatch, /!item\|\|isAppOwnedQueuedPrompt\(item\)\|\|queueDispatchingThreads/);
   assert.match(loadConversation, /if\(conversationChanged&&appQueueEditSaving\)\{statusEl\.textContent='正在保存队列修改，请稍后切换会话';return false\}/);
   assert.match(loadConversation, /if\(conversationChanged&&appQueueEditDraft\)\{appQueueEditDraft=null;input\.value='';input\.style\.height='auto';clearPendingAttachments\(\)\}/);
-  assert.match(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:\s*22px minmax\(0, 1fr\) (?:30|28)px auto (?:30|28)px/s);
+  assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned\s*\{[^}]*grid-template-columns:/s);
   assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueBody:disabled/);
   assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueLead/);
 });
@@ -1583,8 +1779,9 @@ test('queue reorder uses a long-press floating row and keeps active sends as bou
   const promptQueueList = { querySelectorAll: () => rows };
   const api = new Function(
     'promptQueueList',
+    'desktopQueueReorderAvailable',
     `${segmentSource}; return { promptQueueRowCanReorder, promptQueueMovableSegment };`,
-  )(promptQueueList);
+  )(promptQueueList, true);
 
   assert.deepEqual([...api.promptQueueMovableSegment(rows[1])], ['web-a', 'web-b', 'app-c', 'web-d']);
   assert.deepEqual([...api.promptQueueMovableSegment(rows[3])], ['web-a', 'web-b', 'app-c', 'web-d']);
@@ -1641,8 +1838,9 @@ test('queue reorder uses a long-press floating row and keeps active sends as bou
   const reorderSource = sourceBetween('function promptQueueRows', 'function updatePromptQueueDragFromPoint');
   const reorderApi = new Function(
     'promptQueueList',
+    'desktopQueueReorderAvailable',
     `${reorderSource}; return { promptQueueMovableSegment, movePromptQueueDragSource };`,
-  )(reorderList);
+  )(reorderList, true);
   const reorderState = {
     row: reorderRows[1],
     movableIds: reorderApi.promptQueueMovableSegment(reorderRows[1]),
@@ -1665,7 +1863,7 @@ test('queue reorder uses a long-press floating row and keeps active sends as bou
   assert.match(dragSource, /window\.addEventListener\('pointercancel',cancelPromptQueuePointerDrag,true\)/);
   assert.match(dragSource, /if\(event\.key!=='Escape'\|\|!promptQueueDragState\)return/);
   assert.match(dragSource, /if\(!shouldCommit&&state\.active\)restorePromptQueueDragSourceOrder\(state\)/);
-  assert.match(dragSource, /if\(distance>PROMPT_QUEUE_DRAG_CANCEL_DISTANCE\)cancelPromptQueuePointerDrag\(event\)/);
+  assert.match(dragSource, /const tolerance=event\.pointerType==='touch'\?PROMPT_QUEUE_DRAG_CANCEL_DISTANCE\*2\.4:PROMPT_QUEUE_DRAG_CANCEL_DISTANCE;\s*if\(distance>tolerance\)cancelPromptQueuePointerDrag\(event\)/);
   assert.match(uiStyles, /\.promptQueueDragGhost\s*\{[^}]*position:\s*fixed;[^}]*pointer-events:\s*none;[^}]*box-shadow:/s);
   assert.match(uiStyles, /\.promptQueueRow\.dragSource > \*\s*\{[^}]*visibility:\s*hidden/s);
   assert.match(uiStyles, /\.promptQueueBody\s*\{[^}]*touch-action:\s*manipulation;[^}]*-webkit-touch-callout:\s*none/s);
@@ -1729,10 +1927,12 @@ test('dynamic queue clearance keeps the latest message above the composer', () =
   const observerSource = sourceBetween('function enhanceComposerOverlayInset', 'function enhanceComposerKeyboardLift');
   const insetSource = sourceBetween('function updateComposerOverlayInset', 'function scrollChatToLatest');
   const scrollSource = sourceBetween('function scrollChatToLatest', 'async function loadConversation');
-  assert.match(observerSource, /updateComposerOverlayInset\(\{scroll:true\}\)/);
+  assert.match(observerSource, /const schedule=\(\)=>scheduleComposerOverlayInset\(\{scroll:true\}\)/);
+  assert.match(observerSource, /const scheduleViewport=\(\)=>scheduleComposerViewportSync\(\)/);
   assert.match(observerSource, /composer\?\.addEventListener\('transitionend',\(event\)=>\{if\(event\.propertyName==='bottom'\)schedule\(\)\}\)/);
   assert.match(insetSource, /const pinned=distance<=Math\.max\(72,prev\+48\)/);
-  assert.match(insetSource, /options\.scroll&&chat&&pinned/);
+  assert.match(insetSource, /const shouldFollowLatest=options\.followLatest===true\|\|pinned/);
+  assert.match(insetSource, /options\.scroll&&chat&&shouldFollowLatest/);
   assert.match(scrollSource, /chat\.scrollTop=chat\.scrollHeight/);
   assert.doesNotMatch(scrollSource, /scrollIntoView/);
   assert.match(inlineScript, /enhanceComposerKeyboardLift\(\);\s*enhanceComposerOverlayInset\(\);\s*keepComposerAboveKeyboard\(\);/);
@@ -1759,17 +1959,51 @@ test('live process timeline keeps note then tools order while streaming', () => 
   assert.match(inlineScript, /contains\('activityCluster'\)\|\|item\?.classList\?.contains\('agentActivityGroup'\)/);
 });
 
-test('task_complete keeps progress commentary and steering in chronological order', () => {
-  assert.match(inlineScript, /Keep assistant progress commentary in the completion timeline instead of dropping it\./);
-  assert.match(inlineScript, /Interleave note -> tools -> note -> tools in chronological artifact order/);
-  assert.match(inlineScript, /const flushPendingTools=\(\)=>\{/);
-  assert.match(inlineScript, /const kept=\[\]/);
-  assert.match(inlineScript, /processElements\.push\(\.\.\.kept, \.\.\.regroupTurnToolArtifacts\(loose\)\)/);
-  assert.doesNotMatch(inlineScript, /processElements\.push\(\.\.\.progressElements, \.\.\.regroupTurnToolArtifacts\(toolBucket\)\)/);
+test('task_complete folds progress commentary with tool history', () => {
+  const organizeSource = sourceBetween('function organizeTurnArtifactsForCompletion', 'function createCompletionMessage');
+  assert.match(organizeSource, /Completed progress commentary belongs with tool\/process history/);
+  assert.match(organizeSource, /const visibleElements=\[\]/);
+  assert.match(organizeSource, /processElements\.push\(item\)/);
+  assert.match(organizeSource, /processElements\.push\(\.\.\.kept, \.\.\.regroupTurnToolArtifacts\(loose\)\)/);
+  const organizeTurnArtifactsForCompletion = new Function(
+    'isProgressStyleAssistantText',
+    'regroupTurnToolArtifacts',
+    `${organizeSource}; return organizeTurnArtifactsForCompletion;`,
+  )(
+    () => true,
+    (items) => items,
+  );
+  const artifact = (classes, kind, text) => {
+    const values = new Set(classes);
+    return {
+      classList: {
+        contains: (value) => values.has(value),
+        remove: (value) => values.delete(value),
+      },
+      dataset: { messageKind: kind, messageText: text },
+      textContent: text,
+      parentNode: null,
+    };
+  };
+  const firstTool = artifact(['activityBatch'], 'tool_activity', 'read');
+  const firstProgress = artifact(['assistant', 'progressCommentary', 'streaming'], 'commentary', 'first note');
+  const imageActivity = artifact(['activityBatch'], 'image_view_activity', 'view image');
+  const secondTool = artifact(['activityBatch'], 'tool_activity', 'search');
+  const secondProgress = artifact(['assistant', 'progressCommentary'], 'live_progress', 'second note');
+  const finalAnswer = artifact(['assistant'], 'final_answer', 'done');
+  const organized = organizeTurnArtifactsForCompletion(
+    [firstTool, firstProgress, imageActivity, secondTool, secondProgress, finalAnswer],
+    finalAnswer,
+  );
+  assert.deepEqual(organized.processElements, [firstTool, firstProgress, secondTool, secondProgress]);
+  assert.deepEqual(organized.visibleElements, [imageActivity]);
+  assert.deepEqual(organized.visibleActivities, [imageActivity]);
+  assert.equal(firstProgress.classList.contains('streaming'), false);
   assert.match(inlineScript, /function appendTurnProcessTimelineElement/);
   assert.match(inlineScript, /appendTurnProcessTimelineElement\(element,\{beforeTools:false\}\)/);
-  assert.doesNotMatch(inlineScript, /for\(const item of artifacts\)\{if\(isProgressArtifact\(item\)&&item\.parentNode\)item\.remove\(\)\}/);
-  assert.match(inlineScript, /const completion=createCompletionMessage\(text,processElements,options\.turnId,elapsedSeconds,options\.tokenUsage\)/);
+  assert.match(inlineScript, /const completion=createCompletionMessage\(text,organized\.processElements,options\.turnId,elapsedSeconds,options\.tokenUsage\)/);
+  assert.match(inlineScript, /for\(const item of organized\.visibleElements\)chat\.insertBefore\(item,anchor\)/);
+  assert.match(inlineScript, /for\(const item of organized\.visibleElements\)target\.insertBefore\(item,anchor\)/);
   assert.match(inlineScript, /if\(collapsible\)el\.open=false/);
   assert.doesNotMatch(inlineScript, /if\(processElements\.some\([\s\S]*?\)\)completion\.open=true/);
   assert.doesNotMatch(inlineScript, /if\(processKeep\.length\)completion\.open=true/);
@@ -1788,7 +2022,7 @@ test('composerCollapsed defaults to a capsule input', () => {
   assert.match(inlineScript, /setComposerExpanded\(!prefersCollapsedComposer\(\)\|\|composerShouldStayExpanded\(\)\,\{force:true\}\)/);
   assert.match(inlineScript, /composerMicBtn/);
   assert.match(inlineScript, /function composerPopoverOpen\(\)\{/);
-  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':cancelPending\?'正在停止当前任务\.\.\.':webRunActive&&native\?'跟进':'向 Codex 提问'/);
+  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':cancelPending\?'正在停止当前任务\.\.\.':webRunActive&&native\?'排队消息':'向 Codex 提问'/);
   assert.doesNotMatch(sourceBetween('function composerShouldStayExpanded', 'function setComposerExpanded'), /threadGoalBar/);
   assert.match(inlineScript, /向 Codex 提问/);
   assert.match(uiStyles, /body \.box\.composerCollapsed/);
@@ -1874,9 +2108,44 @@ test('composer capsule inherits session wallpaper on mobile and desktop', () => 
   assert.match(uiStyles, /body\[data-chat-bg="skin"\] \.composer:has\(> \.composerProjectPicker\.hidden\) > \.box/);
 });
 
+test('mobile composer capsules avoid backdrop blur rasterization', () => {
+  const mobileStart = uiStyles.indexOf('@media (max-width: 820px) {', uiStyles.indexOf('body .composer > .box'));
+  const mobileEnd = uiStyles.indexOf('@media (prefers-reduced-motion: reduce)', mobileStart);
+  assert.ok(mobileStart >= 0 && mobileEnd > mobileStart, 'missing primary mobile composer styles');
+  const mobileStyles = uiStyles.slice(mobileStart, mobileEnd);
+  const ruleAfter = (selector) => {
+    const selectorStart = mobileStyles.indexOf(selector);
+    assert.ok(selectorStart >= 0, `missing mobile selector: ${selector}`);
+    const open = mobileStyles.indexOf('{', selectorStart);
+    const close = mobileStyles.indexOf('}', open);
+    return mobileStyles.slice(open + 1, close);
+  };
+  for (const selector of [
+    'body[data-theme="light"] .composer > .box,',
+    'body[data-theme="dark"] .composer > .box,',
+    'body[data-chat-bg="skin"] .composer > .box,',
+    'body[data-chat-bg="custom"] .composer > .box,',
+  ]) {
+    const body = ruleAfter(selector);
+    assert.match(body, /backdrop-filter:\s*none/);
+    assert.match(body, /-webkit-backdrop-filter:\s*none/);
+    assert.doesNotMatch(body, /blur\(/);
+  }
+  assert.match(
+    uiStyles,
+    /@media \(max-width:\s*820px\)[\s\S]*?\.main\.sideChatOpen > \.sideChatPane \.sideChatComposerBox\s*\{[^}]*backdrop-filter:\s*none;[^}]*-webkit-backdrop-filter:\s*none/s,
+  );
+});
+
 test('mobile keyboard opens on first composer tap', () => {
+  const expandedSource = sourceBetween('function setComposerExpanded', 'function scheduleComposerKeyboardFocusSync');
+  const clickSource = sourceBetween("dropZone\\.addEventListener\\('click'", "document\\.addEventListener\\('click'");
   assert.match(inlineScript, /Focus synchronously inside the user gesture so mobile keyboards open on the first tap/);
   assert.match(inlineScript, /try\{input\.focus\(\{preventScroll:true\}\)\}catch\{input\.focus\(\)\}/);
+  assert.match(expandedSource, /if\(next&&focus&&input&&!input\.disabled&&document\.activeElement!==input\)/);
+  assert.match(clickSource, /document\.activeElement!==input/);
+  assert.match(inlineScript, /__composerExpandClickGuard[\s\S]{0,520}event\.stopImmediatePropagation\(\)/);
+  assert.match(inlineScript, /const wasCollapsed=dropZone\.classList\.contains\('composerCollapsed'\)/);
   assert.match(inlineScript, /event\.target\.closest\('button,a,select,label,\.composerPopover'\)/);
   assert.doesNotMatch(inlineScript, /event\.target\.closest\('button,a,input,select,textarea,label,\.composerPopover'\)/);
   assert.match(uiStyles, /Keep caret visible so the first mobile tap can open the keyboard immediately/);
@@ -1884,13 +2153,21 @@ test('mobile keyboard opens on first composer tap', () => {
 
 test('keyboard lift keeps composer above the soft keyboard', () => {
   const overlaySource = sourceBetween('function updateComposerOverlayInset', 'function chatHasLayout');
+  const visualViewportSource = sourceBetween('function composerVisualViewportBottom', 'function keepComposerAboveKeyboard');
   assert.match(inlineScript, /function keepComposerAboveKeyboard/);
+  assert.match(visualViewportSource, /function composerVisualViewportBottom\(\)/);
+  assert.match(visualViewportSource, /function syncComposerVisualViewport\(\)/);
   assert.match(inlineScript, /function composerKeyboardInset/);
   assert.match(inlineScript, /function enhanceComposerKeyboardLift/);
   assert.match(inlineScript, /visualViewport/);
   assert.match(inlineScript, /--keyboard-inset/);
-  assert.match(inlineScript, /__composerOverlayInsetKeyboardRaf=requestAnimationFrame\(\(\)=>updateComposerOverlayInset\(\{scroll:true\}\)\)/);
+  assert.match(inlineScript, /--composer-visual-viewport-bottom/);
+  assert.match(inlineScript, /function scheduleComposerKeyboardFocusSync\(\)/);
+  assert.match(inlineScript, /function scheduleComposerOverlayInset\(options=\{\}\)/);
+  assert.match(inlineScript, /function scheduleComposerViewportSync\(\)/);
+  assert.match(inlineScript, /__composerOverlayInsetOptions=\{/);
   assert.match(inlineScript, /__composerOverlayInsetSettleTimer=window\.setTimeout\(\(\)=>updateComposerOverlayInset\(\{scroll:true\}\),160\)/);
+  assert.match(inlineScript, /followLatest:wasFollowing/);
   assert.match(overlaySource, /const chatBottom=chatRect&&chat\.clientHeight>0\?chatRect\.top\+chat\.clientHeight:viewportBottom/);
   assert.match(overlaySource, /const visibleOutput=Math\.max\(112,Math\.min\(180,Math\.round\(visualHeight\*0\.18\)\)\)/);
   assert.match(overlaySource, /document\.body\.classList\.contains\('keyboardOpen'\)/);
@@ -1898,7 +2175,28 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   assert.match(uiStyles, /body\.keyboardOpen \.composer/);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.doesNotMatch(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.chat\s*\{[^}]*var\(--keyboard-inset/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.app,\s*body\.keyboardOpen \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main:not\(\.sideChatOpen\) > \.composer\s*\{[^}]*bottom:\s*0;[^}]*transition:\s*none/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main\.sideChatOpen > \.composer\s*\{[^}]*bottom:\s*0 !important;[^}]*transition:\s*none/s);
   assert.match(serverSource, /interactive-widget=resizes-content/);
+
+  const visualStyles = new Map();
+  let visualViewportWrites = 0;
+  const syncVisualViewport = new Function(
+    'document',
+    'window',
+    `${visualViewportSource}; return syncComposerVisualViewport;`,
+  )(
+    { body: { style: {
+      getPropertyValue: (name) => visualStyles.get(name) || '',
+      setProperty: (name, value) => { visualViewportWrites += 1; visualStyles.set(name, value); },
+    } } },
+    { innerHeight: 852, visualViewport: { offsetTop: 20, height: 506 } },
+  );
+  assert.equal(syncVisualViewport(), 526);
+  assert.equal(visualStyles.get('--composer-visual-viewport-bottom'), '526px');
+  assert.equal(syncVisualViewport(), 526);
+  assert.equal(visualViewportWrites, 1);
 
   const makeOverlayHarness = (chatHeight) => {
     const styles = new Map([['--composer-overlay-height', '0']]);
@@ -1944,48 +2242,184 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   assert.ok(unresized.chatHeight - unresized.height >= 112);
 });
 
+test('keyboard viewport resize keeps a following long chat pinned to its latest output', () => {
+  const overlaySource = sourceBetween('function updateComposerOverlayInset', 'function chatHasLayout');
+  const styles = new Map([['--composer-overlay-height', '190']]);
+  let scrollCalls = 0;
+  const body = {
+    classList: { contains: (name) => name === 'keyboardOpen' },
+    dataset: {},
+    style: {
+      getPropertyValue: (name) => styles.get(name) || '',
+      setProperty: (name, value) => styles.set(name, value),
+    },
+  };
+  const chat = {
+    clientHeight: 470,
+    scrollHeight: 3000,
+    scrollTop: 2000,
+    getBoundingClientRect: () => ({ top: 56 }),
+  };
+  const composer = {
+    offsetHeight: 182,
+    getBoundingClientRect: () => ({ top: 344 }),
+  };
+  const update = new Function(
+    'document',
+    'dropZone',
+    'chat',
+    'window',
+    'scrollChatToLatest',
+    `${overlaySource}; return updateComposerOverlayInset;`,
+  )(
+    { body, querySelector: () => null },
+    { parentElement: composer },
+    chat,
+    { innerHeight: 852, visualViewport: { offsetTop: 0, height: 526 } },
+    () => { scrollCalls += 1; },
+  );
+
+  assert.equal(update({ scroll: true }), 190);
+  assert.equal(scrollCalls, 0);
+  assert.equal(update({ scroll: true, followLatest: true }), 190);
+  assert.equal(scrollCalls, 1);
+});
+
 test('mobile keyboard lift coalesces repeated viewport callbacks', () => {
   const keyboardSource = sourceBetween('function keepComposerAboveKeyboard', 'function enhanceComposerOverlayInset');
+  const focusSyncSource = sourceBetween('function scheduleComposerKeyboardFocusSync', 'function scheduleComposerOverlayInset');
+  const overlayRafSource = sourceBetween('function scheduleComposerOverlayInset', 'function scheduleComposerViewportSync');
+  const viewportSyncSource = sourceBetween('function scheduleComposerViewportSync', 'function composerVisualViewportBottom');
+  const overlayEnhancerSource = sourceBetween('function enhanceComposerOverlayInset', 'function enhanceComposerKeyboardLift');
+  const keyboardLiftSource = sourceBetween('function enhanceComposerKeyboardLift', 'function expandComposer');
   assert.match(keyboardSource, /const previousInset=Number\.isFinite\(Number\(window\.__composerKeyboardInsetValue\)\)/);
-  assert.match(keyboardSource, /if\(next===previousInset&&active===previousActive\)return/);
-  assert.match(keyboardSource, /if\(next>0&&!hadKeyboard&&dropZone\)/);
+  assert.match(keyboardSource, /if\(next===previousInset&&active===previousActive\)\{/);
+  assert.match(keyboardSource, /syncComposerVisualViewport\(\);/);
+  assert.match(keyboardSource, /const wasFollowing=distance<=Math\.max\(72,previousOverlay\+48\)/);
+  assert.match(keyboardSource, /scheduleComposerOverlayInset\(\{scroll:true,followLatest:wasFollowing\}\)/);
+  assert.match(keyboardSource, /scheduleComposerOverlayInset\(\{scroll:true,followLatest:true\}\)/);
+  assert.match(viewportSyncSource, /if\(window\.__composerViewportSyncRaf\)return/);
+  assert.match(overlayEnhancerSource, /window\.visualViewport\?\.addEventListener\('resize', scheduleViewport/);
+  assert.doesNotMatch(keyboardLiftSource, /visualViewport\?\.addEventListener/);
+  assert.doesNotMatch(keyboardSource, /scrollIntoView/);
+
+  const scheduled = new Map();
+  const updates = [];
+  let nextRaf = 0;
+  const scheduleOverlayInset = new Function(
+    'window',
+    'requestAnimationFrame',
+    'updateComposerOverlayInset',
+    `${overlayRafSource}; return scheduleComposerOverlayInset;`,
+  )(
+    {},
+    (callback) => { const id = ++nextRaf; scheduled.set(id, callback); return id; },
+    (options) => { updates.push(options); },
+  );
+  scheduleOverlayInset({ scroll: true });
+  scheduleOverlayInset({ scroll: true, followLatest: true });
+  assert.equal(scheduled.size, 1);
+  scheduled.get(1)();
+  assert.deepEqual(updates, [{ scroll: true, followLatest: true }]);
+
+  const focusRafs = new Map();
+  const focusTimers = new Map();
+  const cancelledFocusRafs = [];
+  const clearedFocusTimers = [];
+  const focusSyncCalls = [];
+  let nextFocusTask = 0;
+  const focusedInput = {};
+  const scheduleFocusSync = new Function(
+    'window',
+    'input',
+    'document',
+    'requestAnimationFrame',
+    'cancelAnimationFrame',
+    'keepComposerAboveKeyboard',
+    `${focusSyncSource}; return scheduleComposerKeyboardFocusSync;`,
+  )(
+    {
+      clearTimeout: (id) => { if(id){ clearedFocusTimers.push(id); focusTimers.delete(id); } },
+      setTimeout: (callback) => { const id = ++nextFocusTask; focusTimers.set(id, callback); return id; },
+    },
+    focusedInput,
+    { activeElement: focusedInput },
+    (callback) => { const id = ++nextFocusTask; focusRafs.set(id, callback); return id; },
+    (id) => { cancelledFocusRafs.push(id); focusRafs.delete(id); },
+    (options) => { focusSyncCalls.push(options); },
+  );
+  scheduleFocusSync();
+  scheduleFocusSync();
+  assert.deepEqual(cancelledFocusRafs, [1]);
+  assert.deepEqual(clearedFocusTimers, [2]);
+  assert.equal(focusRafs.size, 1);
+  assert.equal(focusTimers.size, 1);
+  focusRafs.get(3)();
+  focusTimers.get(4)();
+  assert.deepEqual(focusSyncCalls, [{ force: true }, { force: true }]);
 
   const styles = new Map();
   let scrollCalls = 0;
   let refreshCalls = 0;
+  let visualViewportSyncs = 0;
+  let followLatest = null;
   const body = {
     classList: { toggle: () => {} },
-    style: { setProperty: (name, value) => styles.set(name, value) },
+    style: {
+      getPropertyValue: (name) => styles.get(name) || '',
+      setProperty: (name, value) => styles.set(name, value),
+    },
   };
   const input = {};
   const keepComposerAboveKeyboard = new Function(
     'document',
     'dropZone',
+    'chat',
     'window',
     'composerKeyboardInset',
     'composerChromeContains',
     'input',
-    'requestAnimationFrame',
-    'cancelAnimationFrame',
-    'updateComposerOverlayInset',
+    'syncComposerVisualViewport',
+    'scheduleComposerOverlayInset',
     `${keyboardSource}; return keepComposerAboveKeyboard;`,
   )(
     { body, activeElement: input },
     { parentElement: {}, scrollIntoView: () => { scrollCalls += 1; } },
+    { clientHeight: 400, scrollHeight: 1200, scrollTop: 800 },
     { clearTimeout: () => {}, setTimeout: () => 1 },
     () => 280,
     () => false,
     input,
-    (callback) => { callback(); return 1; },
-    () => {},
-    () => { refreshCalls += 1; },
+    () => { visualViewportSyncs += 1; },
+    (options) => { refreshCalls += 1; followLatest = options.followLatest; },
   );
 
   keepComposerAboveKeyboard({ force: true });
   keepComposerAboveKeyboard({ force: true });
   assert.equal(styles.get('--keyboard-inset'), '280px');
-  assert.equal(scrollCalls, 1);
+  assert.equal(scrollCalls, 0);
   assert.equal(refreshCalls, 1);
+  assert.equal(followLatest, true);
+  assert.equal(visualViewportSyncs, 2);
+});
+
+test('composer typing avoids full conversation redraws and stale command menu renders', () => {
+  const inputListenerSource = sourceBetween("sendBtn\\?\\.addEventListener\\('click', send\\);", "attachFile\\?\\.addEventListener\\('click'");
+  const submitSource = sourceBetween('function syncComposerSubmitControl', 'function syncComposerInputState');
+  const inputStateSource = sourceBetween('function syncComposerInputState', 'function applyConversationMode');
+  const slashSource = sourceBetween('async function syncComposerSlashMenuFromInput', 'function handleComposerSlashKeydown');
+  const atSource = sourceBetween('async function syncComposerAtMenuFromInput', 'function handleComposerAtKeydown');
+
+  assert.match(inputListenerSource, /syncComposerInputState\(\);syncComposerSlashMenuFromInput\(\);syncComposerAtMenuFromInput\(\)/);
+  assert.doesNotMatch(inputListenerSource, /applyConversationMode\(\)/);
+  assert.match(inputStateSource, /syncComposerSubmitControl\(\)/);
+  assert.match(submitSource, /sendBtn\.disabled=/);
+  assert.doesNotMatch(inputStateSource, /renderPromptQueue|renderThreadGoalBar|syncComposerChrome|updateComposerOverlayInset/);
+  assert.match(slashSource, /const syncRevision=\+\+composerSlashSyncRevision/);
+  assert.match(slashSource, /if\(composerSlashLoadedAt&&Date\.now\(\)-composerSlashLoadedAt<15000\)return/);
+  assert.match(slashSource, /if\(syncRevision!==composerSlashSyncRevision\|\|!composerSlashMenuOpen\(\)\)return/);
+  assert.match(atSource, /const syncRevision=\+\+composerAtSyncRevision/);
+  assert.match(atSource, /if\(syncRevision!==composerAtSyncRevision\|\|!composerAtMenuOpen\(\)\)return/);
 });
 
 test('model toggle stays chromeless without a pill background', () => {
@@ -2050,7 +2484,7 @@ test('thread goal status bar exposes native edit, pause, resume, and clear contr
   assert.match(serverSource, /\/api\/native-sessions\/'\+encodeURIComponent\(threadId\)\+'\/goal'/);
   assert.match(serverSource, /appServerClient\.request\('thread\/goal\/set'/);
   assert.match(serverSource, /appServerClient\.request\('thread\/goal\/clear'/);
-  assert.match(serverSource, /webRunActive&&native\?'跟进':'向 Codex 提问'/);
+  assert.match(serverSource, /webRunActive&&native\?'排队消息':'向 Codex 提问'/);
   assert.match(uiStyles, /\.threadGoalBar\s*\{/);
   assert.match(uiStyles, /body \.composer > \.threadGoalBar/);
   assert.match(uiStyles, /\.threadGoalBar\s*\{[^}]*display:\s*grid;[^}]*min-height:\s*42px;[^}]*margin:\s*0 auto 14px;[^}]*border-radius:\s*999px/s);
@@ -2105,6 +2539,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.equal((inlineScript.match(/restoreThreadRunMobileFocus\(focusedPillClass\)/g) || []).length, 2);
   assert.match(inlineScript, /function createThreadRunGoalDetail\(goal\)/);
   assert.match(inlineScript, /function createThreadRunPlanDetail\(progress\)/);
+  assert.match(inlineScript, /progress\.items\.forEach\(\(item,index\)=>\{/);
   assert.match(inlineScript, /function createThreadRunFilesDetail\(files\)/);
   assert.match(inlineScript, /function createThreadRunAgentsDetail\(agents\)/);
   assert.match(inlineScript, /function createThreadRunMobile\(goal\)/);
@@ -2112,6 +2547,8 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(inlineScript, /viewport\.scrollLeft=threadRunMobileScrollLeft/);
   assert.match(inlineScript, /if\(goal\)\{[\s\S]*?mobileThreadGoalStatusLabel\(goal\.status\)/);
   assert.match(inlineScript, /progress\.current\+'\/'\+progress\.total/);
+  assert.match(inlineScript, /planPill\.setAttribute\('aria-controls','threadRunPlanDetail'\)/);
+  assert.match(inlineScript, /threadRunMobilePanel==='plan'[\s\S]*?mobile\.appendChild\(createThreadRunPlanDetail\(progress\)\)/);
   assert.match(inlineScript, /const files=webRunActive\?editedFilesFromTurnArtifacts\(turnProcessElements\):\[\]/);
   assert.match(inlineScript, /threadRunMobilePill\('file-pen-line',files\.length\+' 个文件已更改','threadRunFilesPill',\{selected:filesSelected,expanded:filesSelected,handler:/);
   assert.match(inlineScript, /threadRunMobilePill\('bot',agentCount\+' 个智能体','threadRunAgentPill',\{selected:agentsSelected,expanded:agentsSelected,handler:/);
@@ -2146,7 +2583,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(mobileGoalStyles, /body \.composer > \.threadGoalBar\.runtimeOnly,[\s\S]*?display:\s*block;/s);
   const refreshFilesSource = sourceBetween('function refreshLiveEditedFilesResult', 'function createWebPreviewResultCard');
   assert.equal((refreshFilesSource.match(/renderThreadGoalBar\(\)/g) || []).length, 2);
-  assert.match(serverSource, /ui\.css\?v=login-theme-20260802c/);
+  assert.match(serverSource, /ui\.css\?v=quota-header-align-20260808b/);
 });
 
 test('desktop live plan stays a compact pill with an on-demand detail popup', () => {

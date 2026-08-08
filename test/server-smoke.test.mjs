@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer, request as createHttpRequest } from 'node:http';
 import net from 'node:net';
@@ -11,6 +12,43 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+test('app-server terminal errors broadcast full detail before closing the turn', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const start = serverSource.indexOf('function handleAppServerError');
+  const end = serverSource.indexOf('\nfunction assertAppServerConfigChangeAllowed', start);
+  assert.ok(start >= 0 && end > start);
+  const calls = [];
+  const detail = `unexpected status 405 Method Not Allowed: ${'x'.repeat(520)}, url: http://127.0.0.1:8090/v1/responses`;
+  const handleAppServerError = new Function(
+    'activeNativeTurns',
+    'cleanNativeThreadId',
+    'setNativeTurnState',
+    'recordNativeTurnCompletion',
+    'broadcastNativeRuntime',
+    'console',
+    `${serverSource.slice(start, end)}; return handleAppServerError;`,
+  )(
+    new Map([['thread-a', { turnId: 'turn-a', status: 'running' }]]),
+    (value) => String(value || '').trim(),
+    (...args) => calls.push({ type: 'state', args }),
+    (...args) => calls.push({ type: 'complete', args }),
+    (event) => calls.push({ type: 'runtime', event }),
+    { warn() {} },
+  );
+
+  handleAppServerError({
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+    willRetry: false,
+    error: { message: detail },
+  });
+
+  assert.equal(calls[0].type, 'runtime');
+  assert.equal(calls[0].event.message, detail);
+  assert.equal(calls[1].type, 'complete');
+  assert.deepEqual(calls[1].args, ['thread-a', { id: 'turn-a', status: 'failed' }]);
+});
 
 test('native queue turns ignore unscoped idle status and stale completions', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
@@ -387,6 +425,454 @@ test('server-owned Web queues retry only while native state is settling', async 
   assert.ok(released.length >= 3);
 });
 
+test('native session terminal state clears a stale in-memory running turn', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function nativeActiveTurnFor');
+  const helperEnd = serverSource.indexOf('\nfunction nativeSessionSummaries', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeNativeTurns = new Map([
+    ['thread-done', { turnId: 'turn-done', status: 'running' }],
+    ['thread-new-turn', { turnId: 'turn-new', status: 'running' }],
+    ['thread-running', { turnId: 'turn-running', status: 'running' }],
+    ['thread-resumed', {
+      turnId: 'turn-interrupted',
+      status: 'interrupted',
+      updatedAt: '2026-08-07T13:10:00.000Z',
+    }],
+    ['thread-stale-jsonl', {
+      turnId: 'turn-interrupted',
+      status: 'interrupted',
+      updatedAt: '2026-08-07T13:20:00.000Z',
+    }],
+  ]);
+  const api = new Function(
+    'activeNativeTurns',
+    'cleanNativeThreadId',
+    `${serverSource.slice(helperStart, helperEnd)}; return { nativeActiveTurnFor };`,
+  )(
+    activeNativeTurns,
+    (value) => String(value || '').trim(),
+  );
+
+  assert.equal(api.nativeActiveTurnFor('thread-done', {
+    status: 'done',
+    latestTurnId: 'turn-done',
+  }), null);
+  assert.equal(activeNativeTurns.has('thread-done'), false);
+
+  const newTurn = api.nativeActiveTurnFor('thread-new-turn', {
+    status: 'done',
+    latestTurnId: 'turn-old',
+  });
+  assert.equal(newTurn.status, 'running');
+  assert.equal(activeNativeTurns.has('thread-new-turn'), true);
+
+  const stillRunning = api.nativeActiveTurnFor('thread-running', {
+    status: 'running',
+    latestTurnId: 'turn-running',
+  });
+  assert.equal(stillRunning.status, 'running');
+  assert.equal(activeNativeTurns.has('thread-running'), true);
+
+  assert.equal(api.nativeActiveTurnFor('thread-resumed', {
+    status: 'running',
+    latestTurnId: 'turn-resumed',
+    latestTurnStartedAt: '2026-08-07T13:18:58.198Z',
+  }), null);
+  assert.equal(activeNativeTurns.has('thread-resumed'), false, 'a newer persisted turn must clear the old paused override');
+
+  const stalePersistedRunning = api.nativeActiveTurnFor('thread-stale-jsonl', {
+    status: 'running',
+    latestTurnId: 'turn-older',
+    latestTurnStartedAt: '2026-08-07T13:00:00.000Z',
+  });
+  assert.equal(stalePersistedRunning.status, 'interrupted');
+  assert.equal(activeNativeTurns.has('thread-stale-jsonl'), true, 'an older JSONL running state must not undo a newer pause');
+});
+
+test('app-server latest turn status repairs stale JSONL running state after restart', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function appServerTurnStartedAt');
+  const helperEnd = serverSource.indexOf('\nfunction requestDesktopThreadSnapshot', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeNativeTurns = new Map();
+  const updates = [];
+  const dispatches = [];
+  const requests = [];
+  const api = new Function(
+    'activeNativeTurns',
+    'cleanNativeThreadId',
+    'nativeTurnStatus',
+    'setNativeTurnState',
+    'scheduleServerPromptQueueDispatch',
+    'nativeActiveTurnFor',
+    'nativeTurnStatusSyncRequests',
+    'nativeTurnStatusSyncTimes',
+    'NATIVE_TURN_STATUS_SYNC_INTERVAL_MS',
+    'NATIVE_TURN_STATUS_ACTIVITY_GRACE_MS',
+    'appServerClient',
+    'NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return {
+      applyAppServerTurnStatus,
+      reconcileNativeTurnStatusFromAppServer,
+    };`,
+  )(
+    activeNativeTurns,
+    (value) => String(value || '').trim(),
+    (value) => {
+      const status = String(value || '').toLowerCase();
+      if (status === 'inprogress' || status === 'running') return 'running';
+      if (status === 'failed' || status === 'error') return 'error';
+      if (['interrupted', 'cancelled', 'canceled', 'aborted'].includes(status)) return 'interrupted';
+      return 'done';
+    },
+    (threadId, state) => {
+      updates.push({ threadId, state });
+      activeNativeTurns.set(threadId, { ...state, updatedAt: '2026-08-07T14:00:00.000Z' });
+    },
+    (...args) => dispatches.push(args),
+    (threadId) => activeNativeTurns.get(threadId) || null,
+    new Map(),
+    new Map(),
+    1500,
+    5 * 60 * 1000,
+    {
+      request: async (method, params, options) => {
+        requests.push({ method, params, options });
+        return {
+          data: [{
+            id: 'turn-paused',
+            status: 'interrupted',
+            startedAt: Date.parse('2026-08-07T09:34:46.000Z') / 1000,
+          }],
+        };
+      },
+    },
+    4000,
+  );
+
+  assert.equal(await api.reconcileNativeTurnStatusFromAppServer('thread-paused', {
+    status: 'running',
+    latestTurnId: 'turn-paused',
+    latestTurnStartedAt: '2026-08-07T09:34:46.000Z',
+  }), true);
+  assert.deepEqual(requests, [{
+    method: 'thread/turns/list',
+    params: {
+      threadId: 'thread-paused',
+      limit: 1,
+      sortDirection: 'desc',
+      itemsView: 'notLoaded',
+    },
+    options: { timeoutMs: 4000 },
+  }]);
+  assert.deepEqual(updates, [{
+    threadId: 'thread-paused',
+    state: {
+      turnId: 'turn-paused',
+      status: 'interrupted',
+      startedAt: '2026-08-07T09:34:46.000Z',
+      transport: 'app-server-status',
+    },
+  }]);
+  assert.deepEqual(dispatches, [['thread-paused', 160]]);
+
+  const updateCountBeforeLiveTurn = updates.length;
+  assert.equal(api.applyAppServerTurnStatus('thread-live', {
+    id: 'turn-live',
+    status: 'interrupted',
+    startedAt: Date.parse('2026-08-07T14:00:00.000Z') / 1000,
+  }, {
+    status: 'running',
+    latestTurnId: 'turn-live',
+    latestTurnStartedAt: '2026-08-07T14:00:00.000Z',
+    updatedAt: new Date().toISOString(),
+  }), false, 'fresh JSONL activity must outrank a stale app-server terminal status');
+  assert.equal(updates.length, updateCountBeforeLiveTurn);
+
+  activeNativeTurns.set('thread-newer', {
+    turnId: 'turn-newer',
+    status: 'running',
+    startedAt: '2026-08-07T10:00:00.000Z',
+  });
+  assert.equal(api.applyAppServerTurnStatus('thread-newer', {
+    id: 'turn-older',
+    status: 'interrupted',
+    startedAt: Date.parse('2026-08-07T09:00:00.000Z') / 1000,
+  }), false, 'an older persisted terminal state must not stop a newer live turn');
+});
+
+test('Desktop snapshots and patches synchronize live and terminal turn state', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const handlerStart = serverSource.indexOf('function handleDesktopIpcBroadcast');
+  const handlerEnd = serverSource.indexOf('\nfunction desktopPendingKey', handlerStart);
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+
+  const activeNativeTurns = new Map([
+    ['thread-a', { turnId: 'turn-a', status: 'running', transport: 'desktop-ipc' }],
+    ['thread-b', { turnId: 'turn-b', status: 'running', transport: 'desktop-ipc' }],
+    ['thread-c', { turnId: 'turn-c', status: 'interrupted', transport: 'app-server-status' }],
+  ]);
+  const conversations = new Map([
+    ['thread-a', { status: 'running', latestTurnId: 'turn-a' }],
+    ['thread-b', { status: 'running', latestTurnId: 'turn-b' }],
+    ['thread-c', { status: 'interrupted', latestTurnId: 'turn-c' }],
+  ]);
+  const updates = [];
+  const dispatches = [];
+  const requestedSnapshots = [];
+  const api = new Function(
+    'desktopThreadStates',
+    'cleanNativeThreadId',
+    'requestDesktopThreadSnapshot',
+    'syncDesktopPendingRequests',
+    'activeNativeTurns',
+    'nativeSessions',
+    'setNativeTurnState',
+    'scheduleServerPromptQueueDispatch',
+    `${serverSource.slice(handlerStart, handlerEnd)}; return { handleDesktopIpcBroadcast };`,
+  )(
+    new Map(),
+    (value) => String(value || '').trim(),
+    (...args) => requestedSnapshots.push(args),
+    () => {},
+    activeNativeTurns,
+    { get: (threadId) => conversations.get(threadId) || null },
+    (threadId, state) => {
+      updates.push({ threadId, state });
+      activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state });
+    },
+    (...args) => dispatches.push(args),
+  );
+
+  api.handleDesktopIpcBroadcast({
+    method: 'thread-stream-state-changed',
+    sourceClientId: 'desktop-owner',
+    params: {
+      conversationId: 'thread-a',
+      change: {
+        type: 'snapshot',
+        revision: 1,
+        conversationState: {
+          requests: [],
+          turns: [{ id: 'turn-a', status: 'inProgress' }],
+        },
+      },
+    },
+  });
+  api.handleDesktopIpcBroadcast({
+    method: 'thread-stream-state-changed',
+    sourceClientId: 'desktop-owner',
+    params: {
+      conversationId: 'thread-a',
+      change: {
+        type: 'patches',
+        baseRevision: 1,
+        revision: 2,
+        patches: [{ op: 'replace', path: ['turns', 0, 'status'], value: 'interrupted' }],
+      },
+    },
+  });
+  api.handleDesktopIpcBroadcast({
+    method: 'thread-stream-state-changed',
+    sourceClientId: 'desktop-owner',
+    params: {
+      conversationId: 'thread-b',
+      change: {
+        type: 'snapshot',
+        revision: 1,
+        conversationState: {
+          requests: [],
+          turns: [{ id: 'turn-b', status: 'completed' }],
+        },
+      },
+    },
+  });
+  api.handleDesktopIpcBroadcast({
+    method: 'thread-stream-state-changed',
+    sourceClientId: 'desktop-owner',
+    params: {
+      conversationId: 'thread-c',
+      change: {
+        type: 'snapshot',
+        revision: 1,
+        conversationState: {
+          requests: [],
+          turns: [{ id: 'turn-c', status: 'inProgress' }],
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(updates, [
+    {
+      threadId: 'thread-a',
+      state: { turnId: 'turn-a', status: 'interrupted', transport: 'desktop-ipc' },
+    },
+    {
+      threadId: 'thread-b',
+      state: { turnId: 'turn-b', status: 'done', transport: 'desktop-ipc' },
+    },
+    {
+      threadId: 'thread-c',
+      state: { turnId: 'turn-c', status: 'running', transport: 'desktop-ipc' },
+    },
+  ]);
+  assert.deepEqual(dispatches, [['thread-a', 160], ['thread-b', 160]]);
+
+  api.handleDesktopIpcBroadcast({
+    method: 'thread-stream-state-changed',
+    sourceClientId: 'desktop-owner',
+    params: {
+      conversationId: 'thread-a',
+      change: {
+        type: 'patches',
+        baseRevision: 2,
+        revision: 3,
+        patches: [{ op: 'replace', path: ['turnHistory', 'history', 'entitiesByKey'], value: {} }],
+      },
+    },
+  });
+  assert.deepEqual(requestedSnapshots, [['thread-a', { force: true }]]);
+});
+
+test('Desktop owner loss preserves running state until an authoritative status check completes', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function requestDesktopThreadSnapshot');
+  const helperEnd = serverSource.indexOf('\nasync function respondToNativeRequest', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeNativeTurns = new Map([
+    ['desktop-turn', { turnId: 'desktop-turn-id', status: 'running', transport: 'desktop-ipc' }],
+  ]);
+  const conversations = new Map([
+    ['desktop-turn', {
+      status: 'running',
+      latestTurnId: 'desktop-turn-id',
+      metadata: { originator: 'Codex Desktop' },
+    }],
+  ]);
+  const reconciliations = [];
+  let refreshes = 0;
+  const api = new Function(
+    'desktopSnapshotRequests',
+    'desktopSnapshotRequestTimes',
+    'desktopIpcClient',
+    'isCodexDesktopIpcUnavailableError',
+    'cleanNativeThreadId',
+    'activeNativeTurns',
+    'nativeSessions',
+    'reconcileNativeTurnStatusFromAppServer',
+    `${serverSource.slice(helperStart, helperEnd)}; return { requestDesktopThreadSnapshot };`,
+  )(
+    new Map(),
+    new Map(),
+    {
+      loadCompleteHistory: async () => {
+        const error = new Error('no client');
+        error.reason = 'no-client-found';
+        throw error;
+      },
+    },
+    (error) => error?.reason === 'no-client-found',
+    (value) => String(value || '').trim(),
+    activeNativeTurns,
+    {
+      get: (threadId) => conversations.get(threadId) || null,
+      scheduleRefresh: () => { refreshes += 1; },
+    },
+    async (...args) => {
+      reconciliations.push(args);
+      return false;
+    },
+  );
+
+  await api.requestDesktopThreadSnapshot('desktop-turn', { force: true });
+
+  assert.equal(activeNativeTurns.get('desktop-turn')?.status, 'running');
+  assert.equal(refreshes, 1);
+  assert.deepEqual(reconciliations, [[
+    'desktop-turn',
+    conversations.get('desktop-turn'),
+    { force: true },
+  ]]);
+});
+
+test('invalid Desktop request patches force a snapshot without advancing state', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function normalizeDesktopRequests');
+  const helperEnd = serverSource.indexOf('\nfunction syncDesktopTurnState', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const api = new Function(
+    `${serverSource.slice(helperStart, helperEnd)}; return { applyDesktopStatePatches };`,
+  )();
+  const current = {
+    requests: [{ id: 'approval-1', method: 'item/commandExecution/requestApproval' }],
+    turns: [{ id: 'turn-1', status: 'inProgress' }],
+  };
+
+  assert.equal(api.applyDesktopStatePatches(current, [
+    { op: 'remove', path: ['requests', 99] },
+  ]), null);
+  assert.equal(api.applyDesktopStatePatches(current, [
+    { op: 'replace', path: ['requests', 0, 'missing'], value: true },
+  ]), null);
+  assert.equal(api.applyDesktopStatePatches(current, [
+    { op: 'replace', path: ['unknown', 0], value: true },
+  ]), null);
+  assert.deepEqual(api.applyDesktopStatePatches(current, [
+    { op: 'remove', path: ['requests', 0] },
+  ]), {
+    requests: [],
+    turns: [{ id: 'turn-1', status: 'inProgress' }],
+  });
+});
+
+test('review regressions keep usage, goals, and theme state authoritative', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+
+  assert.doesNotMatch(serverSource, /trackDeepSeekBalanceSpend|DEEPSEEK_BALANCE_FILE/);
+  assert.match(serverSource, /if \(deepSeekStats\) quota\.usageStats = deepSeekStats/);
+  assert.equal(
+    (serverSource.match(/app\.patch\('\/api\/native-sessions\/:id\/goal'/g) || []).length,
+    1,
+  );
+  assert.equal(
+    (serverSource.match(/app\.delete\('\/api\/native-sessions\/:id\/goal'/g) || []).length,
+    1,
+  );
+  assert.match(
+    serverSource,
+    /app\.patch\('\/api\/native-sessions\/:id\/goal'[\s\S]*?broadcastNativeRuntime\(\{ type: 'goal', threadId, goal: result\?\.goal \|\| null \}\)/,
+  );
+  assert.match(
+    serverSource,
+    /function toggleTheme\(\)\{const next=appearance\.theme==='system'\?'light':appearance\.theme==='light'\?'dark':'system';/,
+  );
+  assert.match(serverSource, /黑暗模式；点击恢复跟随系统/);
+});
+
+test('native tool image output falls back to embedded data after its source file is gone', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function decodeNativeToolImageOutput');
+  const helperEnd = serverSource.indexOf('\nasync function continueNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const api = new Function(
+    'TOOL_IMAGE_MAX_BYTES',
+    `${serverSource.slice(helperStart, helperEnd)}; return { decodeNativeToolImageOutput };`,
+  )(25 * 1024 * 1024);
+  const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+  const result = api.decodeNativeToolImageOutput({
+    content: JSON.stringify({
+      output: [{ type: 'input_image', image_url: `data:image/png;base64,${imageData}` }],
+    }),
+  });
+  assert.equal(result.type, 'image/png');
+  assert.deepEqual(result.data, Buffer.from(imageData, 'base64'));
+});
+
 test('playground refresh preserves browser streaming preferences and completed Agent images', async () => {
   const playgroundPage = await readFile(
     path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'index.html'),
@@ -538,6 +1024,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const runtime = path.join(temporary, 'runtime');
   const codexHome = path.join(temporary, 'codex-home');
   const fakeCodex = path.join(temporary, 'fake-codex.mjs');
+  const fakeDocker = path.join(temporary, 'fake-docker.mjs');
+  const fakeDockerArgsFile = path.join(temporary, 'fake-docker-args.json');
   const traceFile = path.join(temporary, 'codex-trace.json');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
   const appServerControlFile = path.join(temporary, 'app-server-control.json');
@@ -545,6 +1033,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const imagePromptFetchFixture = path.join(temporary, 'image-prompt-fetch-fixture.mjs');
   const webEnv = path.join(temporary, 'web.env');
   const toolImagePath = path.join(temporary, 'tool-preview.png');
+  let externalImageRoot = '';
+  let externalImagePath = '';
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
   const nativeFirstTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa780';
   const nativeSecondTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa781';
@@ -558,7 +1048,9 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const appQueueDuplicateNoIdThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa735';
   const appQueueEditThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa736';
   const appQueueReorderThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa737';
+  const appQueueInterruptedThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa738';
   const appOwnedQueueItemId = 'app-owned-queue-item';
+  const interruptedQueuePauseReason = 'Interrupted before the steer was accepted.';
   const appQueueInlineImage = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
   const appOwnedQueueRawItem = {
     id: appOwnedQueueItemId,
@@ -652,6 +1144,22 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     text: 'Second Codex App follow-up',
     context: { ...appOwnedQueueRawItem.context, prompt: 'Second Codex App follow-up' },
     createdAt: 1785204000300,
+  };
+  const appQueueInterruptedRawItem = {
+    ...appOwnedQueueRawItem,
+    id: 'app-interrupted-follow-up',
+    text: 'Resume this exact Codex App follow-up',
+    context: { ...appOwnedQueueRawItem.context, prompt: 'Resume this exact Codex App follow-up' },
+    pausedReason: interruptedQueuePauseReason,
+    createdAt: 1785204000400,
+  };
+  const appQueueFailedRawItem = {
+    ...appOwnedQueueRawItem,
+    id: 'app-failed-follow-up',
+    text: 'Keep this unrelated failure paused',
+    context: { ...appOwnedQueueRawItem.context, prompt: 'Keep this unrelated failure paused' },
+    pausedReason: 'Run ended before the steer was accepted.',
+    createdAt: 1785204000500,
   };
   let child;
   let desktopIpc;
@@ -809,11 +1317,14 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     customProviderBaseUrl = `http://127.0.0.1:${customProviderServer.address().port}`;
     await mkdir(runtime, { recursive: true });
     await mkdir(codexHome, { recursive: true });
+    externalImageRoot = await mkdtemp(path.join(tmpdir(), 'codex-web-image-root-'));
+    externalImagePath = path.join(externalImageRoot, 'gallery-preview.png');
     await writeFile(appServerControlFile, '{}');
     await writeFile(
       toolImagePath,
       Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
     );
+    await writeFile(externalImagePath, await readFile(toolImagePath));
     await writeFile(imagePromptFetchFixture, `
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (input, options) => {
@@ -855,6 +1366,7 @@ experimental_bearer_token = "switch-test-token"
         [appQueueOwnershipThreadId]: [appOwnedQueueRawItem],
         [appQueueEditThreadId]: [appOwnedEditQueueRawItem],
         [appQueueReorderThreadId]: [appQueueReorderFirstRawItem, appQueueReorderSecondRawItem],
+        [appQueueInterruptedThreadId]: [appQueueInterruptedRawItem, appQueueFailedRawItem],
         [appQueueNoIdThreadId]: [
           {
             text: 'Legacy predecessor without an id',
@@ -1208,6 +1720,7 @@ if (args[0] === 'app-server') {
   } catch {}
   const archiveListCounters = new Map();
   let threadGoal = null;
+  let clientName = '';
   const archiveControl = () => {
     try {
       return JSON.parse(readFileSync(process.env.FAKE_APP_SERVER_CONTROL, 'utf8'));
@@ -1244,7 +1757,10 @@ if (args[0] === 'app-server') {
       const message = JSON.parse(line);
       appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify(message) + '\\n');
       if (!Object.hasOwn(message, 'id') || !message.method) continue;
-      if (message.method === 'initialize') send({ id: message.id, result: { userAgent: 'fake' } });
+      if (message.method === 'initialize') {
+        clientName = String(message.params?.clientInfo?.name || '');
+        send({ id: message.id, result: { userAgent: 'fake' } });
+      }
       else if (message.method === 'model/list') {
         send({
           id: message.id,
@@ -1267,6 +1783,25 @@ if (args[0] === 'app-server') {
             nextCursor: null
           }
         });
+      }
+      else if (message.method === 'account/rateLimits/read') {
+        if (clientName === 'codex-web' && archiveControl().failPrimaryQuota === true) {
+          send({ id: message.id, error: { code: -32000, message: 'primary quota channel unavailable' } });
+        } else {
+          send({
+            id: message.id,
+            result: {
+              rateLimits: {
+                planType: 'plus',
+                credits: {
+                  hasCredits: true,
+                  unlimited: false,
+                  balance: '1705.9287250000'
+                }
+              }
+            }
+          });
+        }
       }
       else if (message.method === 'thread/list') {
         const control = archiveControl();
@@ -1406,6 +1941,17 @@ if (args[0] === 'app-server') {
 }
 `);
     await chmod(fakeCodex, 0o755);
+    await writeFile(fakeDocker, `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(fakeDockerArgsFile)}, JSON.stringify(process.argv.slice(2)));
+process.stdout.write([
+  '2026-08-07T08:00:00.000000000Z Grok2API console fixture ready',
+  '2026-08-07T08:00:01.000000000Z api_key=fixture-api-key-value',
+  '2026-08-07T08:00:02.000000000Z cookie=fixture-session-cookie',
+].join('\\n') + '\\n');
+process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixture-bearer-token\\n');
+`);
+    await chmod(fakeDocker, 0o755);
 
     desktopIpc = await createDesktopIpcFixture(temporary);
     child = await startServer({
@@ -1417,10 +1963,12 @@ if (args[0] === 'app-server') {
       appServerTraceFile,
       appServerControlFile,
       fetchFixture: pathToFileURL(imagePromptFetchFixture).href,
+      dockerBin: fakeDocker,
       desktopIpcEnabled: 'true',
       desktopIpcSocket: desktopIpc.socketPath,
       desktopIpcTimeoutMs: '5000',
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
+      localImageRoots: externalImageRoot,
       sub2ApiBaseUrl: providerBaseUrl,
       sub2ApiKey: 'test-sub-key',
     });
@@ -1475,6 +2023,18 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.historyProjectItems\s*\{[^}]*padding-left:\s*22px/s);
     assert.match(uiStyles, /\.memoryCitations\[open\]/);
     assert.match(uiStyles, /\.memoryCitationItem\[open\]/);
+    assert.match(uiStyles, /\.subQuotaStatusRow\s*\{[^}]*display:\s*flex;[^}]*justify-content:\s*space-between/s);
+    assert.match(uiStyles, /\.subQuotaPrimarySource\s*\{[^}]*font-size:\s*12px;[^}]*font-weight:\s*700/s);
+    assert.match(uiStyles, /\.subQuotaCreditsGrid\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
+    assert.match(uiStyles, /\.subQuotaCredits\s*\{[^}]*padding:\s*2px 12px 2px 0/s);
+    assert.match(uiStyles, /\.subQuotaCredits \+ \.subQuotaCredits\s*\{[^}]*padding:\s*2px 0 2px 12px;[^}]*text-align:\s*right/s);
+    assert.match(uiStyles, /\.subQuotaCredits > strong\s*\{[^}]*font-size:\s*12px/s);
+    assert.match(uiStyles, /\.subQuotaCodexPreviewProgress\s*\{[^}]*display:\s*grid;[^}]*gap:\s*4px/s);
+    assert.match(uiStyles, /\.subQuotaCodexPreviewProgressHead\s*\{[^}]*justify-content:\s*flex-end;[^}]*font-size:\s*10px/s);
+    assert.match(uiStyles, /\.subQuotaCodexBalances\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
+    assert.match(uiStyles, /\.subQuotaCodexBalance > strong\s*\{[^}]*font-size:\s*12px/s);
+    assert.match(uiStyles, /\.subQuotaCodexProgress\s*\{[^}]*min-width:\s*120px;[^}]*flex:\s*1 1 180px/s);
+    assert.match(uiStyles, /@media \(max-width: 460px\)[\s\S]*?\.grok2ApiConsoleDialog\s*\{[^}]*width:\s*100%;[^}]*max-height:\s*calc\(100dvh - 24px\)/s);
     assert.match(uiStyles, /\.composerModelToggle/);
     assert.match(uiStyles, /\.composerPermissionToggle/);
     assert.match(uiStyles, /\.composerProjectToggle/);
@@ -1616,6 +2176,12 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /body \.composer > \.box,\s*body \.composer > \.box:focus-within\s*\{[^}]*background:\s*var\(--surface\);[^}]*box-shadow:\s*none/s);
     assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.main\s*\{[^}]*position:\s*relative;[^}]*height:\s*100dvh/s);
     assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(132px, calc\(var\(--composer-overlay-height, 132px\) \+ 12px\)\);[^}]*scroll-padding-bottom:\s*max\(132px, calc\(var\(--composer-overlay-height, 132px\) \+ 12px\)\)/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.main\s*\{[^}]*--header-height:\s*64px/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.top\s*\{[^}]*min-height:\s*64px;[^}]*height:\s*auto;[^}]*padding:\s*calc\(env\(safe-area-inset-top, 0px\) \+ 12px\) 16px 12px;[^}]*gap:\s*14px/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.top \.title\s*\{[^}]*line-height:\s*1\.4/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{[^}]*margin-top:\s*10px;[^}]*padding:\s*22px 16px 20px;[^}]*scroll-padding-top:\s*32px/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.subQuotaCodexSummary\s*\{[^}]*align-items:\s*stretch;[^}]*flex-direction:\s*column;[^}]*padding-top:\s*10px/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.subQuotaCodexBalances\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*none;[^}]*flex:\s*none/s);
     assert.match(uiStyles, /\.liveProcessPanel\s*\{[^}]*margin:\s*0 0 18px/s);
     assert.match(uiStyles, /@media \(min-width: 821px\)[\s\S]*?body \.composer\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*auto 0 0;[^}]*background:\s*transparent;[^}]*pointer-events:\s*none/s);
     assert.match(uiStyles, /body \.composer > \*\s*\{[^}]*pointer-events:\s*auto/s);
@@ -1629,6 +2195,7 @@ if (args[0] === 'app-server') {
     assert.match(uiStyles, /\.imagePreview\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\s*\{/);
     assert.match(uiStyles, /\.userAttachmentStack\.single\s*\{[^}]*width:\s*100px/s);
+    assert.match(uiStyles, /\.browserCommentSteering \.userAttachmentStack\s*\{[^}]*width:\s*min\(220px, 100%\);[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s);
     assert.match(uiStyles, /\.userAttachment\s*\{[^}]*width:\s*100%;[^}]*aspect-ratio:\s*1 \/ 1/s);
     assert.match(uiStyles, /\.userAttachment img\s*\{[^}]*width:\s*100%;[^}]*height:\s*100%;[^}]*max-height:\s*none;[^}]*object-fit:\s*cover/s);
     assert.match(uiStyles, /body \.msg\.user\.steeringUser\.browserCommentSteering \.userAttachmentStack\.single,[^}]*width:\s*100px;[^}]*max-width:\s*100%/s);
@@ -1707,6 +2274,8 @@ if (args[0] === 'app-server') {
     assert.equal(unauthorizedSubQuotas.status, 401);
     const unauthorizedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`);
     assert.equal(unauthorizedSubQuotaConfig.status, 401);
+    const unauthorizedGrok2ApiConsole = await fetch(`${baseUrl}/api/sub-quotas/grok2api/console`);
+    assert.equal(unauthorizedGrok2ApiConsole.status, 401);
     const unauthorizedModelCapabilities = await fetch(`${baseUrl}/api/native-model-capabilities`);
     assert.equal(unauthorizedModelCapabilities.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
@@ -1731,6 +2300,27 @@ if (args[0] === 'app-server') {
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+    const grok2ApiConsole = await fetch(`${baseUrl}/api/sub-quotas/grok2api/console?tail=999`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(grok2ApiConsole.status, 200);
+    assert.match(grok2ApiConsole.headers.get('cache-control'), /private, no-store/);
+    const grok2ApiConsolePayload = await grok2ApiConsole.json();
+    assert.equal(grok2ApiConsolePayload.ok, true);
+    assert.equal(grok2ApiConsolePayload.tail, 400);
+    assert.match(grok2ApiConsolePayload.fetchedAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.match(grok2ApiConsolePayload.output, /Grok2API console fixture ready/);
+    assert.match(grok2ApiConsolePayload.output, /api_key=\[REDACTED\]/);
+    assert.match(grok2ApiConsolePayload.output, /cookie=\[REDACTED\]/);
+    assert.match(grok2ApiConsolePayload.output, /Authorization: \[REDACTED\]/);
+    assert.doesNotMatch(grok2ApiConsolePayload.output, /fixture-api-key-value|fixture-session-cookie|fixture-bearer-token/);
+    assert.deepEqual(JSON.parse(await readFile(fakeDockerArgsFile, 'utf8')), [
+      'logs',
+      '--timestamps',
+      '--tail',
+      '400',
+      'grok2api',
+    ]);
 
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const rejectedLogin = await fetch(`${baseUrl}/api/login`, {
@@ -1761,6 +2351,32 @@ if (args[0] === 'app-server') {
     assert.equal(typeof skillsPayload.count, 'number');
     assert.doesNotMatch(JSON.stringify(skillsPayload), /\/Users\//);
     assert.doesNotMatch(JSON.stringify(skillsPayload), /CODEX_HOME/);
+
+    const unauthorizedCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`);
+    assert.equal(unauthorizedCompletionRead.status, 401);
+    const emptyCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(emptyCompletionRead.status, 200);
+    assert.deepEqual((await emptyCompletionRead.json()).read, {});
+    const savedCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ read: { 'codex:019f4f84-ea9f-73c2-b997-deba7b4aa729': 'done|2026-08-05T00:00:00Z' } }),
+    });
+    assert.equal(savedCompletionRead.status, 200);
+    const fetchedCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`, {
+      headers: { Cookie: cookie },
+    });
+    assert.deepEqual((await fetchedCompletionRead.json()).read, {
+      'codex:019f4f84-ea9f-73c2-b997-deba7b4aa729': 'done|2026-08-05T00:00:00Z',
+    });
+    const invalidCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ read: 'not-an-object' }),
+    });
+    assert.equal(invalidCompletionRead.status, 400);
 
     const unauthorizedGoalUpdate = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/goal`, {
       method: 'PATCH',
@@ -1806,7 +2422,58 @@ if (args[0] === 'app-server') {
     assert.equal(subQuotaConfigPayload.keyConfigured, true);
     assert.equal(subQuotaConfigPayload.provider, 'cpa-codex');
     assert.equal(subQuotaConfigPayload.providerLabel, 'CPA Codex');
+    assert.equal(subQuotaConfigPayload.visibleCount, 5);
+    assert.deepEqual(subQuotaConfigPayload.codexApp, {
+      provider: 'codex-app',
+      providerLabel: 'Codex App',
+      builtin: true,
+      configured: true,
+      visible: true,
+    });
+    assert.ok(subQuotaConfigPayload.sources.every((source) => source.visible === true));
     assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
+
+    await writeFile(appServerControlFile, JSON.stringify({ failPrimaryQuota: true }));
+    const codexAppCredits = await fetch(`${baseUrl}/api/codex-app-credits?refresh=1`, {
+      headers: { Cookie: cookie },
+    });
+    await writeFile(appServerControlFile, '{}');
+    assert.equal(codexAppCredits.status, 200);
+    assert.match(codexAppCredits.headers.get('cache-control'), /private, no-store/);
+    const codexAppCreditsPayload = await codexAppCredits.json();
+    assert.match(codexAppCreditsPayload.fetchedAt, /^\d{4}-\d{2}-\d{2}T/);
+    const { fetchedAt: _codexAppCreditsFetchedAt, ...codexAppCreditsStable } = codexAppCreditsPayload;
+    assert.deepEqual(codexAppCreditsStable, {
+      provider: 'codex-app',
+      providerLabel: 'Codex App',
+      name: 'Codex App',
+      mode: 'codex_app_credits',
+      valid: true,
+      available: true,
+      planType: 'plus',
+      planName: 'Plus',
+      unit: 'credits',
+      balance: 1705.928725,
+      pointsBalance: 1705.928725,
+      pointsLimit: 2500,
+      usdBalance: 68.2,
+      usdLimit: 100,
+      remainingPercent: 68.2,
+      usdPerCredit: 0.04,
+      currency: 'USD',
+      hasCredits: true,
+      unlimited: false,
+      status: 'active',
+      visible: true,
+    });
+    const quotaTrace = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    assert.ok(quotaTrace.some((message) => (
+      message.method === 'initialize'
+      && message.params?.clientInfo?.name === 'codex-web-quota'
+    )));
 
     const rejectedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
@@ -1868,6 +2535,41 @@ if (args[0] === 'app-server') {
     assert.equal(refreshedSubQuotaConfigPayload.keyConfigured, true);
     assert.doesNotMatch(JSON.stringify(refreshedSubQuotaConfigPayload), /new-sub-key/);
 
+    const updatedSubQuotaVisibility = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        codexAppVisible: false,
+        order: ['deepseek', 'cpa-codex', 'sub2api', 'grok2api'],
+        sources: [
+          { provider: 'cpa-codex', baseUrl: providerBaseUrl, apiKey: '', visible: false },
+          { provider: 'sub2api', baseUrl: '', apiKey: '', visible: false },
+          { provider: 'grok2api', baseUrl: '', apiKey: '', visible: true },
+          { provider: 'deepseek', baseUrl: 'https://api.deepseek.com', apiKey: '', visible: true },
+        ],
+      }),
+    });
+    assert.equal(updatedSubQuotaVisibility.status, 200);
+    const updatedSubQuotaVisibilityPayload = await updatedSubQuotaVisibility.json();
+    assert.equal(updatedSubQuotaVisibilityPayload.visibleCount, 2);
+    assert.equal(updatedSubQuotaVisibilityPayload.codexApp.visible, false);
+    assert.deepEqual(
+      updatedSubQuotaVisibilityPayload.sources.map((source) => [source.provider, source.visible]),
+      [
+        ['deepseek', true],
+        ['cpa-codex', false],
+        ['sub2api', false],
+        ['grok2api', true],
+      ],
+    );
+    persistedSubQuotaConfig = await readFile(webEnv, 'utf8');
+    assert.match(persistedSubQuotaConfig, /^CODEX_APP_QUOTA_VISIBLE="false"$/m);
+    assert.match(persistedSubQuotaConfig, /^CPA_QUOTA_VISIBLE="false"$/m);
+    assert.match(persistedSubQuotaConfig, /^SUB2API_QUOTA_VISIBLE="false"$/m);
+    assert.match(persistedSubQuotaConfig, /^GROK2API_QUOTA_VISIBLE="true"$/m);
+    assert.match(persistedSubQuotaConfig, /^DEEPSEEK_QUOTA_VISIBLE="true"$/m);
+    assert.match(persistedSubQuotaConfig, /^SUB_QUOTA_ORDER="deepseek,cpa-codex,sub2api,grok2api"$/m);
+
     const subQuotas = await fetch(`${baseUrl}/api/sub-quotas`, {
       headers: { Cookie: cookie },
     });
@@ -1884,6 +2586,16 @@ if (args[0] === 'app-server') {
     assert.equal(subQuotaPayload.quotas[0].rateLimits[1].window, '7d');
     assert.equal(subQuotaPayload.quotas[0].rateLimits[1].remaining, 82);
     assert.equal(subQuotaPayload.quotas[0].rateLimits[1].resetAt, '2026-08-03T07:19:33.000Z');
+    assert.equal(subQuotaPayload.codexApp.balance, 1705.928725);
+    assert.equal(subQuotaPayload.codexApp.planName, 'Plus');
+    assert.equal(subQuotaPayload.codexApp.visible, false);
+    assert.deepEqual(subQuotaPayload.visibility, {
+      'codex-app': false,
+      'cpa-codex': false,
+      sub2api: false,
+      grok2api: true,
+      deepseek: true,
+    });
     const managementRequests = providerRequests.filter((item) => String(item.url || '').startsWith('/v0/management/'));
     assert.ok(managementRequests.some((item) => item.url === '/v0/management/auth-files'));
     assert.ok(managementRequests.some((item) => item.url === '/v0/management/api-call'));
@@ -2117,6 +2829,7 @@ updated_at = 1784422800000
     });
     assert.equal(dreamSkinConfigResponse.status, 200);
     const dreamSkinConfig = await dreamSkinConfigResponse.json();
+    assert.equal(dreamSkinConfig.appearance.theme, 'system');
     assert.equal(dreamSkinConfig.dreamSkinConcepts.length, 8);
     assert.deepEqual(
       dreamSkinConfig.dreamSkinConcepts.map((concept) => concept.id),
@@ -2183,6 +2896,14 @@ updated_at = 1784422800000
     const retiredDreamSkinPresetState = (await retiredDreamSkinPresetAppearance.json()).appearance;
     assert.equal(retiredDreamSkinPresetState.chatBackground, 'default');
     assert.equal(retiredDreamSkinPresetState.theme, 'dark');
+
+    const systemThemeAppearance = await fetch(`${baseUrl}/api/appearance`, {
+      method: 'PATCH',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ theme: 'system' }),
+    });
+    assert.equal(systemThemeAppearance.status, 200);
+    assert.equal((await systemThemeAppearance.json()).appearance.theme, 'system');
 
     const appliedDreamSkinWallpaper = await fetch(`${baseUrl}/api/appearance`, {
       method: 'PATCH',
@@ -2269,7 +2990,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=login-theme-20260802c"/);
+    assert.match(page, /href="\/ui\.css\?v=quota-header-align-20260808b"/);
     assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -2279,6 +3000,15 @@ updated_at = 1784422800000
     assert.match(page, /function renderDreamSkinConceptPreview/);
     assert.match(page, /function selectDreamSkinConcept/);
     assert.match(page, /saveAppearance\(\{chatBackground:'dream:'\+concept\.id\}\)/);
+    assert.match(page, /data-theme-mode="system"/);
+    assert.match(page, /window\.matchMedia\('\(prefers-color-scheme: dark\)'\)/);
+    assert.match(page, /const systemThemeMedia=window\.matchMedia\('\(prefers-color-scheme: dark\)'\)/);
+    assert.match(page, /function effectiveAppearanceTheme\(\)/);
+    assert.match(page, /function handleSystemThemeChange\(\)\{if\(appearance\.theme==='system'\)applyAppearance\(\)\}/);
+    assert.match(page, /systemThemeMedia\.addEventListener\('change',handleSystemThemeChange\)/);
+    assert.match(page, /document\.body\.dataset\.themeMode=themeMode/);
+    assert.match(page, /跟随系统；点击切换明亮模式/);
+    assert.match(page, /黑暗模式；点击恢复跟随系统/);
     assert.match(page, /function applyDreamSkinTheme/);
     assert.match(page, /const bg=skin&&backgroundUrl\?'skin':backgroundUrl\?'custom':selected/);
     assert.match(page, /themeId:concept\?\.id\|\|''/);
@@ -2418,23 +3148,44 @@ updated_at = 1784422800000
     assert.match(page, /finiteSubQuotaNumber\(quota\.subscription\.monthly\?\.limit\)>0/);
     assert.match(page, /重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
     assert.match(page, /if\(stale\)appendSubQuotaMeta\(meta,subQuotaStaleMetaText\(quota\)\)/);
-    assert.match(page, /subQuotaStatus\.textContent=subQuotaFetchedStatusText\(data\.fetchedAt,hasStale\)/);
+    assert.match(page, /Console 可调用/);
+    assert.match(page, /const fetchedAt=quotas\.find\(\(quota\)=>quota\?\.fetchedAt\)\?\.fetchedAt\|\|data\.fetchedAt/);
+    assert.match(page, /subQuotaStatus\.textContent=subQuotaFetchedStatusText\(fetchedAt,hasStale\)/);
     assert.match(page, /if\(quota\.valid===false\)\{/);
     assert.doesNotMatch(page, /if\(quota\.valid===false&&!?stale\)/);
     assert.match(page, /subQuotaSettingsOverlay\.id='subQuotaSettingsOverlay'/);
     assert.match(page, /subQuotaSettingsDialog\.id='subQuotaSettingsDialog'/);
-    assert.match(page, /title\.textContent='额度监控'/);
+    assert.match(page, /titleText\.textContent='额度监控'/);
+    assert.match(page, /createSubQuotaVisibilityToggle\('Codex App'\)/);
+    assert.match(page, /fetch\('\/api\/codex-app-credits'/);
+    assert.match(page, /codexPointsLabel\.textContent='剩余点数'/);
+    assert.match(page, /codexUsdLabel\.textContent='剩余美元'/);
+    assert.match(page, /codexProgress\.className='subQuotaCodexProgress hidden'/);
+    assert.match(page, /const codexIdentity=createSourceIdentity\('codex-app','Codex App','','monitor'\)/);
+    assert.match(page, /appendSubQuotaProgress\(progressWrap,remainingPercent\)/);
+    assert.match(page, /\[remaining,availability\]\.filter\(Boolean\)\.join\(' · '\)/);
+    assert.match(page, /subQuotaPrimarySource\.textContent=showCodexApp\?'Codex App':''/);
+    assert.match(page, /source\.className='subQuotaSource'\+\(isCodexApp\?' subQuotaSourceCodex':''\)/);
+    assert.match(page, /if\(!isCodexApp\)\{/);
+    assert.doesNotMatch(page, /quota\.provider==='codex-app'\?'点数'/);
+    assert.match(page, /progressWrap\.className='subQuotaCodexPreviewProgress'/);
+    assert.match(page, /progressHead\.className='subQuotaCodexPreviewProgressHead'/);
+    assert.match(page, /grok2ApiConsoleDialog\.id='grok2ApiConsoleDialog'/);
+    assert.match(page, /fetch\('\/api\/sub-quotas\/grok2api\/console\?tail=160'/);
+    assert.match(page, /setIconLabel\(consoleBtn,'terminal-square','控制台'\)/);
+    assert.match(page, /function formatCodexAppUsdAmount\(value\)/);
+    assert.match(page, /formatCodexAppUsdAmount\(dollars\)/);
     assert.match(page, /urlLabel\.textContent='上游 URL'/);
     assert.match(page, /baseUrlInput\.type='url'/);
     assert.doesNotMatch(page, /baseUrlInput\.required=true/);
     assert.match(page, /baseUrlInput\.autocomplete='url'/);
-    assert.match(page, /subQuotaSettingsForm\.appendChild\(createSourceFields\('cpa-codex','CPA Codex'/);
-    assert.match(page, /subQuotaSettingsForm\.appendChild\(createSourceFields\('sub2api','Sub2API'/);
+    assert.match(page, /subQuotaSettingsSourceList\.appendChild\(createSourceFields\('cpa-codex','CPA Codex'/);
+    assert.match(page, /subQuotaSettingsSourceList\.appendChild\(createSourceFields\('sub2api','Sub2API'/);
     assert.match(page, /inputs\.baseUrlInput\.value=source\.baseUrl\|\|''/);
     assert.match(page, /source\.keyConfigured\?'Key 已配置，留空保留'/);
     assert.match(page, /正在保存额度配置…/);
-    assert.match(page, /JSON\.stringify\(\{sources,order\}\)/);
-    assert.match(page, /检测错误不影响保存/);
+    assert.match(page, /JSON\.stringify\(\{sources,order,codexAppVisible\}\)/);
+    assert.match(page, /各来源独立保存，检测失败不影响配置/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);
     assert.match(page, /subQuotaSettingsClose\.addEventListener\('click',closeSubQuotaSettings\)/);
@@ -2510,7 +3261,7 @@ updated_at = 1784422800000
     assert.match(page, /async function renameConversation\(id,title,source='codex'\)\{[\s\S]*?currentConversationId===id[\s\S]*?setCurrentConversationTitle\(clean\)/);
     assert.match(page, /function newChat\(\)\{[^\n]*setCurrentConversationTitle\('新任务'\)/);
     assert.match(page, /async function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(conversation\.title\|\|'Chat','Chat'\)/);
-    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false,trigger=null\}=\{\}\)\{[\s\S]*?loadConversation\(data\.threadId,'codex',\{conversation:data\.conversation,skipPromptQueueSync:true\}\)[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
+    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId=''\}=\{\}\)\{[\s\S]*?const sourceThreadId=String\(requestedThreadId\|\|currentConversationId\|\|''\)[\s\S]*?loadConversation\(data\.threadId,'codex',\{conversation:data\.conversation,skipPromptQueueSync:true\}\)[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
     assert.doesNotMatch(page, /forkNativeConversation[\s\S]{0,500}confirm\(/);
     assert.match(page, /input\.focus\(\);\s*refreshHistory\(\)\.catch\(\(\)=>\{\}\)/);
     assert.match(page, /currentConversationSource==='codex'&&!options\.skipPromptQueueSync\)await pullPromptQueueFromServer/);
@@ -2562,8 +3313,8 @@ updated_at = 1784422800000
     assert.match(page, /const providerReady=await waitForLatestComposerProviderChange\(\);\s*await waitForLatestComposerModelLoad\(\);\s*await nativeComposerSettingsQueue\.catch\(\(\)=>false\)/);
     assert.match(page, /const revision=\+\+modelLoadRevision[\s\S]*?revision!==modelLoadRevision/);
     assert.match(page, /modelListCache\.has\(requestedProvider\)/);
-    assert.match(page, /composerModelSelect\.addEventListener\('change',\(\)=>\{model\.value=composerModelSelect\.value;reconcileComposerFastSupport\(\);void syncNativeComposerSettings\(\{provider:provider\.value,model:model\.value\}\);syncComposerChrome\(\)\}\)/);
-    assert.match(page, /model\?\.addEventListener\('change',\(\)=>\{void syncNativeComposerSettings\(\{provider:provider\.value,model:model\.value\}\);syncComposerChrome\(\)\}\)/);
+    assert.match(page, /composerModelSelect\.addEventListener\('change',\(\)=>\{\s*const previous=model\.value;[\s\S]*?composerModelSwitchConfirm\(previous,model\.value\)[\s\S]*?syncComposerChrome\(\)\}\)/);
+    assert.match(page, /model\?\.addEventListener\('change',\(\)=>\{\s*if\(!composerModelSwitchConfirm\(composerModelValueBeforeChange,model\.value\)\)return;[\s\S]*?syncComposerChrome\(\)\}\)/);
     assert.match(page, /payload\.provider=String\(provider\.value\|\|''\)\.trim\(\)\|\|null/);
     assert.match(page, /reasoningEffort\?\.addEventListener\('change',\(\)=>\{void syncNativeComposerSettings\(\{reasoningEffort:reasoningEffort\.value\}\);syncComposerChrome\(\)\}\)/);
     assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*pending:Boolean\(pending\),writeId:Number\(writeId\)\|\|0\}/);
@@ -2579,7 +3330,7 @@ updated_at = 1784422800000
     assert.match(page, /clearNativeComposerOverride\(\);\s*syncComposerChrome\(\);\s*void syncCurrentNativeConversation\(\)/);
     assert.match(page, /setNativeComposerOverride\(existingId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,\{pending:true\}\)/);
     assert.match(page, /setNativeComposerOverride\(data\.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,\{pending:true\}\)/);
-    assert.match(page, /body:JSON\.stringify\(\{message:text,attachments,provider:requestedProvider,model:requestedModel/);
+    assert.match(page, /body:JSON\.stringify\(\{message,attachments,provider:requestedProvider,model:requestedModel/);
     assert.match(page, /if\(currentConversationSource==='codex'&&currentConversationId===threadId\)\{\s*setNativeComposerOverride\(threadId,item\.provider,item\.model,item\.reasoningEffort,item\.permissionMode,item\.sandbox,item\.approval,item\.serviceTier\);/);
     assert.match(page, /permissionMode:\s*composerPermissionMode/);
     assert.match(page, /\.\.\.composerPermissionPayload\(item\.permissionMode,item\.sandbox,item\.approval\)/);
@@ -2601,7 +3352,7 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -2757,21 +3508,31 @@ updated_at = 1784422800000
       subQuotaProgressHelper + '; return subQuotaProgressPercent;',
     )();
     assert.equal(subQuotaProgressPercent(74, 100, 26, '%'), 26);
-    assert.equal(subQuotaProgressPercent(74, 100, null, '%'), 74);
-    assert.equal(subQuotaProgressPercent(100, 100, null, '%'), 100);
+    assert.equal(subQuotaProgressPercent(74, 100, null, '%'), 26);
+    assert.equal(subQuotaProgressPercent(100, 100, null, '%'), 0);
     assert.equal(subQuotaProgressPercent(75, 100, 25, 'USD'), 25);
+    assert.equal(subQuotaProgressPercent(75, 100, null, 'USD'), 25);
     assert.equal(subQuotaProgressPercent(null, 100, null, 'USD'), null);
     assert.equal(subQuotaProgressPercent(null, null, null, '%', true), 100);
-    assert.match(inlineScript, /const displayUsed=options\.displayUsed===true\|\|windowData\.display==='used'/);
-    assert.match(inlineScript, /formatSubQuotaAmount\(used,unit,fixedCurrency\)\+' \/ '\+formatSubQuotaAmount\(limit,unit,fixedCurrency\)/);
+    assert.match(inlineScript, /const displayUsed=options\.displayUsed===true/);
+    assert.match(inlineScript, /const usedAmount=used!==null\s*\? used\s*: \(limit!==null&&limit>0&&remaining!==null\?Math\.max\(0,limit-remaining\):null\)/s);
+    assert.match(inlineScript, /const remainingAmount=remaining!==null\s*\? remaining\s*: \(limit!==null&&limit>0&&used!==null\?Math\.max\(0,limit-used\):null\)/s);
     assert.match(inlineScript, /const availabilityOnly=available&&used===null&&limit===null&&remaining===null/);
-    assert.match(inlineScript, /subQuotaProgressPercent\(used,limit,displayUsed\?null:remaining,unit,availabilityOnly\)/);
-    assert.match(inlineScript, /if\(availabilityOnly\)bar\.dataset\.level='available'/);
-    assert.match(inlineScript, /\{displayUsed:true,showReset:true,fixedCurrency:true\}/);
-    assert.match(inlineScript, /const rateLimitWindowOptions=quota\.provider==='cpa-codex'\s*\? \{displayUsed:true\}\s*: sub2ApiWindowOptions/);
+    assert.match(inlineScript, /const percent=displayUsed\s*\?/);
+    assert.match(inlineScript, /subQuotaProgressPercent\(used,limit,remainingAmount,unit,availabilityOnly\)/);
+    assert.match(inlineScript, /appendSubQuotaProgress\(row,percent,\{availabilityOnly,displayUsed\}\)/);
+    assert.match(inlineScript, /\{showReset:true,fixedCurrency:true,displayUsed:true\}/);
+    assert.match(inlineScript, /const rateLimitWindowOptions=sub2ApiWindowOptions\|\|\{displayUsed:true\}/);
     assert.match(inlineScript, /appendSubQuotaWindow\(source,label,rateLimit,rateLimit\.unit\|\|unit,rateLimitWindowOptions\)/);
     assert.match(inlineScript, /appendSubQuotaWindow\(source,subQuotaRateLimitLabel\(rateLimit\.window\),rateLimit,rateLimit\.unit\|\|unit,rateLimitWindowOptions\)/);
-    assert.match(inlineScript, /bar\.dataset\.level=percent>=100\?'exhausted':percent>=80\?'warning':'normal'/);
+    assert.match(inlineScript, /normalized<=0\?'exhausted':normalized<=20\?'warning':'normal'/);
+    assert.match(inlineScript, /normalized>=100\?'exhausted':normalized>=80\?'warning':'normal'/);
+    assert.match(inlineScript, /\(displayUsed\?'已用额度 ':'剩余额度 '\)/);
+    assert.match(inlineScript, /value\.textContent='已用 '\+formatSubQuotaAmount\(usedAmount,'%'\)/);
+    assert.match(inlineScript, /creditsLabel\.textContent='剩余点数'/);
+    assert.match(inlineScript, /dollarsLabel\.textContent='剩余美元'/);
+    assert.match(inlineScript, /appendSubQuotaProgress\(progressWrap,remainingPercent\)/);
+    assert.match(inlineScript, /source\.appendChild\(progressWrap\);\s*detailCount\+=1;\s*}\s*if\(creditsGrid\)source\.appendChild\(creditsGrid\);/s);
     assert.match(inlineScript, /value.textContent='当前可用'/);
     assert.doesNotMatch(inlineScript, /用量未返回/);
     const firstFiveHourWindow = inlineScript.indexOf("if(String(rateLimit?.window||'').toLowerCase()!=='5h')continue;");
@@ -2918,7 +3679,7 @@ updated_at = 1784422800000
     assert.match(inlineScript, /const collapsible=role==='tool'\|\|role==='thinking'\|\|role==='context'/);
     assert.match(inlineScript, /function shouldCollapseUserMessage\(text\)/);
     assert.match(inlineScript, /const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage\(text\)/);
-    assert.match(inlineScript, /if\(longUser\)bindLongUserMessage\(el,body\)/);
+    assert.match(inlineScript, /if\(longUser\)bindLongUserMessage\(el,body,options\.scrollContainer\|\|chat\)/);
     assert.match(inlineScript, /function automationHeartbeatDisplayText\(text\)/);
     assert.match(inlineScript, /renderMessageMarkdown\(body,automationHeartbeatDisplayText\(text\),\{assistantArtifacts:true\}\)/);
     const heartbeatDisplayHelper = inlineScript.match(/(function automationHeartbeatDisplayText[\s\S]*?)(?=function automationInstructionDisplayText)/)?.[1];
@@ -4537,6 +5298,12 @@ updated_at = 1784422800000
     );
     assert.equal(inCwdLocalImage.status, 200);
     assert.equal(inCwdLocalImage.headers.get('content-type'), 'image/png');
+    const configuredRootLocalImage = await fetch(
+      `${baseUrl}/api/local-image?${new URLSearchParams({ path: externalImagePath, cwd: temporary })}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(configuredRootLocalImage.status, 200);
+    assert.equal(configuredRootLocalImage.headers.get('content-type'), 'image/png');
     // ...but must reject an absolute path outside both the session cwd and the OS temp
     // dir, or any authenticated user could read arbitrary image files on the host that
     // have nothing to do with the current Codex session.
@@ -5177,10 +5944,80 @@ updated_at = 1784422800000
     assert.equal(appOwnedQueuePayload.items.length, 1);
     assert.equal(appOwnedQueuePayload.items[0].id, appOwnedQueueItemId);
     assert.equal(appOwnedQueuePayload.items[0].source, 'codex-app');
+    assert.deepEqual(appOwnedQueuePayload.items[0].attachments, [
+      { kind: 'image', name: 'tool-preview.png', type: '', size: 0, url: '', filePath: toolImagePath },
+      { kind: 'file', name: 'added-context.mjs', type: '', size: 0, url: '', filePath: path.join(temporary, 'added-context.mjs') },
+      { kind: 'file', name: 'queue-context.mjs', type: '', size: 0, url: '', filePath: path.join(temporary, 'queue-context.mjs') },
+    ]);
 
     // Ordering App-owned messages is an App-backed mutation, unlike the
     // preceding concurrent-start failure path which deliberately has no owner.
     desktopIpc.ownerAvailable = true;
+    const interruptedAppQueue = await fetch(`${baseUrl}/api/prompt-queues/${appQueueInterruptedThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    const interruptedAppQueuePayload = await interruptedAppQueue.json();
+    assert.equal(interruptedAppQueue.status, 200, interruptedAppQueuePayload.error);
+    assert.deepEqual(
+      interruptedAppQueuePayload.items.map((item) => [item.id, item.pauseState]),
+      [
+        [appQueueInterruptedRawItem.id, 'interrupted'],
+        [appQueueFailedRawItem.id, ''],
+      ],
+    );
+    const appQueueResumeTraceBefore = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
+    const desktopMessagesBeforeQueueResume = desktopIpc.messages.length;
+    const resumedAppQueue = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueInterruptedThreadId}/resume-interrupted`,
+      { method: 'POST', headers: { Cookie: cookie } },
+    );
+    const resumedAppQueuePayload = await resumedAppQueue.json();
+    assert.equal(resumedAppQueue.status, 200, resumedAppQueuePayload.error);
+    assert.equal(resumedAppQueuePayload.resumed, 1);
+    assert.deepEqual(
+      resumedAppQueuePayload.items.map((item) => [item.id, item.pauseState]),
+      [
+        [appQueueInterruptedRawItem.id, ''],
+        [appQueueFailedRawItem.id, ''],
+      ],
+    );
+    const stateAfterAppQueueResume = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    assert.equal(
+      Object.hasOwn(stateAfterAppQueueResume['queued-follow-ups'][appQueueInterruptedThreadId][0], 'pausedReason'),
+      false,
+    );
+    assert.equal(
+      stateAfterAppQueueResume['queued-follow-ups'][appQueueInterruptedThreadId][1].pausedReason,
+      appQueueFailedRawItem.pausedReason,
+    );
+    assert.deepEqual(
+      desktopIpc.messages.slice(desktopMessagesBeforeQueueResume)
+        .filter((message) => (
+          /queued-follow-?ups/.test(message.method || '')
+          || ['thread-follower-start-turn', 'thread-follower-steer-turn'].includes(message.method)
+        ))
+        .map((message) => message.method),
+      ['thread-queued-followups-changed'],
+    );
+    const appQueueResumeTraceAfter = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
+    assert.equal(appQueueResumeTraceAfter, appQueueResumeTraceBefore);
+    const repeatedAppQueueResume = await fetch(
+      `${baseUrl}/api/prompt-queues/${appQueueInterruptedThreadId}/resume-interrupted`,
+      { method: 'POST', headers: { Cookie: cookie } },
+    );
+    assert.equal(repeatedAppQueueResume.status, 409);
+    assert.match((await repeatedAppQueueResume.json()).error, /已恢复或不存在/);
+
     const appQueueBeforeOrder = await fetch(`${baseUrl}/api/prompt-queues/${appQueueReorderThreadId}`, {
       headers: { Cookie: cookie },
     });
@@ -5394,19 +6231,6 @@ updated_at = 1784422800000
     });
     assert.equal(attemptedAppQueueTurn.status, 409);
     assert.match((await attemptedAppQueueTurn.json()).error, /Codex App 管理/);
-    const attemptedAppQueueSideChat = await fetch(`${baseUrl}/api/native-sessions`, {
-      method: 'POST',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...concurrentTurnPayload,
-        message: 'Codex App owns this queued prompt',
-        sideChat: true,
-        sourceThreadId: appQueueOwnershipThreadId,
-        queueItemId: appOwnedQueueItemId,
-      }),
-    });
-    assert.equal(attemptedAppQueueSideChat.status, 409);
-    assert.match((await attemptedAppQueueSideChat.json()).error, /Codex App 管理/);
     const appQueueTraceAfter = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
@@ -5544,6 +6368,43 @@ updated_at = 1784422800000
         toolImagePath,
       ],
     );
+
+    const appOwnedSideChatRawItem = {
+      ...appOwnedQueueRawItem,
+      id: 'app-owned-side-chat-item',
+      text: 'Side chat owns this queued prompt',
+      context: { ...appOwnedQueueRawItem.context, prompt: 'Side chat owns this queued prompt' },
+    };
+    const stateBeforeAppQueueSideChat = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    stateBeforeAppQueueSideChat['queued-follow-ups'][appQueueOwnershipThreadId] = [appOwnedSideChatRawItem];
+    await writeFile(codexGlobalStateFile, JSON.stringify(stateBeforeAppQueueSideChat));
+    const reloadedAppQueueBeforeSideChat = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal((await reloadedAppQueueBeforeSideChat.json()).items.length, 1);
+    const appQueueSideChat = await fetch(`${baseUrl}/api/native-sessions`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...concurrentTurnPayload,
+        message: 'Side chat owns this queued prompt',
+        sideChat: true,
+        sourceThreadId: appQueueOwnershipThreadId,
+        queueItemId: appOwnedSideChatRawItem.id,
+      }),
+    });
+    const appQueueSideChatPayload = await appQueueSideChat.json();
+    assert.equal(appQueueSideChat.status, 202, appQueueSideChatPayload.error);
+    assert.ok(String(appQueueSideChatPayload.threadId || '').trim());
+    const queueAfterAppQueueSideChat = await fetch(`${baseUrl}/api/prompt-queues/${appQueueOwnershipThreadId}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.deepEqual((await queueAfterAppQueueSideChat.json()).items, []);
+    const appQueueTraceBeforeRemoval = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+      .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
 
     const timeoutSteerText = 'Desktop write then timeout must reconcile exactly once';
     const timeoutSteerRawItem = {
@@ -5698,7 +6559,7 @@ updated_at = 1784422800000
       .split('\n')
       .map((line) => JSON.parse(line))
       .filter((message) => ['turn/start', 'turn/steer', 'thread/start'].includes(message.method)).length;
-    assert.equal(appQueueTraceAfterRemoval, appQueueTraceBefore);
+    assert.equal(appQueueTraceAfterRemoval, appQueueTraceBeforeRemoval);
 
     const backgroundBeaconThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa739';
     const backgroundBeaconFirst = {
@@ -6415,7 +7276,7 @@ updated_at = 1784422800000
       createdDeleteCountBeforeBulkRace,
     );
     assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 7);
-    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 9);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 10);
     const switchedProviderResume = protocolMessages.find((message) => (
       message.method === 'thread/resume'
       && message.params.modelProvider === 'custom'
@@ -6551,6 +7412,7 @@ updated_at = 1784422800000
       traceFile,
       appServerTraceFile,
       webEnv,
+      localImageRoots: externalImageRoot,
       sub2ApiBaseUrl: providerBaseUrl,
     });
     port = await waitForServer(child, runtime);
@@ -6563,6 +7425,16 @@ updated_at = 1784422800000
     const restoredSubQuotaConfigPayload = await restoredSubQuotaConfig.json();
     assert.equal(restoredSubQuotaConfigPayload.baseUrl, providerBaseUrl);
     assert.equal(restoredSubQuotaConfigPayload.keyConfigured, true);
+    assert.equal(restoredSubQuotaConfigPayload.codexApp.visible, false);
+    assert.deepEqual(
+      restoredSubQuotaConfigPayload.sources.map((source) => [source.provider, source.visible]),
+      [
+        ['deepseek', true],
+        ['cpa-codex', false],
+        ['sub2api', false],
+        ['grok2api', true],
+      ],
+    );
   } finally {
     if (child) await stopServer(child);
     if (desktopIpc) await desktopIpc.close();
@@ -6574,6 +7446,7 @@ updated_at = 1784422800000
       customProviderServer.closeAllConnections?.();
       await new Promise((resolve) => customProviderServer.close(resolve));
     }
+    if (externalImageRoot) await rm(externalImageRoot, { recursive: true, force: true });
     await rm(temporary, { recursive: true, force: true });
   }
 });
@@ -6766,7 +7639,9 @@ function startServer({
   desktopIpcSocket = '',
   desktopIpcTimeoutMs = '',
   playgroundProxyAllowedOrigins = '',
+  localImageRoots = '',
   fetchFixture = '',
+  dockerBin = '',
   sub2ApiBaseUrl,
   sub2ApiKey,
 }) {
@@ -6791,6 +7666,7 @@ function startServer({
     CODEX_DESKTOP_IPC_ENABLED: desktopIpcEnabled,
     CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,
     PLAYGROUND_PROXY_ALLOWED_ORIGINS: playgroundProxyAllowedOrigins,
+    CODEX_WEB_LOCAL_IMAGE_ROOTS: localImageRoots,
     PLAYGROUND_PROXY_HEARTBEAT_MS: '20',
     HOMEPAGE_API_TOKEN: '',
     IMAGE_PROMPT_AUTO_SYNC: 'false',
@@ -6807,6 +7683,7 @@ function startServer({
   if (fetchFixture) {
     env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--import=${fetchFixture}`].filter(Boolean).join(' ');
   }
+  if (dockerBin) env.DOCKER_BIN = dockerBin;
   env.CPA_QUOTA_BASE_URL = '';
   env.CPA_QUOTA_API_KEY = '';
   delete env.SUB2API_BASE_URL;
@@ -6818,16 +7695,47 @@ function startServer({
   // Keep repository-level .env values out of the isolated quota fixture.
   env.DEEPSEEK_BASE_URL = '';
   env.DEEPSEEK_API_KEY = '';
+    env.CODEX_APP_QUOTA_VISIBLE = 'true';
+    env.CODEX_APP_CREDIT_LIMIT = '2500';
+  env.CPA_QUOTA_VISIBLE = 'true';
+  env.SUB2API_QUOTA_VISIBLE = 'true';
+  env.GROK2API_QUOTA_VISIBLE = 'true';
+  env.DEEPSEEK_QUOTA_VISIBLE = 'true';
   env.SUB_QUOTA_ORDER = '';
   env.SUB_QUOTA_SOURCES = '';
   env.SUB_QUOTA_PROVIDER = 'cpa-codex';
   if (sub2ApiBaseUrl !== undefined) env.SUB2API_BASE_URL = sub2ApiBaseUrl;
   if (sub2ApiKey !== undefined) env.SUB2API_API_KEY = sub2ApiKey;
+  Object.assign(env, readPersistedTestEnv(webEnv));
   return spawn(process.execPath, [path.join(ROOT, 'server.mjs')], {
     cwd: ROOT,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+}
+
+function readPersistedTestEnv(file) {
+  try {
+    const values = {};
+    for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
+      const index = trimmed.indexOf('=');
+      const key = trimmed.slice(0, index).trim();
+      const raw = trimmed.slice(index + 1).trim();
+      if (!key) continue;
+      if (raw.startsWith('"') && raw.endsWith('"')) {
+        try {
+          values[key] = JSON.parse(raw);
+          continue;
+        } catch {}
+      }
+      values[key] = raw.startsWith("'") && raw.endsWith("'") ? raw.slice(1, -1) : raw;
+    }
+    return values;
+  } catch {
+    return {};
+  }
 }
 
 async function createDesktopIpcFixture(temporary) {
