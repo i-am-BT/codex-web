@@ -5290,6 +5290,40 @@ body .msg.assistant .markdownBody li + li {
   margin-top: 3px;
 }
 
+body .nativeHistoryLoadEarlier {
+  align-self: center;
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 4px 9px;
+  font-size: 12px;
+  font-weight: 560;
+  cursor: pointer;
+}
+
+body .nativeHistoryLoadEarlier:hover,
+body .nativeHistoryLoadEarlier:focus-visible {
+  background: var(--surface-hover);
+  color: var(--text);
+  outline: none;
+}
+
+body .nativeHistoryLoadEarlier:disabled {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+body .nativeHistoryLoadEarlier .lucide {
+  width: 14px;
+  height: 14px;
+}
+
 .markdownBody a {
   color: var(--primary);
 }
