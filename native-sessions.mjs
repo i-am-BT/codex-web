@@ -43,9 +43,6 @@ export class NativeSessionStore extends EventEmitter {
       options.sideChatStateFile || path.join(this.codexHome, 'codex-web-side-chat.json'),
     );
     this.deepSeekUsageFile = String(options.deepSeekUsageFile || '').trim();
-    this.deepSeekPriceTable = options.deepSeekPriceTable && typeof options.deepSeekPriceTable === 'object'
-      ? options.deepSeekPriceTable
-      : {};
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.goalsDbFile = path.resolve(options.goalsDbFile || path.join(this.codexHome, 'goals_1.sqlite'));
     this.maxReadBytes = positiveNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
@@ -791,8 +788,6 @@ export class NativeSessionStore extends EventEmitter {
     if (!Number.isFinite(total) || total <= 0) return;
     const turnKey = `${String(cache?.id || '')}:${String(payload?.turn_id || payload?.turnId || cache?.latestTurnId || '')}`;
     if (!turnKey || turnKey.endsWith(':')) return;
-    const price = this.deepSeekPriceTable[model] || this.deepSeekPriceTable['deepseek-v4-flash'];
-    if (!price || typeof price !== 'object') return;
     try {
       const current = readDeepSeekUsageStatsFile(this.deepSeekUsageFile) || {};
       const counted = Array.isArray(current.countedTurns) ? current.countedTurns : [];
@@ -800,17 +795,11 @@ export class NativeSessionStore extends EventEmitter {
       const input = Math.max(0, Number(usage.inputTokens) || 0);
       const cached = Math.max(0, Number(usage.cachedInputTokens) || 0);
       const output = Math.max(0, Number(usage.outputTokens) || 0);
-      const cost = (
-        (input - cached) * Number(price.input || 0)
-        + cached * Number(price.cached || 0)
-        + output * Number(price.output || 0)
-      ) / 1e6;
       const next = {
         totalTokens: (Number(current.totalTokens) || 0) + total,
         inputTokens: (Number(current.inputTokens) || 0) + input,
         outputTokens: (Number(current.outputTokens) || 0) + output,
         cachedInputTokens: (Number(current.cachedInputTokens) || 0) + cached,
-        cost: Math.round(((Number(current.cost) || 0) + cost) * 1e6) / 1e6,
         requests: (Number(current.requests) || 0) + 1,
         updatedAt: new Date().toISOString(),
         countedTurns: [...counted.slice(-999), turnKey],

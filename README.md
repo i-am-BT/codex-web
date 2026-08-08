@@ -202,9 +202,9 @@ cp .env.example .env
 
 ### 额度监控
 
-左侧额度入口可同时查询本地 CLIProxyAPI（CPA）Codex 账号额度、Sub2API 额度、Grok2API 账号池与 DeepSeek 官方余额。悬停额度图标显示各渠道只读额度卡，点击图标可分别填写各组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与 API Key 限速窗口；Grok2API 通过管理面板分别汇总 Build 与 Console 账号池。可选设置 `SUB2API_ADMIN_API_KEY` 后，服务端还会读取 `/api/v1/admin/accounts` 中缓存的 Codex 提供商账号 5 小时/7 天使用百分比；管理 Key 不会发送到浏览器。
+左侧额度入口可同时查询本地 CLIProxyAPI（CPA）Codex 账号额度、Sub2API 额度、Grok2API 账号池与 DeepSeek 官方余额。悬停额度图标显示各渠道只读额度卡，点击图标可分别填写各组 URL 与 Key。配置会先保存，额度检测独立刷新，连接或凭证错误不会阻止配置落盘。CPA 通过 `/v0/management/auth-files` 找到 Codex 凭证，再经 `/v0/management/api-call` 请求 `chatgpt.com/backend-api/wham/usage`；Sub2API 通过 `/v1/usage` 读取订阅、余额与 API Key 限速窗口；Grok2API 通过管理面板分别汇总 Build 与 Console 账号池，并展示正常账号、风控、需关注、异常、恢复中、冷却、禁用等账号状态数量。可选设置 `SUB2API_ADMIN_API_KEY` 后，服务端还会读取 `/api/v1/admin/accounts` 中缓存的 Codex 提供商账号 5 小时/7 天使用百分比；管理 Key 不会发送到浏览器。
 
-**DeepSeek 官方额度**：余额通过官方 `GET https://api.deepseek.com/user/balance` 实时查询；官方 API 未开放累计消费/用量查询接口，因此累计 Token 与累计消费由本服务根据每次实际 API 调用返回的 `usage` 本地累计，消费金额按官方单价统计（缓存命中按缓存价），仅供参考。统计文件保存在 `runtime/deepseek-usage.json`。
+**DeepSeek 官方额度**：余额通过官方 `GET https://api.deepseek.com/user/balance` 实时查询；官方 API 未开放累计消费/用量查询接口，因此累计 Token 由本服务根据每次实际 API 调用返回的 `usage` 本地累计，仅供参考。可在额度设置的“本地累计校准”中填写官网当前显示的累计 Token 与累计请求，后续调用会从该基准继续累加。统计文件保存在 `runtime/deepseek-usage.json`。
 
 ```bash
 CPA_QUOTA_BASE_URL=http://127.0.0.1:8327
@@ -291,7 +291,7 @@ rg '"type":"turn_context"' "$latest" | tail -1
 
 ## Homepage 小组件
 
-设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Codex App 原生会话数、服务商数、默认服务商模型数和运行中任务数。请求必须携带 `X-API-Token` 请求头：
+设置 `HOMEPAGE_API_TOKEN` 后，可通过只读接口 `GET /api/homepage/stats` 获取 Codex App 原生会话数、服务商数、默认服务商模型数、运行中任务数及当前任务名。接口同时返回按开始时间倒序排列的 `runningTasks`，可用于 Homepage 动态列表。请求必须携带 `X-API-Token` 请求头：
 
 ```bash
 curl -H "X-API-Token: $HOMEPAGE_API_TOKEN" http://localhost:36354/api/homepage/stats
@@ -304,25 +304,40 @@ Homepage 的 `services.yaml` 可使用内置 `customapi` 小组件：
     - Codex Web:
         icon: codex-web.svg
         href: http://192.168.10.10:36354
-        widget:
-          type: customapi
-          url: http://192.168.10.10:36354/api/homepage/stats
-          headers:
-            X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
-          mappings:
-            - field: conversations
-              label: 会话
-              format: number
-            - field: providers
-              label: 供应商
-              format: number
-            - field: models
-              label: 模型
-              format: number
-            - field: running
-              label: 运行中
-              format: number
+        widgets:
+          - type: customapi
+            url: http://192.168.10.10:36354/api/homepage/stats
+            headers:
+              X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
+            mappings:
+              - field: conversations
+                label: 会话
+                format: number
+              - field: providers
+                label: 供应商
+                format: number
+              - field: models
+                label: 模型
+                format: number
+              - field: running
+                label: 运行中
+                format: number
+              - field: currentTask
+                label: 当前任务
+                format: text
+          - type: customapi
+            url: http://192.168.10.10:36354/api/homepage/stats
+            headers:
+              X-API-Token: "替换为 HOMEPAGE_API_TOKEN"
+            display: dynamic-list
+            mappings:
+              items: runningTasks
+              name: name
+              label: status
+              limit: 5
 ```
+
+第一个小组件保留统计块并显示最近开始的任务名；第二个动态列表用于展示所有并发运行任务，效果接近 Emby “正在播放”。没有任务运行时，`currentTask` 为“空闲”，`runningTasks` 为空数组。任务数据仅包含名称、状态和开始时间，不包含工作目录、提示正文或会话 ID。
 
 模型数量按当前默认服务商的 `/models` 返回结果统计，并使用短期缓存，避免 Homepage 刷新时频繁访问上游。
 

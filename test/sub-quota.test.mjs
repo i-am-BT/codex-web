@@ -1325,6 +1325,13 @@ test('normalizes Grok2API account summary into callable and abnormal stats', () 
   assert.equal(quota.accountStats.pools.console.total, 3);
   assert.equal(quota.accountStats.pools.console.available, 1);
   assert.equal(quota.accountStats.pools.console.abnormal, 2);
+  assert.equal(quota.accountStats.normalAvailable, 10);
+  assert.equal(quota.accountStats.totalAccounts, 13);
+  assert.equal(quota.accountStats.risk, 0);
+  assert.equal(quota.accountStats.attention, 1);
+  assert.equal(quota.accountStats.disabled, 1);
+  assert.equal(quota.accountStats.cooldown, 0);
+  assert.equal(quota.accountStats.probing, 0);
   assert.equal(quota.accountStats.providers.grok_web.available, 5);
   assert.equal(quota.rateLimits[1].id, 'grok-console-accounts');
   assert.equal(quota.rateLimits[1].remaining, 1);

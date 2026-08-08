@@ -79,12 +79,6 @@ const CODEX_APP_CREDIT_LIMIT = (() => {
 })();
 const DEEPSEEK_USAGE_FILE = path.join(RUNTIME_DIR, 'deepseek-usage.json');
 const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com';
-const DEEPSEEK_PRICE_TABLE = {
-  'deepseek-v4-pro': { input: 0.435, cached: 0.003625, output: 0.87 },
-  'deepseek-v4-flash': { input: 0.14, cached: 0.0028, output: 0.28 },
-  'deepseek-reasoner': { input: 0.55, cached: 0.14, output: 2.19 },
-  'deepseek-chat': { input: 0.28, cached: 0.028, output: 0.42 },
-};
 const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
 const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
 const PLAYGROUND_PREVIOUS_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'previous');
@@ -252,7 +246,6 @@ const nativeSessions = new NativeSessionStore(CODEX_HOME, {
   runningWindowMs: Number(process.env.NATIVE_SESSION_RUNNING_WINDOW_MS || 6 * 60 * 60 * 1000),
   sideChatStateFile: path.join(RUNTIME_DIR, 'side-chat-threads.json'),
   deepSeekUsageFile: DEEPSEEK_USAGE_FILE,
-  deepSeekPriceTable: DEEPSEEK_PRICE_TABLE,
 });
 const automationStore = new AutomationStore(CODEX_HOME);
 const SUB2API_ADMIN_API_KEY = String(process.env.SUB2API_ADMIN_API_KEY || '').trim();
@@ -280,6 +273,7 @@ const desktopIpcClient = new CodexDesktopIpcClient({
 });
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
+const pendingDeepSeekNativeTurns = new Map();
 const nativeTurnReservations = new Set();
 const promptQueueItemReservations = new Map();
 const serverPromptQueueDispatchTimers = new Map();
@@ -349,6 +343,7 @@ app.get('/api/homepage/stats', requireHomepageToken, async (req, res) => {
     const providers = readProviderDetails();
     const provider = providers.find((item) => item.name === DEFAULT_PROVIDER) || providers[0];
     const nativeSessionList = nativeSessionSummaries();
+    const taskStats = homepageRunningTaskStats(nativeSessionList);
     let models = 0;
     if (provider) {
       const now = Date.now();
@@ -365,7 +360,9 @@ app.get('/api/homepage/stats', requireHomepageToken, async (req, res) => {
       conversations: nativeSessionList.length,
       providers: providers.length,
       models,
-      running: nativeSessionList.filter((session) => session.status === 'running').length + (activeProcess ? 1 : 0),
+      running: taskStats.running,
+      currentTask: taskStats.currentTask,
+      runningTasks: taskStats.runningTasks,
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -860,6 +857,7 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
   const sources = publicSubQuotaConfigs();
   const primary = sources.find((source) => source.configured) || sources[0];
   const codexApp = publicCodexAppQuotaConfig();
+  const deepSeekUsage = readDeepSeekUsageStats() || {};
   res.json({
     baseUrl: primary?.baseUrl || '',
     provider: configuredSubQuotaConfigs().length > 1 ? 'multi' : currentSubQuotaProvider(),
@@ -872,7 +870,23 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
     visibleCount: sources.filter((source) => source.visible).length + (codexApp.visible ? 1 : 0),
     codexApp,
     sources,
+    deepSeekUsage: {
+      totalTokens: Number(deepSeekUsage.totalTokens) || 0,
+      requests: Number(deepSeekUsage.requests) || 0,
+      updatedAt: String(deepSeekUsage.updatedAt || ''),
+    },
   });
+});
+
+app.put('/api/deepseek-usage-calibration', requireAuth, (req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    const usage = calibrateDeepSeekUsage(req.body?.totalTokens, req.body?.requests);
+    res.json({ ok: true, usage });
+  } catch (err) {
+    const status = Number(err?.statusCode) || 500;
+    res.status(status).json({ error: `校准 DeepSeek 本地累计失败: ${err.message}` });
+  }
 });
 
 app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
@@ -2336,6 +2350,47 @@ function requireHomepageToken(req, res, next) {
   next();
 }
 
+function homepageTaskName(task) {
+  const title = String(task?.title || task?.preview || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  return title || '未命名任务';
+}
+
+function homepageRunningTaskStats(nativeSessionList = []) {
+  const runningTasks = [];
+  for (const session of nativeSessionList) {
+    if (session?.status !== 'running') continue;
+    const active = activeNativeTurns.get(session.id);
+    runningTasks.push({
+      name: homepageTaskName(session),
+      status: '执行中',
+      startedAt: String(active?.startedAt || session.updatedAt || session.createdAt || ''),
+    });
+  }
+
+  if (activeProcess) {
+    const conversation = conversations.find((item) => item.id === activeConversationId);
+    runningTasks.push({
+      name: homepageTaskName(conversation),
+      status: '执行中',
+      startedAt: String(conversation?.updatedAt || conversation?.createdAt || ''),
+    });
+  }
+
+  const timestamp = (task) => {
+    const value = Date.parse(task.startedAt || '');
+    return Number.isFinite(value) ? value : 0;
+  };
+  runningTasks.sort((left, right) => timestamp(right) - timestamp(left));
+  return {
+    running: runningTasks.length,
+    currentTask: runningTasks[0]?.name || '空闲',
+    runningTasks,
+  };
+}
+
 function requireConfigWrite(req, res, next) {
   if (CODEX_CONFIG_WRITABLE) return next();
   res.status(403).json({ error: '当前使用只读 Codex 配置；如需从 Web 修改，请设置 CODEX_CONFIG_WRITABLE=true 后重启' });
@@ -2535,12 +2590,20 @@ function captureDeepSeekTurnUsage(line, usage) {
   }
 }
 
-function deepSeekPriceFor(model) {
-  const key = String(model || '').trim().toLowerCase();
-  return DEEPSEEK_PRICE_TABLE[key] || DEEPSEEK_PRICE_TABLE['deepseek-v4-flash'];
+function readDeepSeekUsageStats() {
+  const state = readDeepSeekUsageState();
+  if (!state) return null;
+  return {
+    totalTokens: state.totalTokens,
+    inputTokens: state.inputTokens,
+    outputTokens: state.outputTokens,
+    cachedInputTokens: state.cachedInputTokens,
+    requests: state.requests,
+    updatedAt: state.updatedAt,
+  };
 }
 
-function readDeepSeekUsageStats() {
+function readDeepSeekUsageState() {
   try {
     if (!existsSync(DEEPSEEK_USAGE_FILE)) return null;
     const data = JSON.parse(readFileSync(DEEPSEEK_USAGE_FILE, 'utf8'));
@@ -2550,38 +2613,80 @@ function readDeepSeekUsageStats() {
       inputTokens: Number(data.inputTokens) || 0,
       outputTokens: Number(data.outputTokens) || 0,
       cachedInputTokens: Number(data.cachedInputTokens) || 0,
-      cost: Number(data.cost) || 0,
       requests: Number(data.requests) || 0,
       updatedAt: String(data.updatedAt || ''),
+      calibratedAt: String(data.calibratedAt || ''),
+      countedTurns: Array.isArray(data.countedTurns)
+        ? [...new Set(data.countedTurns.map((item) => String(item || '').trim()).filter(Boolean))]
+        : [],
     };
   } catch {
     return null;
   }
 }
 
-function accumulateDeepSeekUsage(model, usage) {
-  if (!usage || !(Number(usage.total) > 0)) return;
+function accumulateDeepSeekUsage(model, usage, turnKey = '') {
+  if (!usage || !(Number(usage.total) > 0)) return false;
   try {
-    const current = readDeepSeekUsageStats() || {};
-    const price = deepSeekPriceFor(model);
-    const cost = (
-      (Math.max(0, Number(usage.input) - Number(usage.cached)) * price.input)
-      + (Number(usage.cached) * price.cached)
-      + (Number(usage.output) * price.output)
-    ) / 1e6;
+    const current = readDeepSeekUsageState() || {};
+    const key = String(turnKey || '').trim().slice(0, 160);
+    const countedTurns = Array.isArray(current.countedTurns) ? current.countedTurns : [];
+    if (key && countedTurns.includes(key)) return true;
     const next = {
       totalTokens: (Number(current.totalTokens) || 0) + usage.total,
       inputTokens: (Number(current.inputTokens) || 0) + usage.input,
       outputTokens: (Number(current.outputTokens) || 0) + usage.output,
       cachedInputTokens: (Number(current.cachedInputTokens) || 0) + usage.cached,
-      cost: Math.round(((Number(current.cost) || 0) + cost) * 1e6) / 1e6,
       requests: (Number(current.requests) || 0) + (Number(usage.requests) || 1),
       updatedAt: new Date().toISOString(),
+      ...(current.calibratedAt ? { calibratedAt: current.calibratedAt } : {}),
+      countedTurns: key ? [...countedTurns, key] : countedTurns,
     };
     atomicWriteFile(DEEPSEEK_USAGE_FILE, JSON.stringify(next, null, 2) + '\n');
+    return true;
   } catch {
     // 用量统计失败不应阻塞聊天流程
+    return false;
   }
+}
+
+function deepSeekCalibrationInteger(value, label) {
+  const compact = String(value ?? '').trim().replace(/[,，\s]/g, '');
+  if (!/^\d+$/.test(compact)) {
+    const error = new Error(`${label}必须是非负整数`);
+    error.statusCode = 400;
+    throw error;
+  }
+  const number = Number(compact);
+  if (!Number.isSafeInteger(number)) {
+    const error = new Error(`${label}超出安全整数范围`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return number;
+}
+
+function calibrateDeepSeekUsage(totalTokensValue, requestsValue) {
+  const totalTokens = deepSeekCalibrationInteger(totalTokensValue, '累计 Token');
+  const requests = deepSeekCalibrationInteger(requestsValue, '累计请求');
+  const current = readDeepSeekUsageState() || {};
+  const calibratedAt = new Date().toISOString();
+  const next = {
+    totalTokens,
+    inputTokens: Number(current.inputTokens) || 0,
+    outputTokens: Number(current.outputTokens) || 0,
+    cachedInputTokens: Number(current.cachedInputTokens) || 0,
+    requests,
+    updatedAt: calibratedAt,
+    calibratedAt,
+    countedTurns: Array.isArray(current.countedTurns) ? current.countedTurns : [],
+  };
+  atomicWriteFile(DEEPSEEK_USAGE_FILE, JSON.stringify(next, null, 2) + '\n');
+  return {
+    totalTokens: next.totalTokens,
+    requests: next.requests,
+    updatedAt: next.updatedAt,
+  };
 }
 
 function saveUploadedBackground(body) {
@@ -3071,11 +3176,36 @@ function broadcastNativeSessionChange(change) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'sessions', change);
 }
 
+function captureDeepSeekNativeTurnUsage(change) {
+  for (const threadId of change?.changedIds || []) {
+    const conversation = nativeSessions.get(threadId);
+    for (const [turnKey, pending] of pendingDeepSeekNativeTurns) {
+      if (pending.threadId !== threadId) continue;
+      const completion = [...(conversation?.messages || [])].reverse().find((message) => (
+        message.kind === 'task_complete'
+        && String(message.turnId || '') === pending.turnId
+        && Number(message.tokenUsage?.totalTokens) > 0
+      ));
+      if (!completion) continue;
+      const tokenUsage = completion.tokenUsage;
+      const recorded = accumulateDeepSeekUsage(pending.model, {
+        input: Number(tokenUsage.inputTokens) || 0,
+        cached: Number(tokenUsage.cachedInputTokens) || 0,
+        output: Number(tokenUsage.outputTokens) || 0,
+        total: Number(tokenUsage.totalTokens) || 0,
+        requests: 1,
+      }, turnKey);
+      if (recorded) pendingDeepSeekNativeTurns.delete(turnKey);
+    }
+  }
+}
+
 function handleNativeSessionChange(change) {
   clearPersistedTerminalNativeTurns(change);
   scheduleTerminalPromptQueueDispatches(change);
   // Session snapshots can briefly report idle before the matching turn completion
   // notification arrives. They must not release the turn lock used by queue dispatch.
+  captureDeepSeekNativeTurnUsage(change);
   broadcastNativeSessionChange(change);
 }
 
@@ -3978,6 +4108,18 @@ function setNativeTurnState(threadId, state) {
   if (Object.hasOwn(state, 'serviceTier')) next.serviceTier = cleanServiceTier(state.serviceTier);
   else if (Object.hasOwn(current || {}, 'serviceTier')) next.serviceTier = current.serviceTier;
   activeNativeTurns.set(cleanId, next);
+  const deepSeekTurnKey = `${cleanId}:${next.turnId}`;
+  if (next.status === 'running' && next.turnId) {
+    if (isDeepSeekCodexProvider(next.provider)) {
+      pendingDeepSeekNativeTurns.set(deepSeekTurnKey, {
+        threadId: cleanId,
+        turnId: next.turnId,
+        model: next.model,
+      });
+    }
+  } else if (next.status === 'error' || next.status === 'interrupted') {
+    pendingDeepSeekNativeTurns.delete(deepSeekTurnKey);
+  }
   if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
   broadcastNativeRuntime({ type: 'turn', threadId: cleanId, ...next });
   nativeSessions.scheduleRefresh();
@@ -12092,7 +12234,7 @@ function setComposerExpanded(expanded,{focus=false,force=false}={}){
     composerMicBtn.classList.remove('hidden');
   }
   if(next&&focus&&input&&!input.disabled&&document.activeElement!==input){
-    // Focus synchronously inside the user gesture so mobile keyboards open on the first tap.
+    // Focus synchronously inside the user gesture so mobile keyboards open without a delayed reflow.
     try{input.focus({preventScroll:true})}catch{input.focus()}
     if(document.activeElement!==input){
       if(window.__composerFocusRaf)cancelAnimationFrame(window.__composerFocusRaf);
@@ -13299,34 +13441,55 @@ function enhanceComposer(){
   dropZone.addEventListener('click',(event)=>{
     const guard=window.__composerExpandClickGuard;
     if(!guard)return;
-    if(guard.pointerId!==null&&typeof event.pointerId==='number'&&event.pointerId!==guard.pointerId)return;
+    const suppressClick=guard.suppressClick===true;
+    if(!suppressClick&&guard.pointerId!==null&&typeof event.pointerId==='number'&&event.pointerId!==guard.pointerId)return;
     window.__composerExpandClickGuard=null;
     window.clearTimeout(window.__composerExpandClickGuardTimer);
-    if(event.target===guard.target||guard.target?.contains?.(event.target))return;
+    if(!suppressClick&&(event.target===guard.target||guard.target?.contains?.(event.target)))return;
     // The capsule grows during pointerdown. Ignore a trailing click that would
     // otherwise land on a newly revealed toolbar control after that reflow.
     event.preventDefault();
     event.stopImmediatePropagation();
   },true);
   dropZone.addEventListener('pointerdown',(event)=>{
-    // Keep buttons/menus from stealing the keyboard path; textarea/input still get focus:true.
+    const wasCollapsed=dropZone.classList.contains('composerCollapsed');
+    if(!wasCollapsed&&window.__composerExpandClickGuard){
+      window.__composerExpandClickGuard=null;
+      window.clearTimeout(window.__composerExpandClickGuardTimer);
+    }
+    // Keep the collapsed capsule geometry stable while its edge controls are tapped.
+    // Expanding here would move the permission/model controls under the same finger,
+    // so the trailing click could activate the wrong button on mobile browsers.
     if(event.target.closest('button,a,select,label,.composerPopover')){
-      expandComposer();
+      if(!wasCollapsed)expandComposer();
       return;
     }
-    const wasCollapsed=dropZone.classList.contains('composerCollapsed');
-    expandComposer({focus:true});
+    if(wasCollapsed){
+      // The first mobile tap is only an expansion gesture. Prevent the browser's
+      // default textarea focus so the keyboard opens on the deliberate second tap.
+      event.preventDefault();
+      expandComposer();
+    }else{
+      expandComposer({focus:true});
+    }
     if(wasCollapsed&&dropZone.classList.contains('composerExpanded')){
       window.__composerExpandClickGuard={
         pointerId:typeof event.pointerId==='number'?event.pointerId:null,
         target:event.target,
+        suppressClick:true,
       };
       window.clearTimeout(window.__composerExpandClickGuardTimer);
       window.__composerExpandClickGuardTimer=window.setTimeout(()=>{window.__composerExpandClickGuard=null},500);
     }
   });
   dropZone.addEventListener('click',(event)=>{
-    if((event.target===dropZone||event.target===input||event.target.closest('textarea'))&&document.activeElement!==input)expandComposer({focus:true});
+    if(!(event.target===dropZone||event.target===input||event.target.closest('textarea'))||document.activeElement===input)return;
+    // A fallback click can still arrive on mobile when the browser does not
+    // expose pointer events. The first tap remains an expansion gesture and
+    // must not focus the textarea; only a later tap on the expanded composer
+    // may open the keyboard.
+    if(dropZone.classList.contains('composerCollapsed'))expandComposer();
+    else expandComposer({focus:true});
   });
   document.addEventListener('click',(event)=>{
     if(composerChromeContains(event.target))return;
@@ -13418,7 +13581,10 @@ function ensureComposerSpeechRecognition(){
   return rec;
 }
 function toggleComposerSpeech(){
-  expandComposer({focus:true});
+  // Voice input should not steal focus from a mobile toolbar tap. The
+  // recognition API does not require the textarea to be focused, and keeping
+  // it unfocused prevents a transient keyboard from appearing beside the mic.
+  expandComposer();
   if(composerSpeechListening){
     stopComposerSpeech();
     if(statusEl)statusEl.textContent='已停止语音输入';
@@ -13881,14 +14047,61 @@ function ensureSubQuotaSettingsDialog(){
     keyField.appendChild(credentialHint);
     fields.append(urlField,keyField);
     source.append(sourceHead,fields);
-    subQuotaSettingsInputs.set(provider,{
-      baseUrlInput,
-      apiKeyInput,
-      credentialHint,
-      source,
-      stateBadge:sourceIdentity.stateBadge,
-      visibilityToggle,
-    });
+    let calibration=null;
+    if(provider==='deepseek'){
+      const panel=document.createElement('div');
+      panel.className='deepSeekUsageCalibration';
+      const calibrationTitle=document.createElement('h4');
+      calibrationTitle.className='deepSeekUsageCalibrationTitle';
+      calibrationTitle.textContent='本地累计校准';
+      const calibrationHint=document.createElement('p');
+      calibrationHint.className='deepSeekUsageCalibrationHint';
+      calibrationHint.textContent='填写 DeepSeek 官网当前显示值；校准后，新的本地调用会继续累加。';
+      const calibrationFields=document.createElement('div');
+      calibrationFields.className='deepSeekUsageCalibrationFields';
+      const createCalibrationField=(name,labelText)=>{
+        const field=document.createElement('label');
+        field.className='field';
+        const label=document.createElement('span');
+        label.textContent=labelText;
+        const input=document.createElement('input');
+        input.name=name;
+        input.type='text';
+        input.inputMode='numeric';
+        input.autocomplete='off';
+        input.maxLength=32;
+        input.placeholder='0';
+        field.appendChild(label);
+        field.appendChild(input);
+        calibrationFields.appendChild(field);
+        return input;
+      };
+      const totalTokensInput=createCalibrationField('deepSeekTotalTokens','累计 Token');
+      const requestsInput=createCalibrationField('deepSeekTotalRequests','累计请求');
+      const actions=document.createElement('div');
+      actions.className='deepSeekUsageCalibrationActions';
+      const calibrateButton=document.createElement('button');
+      calibrateButton.type='button';
+      calibrateButton.className='miniSecondary deepSeekUsageCalibrationSubmit';
+      setIconLabel(calibrateButton,'crosshair','校准累计量');
+      const calibrationStatus=document.createElement('div');
+      calibrationStatus.className='deepSeekUsageCalibrationStatus';
+      calibrationStatus.setAttribute('role','status');
+      calibrationStatus.setAttribute('aria-live','polite');
+      actions.appendChild(calibrateButton);
+      panel.appendChild(calibrationTitle);
+      panel.appendChild(calibrationHint);
+      panel.appendChild(calibrationFields);
+      panel.appendChild(actions);
+      panel.appendChild(calibrationStatus);
+      source.appendChild(panel);
+      calibration={totalTokensInput,requestsInput,calibrateButton,calibrationStatus};
+      calibrateButton.addEventListener('click',submitDeepSeekUsageCalibration);
+      for(const input of [totalTokensInput,requestsInput]){
+        input.addEventListener('keydown',(event)=>{if(event.key==='Enter'){event.preventDefault();calibrateButton.click()}});
+      }
+    }
+    subQuotaSettingsInputs.set(provider,{baseUrlInput,apiKeyInput,credentialHint,source,stateBadge:sourceIdentity.stateBadge,visibilityToggle,calibration});
     return source;
   };
   subQuotaSettingsSourceList=document.createElement('div');
@@ -14108,15 +14321,50 @@ async function syncSubQuotaSettings(){
       inputs.credentialHint.textContent=source.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，可先保存 URL';
       syncSubQuotaSourceState(inputs,source);
     }
+    const calibration=subQuotaSettingsInputs.get('deepseek')?.calibration;
+    if(calibration){
+      const usage=data.deepSeekUsage||{};
+      calibration.totalTokensInput.value=Number(usage.totalTokens||0).toLocaleString('en-US',{maximumFractionDigits:0});
+      calibration.requestsInput.value=Number(usage.requests||0).toLocaleString('en-US',{maximumFractionDigits:0});
+      calibration.calibrationStatus.textContent='';
+      calibration.calibrationStatus.classList.remove('success');
+    }
     if(Array.isArray(data.sources)&&data.sources.length){
+      const footer=subQuotaSettingsForm.querySelector('.subQuotaSettingsFooter');
       for(const item of data.sources){
         const inputs=subQuotaSettingsInputs.get(item.provider);
-        if(inputs?.source)subQuotaSettingsSourceList.appendChild(inputs.source);
+        if(inputs?.source){
+          if(footer)subQuotaSettingsForm.insertBefore(inputs.source,footer);
+          else subQuotaSettingsForm.appendChild(inputs.source);
+        }
       }
       syncSubQuotaMoveButtons();
     }
     void syncCodexAppCredits();
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'读取设置失败')}
+}
+async function submitDeepSeekUsageCalibration(){
+  const calibration=subQuotaSettingsInputs.get('deepseek')?.calibration;
+  if(!calibration)return;
+  const {totalTokensInput,requestsInput,calibrateButton,calibrationStatus}=calibration;
+  calibrateButton.disabled=true;
+  calibrationStatus.classList.remove('success');
+  calibrationStatus.textContent='正在校准本地累计…';
+  try{
+    const response=await fetch('/api/deepseek-usage-calibration',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({totalTokens:totalTokensInput.value,requests:requestsInput.value})});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||'校准失败');
+    const usage=data.usage||{};
+    totalTokensInput.value=Number(usage.totalTokens||0).toLocaleString('en-US',{maximumFractionDigits:0});
+    requestsInput.value=Number(usage.requests||0).toLocaleString('en-US',{maximumFractionDigits:0});
+    calibrationStatus.classList.add('success');
+    calibrationStatus.textContent='校准完成，后续本地用量将继续累加';
+    void loadSubQuota({refresh:true});
+  }catch(error){
+    calibrationStatus.textContent=String(error?.message||'校准失败');
+  }finally{
+    calibrateButton.disabled=false;
+  }
 }
 async function submitSubQuotaSettings(event){
   event.preventDefault();
@@ -14707,9 +14955,11 @@ function renderSubQuota(data){
     const isSub2Api=quota.provider==='sub2api';
     const isSub2ApiSubscription=isSub2Api&&Boolean(quota.subscription);
     const sub2ApiWindowOptions=isSub2Api
-      ? {showReset:true,fixedCurrency:true,displayUsed:true}
+      ? {displayUsed:true,showReset:true,fixedCurrency:true}
       : undefined;
-    const rateLimitWindowOptions=sub2ApiWindowOptions||{displayUsed:true};
+    const rateLimitWindowOptions=quota.provider==='cpa-codex'
+      ? {displayUsed:true}
+      : sub2ApiWindowOptions;
     const expiresAt=quota.expiresAt||quota.subscription?.expiresAt;
     if(isSub2ApiSubscription&&expiresAt)appendSubQuotaExpiry(source,expiresAt);
     if(quota.provider==='grok2api' && quota.accountStats){
@@ -14728,9 +14978,15 @@ function renderSubQuota(data){
       }
       const meta=document.createElement('div');
       meta.className='subQuotaMeta';
+      if(Number.isFinite(Number(stats.normalAvailable))&&Number(stats.normalAvailable)>0)appendSubQuotaMeta(meta,'正常账号 '+Number(stats.normalAvailable).toLocaleString('zh-CN'));
+      if(Number(stats.risk||0)>0)appendSubQuotaMeta(meta,'风控 '+Number(stats.risk).toLocaleString('zh-CN'));
+      if(Number(stats.attention||0)>0)appendSubQuotaMeta(meta,'需关注 '+Number(stats.attention).toLocaleString('zh-CN'));
       if(Number(stats.abnormal||0)>0)appendSubQuotaMeta(meta,'异常 '+Number(stats.abnormal||0).toLocaleString('zh-CN'));
-      if(Number(stats.waitingReset||0)>0)appendSubQuotaMeta(meta,'等待重置 '+Number(stats.waitingReset).toLocaleString('zh-CN'));
       if(Number(stats.recovering||0)>0)appendSubQuotaMeta(meta,'恢复中 '+Number(stats.recovering).toLocaleString('zh-CN'));
+      if(Number(stats.waitingReset||0)>0)appendSubQuotaMeta(meta,'等待重置 '+Number(stats.waitingReset).toLocaleString('zh-CN'));
+      if(Number(stats.cooldown||0)>0)appendSubQuotaMeta(meta,'冷却 '+Number(stats.cooldown).toLocaleString('zh-CN'));
+      if(Number(stats.disabled||0)>0)appendSubQuotaMeta(meta,'禁用 '+Number(stats.disabled).toLocaleString('zh-CN'));
+      if(Number(stats.probing||0)>0)appendSubQuotaMeta(meta,'探测中 '+Number(stats.probing).toLocaleString('zh-CN'));
       if(Number(stats.reauthRequired||0)>0)appendSubQuotaMeta(meta,'需重登 '+Number(stats.reauthRequired).toLocaleString('zh-CN'));
       if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
       if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
@@ -14771,25 +15027,17 @@ function renderSubQuota(data){
       let detailCount=0;
       const balanceValue=finiteSubQuotaNumber(quota.balance??quota.remaining);
       const currency=String(quota.currency||'CNY').toUpperCase();
-      if(balanceValue!==null)detailCount+=appendSubQuotaWindow(source,'余额',{remaining:balanceValue},currency,{fixedCurrency:false})?1:0;
-      const stats=quota.usageStats||{};
-      if(Number.isFinite(Number(stats.cost))&&Number(stats.cost)>0){
-        const usageRow=document.createElement('div');
-        usageRow.className='subQuotaWindow';
-        const usageHead=document.createElement('div');
-        usageHead.className='subQuotaWindowHead';
-        const usageLabel=document.createElement('span');
-        usageLabel.textContent='使用额度';
-        const usageValue=document.createElement('span');
-        usageValue.textContent=formatSubQuotaAmount(Number(stats.cost),currency);
-        usageHead.append(usageLabel,usageValue);
-        usageRow.appendChild(usageHead);
-        source.appendChild(usageRow);
-        detailCount+=1;
-      }
+      const balanceStatus=quota.status?'状态 '+formatSubQuotaStatus(quota.status):'';
+      if(balanceValue!==null)detailCount+=appendSubQuotaWindow(source,'余额',{remaining:balanceValue},currency,{fixedCurrency:false,inlineStatus:balanceStatus,showRemainingLabel:false})?1:0;
       const meta=document.createElement('div');
-      meta.className='subQuotaMeta';
+      meta.className='subQuotaMeta subQuotaMetaDeepSeek';
+      const stats=quota.usageStats||{};
+      if(Number.isFinite(Number(stats.totalTokens))&&Number(stats.totalTokens)>0)appendSubQuotaMeta(meta,'累计 Token '+Number(stats.totalTokens).toLocaleString('zh-CN'));
       if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
+      if(Number.isFinite(Number(stats.requests))&&Number(stats.requests)>0){
+        const requests=appendSubQuotaMeta(meta,'累计请求 '+Number(stats.requests).toLocaleString('zh-CN'));
+        requests.className='subQuotaMetaTrailing';
+      }
       if(meta.childElementCount)source.appendChild(meta);
       if(detailCount||meta.childElementCount){
         subQuotaContent.appendChild(source);
@@ -14856,9 +15104,7 @@ function renderSubQuota(data){
   refreshSubQuotaCountdowns();
 }
 function subQuotaProgressPercent(used,limit,remaining,unit,availabilityOnly=false){
-  const progressAmount=remaining!==null
-    ? remaining
-    : (limit!==null&&limit>0&&used!==null?Math.max(0,limit-used):null);
+  const progressAmount=remaining!==null?remaining:used;
   if(progressAmount===null)return availabilityOnly?100:null;
   if(unit==='%')return Math.min(100,Math.max(0,progressAmount));
   if(limit===null||limit<=0)return null;
@@ -14885,53 +15131,58 @@ function appendSubQuotaProgress(parent,percent,{availabilityOnly=false,displayUs
   parent.appendChild(progress);
 }
 function appendSubQuotaWindow(parent,label,windowData,unit,options={}){
-  if(!windowData)return false;
-  const used=finiteSubQuotaNumber(windowData.used);
-  const limit=finiteSubQuotaNumber(windowData.limit);
   const remaining=finiteSubQuotaNumber(windowData.remaining);
-  const usedAmount=used!==null
-    ? used
-    : (limit!==null&&limit>0&&remaining!==null?Math.max(0,limit-remaining):null);
-  const remainingAmount=remaining!==null
-    ? remaining
-    : (limit!==null&&limit>0&&used!==null?Math.max(0,limit-used):null);
   const available=windowData.availability==='available';
   const availabilityOnly=available&&used===null&&limit===null&&remaining===null;
+  const displayUsed=options.displayUsed===true||windowData.display==='used';
   const fixedCurrency=options.fixedCurrency===true;
-  const displayUsed=options.displayUsed===true;
+  const remainingLabel=options.showRemainingLabel===false?'':'剩余 ';
   if(used===null&&limit===null&&remaining===null&&!available)return false;
   const row=document.createElement('div');
   row.className='subQuotaWindow';
   const head=document.createElement('div');
-  head.className='subQuotaWindowHead';
+  const inlineStatus=String(options.inlineStatus||'').trim();
+  head.className='subQuotaWindowHead'+(inlineStatus?' subQuotaWindowHeadInline':'');
   const title=document.createElement('span');
   title.textContent=label;
   const value=document.createElement('span');
-  if(displayUsed&&usedAmount!==null){
-    if(unit==='%')value.textContent='已用 '+formatSubQuotaAmount(usedAmount,'%');
-    else if(limit!==null&&limit>0)value.textContent='已用 '+formatSubQuotaAmount(usedAmount,unit,fixedCurrency)+' / '+formatSubQuotaAmount(limit,unit,fixedCurrency);
-    else value.textContent='已用 '+formatSubQuotaAmount(usedAmount,unit,fixedCurrency);
+  if(displayUsed&&used!==null&&limit!==null&&limit>0){
+    value.textContent=formatSubQuotaAmount(used,unit,fixedCurrency)+' / '+formatSubQuotaAmount(limit,unit,fixedCurrency);
   }else if(available&&used===null&&remaining===null){
     value.textContent='当前可用';
-  }else if(unit==='%'&&remainingAmount!==null){
-    value.textContent='剩余 '+formatSubQuotaAmount(remainingAmount,'%');
+  }else if(unit==='%'&&(used!==null||remaining!==null)){
+    if(remaining!==null)value.textContent=remainingLabel+formatSubQuotaAmount(remaining,'%');
+    else value.textContent='已用 '+formatSubQuotaAmount(used,'%');
   }else if(limit!==null&&limit>0){
-    if(remainingAmount!==null)value.textContent='剩余 '+formatSubQuotaAmount(remainingAmount,unit,fixedCurrency)+' / '+formatSubQuotaAmount(limit,unit,fixedCurrency);
+    if(remaining!==null)value.textContent=remainingLabel+formatSubQuotaAmount(remaining,unit)+' / '+formatSubQuotaAmount(limit,unit);
+    else if(used!==null)value.textContent='已用 '+formatSubQuotaAmount(used,unit)+' / '+formatSubQuotaAmount(limit,unit);
     else value.textContent='限额 '+formatSubQuotaAmount(limit,unit);
-  }else if(remainingAmount!==null){
-    value.textContent='剩余 '+formatSubQuotaAmount(remainingAmount,unit,fixedCurrency);
+  }else if(remaining!==null){
+    value.textContent=remainingLabel+formatSubQuotaAmount(remaining,unit);
   }else{
     value.textContent='不限额'+(used===null?'':' · 已用 '+formatSubQuotaAmount(used,unit));
   }
   head.appendChild(title);
   head.appendChild(value);
+  if(inlineStatus){
+    const status=document.createElement('span');
+    status.className='subQuotaInlineStatus';
+    status.textContent=inlineStatus;
+    head.appendChild(status);
+  }
   row.appendChild(head);
-  const percent=displayUsed
-    ? (usedAmount===null
-      ? null
-      : (unit==='%'?Math.min(100,Math.max(0,usedAmount)):(limit!==null&&limit>0?Math.min(100,Math.max(0,(usedAmount/limit)*100)):null)))
-    : subQuotaProgressPercent(used,limit,remainingAmount,unit,availabilityOnly);
-  if(percent!==null)appendSubQuotaProgress(row,percent,{availabilityOnly,displayUsed});
+  const percent=subQuotaProgressPercent(used,limit,displayUsed?null:remaining,unit,availabilityOnly);
+  if(percent!==null){
+    const progress=document.createElement('div');
+    progress.className='subQuotaProgress';
+    const bar=document.createElement('span');
+    bar.className='subQuotaProgressBar';
+    bar.style.setProperty('--sub-quota-percent',percent.toFixed(2)+'%');
+    if(availabilityOnly)bar.dataset.level='available';
+    else if(displayUsed)bar.dataset.level=percent>=100?'exhausted':percent>=80?'warning':'normal';
+    progress.appendChild(bar);
+    row.appendChild(progress);
+  }
   if(options.showReset===true&&windowData.resetAt){
     const reset=document.createElement('span');
     reset.className='subQuotaWindowReset';
@@ -14991,7 +15242,7 @@ function stopSubQuotaCountdowns(){
   clearInterval(subQuotaCountdownTimer);
   subQuotaCountdownTimer=null;
 }
-function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item)}
+function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item);return item}
 function finiteSubQuotaNumber(value){if(value===null||value===undefined||value==='')return null;const number=Number(value);return Number.isFinite(number)&&number>=0?number:null}
 function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[String(value||'').toLowerCase()]||String(value||'限速')}
 function formatSubQuotaStatus(value){return({active:'正常',unlimited:'不限量',not_available:'未提供',quota_exhausted:'额度耗尽',expired:'已过期',no_access:'无访问权限',blocked:'已限制'})[String(value||'').toLowerCase()]||String(value||'')}

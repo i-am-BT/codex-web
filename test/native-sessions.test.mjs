@@ -2783,7 +2783,6 @@ test('native sessions accumulate DeepSeek usage once per completed turn', { time
   const id = '019f6f84-ea9f-73c2-b997-deba7b4aa888';
   const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '12');
   const sessionFile = path.join(sessionDir, `rollout-2026-07-12T12-00-00-${id}.jsonl`);
-  const priceTable = { 'deepseek-v4-flash': { input: 0.14, cached: 0.0028, output: 0.28 } };
 
   try {
     await mkdir(sessionDir, { recursive: true });
@@ -2826,7 +2825,6 @@ test('native sessions accumulate DeepSeek usage once per completed turn', { time
       watchChanges: false,
       maxMessages: 100,
       deepSeekUsageFile: usageFile,
-      deepSeekPriceTable: priceTable,
     });
 
     let store = makeStore();
@@ -2834,13 +2832,11 @@ test('native sessions accumulate DeepSeek usage once per completed turn', { time
     const stats = JSON.parse(await readFile(usageFile, 'utf8'));
     assert.equal(stats.requests, 1);
     assert.equal(stats.totalTokens, 3000);
-    assert.equal(stats.cost, 0.0007);
 
     store = makeStore();
     store.get(id);
     const again = JSON.parse(await readFile(usageFile, 'utf8'));
     assert.equal(again.requests, 1);
-    assert.equal(again.cost, 0.0007);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
