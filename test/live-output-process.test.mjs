@@ -1749,10 +1749,17 @@ test('Codex App queue entries keep their message ownership while Web can persist
   assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueLead/);
 });
 
-test('large native histories render the recent tail without an obstructive history control', () => {
+test('native histories load the complete transcript without an obstructive history control', () => {
   const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  const syncSideChatConversation = sourceBetween('async function syncSideChatConversation', 'function updateSideChatHeadState');
+  const syncCurrentNativeConversationOnce = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
 
-  assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external&limit='\+NATIVE_INITIAL_MESSAGE_LIMIT/);
+  assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external'/);
+  assert.doesNotMatch(loadConversation, /NATIVE_INITIAL_MESSAGE_LIMIT|[?&]limit=/);
+  assert.match(syncSideChatConversation, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external'\)/);
+  assert.doesNotMatch(syncSideChatConversation, /[?&]limit=/);
+  assert.match(syncCurrentNativeConversationOnce, /'\?images=external&after='\+nativeCursor\+'&generation='\+nativeGeneration/);
+  assert.doesNotMatch(syncCurrentNativeConversationOnce, /NATIVE_INITIAL_MESSAGE_LIMIT|[?&]limit=/);
   assert.match(loadConversation, /chat\.innerHTML='';\s*const messages=conversation\.messages\|\|\[\];/);
   assert.doesNotMatch(inlineScript, /addNativeHistoryLoadButton|nativeHistoryLoadEarlier|加载完整记录/);
   assert.doesNotMatch(uiStyles, /nativeHistoryLoadEarlier/);

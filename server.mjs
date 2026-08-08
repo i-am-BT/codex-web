@@ -8827,7 +8827,6 @@ let sideChatRenderedWidth=SIDE_CHAT_WIDTH_DEFAULT;
 let sideChatResizePointerId=null;
 const ACTIVE_CONVERSATION_STORAGE_KEY='codexWeb.activeConversation.v1';
 const NATIVE_FORK_MARKERS_STORAGE_KEY='codexWeb.nativeForkMarkers.v1';
-const NATIVE_INITIAL_MESSAGE_LIMIT=60;
 const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
 let historyPinnedCollapsed=readHistoryPinnedCollapsed();
@@ -10454,7 +10453,7 @@ async function syncSideChatConversation(){
   if(!sideChatThreadId)return;
   const syncId=sideChatThreadId;
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external&limit=80');
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external');
     const data=await res.json().catch(()=>({}));
     if(!res.ok)throw new Error(data.error||'Side chat 同步失败');
     if(sideChatThreadId!==syncId)return;
@@ -17758,10 +17757,9 @@ async function loadConversation(id,source='web',options={}){
   let conversation=options.conversation||null;
   if(!conversation){
     const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
-    // Rendering several hundred historical messages synchronously blocks the
-    // main thread, so show the recent tail without adding an obstructive control.
+    // Keep native transcripts aligned with Codex App instead of hiding older turns.
     const nativeHistoryQuery=currentConversationSource==='codex'
-      ? '?images=external&limit='+NATIVE_INITIAL_MESSAGE_LIMIT
+      ? '?images=external'
       : '';
     const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery;
     const res=await fetch(requestUrl);
@@ -18140,7 +18138,7 @@ async function syncCurrentNativeConversationOnce(){
   const renderSnapshotImmediately=nativeLiveDocumentHidden()||nativeSnapshotResumeCatchup;
   const id=currentConversationId;
   const seq=conversationLoadSeq;
-  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&limit='+NATIVE_INITIAL_MESSAGE_LIMIT+'&after='+nativeCursor+'&generation='+nativeGeneration;
+  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&after='+nativeCursor+'&generation='+nativeGeneration;
   const res=await fetch(url);
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
