@@ -1207,6 +1207,8 @@ test('persisted active commentary renders progressively and deduplicates by sequ
       let nativeRenderedMessageKeys = new Set();
       let nativeLiveScrollTimer = null;
       let nativeLiveFollowBottom = true;
+      let nativeLiveReadingHistory = false;
+      let nativeLiveTowardLatestUntil = 0;
       let nativeLiveScrollTrackingBound = false;
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
@@ -1368,14 +1370,17 @@ test('running native output offers a non-disruptive jump-to-latest control', () 
       let nativeLiveItems = new Map();
       let nativeLiveScrollTimer = null;
       let nativeLiveScrollTrackingBound = false;
+      let nativeLiveReadingHistory = false;
+      let nativeLiveTowardLatestUntil = 0;
       ${followSource}
       return {
         bind: bindNativeLiveScrollTracking,
         update: updateJumpToLatestButton,
         scroll: scrollToLatestOutput,
+        setReading(value) { setNativeLiveReadingHistory(value); },
         setRunning(value) { webRunActive = value; },
         setView(value) { activeMainView = value; },
-        state: () => ({ follow: nativeLiveFollowBottom }),
+        state: () => ({ follow: nativeLiveFollowBottom, reading: nativeLiveReadingHistory }),
       };
     `,
   )(chat, jumpToLatest, { querySelector: () => main }, { matchMedia: () => ({ matches: false }) });
@@ -1392,6 +1397,12 @@ test('running native output offers a non-disruptive jump-to-latest control', () 
   chatScrollTop = 0;
   scrollListener();
   assert.equal(classes.has('hidden'), false, 'manual upward scrolling should show the control again without forcing a scroll');
+  api.setReading(true);
+  chatScrollTop = 800;
+  scrollListener();
+  assert.deepEqual(api.state(), { follow: false, reading: true }, 'a programmatic bottom position must not take ownership while history is being read');
+  api.scroll();
+  assert.deepEqual(api.state(), { follow: true, reading: false }, 'the explicit jump action resumes bottom following');
   api.setRunning(false);
   api.update();
   assert.equal(classes.has('hidden'), true, 'completed turns never retain the control');
@@ -1455,6 +1466,8 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
       let nativeRenderedMessageKeys = new Set();
       let nativeLiveScrollTimer = null;
       let nativeLiveFollowBottom = true;
+      let nativeLiveReadingHistory = false;
+      let nativeLiveTowardLatestUntil = 0;
       let nativeLiveScrollTrackingBound = false;
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
@@ -1749,16 +1762,56 @@ test('Codex App queue entries keep their message ownership while Web can persist
   assert.doesNotMatch(uiStyles, /\.promptQueueRow\.appOwned \.promptQueueLead/);
 });
 
-test('large native histories render the recent tail before full-history expansion', () => {
-  const historyControl = sourceBetween('function addNativeHistoryLoadButton', 'async function loadConversation');
+test('native histories load upward in real pages without an obstructive history control', () => {
+  const loadEarlierNativeHistoryPage = sourceBetween('async function loadEarlierNativeHistoryPage', 'async function loadConversation');
   const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  const syncSideChatConversation = sourceBetween('async function syncSideChatConversation', 'function updateSideChatHeadState');
+  const syncCurrentNativeConversationOnce = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
+  const nativeScrollTracking = sourceBetween('function bindNativeLiveScrollTracking', 'function captureNativeLiveFollowBottom');
 
-  assert.match(historyControl, /if\(!id\|\|!conversation\?\.hasEarlierMessages\|\|!chat\)return null/);
-  assert.match(historyControl, /button\.id='nativeHistoryLoadEarlier'/);
-  assert.match(historyControl, /await loadConversation\(id,'codex',\{fullHistory:true\}\)/);
-  assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external'\+\(options\.fullHistory\?'':'&limit='\+NATIVE_INITIAL_MESSAGE_LIMIT\)/);
-  assert.match(loadConversation, /chat\.innerHTML='';\s*if\(currentConversationSource==='codex'\)addNativeHistoryLoadButton\(currentConversationId,conversation\);\s*const messages=conversation\.messages\|\|\[\];/);
-  assert.match(uiStyles, /body \.nativeHistoryLoadEarlier\s*\{[^}]*display:\s*inline-flex;[^}]*background:\s*transparent;[^}]*cursor:\s*pointer/s);
+  assert.match(inlineScript, /let deferredIconRefreshDepth=0;/);
+  assert.match(inlineScript, /function refreshIcons\(root=document\)\{if\(deferredIconRefreshDepth>0\|\|/);
+  assert.match(inlineScript, /const NATIVE_HISTORY_PAGE_SIZE = 60;/);
+  assert.match(inlineScript, /const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;/);
+  assert.match(inlineScript, /const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;/);
+  assert.match(inlineScript, /function nativeHistoryViewportFilled\(container\)/);
+  assert.match(inlineScript, /function nativeHistoryPageGrowthTarget\(container\)/);
+  assert.doesNotMatch(inlineScript, /function nativeHistoryNextBatchCount\(/);
+  assert.match(inlineScript, /function historyNodeHasLayout\(node\)/);
+  assert.match(inlineScript, /function captureHistoryScrollAnchor\(container\)/);
+  assert.match(inlineScript, /function restoreHistoryScrollAnchor\(container,anchor\)/);
+  assert.match(loadConversation, /const deferHistoryIcons=messages\.length>240;[\s\S]*?beginDeferredIconRefresh\(\);[\s\S]*?finally\{[\s\S]*?endDeferredIconRefresh\(chat\)/);
+  assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external&history=page&limit='\+nativeHistoryPageLimit/);
+  assert.match(loadEarlierNativeHistoryPage, /const requestedLimit=lastSuccessfulLimit\+NATIVE_HISTORY_PAGE_SIZE\*batchCount/);
+  assert.match(loadEarlierNativeHistoryPage, /const batchCount=1/);
+  assert.match(loadEarlierNativeHistoryPage, /historyScrollAnchor:anchor/);
+  assert.match(loadEarlierNativeHistoryPage, /const preserveFollowBottom=fillViewport&&!nativeLiveReadingHistory&&nativeLiveFollowBottom/);
+  assert.match(loadEarlierNativeHistoryPage, /preserveHistoryFollowBottom:preserveFollowBottom/);
+  assert.match(loadEarlierNativeHistoryPage, /fillViewport\?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_PAGE_MAX_BATCHES/);
+  assert.match(loadEarlierNativeHistoryPage, /nativeHistorySyncDeferred=true/);
+  assert.match(loadEarlierNativeHistoryPage, /clearNativeHistoryDeferredSync\(\)/);
+  assert.match(loadEarlierNativeHistoryPage, /if\(sameConversation&&syncDeferred\)scheduleDeferredNativeHistorySync\(id\)/);
+  assert.match(loadEarlierNativeHistoryPage, /fillViewport\?nativeHistoryViewportFilled\(chat\):growth>=growthTarget/);
+  assert.match(loadConversation, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\)/);
+  assert.match(loadConversation, /const preserveHistoryFollowBottom=Boolean\(options\.historyScrollAnchor\)&&options\.preserveHistoryFollowBottom===true/);
+  assert.match(loadConversation, /if\(options\.historyScrollAnchor&&!preserveHistoryFollowBottom\)setNativeLiveReadingHistory\(true\);\s*else resumeNativeLiveFollowBottom\(\);/);
+  assert.match(loadConversation, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);\s*if\(preserveHistoryFollowBottom\)resumeNativeLiveFollowBottom\(\);\s*else setNativeLiveReadingHistory\(true\)/);
+  assert.match(loadConversation, /loadEarlierNativeHistoryPage\(\{fillViewport:true\}\)/);
+  assert.match(nativeScrollTracking, /addEventListener\('wheel'[\s\S]*?event\.deltaY<0/);
+  assert.match(nativeScrollTracking, /addEventListener\('touchmove'[\s\S]*?const step=currentY-historyTouchLastY;[\s\S]*?currentY-historyTouchStartY>=28/);
+  assert.match(syncSideChatConversation, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&limit='\+historyLimit\)/);
+  assert.match(syncSideChatConversation, /tab\.historyLimit=lastSuccessfulLimit\+NATIVE_HISTORY_PAGE_SIZE\*batchCount/);
+  assert.match(syncSideChatConversation, /const batchCount=1/);
+  assert.match(syncSideChatConversation, /historyScrollAnchor:anchor,followBottom:false/);
+  assert.match(syncSideChatConversation, /fillInitialSideChatHistoryPage\(\)/);
+  assert.match(syncCurrentNativeConversationOnce, /'\?images=external&history=page&limit='\+nativeHistoryPageLimit\+'&after='\+nativeCursor\+'&generation='\+nativeGeneration/);
+  assert.match(syncCurrentNativeConversationOnce, /if\(deferNativeSyncForHistoryPage\(\)\)return/);
+  assert.match(syncCurrentNativeConversationOnce, /historyPageLimit:nativeHistoryPageLimit/);
+  assert.match(syncCurrentNativeConversationOnce, /nativeLiveFollowBottom&&nativeLiveNearBottom\(\)\?null:captureHistoryScrollAnchor\(chat\)/);
+  assert.match(syncCurrentNativeConversationOnce, /historyScrollAnchor,/);
+  assert.match(loadConversation, /chat\.innerHTML='';\s*const messages=conversation\.messages\|\|\[\];/);
+  assert.doesNotMatch(inlineScript, /addNativeHistoryLoadButton|nativeHistoryLoadEarlier|加载完整记录/);
+  assert.doesNotMatch(uiStyles, /nativeHistoryLoadEarlier/);
 });
 
 test('queue reorder uses a long-press floating row and keeps active sends as boundaries', () => {
@@ -2067,7 +2120,7 @@ test('generation resets reconcile live messages without rebuilding the conversat
   assert.match(syncSource, /let syncMessages=conversation\.messages\|\|\[\]/);
   assert.match(syncSource, /const renderSnapshotImmediately=nativeLiveDocumentHidden\(\)\|\|nativeSnapshotResumeCatchup/);
   assert.match(syncSource, /syncMessages=nativeResetMessagesForIncrementalSync\(conversation\)/);
-  assert.match(syncSource, /if\(!syncMessages\)\{[\s\S]*?await loadConversation\(id,'codex'\);[\s\S]*?return;/);
+  assert.match(syncSource, /if\(!syncMessages\)\{[\s\S]*?await loadConversation\(id,'codex',\{[\s\S]*?historyPageLimit:nativeHistoryPageLimit,[\s\S]*?historyScrollAnchor,[\s\S]*?\}\);[\s\S]*?return;/);
   assert.doesNotMatch(syncSource, /if\(conversation\.status==='running'\)[\s\S]*?loadConversation/);
   assert.match(syncSource, /for\(const msg of syncMessages\)/);
   assert.match(inlineScript, /\['','message','commentary','final_answer'\]\.includes\(kind\)/);
@@ -2085,7 +2138,7 @@ test('rolled-back retry collapse invalidates the open page before appending the 
   const syncSource = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
   assert.ok(syncSource.indexOf('if(conversation.reset)') < syncSource.indexOf('for(const msg of syncMessages)'));
   assert.match(inlineScript, /const staleVisible=[\s\S]*?!sequences\.has\(sequence\)/);
-  assert.match(syncSource, /if\(!syncMessages\)\{[\s\S]*?await loadConversation\(id,'codex'\);[\s\S]*?return;/);
+  assert.match(syncSource, /if\(!syncMessages\)\{[\s\S]*?await loadConversation\(id,'codex',\{[\s\S]*?historyPageLimit:nativeHistoryPageLimit,[\s\S]*?historyScrollAnchor,[\s\S]*?\}\);[\s\S]*?return;/);
 });
 
 test('message action chrome stays hidden until hover or touch selection', () => {
@@ -2636,7 +2689,7 @@ test('conversation load defers bottom alignment until the chat is laid out and p
   const layoutSource = sourceBetween('function chatHasLayout', 'function scrollChatToLatest');
   const alignSource = sourceBetween('function alignChatToBottomStable', 'async function loadConversation');
   const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
-  assert.match(loadConversation, /scrollChatToLatest\(\{force:true\}\);\s*alignChatToBottomStable\(\)/);
+  assert.match(loadConversation, /scrollChatToLatest\(\{force:true\}\);\s*alignChatToBottomStable\(12,seq\)/);
   assert.doesNotMatch(loadConversation, /\[120,320,800\]/);
   let visible = false;
   let height = 0;

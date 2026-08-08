@@ -7,6 +7,105 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { NativeSessionStore } from '../native-sessions.mjs';
 
+test('native session store keeps the complete transcript by default', { timeout: 10000 }, async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-full-history-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019fe1f7-5a25-7bf0-9b0a-6da7c0d4f001';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '08');
+  const sessionFile = path.join(sessionDir, `rollout-2026-08-08T23-10-00-${id}.jsonl`);
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(path.join(codexHome, 'session_index.jsonl'), `${JSON.stringify({
+      id,
+      thread_name: '完整历史测试',
+      updated_at: '2026-08-08T15:10:00Z',
+    })}\n`);
+
+    const records = [{
+      timestamp: '2026-08-08T15:10:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id,
+        timestamp: '2026-08-08T15:10:00.000Z',
+        cwd: '/workspace',
+        originator: 'Codex Desktop',
+        source: 'vscode',
+      },
+    }];
+    for (let index = 0; index < 360; index += 1) {
+      const turnId = `turn-full-${index}`;
+      const stamp = String(index).padStart(3, '0');
+      const timestamp = `2026-08-08T15:10:00.${stamp}Z`;
+      records.push(
+        {
+          timestamp,
+          type: 'turn_context',
+          payload: { turn_id: turnId },
+        },
+        {
+          timestamp,
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: turnId },
+        },
+        {
+          timestamp,
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `history-user-${stamp}` }],
+          },
+        },
+        {
+          timestamp,
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: `history-assistant-${stamp}` }],
+          },
+        },
+        {
+          timestamp,
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: turnId, duration_ms: 1 },
+        },
+      );
+    }
+    await writeFile(sessionFile, jsonl(records));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.equal(store.maxReadBytes, 0);
+    assert.equal(store.maxMessages, 0);
+
+    const conversation = store.get(id);
+    const userMessages = conversation.messages
+      .filter((message) => message.role === 'user')
+      .map((message) => message.content);
+    assert.equal(conversation.truncated, false);
+    assert.ok(conversation.messages.length > 700);
+    assert.equal(userMessages.length, 360);
+    assert.equal(userMessages[0], 'history-user-000');
+    assert.equal(userMessages.at(-1), 'history-user-359');
+
+    const firstPage = store.get(id, { limit: 60, historyPage: true });
+    const secondPage = store.get(id, { limit: 120, historyPage: true });
+    const completePage = store.get(id, { limit: conversation.messages.length + 60, historyPage: true });
+    assert.deepEqual(firstPage.messages, conversation.messages.slice(-60));
+    assert.deepEqual(secondPage.messages, conversation.messages.slice(-120));
+    assert.ok(secondPage.messages[0].seq < firstPage.messages[0].seq);
+    assert.equal(firstPage.hasEarlierMessages, true);
+    assert.equal(secondPage.hasEarlierMessages, true);
+    assert.deepEqual(completePage.messages, conversation.messages);
+    assert.equal(completePage.hasEarlierMessages, false);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('native session store lists, parses, and incrementally follows Codex JSONL', { timeout: 10000 }, async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-sessions-'));
   const codexHome = path.join(temporary, '.codex');

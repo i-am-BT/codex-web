@@ -82,7 +82,7 @@ test('side chat projects tools through the same folded timeline components as th
   const server = fs.readFileSync(path.join(root, 'server.mjs'), 'utf8');
   const css = fs.readFileSync(path.join(root, 'ui.css'), 'utf8');
   const renderStart = server.indexOf('function renderSideChatMessages(messages,context={})');
-  const renderEnd = server.indexOf('async function syncSideChatConversation()', renderStart);
+  const renderEnd = server.indexOf('async function syncSideChatConversation(options={})', renderStart);
   const renderer = server.slice(renderStart, renderEnd);
   const toolStart = server.indexOf('function sideChatAppendToolBatch(');
   const toolEnd = server.indexOf('function sideChatAppendToolMessage(', toolStart);
