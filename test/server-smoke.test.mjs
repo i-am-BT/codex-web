@@ -3358,7 +3358,7 @@ updated_at = 1784422800000
     assert.match(page, /sessionEvents\.addEventListener\('open'/);
     assert.doesNotMatch(page, /NATIVE_INITIAL_MESSAGE_LIMIT/);
     assert.match(page, /const NATIVE_HISTORY_PAGE_SIZE = 60;/);
-    assert.match(page, /const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;/);
+    assert.match(page, /const NATIVE_HISTORY_MANUAL_MAX_BATCHES = 1;/);
     assert.match(page, /const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;/);
     assert.match(page, /const NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES = 2;/);
     assert.match(page, /let nativeHistoryNextPageLimit = NATIVE_HISTORY_PAGE_SIZE;/);
@@ -3367,10 +3367,12 @@ updated_at = 1784422800000
     assert.match(page, /function nativeHistoryNextBatchCount\(growth,growthTarget,loadedBatches,maxBatches\)/);
     assert.match(page, /function historyNodeHasLayout\(node\)/);
     assert.match(page, /const nativeHistoryQuery=currentConversationSource==='codex'\s*\? '\?images=external&history=page&latest=complete&limit='\+nativeHistoryPageLimit\s*:\s*'';/);
-    assert.match(page, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&latest=complete&limit='\+historyLimit\)/);
+    assert.match(page, /const pagingQuery=options\.historyPaging===true\?'&paging=earlier':''/);
+    assert.match(page, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&latest=complete&limit='\+historyLimit\+pagingQuery\)/);
     assert.match(page, /async function loadEarlierNativeHistoryPage\(options=\{\}\)/);
     assert.match(page, /const hintedLimit=normalizeNativeHistoryPageLimit\(nativeHistoryNextPageLimit\)/);
     assert.match(page, /const requestedLimit=fillViewport\?adaptiveLimit:Math\.max\(adaptiveLimit,hintedLimit\)/);
+    assert.match(page, /historyPaging:true/);
     assert.match(page, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\)/);
     assert.match(page, /loadEarlierNativeHistoryPage\(\{fillViewport:true\}\)/);
     assert.match(page, /fillInitialSideChatHistoryPage\(\)/);

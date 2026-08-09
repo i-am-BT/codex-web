@@ -1766,6 +1766,7 @@ test('native histories load upward in real pages without an obstructive history 
   const historyPagingSource = sourceBetween('function normalizeNativeHistoryPageLimit', 'function clearNativeHistoryDeferredSync');
   const loadEarlierNativeHistoryPage = sourceBetween('async function loadEarlierNativeHistoryPage', 'async function loadConversation');
   const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  const renderSideChatMessages = sourceBetween('function renderSideChatMessages', 'async function syncSideChatConversation');
   const syncSideChatConversation = sourceBetween('async function syncSideChatConversation', 'function updateSideChatHeadState');
   const syncCurrentNativeConversationOnce = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
   const nativeScrollTracking = sourceBetween('function bindNativeLiveScrollTracking', 'function captureNativeLiveFollowBottom');
@@ -1781,7 +1782,7 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(inlineScript, /let deferredIconRefreshDepth=0;/);
   assert.match(inlineScript, /function refreshIcons\(root=document\)\{if\(deferredIconRefreshDepth>0\|\|/);
   assert.match(inlineScript, /const NATIVE_HISTORY_PAGE_SIZE = 60;/);
-  assert.match(inlineScript, /const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;/);
+  assert.match(inlineScript, /const NATIVE_HISTORY_MANUAL_MAX_BATCHES = 1;/);
   assert.match(inlineScript, /const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;/);
   assert.match(inlineScript, /const NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES = 2;/);
   assert.match(inlineScript, /let nativeHistoryNextPageLimit = NATIVE_HISTORY_PAGE_SIZE;/);
@@ -1793,6 +1794,8 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(inlineScript, /function historyNodeHasLayout\(node\)/);
   assert.match(inlineScript, /function captureHistoryScrollAnchor\(container\)/);
   assert.match(inlineScript, /function restoreHistoryScrollAnchor\(container,anchor\)/);
+  assert.match(serverSource, /const earlierHistoryPage = req\.query\.history === 'page' && req\.query\.paging === 'earlier';/);
+  assert.match(serverSource, /if \(!earlierHistoryPage\) await reconcileNativeTurnStatusFromAppServer\(conversation\.id, conversation\);/);
   let emptyGrowthBatches=0;
   let emptyGrowthRequests=0;
   while(emptyGrowthBatches<maxPageBatches){
@@ -1818,8 +1821,10 @@ test('native histories load upward in real pages without an obstructive history 
   }
   assert.equal(visualGrowthRequests,2);
   assert.ok(visualGrowth>=675&&visualGrowth<=1350);
-  assert.match(loadConversation, /const deferHistoryIcons=messages\.length>240;[\s\S]*?beginDeferredIconRefresh\(\);[\s\S]*?finally\{[\s\S]*?endDeferredIconRefresh\(chat\)/);
+  assert.match(loadConversation, /const deferHistoryIcons=Boolean\(options\.historyScrollAnchor\)\|\|messages\.length>=NATIVE_HISTORY_PAGE_SIZE;[\s\S]*?beginDeferredIconRefresh\(\);[\s\S]*?finally\{[\s\S]*?endDeferredIconRefresh\(chat\)/);
   assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external&history=page&latest=complete&limit='\+nativeHistoryPageLimit/);
+  assert.match(loadConversation, /const nativeHistoryPagingQuery=currentConversationSource==='codex'&&options\.historyPaging===true\?'&paging=earlier':''/);
+  assert.match(loadConversation, /const requestUrl=endpoint\+encodeURIComponent\(id\)\+nativeHistoryQuery\+nativeHistoryPagingQuery/);
   assert.match(loadEarlierNativeHistoryPage, /const batchCount=nativeHistoryNextBatchCount\(growth,growthTarget,loadedBatches,maxBatches\)/);
   assert.match(loadEarlierNativeHistoryPage, /if\(!batchCount\)break/);
   assert.match(loadEarlierNativeHistoryPage, /const adaptiveLimit=lastSuccessfulLimit\+NATIVE_HISTORY_PAGE_SIZE\*batchCount/);
@@ -1827,9 +1832,10 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(loadEarlierNativeHistoryPage, /const requestedLimit=fillViewport\?adaptiveLimit:Math\.max\(adaptiveLimit,hintedLimit\)/);
   assert.match(loadEarlierNativeHistoryPage, /loadedBatches\+=fillViewport\?requestedBatches:1/);
   assert.match(loadEarlierNativeHistoryPage, /historyScrollAnchor:anchor/);
+  assert.match(loadEarlierNativeHistoryPage, /historyPaging:true/);
   assert.match(loadEarlierNativeHistoryPage, /const preserveFollowBottom=fillViewport&&!nativeLiveReadingHistory&&nativeLiveFollowBottom/);
   assert.match(loadEarlierNativeHistoryPage, /preserveHistoryFollowBottom:preserveFollowBottom/);
-  assert.match(loadEarlierNativeHistoryPage, /fillViewport\?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_PAGE_MAX_BATCHES/);
+  assert.match(loadEarlierNativeHistoryPage, /fillViewport\?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_MANUAL_MAX_BATCHES/);
   assert.match(loadEarlierNativeHistoryPage, /nativeHistorySyncDeferred=true/);
   assert.match(loadEarlierNativeHistoryPage, /clearNativeHistoryDeferredSync\(\)/);
   assert.match(loadEarlierNativeHistoryPage, /if\(sameConversation&&syncDeferred\)scheduleDeferredNativeHistorySync\(id\)/);
@@ -1840,15 +1846,20 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(loadConversation, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);\s*if\(preserveHistoryFollowBottom\)resumeNativeLiveFollowBottom\(\);\s*else setNativeLiveReadingHistory\(true\)/);
   assert.match(loadConversation, /loadEarlierNativeHistoryPage\(\{fillViewport:true\}\)/);
   assert.match(nativeScrollTracking, /addEventListener\('wheel'[\s\S]*?event\.deltaY<0/);
-  assert.match(nativeScrollTracking, /addEventListener\('touchmove'[\s\S]*?const step=currentY-historyTouchLastY;[\s\S]*?currentY-historyTouchStartY>=28/);
-  assert.match(syncSideChatConversation, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&latest=complete&limit='\+historyLimit\)/);
+  assert.match(nativeScrollTracking, /let historyTouchPageTriggered=false;[\s\S]*?addEventListener\('touchmove'[\s\S]*?!historyTouchPageTriggered[\s\S]*?currentY-historyTouchStartY>=28[\s\S]*?historyTouchPageTriggered=true/);
+  assert.match(nativeScrollTracking, /addEventListener\('touchend',resetHistoryTouch/);
+  assert.match(nativeScrollTracking, /addEventListener\('touchcancel',resetHistoryTouch/);
+  assert.match(syncSideChatConversation, /const pagingQuery=options\.historyPaging===true\?'&paging=earlier':''/);
+  assert.match(syncSideChatConversation, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&latest=complete&limit='\+historyLimit\+pagingQuery\)/);
+  assert.match(renderSideChatMessages, /const deferIcons=Boolean\(context\.historyScrollAnchor\)\|\|list\.length>=NATIVE_HISTORY_PAGE_SIZE/);
   assert.match(syncSideChatConversation, /tab\.historyNextLimit=normalizeNativeHistoryPageLimit/);
+  assert.match(syncSideChatConversation, /fillViewport\?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_MANUAL_MAX_BATCHES/);
   assert.match(syncSideChatConversation, /const batchCount=nativeHistoryNextBatchCount\(growth,growthTarget,loadedBatches,maxBatches\)/);
   assert.match(syncSideChatConversation, /if\(!batchCount\)break/);
   assert.match(syncSideChatConversation, /const hintedLimit=normalizeNativeHistoryPageLimit\(tab\.historyNextLimit\)/);
   assert.match(syncSideChatConversation, /tab\.historyLimit=requestedLimit/);
   assert.match(syncSideChatConversation, /loadedBatches\+=fillViewport\?requestedBatches:1/);
-  assert.match(syncSideChatConversation, /historyScrollAnchor:anchor,followBottom:false/);
+  assert.match(syncSideChatConversation, /historyScrollAnchor:anchor,followBottom:false,historyPaging:true/);
   assert.match(syncSideChatConversation, /fillInitialSideChatHistoryPage\(\)/);
   assert.match(syncCurrentNativeConversationOnce, /'\?images=external&history=page&latest=complete&limit='\+nativeHistoryPageLimit\+'&after='\+nativeCursor\+'&generation='\+nativeGeneration/);
   assert.match(syncCurrentNativeConversationOnce, /if\(deferNativeSyncForHistoryPage\(\)\)return/);
@@ -1860,6 +1871,69 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(loadConversation, /Number\(conversation\.nextHistoryPageLimit\)\|\|0/);
   assert.doesNotMatch(inlineScript, /addNativeHistoryLoadButton|nativeHistoryLoadEarlier|加载完整记录/);
   assert.doesNotMatch(uiStyles, /nativeHistoryLoadEarlier/);
+});
+
+test('history anchor restoration completes in frames and yields to user scrolling', async () => {
+  const anchorSource = sourceBetween('function historyNodeHasLayout', 'function upsertSideChatTab');
+  const frames = [];
+  let scrollTop = 0;
+  let nodeTop = 900;
+  const node = {
+    dataset: { nativeMessageSeq: '42' },
+    getClientRects: () => [{}],
+    getBoundingClientRect: () => ({
+      top: nodeTop - scrollTop,
+      bottom: nodeTop - scrollTop + 40,
+      width: 100,
+      height: 40,
+    }),
+  };
+  const container = {
+    isConnected: true,
+    scrollHeight: 1600,
+    querySelectorAll: () => [node],
+    getBoundingClientRect: () => ({ top: 0, bottom: 600 }),
+  };
+  Object.defineProperty(container, 'scrollTop', {
+    get: () => scrollTop,
+    set: (value) => { scrollTop = Number(value); },
+  });
+  const restoreHistoryScrollAnchor = new Function(
+    'requestAnimationFrame',
+    `${anchorSource}; return restoreHistoryScrollAnchor;`,
+  )((callback) => {
+    frames.push(callback);
+    return frames.length;
+  });
+
+  const settled = restoreHistoryScrollAnchor(container, {
+    sequence: 42,
+    offset: 100,
+    scrollTop: 0,
+    scrollHeight: 800,
+  });
+  assert.equal(scrollTop, 800);
+  nodeTop = 920;
+  frames.shift()();
+  assert.equal(scrollTop, 820);
+  frames.shift()();
+  await settled;
+  assert.equal(scrollTop, 820);
+
+  nodeTop = 980;
+  const userControlled = restoreHistoryScrollAnchor(container, {
+    sequence: 42,
+    offset: 100,
+    scrollTop,
+    scrollHeight: 1600,
+  });
+  assert.equal(scrollTop, 880);
+  scrollTop = 840;
+  frames.shift()();
+  await userControlled;
+  assert.equal(scrollTop, 840);
+  assert.equal(frames.length, 0);
+  assert.doesNotMatch(anchorSource, /setTimeout/);
 });
 
 test('deferred native history sync clears its pending state before catch-up', () => {

@@ -1134,6 +1134,7 @@ app.get('/api/native-sessions/:id', requireAuth, async (req, res) => {
   try {
     const limit = positiveInteger(req.query.limit);
     const externalizeImages = Boolean(limit) || req.query.images === 'external';
+    const earlierHistoryPage = req.query.history === 'page' && req.query.paging === 'earlier';
     const conversation = nativeSessions.get(cleanNativeThreadId(req.params.id), {
       after: req.query.after,
       generation: req.query.generation,
@@ -1142,7 +1143,7 @@ app.get('/api/native-sessions/:id', requireAuth, async (req, res) => {
       completeLatestTurn: req.query.latest === 'complete',
     });
     if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
-    await reconcileNativeTurnStatusFromAppServer(conversation.id, conversation);
+    if (!earlierHistoryPage) await reconcileNativeTurnStatusFromAppServer(conversation.id, conversation);
     requestDesktopThreadSnapshot(conversation.id);
     res.json({ conversation: decorateNativeConversation(conversation, { externalizeImages }) });
   } catch (err) {
@@ -8572,7 +8573,7 @@ let nativeCursor = 0;
 let nativeGeneration = 0;
 const NATIVE_HISTORY_PAGE_SIZE = 60;
 const NATIVE_HISTORY_SCROLL_THRESHOLD = 96;
-const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;
+const NATIVE_HISTORY_MANUAL_MAX_BATCHES = 1;
 const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;
 const NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES = 2;
 const NATIVE_HISTORY_PAGE_OVERFLOW = 24;
@@ -9923,24 +9924,32 @@ function captureHistoryScrollAnchor(container){
 }
 function restoreHistoryScrollAnchor(container,anchor){
   if(!container||!anchor)return Promise.resolve();
+  let appliedScrollTop=Number(container.scrollTop)||0;
+  let userMoved=false;
   const align=()=>{
+    if(userMoved||container.isConnected===false)return false;
+    const currentScrollTop=Number(container.scrollTop)||0;
+    if(Math.abs(currentScrollTop-appliedScrollTop)>2){
+      userMoved=true;
+      return false;
+    }
     const node=historySequenceNode(container,anchor.sequence);
     if(node){
       const offset=node.getBoundingClientRect().top-container.getBoundingClientRect().top;
       const delta=offset-Number(anchor.offset||0);
       if(Number.isFinite(delta)&&Math.abs(delta)>0.5)container.scrollTop+=delta;
-      return;
+    }else{
+      const delta=container.scrollHeight-Number(anchor.scrollHeight||0);
+      container.scrollTop=Math.max(0,Number(anchor.scrollTop||0)+delta);
     }
-    const delta=container.scrollHeight-Number(anchor.scrollHeight||0);
-    container.scrollTop=Math.max(0,Number(anchor.scrollTop||0)+delta);
+    appliedScrollTop=Number(container.scrollTop)||0;
+    return true;
   };
+  align();
   return new Promise((resolve)=>{
     requestAnimationFrame(()=>{
-      align();
-      requestAnimationFrame(align);
-      setTimeout(align,80);
-      setTimeout(align,180);
-      setTimeout(()=>{align();resolve()},320);
+      if(!align()){resolve();return}
+      requestAnimationFrame(()=>{align();resolve()});
     });
   });
 }
@@ -10128,15 +10137,24 @@ function ensureSideChatPane(){
     if(event.deltaY<0&&sideChatMessages.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD)void loadEarlierSideChatHistoryPage();
   },{passive:true});
   let sideChatHistoryTouchStartY=0;
+  let sideChatHistoryTouchPageTriggered=false;
   sideChatMessages.addEventListener('touchstart',(event)=>{
     sideChatHistoryTouchStartY=Number(event.touches?.[0]?.clientY)||0;
+    sideChatHistoryTouchPageTriggered=false;
   },{passive:true});
   sideChatMessages.addEventListener('touchmove',(event)=>{
     const currentY=Number(event.touches?.[0]?.clientY)||0;
-    if(currentY-sideChatHistoryTouchStartY<28||sideChatMessages.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD)return;
-    sideChatHistoryTouchStartY=currentY;
+    if(
+      sideChatHistoryTouchPageTriggered
+      ||currentY-sideChatHistoryTouchStartY<28
+      ||sideChatMessages.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD
+    )return;
+    sideChatHistoryTouchPageTriggered=true;
     void loadEarlierSideChatHistoryPage();
   },{passive:true});
+  const resetSideChatHistoryTouch=()=>{sideChatHistoryTouchPageTriggered=false};
+  sideChatMessages.addEventListener('touchend',resetSideChatHistoryTouch,{passive:true});
+  sideChatMessages.addEventListener('touchcancel',resetSideChatHistoryTouch,{passive:true});
   const foot=document.createElement('form');
   foot.className='sideChatComposer';
   foot.addEventListener('submit',(event)=>{
@@ -10484,7 +10502,7 @@ function renderSideChatMessages(messages,context={}){
   };
   const savedAnnotations=responseAnnotationsByTurn;
   responseAnnotationsByTurn=new Map();
-  const deferIcons=list.length>240;
+  const deferIcons=Boolean(context.historyScrollAnchor)||list.length>=NATIVE_HISTORY_PAGE_SIZE;
   if(deferIcons)beginDeferredIconRefresh();
   let state=null;
   let latestUser=null;
@@ -10629,7 +10647,8 @@ async function syncSideChatConversation(options={}){
     : true;
   const historyScrollAnchor=options.historyScrollAnchor||(!followBottom?captureHistoryScrollAnchor(sideChatMessages):null);
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external&history=page&latest=complete&limit='+historyLimit);
+    const pagingQuery=options.historyPaging===true?'&paging=earlier':'';
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external&history=page&latest=complete&limit='+historyLimit+pagingQuery);
     const data=await res.json().catch(()=>({}));
     if(!res.ok)throw new Error(data.error||'Side chat 同步失败');
     if(sideChatThreadId!==syncId)return;
@@ -10711,7 +10730,7 @@ async function loadEarlierSideChatHistoryPage(options={}){
   let lastSuccessfulLimit=previousLimit;
   let loadedAny=false;
   let loadedBatches=0;
-  const maxBatches=fillViewport?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_PAGE_MAX_BATCHES;
+  const maxBatches=fillViewport?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_MANUAL_MAX_BATCHES;
   tab.historyLoading=true;
   sideChatMessages.setAttribute('aria-busy','true');
   try{
@@ -10728,7 +10747,7 @@ async function loadEarlierSideChatHistoryPage(options={}){
         Math.ceil((requestedLimit-lastSuccessfulLimit)/NATIVE_HISTORY_PAGE_SIZE),
       );
       tab.historyLimit=requestedLimit;
-      const loaded=await syncSideChatConversation({historyScrollAnchor:anchor,followBottom:false});
+      const loaded=await syncSideChatConversation({historyScrollAnchor:anchor,followBottom:false,historyPaging:true});
       if(!loaded)break;
       loadedAny=true;
       loadedBatches+=fillViewport?requestedBatches:1;
@@ -18060,7 +18079,7 @@ async function loadEarlierNativeHistoryPage(options={}){
   let lastSuccessfulLimit=previousLimit;
   let loadedAny=false;
   let loadedBatches=0;
-  const maxBatches=fillViewport?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_PAGE_MAX_BATCHES;
+  const maxBatches=fillViewport?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_MANUAL_MAX_BATCHES;
   nativeHistoryPageLoading=true;
   nativeHistoryLoadReady=false;
   nativeHistorySyncDeferred=true;
@@ -18087,6 +18106,7 @@ async function loadEarlierNativeHistoryPage(options={}){
       const loaded=await loadConversation(id,'codex',{
         historyPageLimit:requestedLimit,
         historyScrollAnchor:anchor,
+        historyPaging:true,
         preserveHistoryFollowBottom:preserveFollowBottom,
         skipPromptQueueSync:true,
       });
@@ -18174,7 +18194,8 @@ async function loadConversation(id,source='web',options={}){
     const nativeHistoryQuery=currentConversationSource==='codex'
       ? '?images=external&history=page&latest=complete&limit='+nativeHistoryPageLimit
       : '';
-    const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery;
+    const nativeHistoryPagingQuery=currentConversationSource==='codex'&&options.historyPaging===true?'&paging=earlier':'';
+    const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery+nativeHistoryPagingQuery;
     const res=await fetch(requestUrl);
     if(seq!==conversationLoadSeq)return false;
     if(!res.ok){statusEl.textContent='加载失败';return false}
@@ -18222,7 +18243,7 @@ async function loadConversation(id,source='web',options={}){
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
   const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
   beginTurnProcessCollection();
-  const deferHistoryIcons=messages.length>240;
+  const deferHistoryIcons=Boolean(options.historyScrollAnchor)||messages.length>=NATIVE_HISTORY_PAGE_SIZE;
   if(deferHistoryIcons)beginDeferredIconRefresh();
   try{
     messages.forEach((msg,index)=>{
@@ -22492,9 +22513,11 @@ function bindNativeLiveScrollTracking(){
   },{passive:true});
   let historyTouchStartY=0;
   let historyTouchLastY=0;
+  let historyTouchPageTriggered=false;
   chat.addEventListener('touchstart',(event)=>{
     historyTouchStartY=Number(event.touches?.[0]?.clientY)||0;
     historyTouchLastY=historyTouchStartY;
+    historyTouchPageTriggered=false;
   },{passive:true});
   chat.addEventListener('touchmove',(event)=>{
     const currentY=Number(event.touches?.[0]?.clientY)||0;
@@ -22503,8 +22526,12 @@ function bindNativeLiveScrollTracking(){
     historyTouchLastY=currentY;
     if(step>0){
       setNativeLiveReadingHistory(true);
-      if(currentY-historyTouchStartY>=28&&chat.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD){
-        historyTouchStartY=currentY;
+      if(
+        !historyTouchPageTriggered
+        &&currentY-historyTouchStartY>=28
+        &&chat.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD
+      ){
+        historyTouchPageTriggered=true;
         loadEarlierFromTop();
       }
     }else{
@@ -22512,6 +22539,9 @@ function bindNativeLiveScrollTracking(){
       markNativeLiveTowardLatestIntent();
     }
   },{passive:true});
+  const resetHistoryTouch=()=>{historyTouchPageTriggered=false};
+  chat.addEventListener('touchend',resetHistoryTouch,{passive:true});
+  chat.addEventListener('touchcancel',resetHistoryTouch,{passive:true});
 }
 function captureNativeLiveFollowBottom(){
   bindNativeLiveScrollTracking();
