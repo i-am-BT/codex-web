@@ -1763,27 +1763,69 @@ test('Codex App queue entries keep their message ownership while Web can persist
 });
 
 test('native histories load upward in real pages without an obstructive history control', () => {
+  const historyPagingSource = sourceBetween('function normalizeNativeHistoryPageLimit', 'function clearNativeHistoryDeferredSync');
   const loadEarlierNativeHistoryPage = sourceBetween('async function loadEarlierNativeHistoryPage', 'async function loadConversation');
   const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
   const syncSideChatConversation = sourceBetween('async function syncSideChatConversation', 'function updateSideChatHeadState');
   const syncCurrentNativeConversationOnce = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
   const nativeScrollTracking = sourceBetween('function bindNativeLiveScrollTracking', 'function captureNativeLiveFollowBottom');
+  const { nativeHistoryNextBatchCount } = new Function(`
+    const NATIVE_HISTORY_PAGE_SIZE=60;
+    const NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES=2;
+    const NATIVE_HISTORY_PAGE_OVERFLOW=24;
+    ${historyPagingSource}
+    return { nativeHistoryNextBatchCount };
+  `)();
+  const maxPageBatches=12;
 
   assert.match(inlineScript, /let deferredIconRefreshDepth=0;/);
   assert.match(inlineScript, /function refreshIcons\(root=document\)\{if\(deferredIconRefreshDepth>0\|\|/);
   assert.match(inlineScript, /const NATIVE_HISTORY_PAGE_SIZE = 60;/);
   assert.match(inlineScript, /const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;/);
   assert.match(inlineScript, /const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;/);
+  assert.match(inlineScript, /const NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES = 2;/);
+  assert.match(inlineScript, /let nativeHistoryNextPageLimit = NATIVE_HISTORY_PAGE_SIZE;/);
   assert.match(inlineScript, /function nativeHistoryViewportFilled\(container\)/);
   assert.match(inlineScript, /function nativeHistoryPageGrowthTarget\(container\)/);
-  assert.doesNotMatch(inlineScript, /function nativeHistoryNextBatchCount\(/);
+  assert.match(inlineScript, /Math\.min\(height,1200\)\*0\.75/);
+  assert.match(inlineScript, /function nativeHistoryPageGrowthGoal\(container,initialHeight,fillViewport\)/);
+  assert.match(inlineScript, /function nativeHistoryNextBatchCount\(growth,growthTarget,loadedBatches,maxBatches\)/);
   assert.match(inlineScript, /function historyNodeHasLayout\(node\)/);
   assert.match(inlineScript, /function captureHistoryScrollAnchor\(container\)/);
   assert.match(inlineScript, /function restoreHistoryScrollAnchor\(container,anchor\)/);
+  let emptyGrowthBatches=0;
+  let emptyGrowthRequests=0;
+  while(emptyGrowthBatches<maxPageBatches){
+    const batchCount=nativeHistoryNextBatchCount(0,675,emptyGrowthBatches,maxPageBatches);
+    assert.ok(batchCount>=1&&batchCount<=2);
+    emptyGrowthBatches+=batchCount;
+    emptyGrowthRequests+=1;
+  }
+  assert.equal(emptyGrowthRequests,7);
+  let visualGrowth=0;
+  let visualGrowthBatches=0;
+  let visualGrowthRequests=0;
+  while(visualGrowth<675&&visualGrowthBatches<maxPageBatches){
+    const batchCount=nativeHistoryNextBatchCount(
+      visualGrowth,
+      675,
+      visualGrowthBatches,
+      maxPageBatches,
+    );
+    visualGrowthBatches+=batchCount;
+    visualGrowth+=350*batchCount;
+    visualGrowthRequests+=1;
+  }
+  assert.equal(visualGrowthRequests,2);
+  assert.ok(visualGrowth>=675&&visualGrowth<=1350);
   assert.match(loadConversation, /const deferHistoryIcons=messages\.length>240;[\s\S]*?beginDeferredIconRefresh\(\);[\s\S]*?finally\{[\s\S]*?endDeferredIconRefresh\(chat\)/);
-  assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external&history=page&limit='\+nativeHistoryPageLimit/);
-  assert.match(loadEarlierNativeHistoryPage, /const requestedLimit=lastSuccessfulLimit\+NATIVE_HISTORY_PAGE_SIZE\*batchCount/);
-  assert.match(loadEarlierNativeHistoryPage, /const batchCount=1/);
+  assert.match(loadConversation, /const nativeHistoryQuery=currentConversationSource==='codex'[\s\S]*?'\?images=external&history=page&latest=complete&limit='\+nativeHistoryPageLimit/);
+  assert.match(loadEarlierNativeHistoryPage, /const batchCount=nativeHistoryNextBatchCount\(growth,growthTarget,loadedBatches,maxBatches\)/);
+  assert.match(loadEarlierNativeHistoryPage, /if\(!batchCount\)break/);
+  assert.match(loadEarlierNativeHistoryPage, /const adaptiveLimit=lastSuccessfulLimit\+NATIVE_HISTORY_PAGE_SIZE\*batchCount/);
+  assert.match(loadEarlierNativeHistoryPage, /const hintedLimit=normalizeNativeHistoryPageLimit\(nativeHistoryNextPageLimit\)/);
+  assert.match(loadEarlierNativeHistoryPage, /const requestedLimit=fillViewport\?adaptiveLimit:Math\.max\(adaptiveLimit,hintedLimit\)/);
+  assert.match(loadEarlierNativeHistoryPage, /loadedBatches\+=fillViewport\?requestedBatches:1/);
   assert.match(loadEarlierNativeHistoryPage, /historyScrollAnchor:anchor/);
   assert.match(loadEarlierNativeHistoryPage, /const preserveFollowBottom=fillViewport&&!nativeLiveReadingHistory&&nativeLiveFollowBottom/);
   assert.match(loadEarlierNativeHistoryPage, /preserveHistoryFollowBottom:preserveFollowBottom/);
@@ -1799,19 +1841,62 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(loadConversation, /loadEarlierNativeHistoryPage\(\{fillViewport:true\}\)/);
   assert.match(nativeScrollTracking, /addEventListener\('wheel'[\s\S]*?event\.deltaY<0/);
   assert.match(nativeScrollTracking, /addEventListener\('touchmove'[\s\S]*?const step=currentY-historyTouchLastY;[\s\S]*?currentY-historyTouchStartY>=28/);
-  assert.match(syncSideChatConversation, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&limit='\+historyLimit\)/);
-  assert.match(syncSideChatConversation, /tab\.historyLimit=lastSuccessfulLimit\+NATIVE_HISTORY_PAGE_SIZE\*batchCount/);
-  assert.match(syncSideChatConversation, /const batchCount=1/);
+  assert.match(syncSideChatConversation, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&latest=complete&limit='\+historyLimit\)/);
+  assert.match(syncSideChatConversation, /tab\.historyNextLimit=normalizeNativeHistoryPageLimit/);
+  assert.match(syncSideChatConversation, /const batchCount=nativeHistoryNextBatchCount\(growth,growthTarget,loadedBatches,maxBatches\)/);
+  assert.match(syncSideChatConversation, /if\(!batchCount\)break/);
+  assert.match(syncSideChatConversation, /const hintedLimit=normalizeNativeHistoryPageLimit\(tab\.historyNextLimit\)/);
+  assert.match(syncSideChatConversation, /tab\.historyLimit=requestedLimit/);
+  assert.match(syncSideChatConversation, /loadedBatches\+=fillViewport\?requestedBatches:1/);
   assert.match(syncSideChatConversation, /historyScrollAnchor:anchor,followBottom:false/);
   assert.match(syncSideChatConversation, /fillInitialSideChatHistoryPage\(\)/);
-  assert.match(syncCurrentNativeConversationOnce, /'\?images=external&history=page&limit='\+nativeHistoryPageLimit\+'&after='\+nativeCursor\+'&generation='\+nativeGeneration/);
+  assert.match(syncCurrentNativeConversationOnce, /'\?images=external&history=page&latest=complete&limit='\+nativeHistoryPageLimit\+'&after='\+nativeCursor\+'&generation='\+nativeGeneration/);
   assert.match(syncCurrentNativeConversationOnce, /if\(deferNativeSyncForHistoryPage\(\)\)return/);
+  assert.match(syncCurrentNativeConversationOnce, /nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit\(Math\.max/);
   assert.match(syncCurrentNativeConversationOnce, /historyPageLimit:nativeHistoryPageLimit/);
   assert.match(syncCurrentNativeConversationOnce, /nativeLiveFollowBottom&&nativeLiveNearBottom\(\)\?null:captureHistoryScrollAnchor\(chat\)/);
   assert.match(syncCurrentNativeConversationOnce, /historyScrollAnchor,/);
   assert.match(loadConversation, /chat\.innerHTML='';\s*const messages=conversation\.messages\|\|\[\];/);
+  assert.match(loadConversation, /Number\(conversation\.nextHistoryPageLimit\)\|\|0/);
   assert.doesNotMatch(inlineScript, /addNativeHistoryLoadButton|nativeHistoryLoadEarlier|加载完整记录/);
   assert.doesNotMatch(uiStyles, /nativeHistoryLoadEarlier/);
+});
+
+test('deferred native history sync clears its pending state before catch-up', () => {
+  const deferredSource = sourceBetween('function clearNativeHistoryDeferredSync', 'function historyNodeHasLayout');
+  const deferred = new Function(`
+    let nativeHistoryDeferredSyncTimer=null;
+    let nativeHistorySyncDeferred=true;
+    let nativeHistoryPageLoading=false;
+    let currentConversationSource='codex';
+    let currentConversationId='thread-1';
+    let syncCalls=0;
+    const callbacks=[];
+    const clearTimeout=()=>{};
+    const setTimeout=(callback)=>{callbacks.push(callback);return callbacks.length};
+    const syncCurrentNativeConversation=()=>{syncCalls+=1};
+    ${deferredSource}
+    return {
+      scheduleDeferredNativeHistorySync,
+      runNext:()=>callbacks.shift()?.(),
+      setLoading:(value)=>{nativeHistoryPageLoading=Boolean(value)},
+      state:()=>({deferred:nativeHistorySyncDeferred,syncCalls}),
+    };
+  `)();
+
+  deferred.scheduleDeferredNativeHistorySync('thread-1');
+  deferred.runNext();
+  assert.deepEqual(deferred.state(),{deferred:false,syncCalls:1});
+
+  deferred.setLoading(true);
+  deferred.scheduleDeferredNativeHistorySync('thread-1');
+  deferred.runNext();
+  assert.deepEqual(deferred.state(),{deferred:true,syncCalls:1});
+
+  deferred.setLoading(false);
+  deferred.scheduleDeferredNativeHistorySync('thread-1');
+  deferred.runNext();
+  assert.deepEqual(deferred.state(),{deferred:false,syncCalls:2});
 });
 
 test('queue reorder uses a long-press floating row and keeps active sends as boundaries', () => {

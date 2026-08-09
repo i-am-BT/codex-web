@@ -73,6 +73,32 @@ test('native session store keeps the complete transcript by default', { timeout:
           payload: { type: 'task_complete', turn_id: turnId, duration_ms: 1 },
         },
       );
+      if (index === 359) {
+        for (let toolIndex = 0; toolIndex < 150; toolIndex += 1) {
+          const callId = `history-tool-${toolIndex}`;
+          records.push(
+            {
+              timestamp,
+              type: 'response_item',
+              payload: {
+                type: 'function_call',
+                call_id: callId,
+                name: 'exec_command',
+                arguments: '{}',
+              },
+            },
+            {
+              timestamp,
+              type: 'response_item',
+              payload: {
+                type: 'function_call_output',
+                call_id: callId,
+                output: `history-tool-output-${toolIndex}`,
+              },
+            },
+          );
+        }
+      }
     }
     await writeFile(sessionFile, jsonl(records));
 
@@ -92,14 +118,31 @@ test('native session store keeps the complete transcript by default', { timeout:
 
     const firstPage = store.get(id, { limit: 60, historyPage: true });
     const secondPage = store.get(id, { limit: 120, historyPage: true });
+    const completeLatestTurnPage = store.get(id, {
+      limit: 60,
+      historyPage: true,
+      completeLatestTurn: true,
+    });
     const completePage = store.get(id, { limit: conversation.messages.length + 60, historyPage: true });
     assert.deepEqual(firstPage.messages, conversation.messages.slice(-60));
     assert.deepEqual(secondPage.messages, conversation.messages.slice(-120));
     assert.ok(secondPage.messages[0].seq < firstPage.messages[0].seq);
+    assert.equal(firstPage.historyPageLimit, 60);
+    assert.ok(completeLatestTurnPage.historyPageLimit > 300);
+    assert.equal(completeLatestTurnPage.messages[0].turnId, 'turn-full-359');
+    assert.ok(completeLatestTurnPage.nextHistoryPageLimit > completeLatestTurnPage.historyPageLimit);
+    const hintedPage = store.get(id, {
+      limit: completeLatestTurnPage.nextHistoryPageLimit,
+      historyPage: true,
+      completeLatestTurn: true,
+    });
+    assert.ok(new Set(hintedPage.messages.map((message) => message.turnId).filter(Boolean)).size >= 3);
     assert.equal(firstPage.hasEarlierMessages, true);
     assert.equal(secondPage.hasEarlierMessages, true);
     assert.deepEqual(completePage.messages, conversation.messages);
     assert.equal(completePage.hasEarlierMessages, false);
+    assert.equal(completePage.historyPageLimit, conversation.messages.length);
+    assert.equal(completePage.nextHistoryPageLimit, conversation.messages.length);
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });

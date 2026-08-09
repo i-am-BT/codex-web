@@ -3360,20 +3360,26 @@ updated_at = 1784422800000
     assert.match(page, /const NATIVE_HISTORY_PAGE_SIZE = 60;/);
     assert.match(page, /const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;/);
     assert.match(page, /const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;/);
+    assert.match(page, /const NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES = 2;/);
+    assert.match(page, /let nativeHistoryNextPageLimit = NATIVE_HISTORY_PAGE_SIZE;/);
     assert.match(page, /function nativeHistoryViewportFilled\(container\)/);
+    assert.match(page, /function nativeHistoryPageGrowthGoal\(container,initialHeight,fillViewport\)/);
+    assert.match(page, /function nativeHistoryNextBatchCount\(growth,growthTarget,loadedBatches,maxBatches\)/);
     assert.match(page, /function historyNodeHasLayout\(node\)/);
-    assert.match(page, /const nativeHistoryQuery=currentConversationSource==='codex'\s*\? '\?images=external&history=page&limit='\+nativeHistoryPageLimit\s*:\s*'';/);
-    assert.match(page, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&limit='\+historyLimit\)/);
+    assert.match(page, /const nativeHistoryQuery=currentConversationSource==='codex'\s*\? '\?images=external&history=page&latest=complete&limit='\+nativeHistoryPageLimit\s*:\s*'';/);
+    assert.match(page, /fetch\('\/api\/native-sessions\/'\+encodeURIComponent\(syncId\)\+'\?images=external&history=page&latest=complete&limit='\+historyLimit\)/);
     assert.match(page, /async function loadEarlierNativeHistoryPage\(options=\{\}\)/);
-    assert.match(page, /const requestedLimit=lastSuccessfulLimit\+NATIVE_HISTORY_PAGE_SIZE\*batchCount/);
+    assert.match(page, /const hintedLimit=normalizeNativeHistoryPageLimit\(nativeHistoryNextPageLimit\)/);
+    assert.match(page, /const requestedLimit=fillViewport\?adaptiveLimit:Math\.max\(adaptiveLimit,hintedLimit\)/);
     assert.match(page, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\)/);
     assert.match(page, /loadEarlierNativeHistoryPage\(\{fillViewport:true\}\)/);
     assert.match(page, /fillInitialSideChatHistoryPage\(\)/);
     assert.match(page, /function scheduleDeferredNativeHistorySync\(threadId\)/);
+    assert.match(page, /nativeHistoryDeferredSyncTimer=null;\s*nativeHistorySyncDeferred=false;\s*if\(currentConversationSource!=='codex'/);
     assert.match(page, /if\(deferNativeSyncForHistoryPage\(\)\)return/);
     assert.match(page, /if\(sameConversation&&syncDeferred\)scheduleDeferredNativeHistorySync\(id\)/);
     assert.match(page, /historyPageLimit:nativeHistoryPageLimit,\s*historyScrollAnchor,/);
-    assert.match(page, /const url='\/api\/native-sessions\/'\+encodeURIComponent\(id\)\+'\?images=external&history=page&limit='\+nativeHistoryPageLimit\+'&after='\+nativeCursor\+'&generation='\+nativeGeneration;/);
+    assert.match(page, /const url='\/api\/native-sessions\/'\+encodeURIComponent\(id\)\+'\?images=external&history=page&latest=complete&limit='\+nativeHistoryPageLimit\+'&after='\+nativeCursor\+'&generation='\+nativeGeneration;/);
     assert.doesNotMatch(page, /addNativeHistoryLoadButton|nativeHistoryLoadEarlier/);
     assert.doesNotMatch(page, /fastNativeLoad/);
     assert.doesNotMatch(page, /加载完整记录/);
@@ -3652,7 +3658,7 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*if\(deferNativeSyncForHistoryPage\(\)\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit\(Math\.max\([\s\S]*?Number\(conversation\.nextHistoryPageLimit\)\|\|0,[\s\S]*?\)\);\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*if\(deferNativeSyncForHistoryPage\(\)\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);
@@ -5646,6 +5652,8 @@ updated_at = 1784422800000
       nativeConversation.messages.slice(-3).map((message) => message.seq),
     );
     assert.equal(historyPageNativeConversation.hasEarlierMessages, true);
+    assert.equal(historyPageNativeConversation.historyPageLimit, 3);
+    assert.ok(historyPageNativeConversation.nextHistoryPageLimit > 3);
 
     const externalizedNativeSession = await fetch(
       `${baseUrl}/api/native-sessions/${nativeSessionId}?images=external`,

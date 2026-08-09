@@ -1139,6 +1139,7 @@ app.get('/api/native-sessions/:id', requireAuth, async (req, res) => {
       generation: req.query.generation,
       limit,
       historyPage: req.query.history === 'page',
+      completeLatestTurn: req.query.latest === 'complete',
     });
     if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
     await reconcileNativeTurnStatusFromAppServer(conversation.id, conversation);
@@ -8573,6 +8574,7 @@ const NATIVE_HISTORY_PAGE_SIZE = 60;
 const NATIVE_HISTORY_SCROLL_THRESHOLD = 96;
 const NATIVE_HISTORY_PAGE_MAX_BATCHES = 12;
 const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;
+const NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES = 2;
 const NATIVE_HISTORY_PAGE_OVERFLOW = 24;
 let nativeHistoryPageLimit = NATIVE_HISTORY_PAGE_SIZE;
 let nativeHistoryHasEarlierMessages = false;
@@ -8580,6 +8582,7 @@ let nativeHistoryPageLoading = false;
 let nativeHistoryLoadReady = false;
 let nativeHistorySyncDeferred = false;
 let nativeHistoryDeferredSyncTimer = null;
+let nativeHistoryNextPageLimit = NATIVE_HISTORY_PAGE_SIZE;
 let sessionEvents = null;
 let nativeSyncTimer = null;
 let nativeCompletionSync = null;
@@ -8777,7 +8780,7 @@ let sideChatCursor = 0;
 let sideChatGeneration = 0;
 let sideChatTabs = null;
 let sideChatView = 'side';
-/** @type {{threadId:string,sourceThreadId:string,title:string,running?:boolean,historyLimit?:number,hasEarlierMessages?:boolean,historyLoading?:boolean}[]} */
+/** @type {{threadId:string,sourceThreadId:string,title:string,running?:boolean,historyLimit?:number,historyNextLimit?:number,hasEarlierMessages?:boolean,historyLoading?:boolean}[]} */
 let sideChatOpenTabs = [];
 let sideChatActiveTurnId = '';
 const syncCurrentNativeConversation = createTrailingSingleFlight(syncCurrentNativeConversationOnce);
@@ -9825,7 +9828,7 @@ function sideChatTabLabel(title){
 function normalizeNativeHistoryPageLimit(value){
   const number=Number(value);
   if(!Number.isInteger(number)||number<NATIVE_HISTORY_PAGE_SIZE)return NATIVE_HISTORY_PAGE_SIZE;
-  return Math.ceil(number/NATIVE_HISTORY_PAGE_SIZE)*NATIVE_HISTORY_PAGE_SIZE;
+  return number;
 }
 function nativeHistoryViewportFilled(container){
   const height=Number(container?.clientHeight)||0;
@@ -9833,7 +9836,29 @@ function nativeHistoryViewportFilled(container){
 }
 function nativeHistoryPageGrowthTarget(container){
   const height=Number(container?.clientHeight)||720;
-  return Math.max(320,Math.round(Math.min(height,1200)*0.9));
+  return Math.max(320,Math.round(Math.min(height,1200)*0.75));
+}
+function nativeHistoryPageGrowthGoal(container,initialHeight,fillViewport){
+  if(!fillViewport)return nativeHistoryPageGrowthTarget(container);
+  const height=Number(container?.clientHeight)||0;
+  if(!height)return nativeHistoryPageGrowthTarget(container);
+  return Math.max(NATIVE_HISTORY_PAGE_OVERFLOW,height+NATIVE_HISTORY_PAGE_OVERFLOW-Number(initialHeight||0));
+}
+function nativeHistoryNextBatchCount(growth,growthTarget,loadedBatches,maxBatches){
+  const remainingBatches=Math.max(0,Number(maxBatches||0)-Number(loadedBatches||0));
+  if(!remainingBatches)return 0;
+  if(!loadedBatches)return 1;
+  const normalizedGrowth=Math.max(0,Number(growth)||0);
+  const normalizedTarget=Math.max(1,Number(growthTarget)||1);
+  const averageGrowth=normalizedGrowth/loadedBatches;
+  const estimatedBatches=averageGrowth>0
+    ? Math.ceil(Math.max(0,normalizedTarget-normalizedGrowth)/averageGrowth)
+    : NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES;
+  return Math.max(1,Math.min(
+    NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES,
+    remainingBatches,
+    estimatedBatches||1,
+  ));
 }
 function clearNativeHistoryDeferredSync(){
   if(nativeHistoryDeferredSyncTimer)clearTimeout(nativeHistoryDeferredSyncTimer);
@@ -9847,9 +9872,10 @@ function deferNativeSyncForHistoryPage(){
 function scheduleDeferredNativeHistorySync(threadId){
   const id=String(threadId||'');
   clearNativeHistoryDeferredSync();
-  if(!id)return;
+  if(!id){nativeHistorySyncDeferred=false;return}
   nativeHistoryDeferredSyncTimer=setTimeout(()=>{
     nativeHistoryDeferredSyncTimer=null;
+    nativeHistorySyncDeferred=false;
     if(currentConversationSource!=='codex'||currentConversationId!==id)return;
     if(nativeHistoryPageLoading){nativeHistorySyncDeferred=true;return}
     void syncCurrentNativeConversation();
@@ -9919,6 +9945,7 @@ function upsertSideChatTab(options={}){
     if(sourceThreadId)existing.sourceThreadId=String(sourceThreadId);
     if(hasServiceTier)existing.serviceTier=normalizeComposerServiceTier(options.serviceTier);
     existing.historyLimit=Number.isInteger(existing.historyLimit)&&existing.historyLimit>0?existing.historyLimit:60;
+    existing.historyNextLimit=Number.isInteger(existing.historyNextLimit)&&existing.historyNextLimit>0?existing.historyNextLimit:existing.historyLimit+60;
     existing.hasEarlierMessages=Boolean(existing.hasEarlierMessages);
     existing.historyLoading=Boolean(existing.historyLoading);
     return existing;
@@ -9930,6 +9957,7 @@ function upsertSideChatTab(options={}){
     serviceTier:hasServiceTier?normalizeComposerServiceTier(options.serviceTier):null,
     running:false,
     historyLimit:60,
+    historyNextLimit:120,
     hasEarlierMessages:false,
     historyLoading:false,
   };
@@ -10161,6 +10189,7 @@ function readSideChatState(){
         serviceTier:normalizeComposerServiceTier(tab?.serviceTier),
         running:false,
         historyLimit:NATIVE_HISTORY_PAGE_SIZE,
+        historyNextLimit:NATIVE_HISTORY_PAGE_SIZE*2,
         hasEarlierMessages:false,
         historyLoading:false,
       })).filter((tab)=>tab.threadId);
@@ -10171,7 +10200,7 @@ function readSideChatState(){
     const threadId=String(parsed.threadId||'').trim();
     if(!threadId)return null;
     return {
-      tabs:[{threadId,sourceThreadId:String(parsed.sourceThreadId||'').trim(),title:'临时侧聊',serviceTier:normalizeComposerServiceTier(parsed.serviceTier),running:false,historyLimit:NATIVE_HISTORY_PAGE_SIZE,hasEarlierMessages:false,historyLoading:false}],
+      tabs:[{threadId,sourceThreadId:String(parsed.sourceThreadId||'').trim(),title:'临时侧聊',serviceTier:normalizeComposerServiceTier(parsed.serviceTier),running:false,historyLimit:NATIVE_HISTORY_PAGE_SIZE,historyNextLimit:NATIVE_HISTORY_PAGE_SIZE*2,hasEarlierMessages:false,historyLoading:false}],
       activeThreadId:threadId,
       view:'side',
     };
@@ -10590,7 +10619,7 @@ async function syncSideChatConversation(options={}){
     : true;
   const historyScrollAnchor=options.historyScrollAnchor||(!followBottom?captureHistoryScrollAnchor(sideChatMessages):null);
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external&history=page&limit='+historyLimit);
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external&history=page&latest=complete&limit='+historyLimit);
     const data=await res.json().catch(()=>({}));
     if(!res.ok)throw new Error(data.error||'Side chat 同步失败');
     if(sideChatThreadId!==syncId)return;
@@ -10601,7 +10630,10 @@ async function syncSideChatConversation(options={}){
     const tab=getSideChatTab(syncId);
     if(tab){
       tab.title=title;
-      tab.historyLimit=historyLimit;
+      tab.historyLimit=normalizeNativeHistoryPageLimit(conversation.historyPageLimit||historyLimit);
+      tab.historyNextLimit=normalizeNativeHistoryPageLimit(
+        Math.max(tab.historyLimit+NATIVE_HISTORY_PAGE_SIZE,Number(conversation.nextHistoryPageLimit)||0),
+      );
       tab.hasEarlierMessages=Boolean(conversation.hasEarlierMessages);
     }
     renderTopConversationTitle();
@@ -10665,7 +10697,7 @@ async function loadEarlierSideChatHistoryPage(options={}){
   const anchor=captureHistoryScrollAnchor(sideChatMessages);
   const previousLimit=normalizeNativeHistoryPageLimit(tab.historyLimit);
   const initialHeight=sideChatMessages.scrollHeight;
-  const growthTarget=nativeHistoryPageGrowthTarget(sideChatMessages);
+  const growthTarget=nativeHistoryPageGrowthGoal(sideChatMessages,initialHeight,fillViewport);
   let lastSuccessfulLimit=previousLimit;
   let loadedAny=false;
   let loadedBatches=0;
@@ -10676,12 +10708,20 @@ async function loadEarlierSideChatHistoryPage(options={}){
     while(tab.hasEarlierMessages&&loadedBatches<maxBatches&&sideChatThreadId===id){
       const growth=Math.max(0,sideChatMessages.scrollHeight-initialHeight);
       if(loadedAny&&(fillViewport?nativeHistoryViewportFilled(sideChatMessages):growth>=growthTarget))break;
-      const batchCount=1;
-      tab.historyLimit=lastSuccessfulLimit+NATIVE_HISTORY_PAGE_SIZE*batchCount;
+      const batchCount=nativeHistoryNextBatchCount(growth,growthTarget,loadedBatches,maxBatches);
+      if(!batchCount)break;
+      const adaptiveLimit=lastSuccessfulLimit+NATIVE_HISTORY_PAGE_SIZE*batchCount;
+      const hintedLimit=normalizeNativeHistoryPageLimit(tab.historyNextLimit);
+      const requestedLimit=fillViewport?adaptiveLimit:Math.max(adaptiveLimit,hintedLimit);
+      const requestedBatches=Math.max(
+        batchCount,
+        Math.ceil((requestedLimit-lastSuccessfulLimit)/NATIVE_HISTORY_PAGE_SIZE),
+      );
+      tab.historyLimit=requestedLimit;
       const loaded=await syncSideChatConversation({historyScrollAnchor:anchor,followBottom:false});
       if(!loaded)break;
       loadedAny=true;
-      loadedBatches+=batchCount;
+      loadedBatches+=fillViewport?requestedBatches:1;
       lastSuccessfulLimit=normalizeNativeHistoryPageLimit(tab.historyLimit);
     }
     return loadedAny;
@@ -10893,6 +10933,7 @@ async function restoreSideChatIfNeeded(){
       ...tab,
       running:false,
       historyLimit:NATIVE_HISTORY_PAGE_SIZE,
+      historyNextLimit:NATIVE_HISTORY_PAGE_SIZE*2,
       hasEarlierMessages:false,
       historyLoading:false,
     }));
@@ -17773,7 +17814,7 @@ function syncNativeComposerSettings(changes={}){
   nativeComposerSettingsQueue=queued.catch(()=>false);
   return queued;
 }
-function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -17959,7 +18000,7 @@ async function loadEarlierNativeHistoryPage(options={}){
   const anchor=captureHistoryScrollAnchor(chat);
   const previousLimit=nativeHistoryPageLimit;
   const initialHeight=chat.scrollHeight;
-  const growthTarget=nativeHistoryPageGrowthTarget(chat);
+  const growthTarget=nativeHistoryPageGrowthGoal(chat,initialHeight,fillViewport);
   let lastSuccessfulLimit=previousLimit;
   let loadedAny=false;
   let loadedBatches=0;
@@ -17978,8 +18019,15 @@ async function loadEarlierNativeHistoryPage(options={}){
     ){
       const growth=Math.max(0,chat.scrollHeight-initialHeight);
       if(loadedAny&&(fillViewport?nativeHistoryViewportFilled(chat):growth>=growthTarget))break;
-      const batchCount=1;
-      const requestedLimit=lastSuccessfulLimit+NATIVE_HISTORY_PAGE_SIZE*batchCount;
+      const batchCount=nativeHistoryNextBatchCount(growth,growthTarget,loadedBatches,maxBatches);
+      if(!batchCount)break;
+      const adaptiveLimit=lastSuccessfulLimit+NATIVE_HISTORY_PAGE_SIZE*batchCount;
+      const hintedLimit=normalizeNativeHistoryPageLimit(nativeHistoryNextPageLimit);
+      const requestedLimit=fillViewport?adaptiveLimit:Math.max(adaptiveLimit,hintedLimit);
+      const requestedBatches=Math.max(
+        batchCount,
+        Math.ceil((requestedLimit-lastSuccessfulLimit)/NATIVE_HISTORY_PAGE_SIZE),
+      );
       const loaded=await loadConversation(id,'codex',{
         historyPageLimit:requestedLimit,
         historyScrollAnchor:anchor,
@@ -17988,7 +18036,7 @@ async function loadEarlierNativeHistoryPage(options={}){
       });
       if(!loaded)break;
       loadedAny=true;
-      loadedBatches+=batchCount;
+      loadedBatches+=fillViewport?requestedBatches:1;
       lastSuccessfulLimit=nativeHistoryPageLimit;
     }
     return loadedAny;
@@ -18020,9 +18068,11 @@ async function loadConversation(id,source='web',options={}){
       nativeHistoryHasEarlierMessages=false;
       nativeHistoryPageLoading=false;
       nativeHistorySyncDeferred=false;
+      nativeHistoryNextPageLimit=nativeHistoryPageLimit+NATIVE_HISTORY_PAGE_SIZE;
     }
   }else{
     nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;
+    nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;
     nativeHistoryHasEarlierMessages=false;
     nativeHistoryPageLoading=false;
     nativeHistoryLoadReady=false;
@@ -18066,7 +18116,7 @@ async function loadConversation(id,source='web',options={}){
   if(!conversation){
     const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
     const nativeHistoryQuery=currentConversationSource==='codex'
-      ? '?images=external&history=page&limit='+nativeHistoryPageLimit
+      ? '?images=external&history=page&latest=complete&limit='+nativeHistoryPageLimit
       : '';
     const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery;
     const res=await fetch(requestUrl);
@@ -18084,6 +18134,16 @@ async function loadConversation(id,source='web',options={}){
   nativeCursor=Number(conversation.cursor||0);
   nativeGeneration=Number(conversation.generation||0);
   nativeHistoryHasEarlierMessages=currentConversationSource==='codex'&&Boolean(conversation.hasEarlierMessages);
+  if(currentConversationSource==='codex'){
+    const returnedHistoryLimit=Number(conversation.historyPageLimit);
+    if(Number.isInteger(returnedHistoryLimit)&&returnedHistoryLimit>0){
+      nativeHistoryPageLimit=normalizeNativeHistoryPageLimit(returnedHistoryLimit);
+    }
+    nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit(Math.max(
+      nativeHistoryPageLimit+NATIVE_HISTORY_PAGE_SIZE,
+      Number(conversation.nextHistoryPageLimit)||0,
+    ));
+  }
   const promptQueueLock=reconcilePromptQueueTurnLock(currentConversationId,conversation);
   if(currentConversationSource==='codex'&&conversation.status==='running'&&!promptQueueLock.terminal)markPromptQueueTurnRunning(currentConversationId,conversation.activeTurnId);
   const queueTurnId=promptQueueTurnLock(currentConversationId);
@@ -18471,7 +18531,7 @@ async function syncCurrentNativeConversationOnce(){
   const renderSnapshotImmediately=nativeLiveDocumentHidden()||nativeSnapshotResumeCatchup;
   const id=currentConversationId;
   const seq=conversationLoadSeq;
-  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&history=page&limit='+nativeHistoryPageLimit+'&after='+nativeCursor+'&generation='+nativeGeneration;
+  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&history=page&latest=complete&limit='+nativeHistoryPageLimit+'&after='+nativeCursor+'&generation='+nativeGeneration;
   const res=await fetch(url);
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
@@ -18479,6 +18539,10 @@ async function syncCurrentNativeConversationOnce(){
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(deferNativeSyncForHistoryPage())return;
   const conversation=data.conversation;
+  nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit(Math.max(
+    nativeHistoryPageLimit+NATIVE_HISTORY_PAGE_SIZE,
+    Number(conversation.nextHistoryPageLimit)||0,
+  ));
   currentNativeRunStatus=String(conversation.status||'');
   await applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;

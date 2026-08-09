@@ -24,6 +24,8 @@ const DEFAULT_MAX_MESSAGES = 0;
 const DEFAULT_MAX_SESSIONS = 100;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_RUNNING_WINDOW_MS = 6 * 60 * 60 * 1000;
+const HISTORY_PAGE_TURN_HINT_COUNT = 2;
+const HISTORY_PAGE_TURN_TAIL_LIMIT = 60;
 const MESSAGE_TEXT_LIMIT = 80000;
 const DETAIL_TEXT_LIMIT = 8000;
 const IMAGE_URL_LIMIT = 16 * 1024 * 1024;
@@ -2485,6 +2487,57 @@ function selectRecentNativeMessages(visibleMessages, limit) {
   return visibleMessages.filter((message) => keep.has(message));
 }
 
+function nativeHistoryTurnKey(message) {
+  return String(message?.turnId || '').trim() || '__untagged__';
+}
+
+function nextNativeHistoryPageLimit(visibleMessages, currentLimit) {
+  const messages = Array.isArray(visibleMessages) ? visibleMessages : [];
+  const total = messages.length;
+  const boundedLimit = Math.min(total, Math.max(0, Number(currentLimit) || 0));
+  const currentStart = total - boundedLimit;
+  if (currentStart <= 0 || currentStart >= total) return boundedLimit;
+
+  let scanKey = nativeHistoryTurnKey(messages[currentStart]);
+  let targetStart = currentStart;
+  let turnTransitions = 0;
+  for (let index = currentStart - 1; index >= 0; index -= 1) {
+    const key = nativeHistoryTurnKey(messages[index]);
+    targetStart = index;
+    if (key === scanKey) continue;
+    scanKey = key;
+    turnTransitions += 1;
+    if (turnTransitions < HISTORY_PAGE_TURN_HINT_COUNT) continue;
+
+    let tailCount = 1;
+    while (
+      targetStart > 0
+      && tailCount < HISTORY_PAGE_TURN_TAIL_LIMIT
+      && nativeHistoryTurnKey(messages[targetStart - 1]) === scanKey
+    ) {
+      targetStart -= 1;
+      tailCount += 1;
+    }
+    break;
+  }
+  return total - targetStart;
+}
+
+function selectNativeHistoryPage(visibleMessages, limit, completeLatestTurn) {
+  const messages = Array.isArray(visibleMessages) ? visibleMessages : [];
+  if (!limit || messages.length <= limit) return messages;
+  let start = messages.length - limit;
+  if (completeLatestTurn && start > 0) {
+    const latestKey = nativeHistoryTurnKey(messages.at(-1));
+    let latestTurnStart = messages.length - 1;
+    while (latestTurnStart > 0 && nativeHistoryTurnKey(messages[latestTurnStart - 1]) === latestKey) {
+      latestTurnStart -= 1;
+    }
+    start = Math.min(start, latestTurnStart);
+  }
+  return messages.slice(start);
+}
+
 function tryMergeAssistantMessage(cache, role, clean, record, kind, metadata = null) {
   if (role !== 'assistant') return false;
   if (!canMergeAssistantKind(kind)) return false;
@@ -3146,15 +3199,24 @@ function buildConversation(entry, cache, options, runningWindowMs) {
   const generationMatches = Number.isInteger(requestedGeneration) && requestedGeneration === cache.generation;
   const firstSequence = cache.messages[0]?.seq || cache.nextSequence;
   const reset = hasAfter && (!generationMatches || after < firstSequence - 1);
-  const availableMessages = hasAfter && !reset
-    ? cache.messages.filter((message) => message.seq > after)
-    : cache.messages;
-  const visibleMessages = availableMessages.filter((message) => !shouldHideHandoffMessage(message));
+  const allVisibleMessages = cache.messages.filter((message) => !shouldHideHandoffMessage(message));
+  const visibleMessages = hasAfter && !reset
+    ? allVisibleMessages.filter((message) => message.seq > after)
+    : allVisibleMessages;
+  const historyPageMessages = historyPage
+    ? selectNativeHistoryPage(allVisibleMessages, limit, options.completeLatestTurn === true)
+    : allVisibleMessages;
   const messages = limit && (!hasAfter || reset)
     ? historyPage
-      ? visibleMessages.slice(-limit)
+      ? historyPageMessages
       : selectRecentNativeMessages(visibleMessages, limit)
     : visibleMessages;
+  const historyPageLimit = historyPage
+    ? historyPageMessages.length
+    : 0;
+  const nextHistoryPageLimit = historyPage
+    ? nextNativeHistoryPageLimit(allVisibleMessages, historyPageLimit)
+    : 0;
 
   return {
     id: entry.id,
@@ -3168,6 +3230,7 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     readOnly: false,
     truncated: cache.messagesTruncated,
     hasEarlierMessages: messages.length < visibleMessages.length,
+    ...(historyPage ? { historyPageLimit, nextHistoryPageLimit } : {}),
     generation: cache.generation,
     cursor: Math.max(0, cache.nextSequence - 1),
     reset,
