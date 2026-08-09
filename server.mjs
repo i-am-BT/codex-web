@@ -8585,6 +8585,7 @@ let nativeHistoryDeferredSyncTimer = null;
 let nativeHistoryNextPageLimit = NATIVE_HISTORY_PAGE_SIZE;
 let sessionEvents = null;
 let nativeSyncTimer = null;
+let nativeSyncChangedIds = new Set();
 let nativeCompletionSync = null;
 let nativeCompletionTimer = null;
 let webRunActive = false;
@@ -8855,9 +8856,18 @@ let renamedHistoryProjects=readRenamedHistoryProjects();
 let historyCompletionRead=readHistoryCompletionState(HISTORY_COMPLETION_READ_STORAGE_KEY);
 let historyCompletionSeen=readHistoryCompletionState(HISTORY_COMPLETION_SEEN_STORAGE_KEY);
 let historyCompletionPushTimer=null;
+let historyCompletionSyncTimer=null;
+let historyCompletionSyncInFlight=null;
 let composerModelValueBeforeChange='';
 let activeHistoryProjectMenu=null;
+const HISTORY_SESSION_REFRESH_DELAY_MS=700;
+const HISTORY_COMPLETION_SYNC_DELAY_MS=5000;
+let historySessionRefreshTimer=null;
+let historySessionRefreshActive=false;
+let historySessionRefreshQueued=false;
 let historyRefreshPending=false;
+let historyRefreshInFlight=null;
+let historyRefreshRerun=false;
 let historyRefreshPointerId=null;
 let historyRefreshReleaseTimer=null;
 let historyRenameActive=false;
@@ -15853,16 +15863,41 @@ function flushPendingHistoryRefresh(){
   historyRefreshPending=false;
   queueMicrotask(()=>refreshHistory());
 }
+function scheduleHistoryRefreshFromSession(delay=HISTORY_SESSION_REFRESH_DELAY_MS){
+  historySessionRefreshQueued=true;
+  if(historyRefreshBlocked()){historyRefreshPending=true;return}
+  if(historySessionRefreshTimer||historySessionRefreshActive)return;
+  historySessionRefreshTimer=setTimeout(async()=>{
+    historySessionRefreshTimer=null;
+    historySessionRefreshQueued=false;
+    historySessionRefreshActive=true;
+    try{await refreshHistory()}finally{
+      historySessionRefreshActive=false;
+      if(historySessionRefreshQueued)scheduleHistoryRefreshFromSession(delay);
+    }
+  },Math.max(0,Number(delay)||0));
+}
 async function refreshHistory(){
   if(historyRefreshBlocked()){historyRefreshPending=true;return}
-  historyRefreshPending=false;
-  const res=await fetch('/api/config');
-  if(!res.ok)return;
-  const data=await res.json();
-  // A live-session refresh may have started just before the user pressed a row.
-  if(historyRefreshBlocked()){historyRefreshPending=true;return}
-  pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];
-  renderHistory(data.conversations);
+  if(historySessionRefreshTimer)clearTimeout(historySessionRefreshTimer);
+  historySessionRefreshTimer=null;
+  historySessionRefreshQueued=false;
+  if(historyRefreshInFlight){historyRefreshRerun=true;return historyRefreshInFlight}
+  historyRefreshInFlight=(async()=>{
+    do{
+      historyRefreshRerun=false;
+      if(historyRefreshBlocked()){historyRefreshPending=true;return}
+      historyRefreshPending=false;
+      const res=await fetch('/api/config');
+      if(!res.ok)return;
+      const data=await res.json();
+      // A live-session refresh may have started just before the user pressed a row.
+      if(historyRefreshBlocked()){historyRefreshPending=true;return}
+      pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];
+      renderHistory(data.conversations);
+    }while(historyRefreshRerun);
+  })().finally(()=>{historyRefreshInFlight=null});
+  return historyRefreshInFlight;
 }
 function nativeRuntimeNeedsHistoryRefresh(type){return ['turn','turn-cleared','connection-error'].includes(String(type||''))}
 function composerModelItems(items,selected){const list=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];const selectedModel=String(selected||'').trim();if(selectedModel&&!list.includes(selectedModel))list.push(selectedModel);return list}
@@ -16829,25 +16864,41 @@ function markHistoryCompletionRead(item){
   renderHistory();
 }
 async function syncHistoryCompletionReadFromServer(){
-  try{
-    const res=await fetch('/api/history-completion-read');
-    const data=await res.json();
-    if(!res.ok||!data||typeof data.read!=='object')return;
-    const merged=new Map();
-    for(const [key,version] of Object.entries(data.read)){
-      if(key&&typeof version==='string')merged.set(key,version);
-    }
-    for(const [key,version] of historyCompletionRead){
-      if(!merged.has(key))merged.set(key,version);
-    }
-    const changed=merged.size!==historyCompletionRead.size
-      ||[...merged.entries()].some(([key,version])=>historyCompletionRead.get(key)!==version);
-    if(changed){
-      historyCompletionRead=merged;
-      pushHistoryCompletionReadToServer();
-      renderHistory();
-    }
-  }catch{}
+  if(historyCompletionSyncTimer)clearTimeout(historyCompletionSyncTimer);
+  historyCompletionSyncTimer=null;
+  if(historyCompletionSyncInFlight)return historyCompletionSyncInFlight;
+  const pending=(async()=>{
+    try{
+      const res=await fetch('/api/history-completion-read');
+      const data=await res.json();
+      if(!res.ok||!data||typeof data.read!=='object')return;
+      const merged=new Map();
+      for(const [key,version] of Object.entries(data.read)){
+        if(key&&typeof version==='string')merged.set(key,version);
+      }
+      for(const [key,version] of historyCompletionRead){
+        if(!merged.has(key))merged.set(key,version);
+      }
+      const changed=merged.size!==historyCompletionRead.size
+        ||[...merged.entries()].some(([key,version])=>historyCompletionRead.get(key)!==version);
+      if(changed){
+        historyCompletionRead=merged;
+        pushHistoryCompletionReadToServer();
+        renderHistory();
+      }
+    }catch{}
+  })();
+  historyCompletionSyncInFlight=pending;
+  try{return await pending}finally{
+    if(historyCompletionSyncInFlight===pending)historyCompletionSyncInFlight=null;
+  }
+}
+function scheduleHistoryCompletionReadSync(delay=HISTORY_COMPLETION_SYNC_DELAY_MS){
+  if(historyCompletionSyncTimer||historyCompletionSyncInFlight)return;
+  historyCompletionSyncTimer=setTimeout(()=>{
+    historyCompletionSyncTimer=null;
+    void syncHistoryCompletionReadFromServer();
+  },Math.max(0,Number(delay)||0));
 }
 function pushHistoryCompletionReadToServer(){
   if(historyCompletionPushTimer)clearTimeout(historyCompletionPushTimer);
@@ -17220,6 +17271,8 @@ function renderHistory(items){
     return;
   }
   renderComposerProjectOptions();
+  beginDeferredIconRefresh();
+  try{
   const query=String(historyFilter?.value||'').trim().toLocaleLowerCase();
   const candidates=query?historyItems:historyItems.filter((item)=>isStandaloneHistoryItem(item)||!hiddenHistoryProjects.has(historyProjectKey(item.cwd)));
   const visibleItems=query?candidates.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')+' '+historyProjectName(item.cwd)).toLocaleLowerCase().includes(query)):candidates;
@@ -17308,6 +17361,9 @@ function renderHistory(items){
     });
   }
   history.scrollTop=scrollTop;
+  }finally{
+    endDeferredIconRefresh(history);
+  }
 }
 function createHistoryRow(item,projectPath){
   const source=item.source==='codex'?'codex':'web';
@@ -18341,6 +18397,22 @@ function refreshPromptQueueOnResume(){
   if(document.visibilityState&&document.visibilityState!=='visible')return;
   if(currentConversationSource==='codex'&&currentConversationId)void pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
 }
+function scheduleChangedNativeSessionSync(changedIds){
+  for(const id of changedIds||[]){
+    const clean=String(id||'');
+    if(clean)nativeSyncChangedIds.add(clean);
+  }
+  if(!nativeSyncChangedIds.size||nativeSyncTimer)return;
+  const syncDelay=webRunActive&&currentConversationSource==='codex'?80:260;
+  nativeSyncTimer=setTimeout(async()=>{
+    nativeSyncTimer=null;
+    const pendingIds=new Set(nativeSyncChangedIds);
+    nativeSyncChangedIds.clear();
+    if(currentConversationSource==='codex'&&pendingIds.has(currentConversationId))await syncCurrentNativeConversation();
+    if(sideChatThreadId&&pendingIds.has(sideChatThreadId))scheduleSideChatSync(120);
+    if(nativeSyncChangedIds.size)scheduleChangedNativeSessionSync([]);
+  },syncDelay);
+}
 function flushPromptQueuesBeforeBackground(event){
   if(event?.type!=='pagehide'&&document.visibilityState==='visible')return;
   const beaconBudget={remaining:PROMPT_QUEUE_BEACON_MAX_BYTES};
@@ -18363,26 +18435,26 @@ function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
   sessionEvents.addEventListener('open',async()=>{
-    await refreshHistory();
     syncNativeAfterPageResume();
-    void syncHistoryCompletionReadFromServer();
     if(currentConversationSource==='codex'&&currentConversationId){
       void pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
     }
   });
   sessionEvents.addEventListener('sessions',(event)=>{
     let changedIds=[];
-    try{changedIds=JSON.parse(event.data||'{}').changedIds||[]}catch(e){}
+    let conversationChangedIds=[];
+    try{
+      const parsed=JSON.parse(event.data||'{}');
+      changedIds=Array.isArray(parsed.changedIds)?parsed.changedIds:[];
+      conversationChangedIds=Array.isArray(parsed.conversationChangedIds)?parsed.conversationChangedIds:changedIds;
+    }catch(e){}
+    if(!changedIds.length)return;
     refreshOpenSubagentTraces(changedIds);
-    if(nativeSyncTimer)clearTimeout(nativeSyncTimer);
-    const syncDelay=webRunActive&&currentConversationSource==='codex'?80:260;
-    nativeSyncTimer=setTimeout(async()=>{
-      nativeSyncTimer=null;
-      await refreshHistory();
-      void syncHistoryCompletionReadFromServer();
-      if(currentConversationSource==='codex'&&(!changedIds.length||changedIds.includes(currentConversationId)))await syncCurrentNativeConversation();
-      if(sideChatThreadId&&(!changedIds.length||changedIds.includes(sideChatThreadId)))scheduleSideChatSync(120);
-    },syncDelay);
+    if(conversationChangedIds.length){
+      scheduleHistoryRefreshFromSession();
+      scheduleHistoryCompletionReadSync();
+    }
+    scheduleChangedNativeSessionSync(changedIds);
   });
   sessionEvents.addEventListener('native-runtime',(event)=>{
     let runtime={};
@@ -18393,7 +18465,7 @@ function connectSessionEvents(){
     }
     // Text deltas can arrive many times per second. Their persisted snapshot is already
     // coalesced by the sessions listener, so only refresh the sidebar for lifecycle changes.
-    if(nativeRuntimeNeedsHistoryRefresh(runtime.type))void refreshHistory();
+    if(nativeRuntimeNeedsHistoryRefresh(runtime.type))scheduleHistoryRefreshFromSession();
     if(runtime.threadId!==currentConversationId||currentConversationSource!=='codex')return;
     if(isCompletedNativeRuntimeTurn(runtime.turnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
     if(webRunActive&&activeNativeTurnId&&runtime.turnId&&String(runtime.turnId)!==String(activeNativeTurnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
@@ -18438,7 +18510,6 @@ function connectSessionEvents(){
         removeNativeRunningElement();
         finishAllNativeLiveItems();
         statusEl.textContent=runtime.status==='error'?'Codex App 任务失败':runtime.status==='interrupted'?'Codex App · 已暂停':'Codex App 任务完成';
-        playTaskCompleteSound();
         const completedId=currentConversationId;
         scheduleNativeCompletionSync(completedId,runtimeTurnId,220);
         schedulePromptQueueDispatch(completedId,320);
@@ -18666,6 +18737,7 @@ async function reconcileNativeCompletion(){
 function syncNativeAfterPageResume(){
   if(nativeLiveDocumentHidden())return;
   refreshHistory();
+  void syncHistoryCompletionReadFromServer();
   if(currentConversationSource!=='codex'||!currentConversationId)return;
   if(nativeCompletionSync){scheduleNativeCompletionSync(nativeCompletionSync.threadId,nativeCompletionSync.turnId,0);return}
   syncCurrentNativeConversation();
@@ -22799,8 +22871,6 @@ function updateSafetyHint(){
   safetyHint.className='safety '+(mode==='read-only'?'safe':mode==='workspace-write'?'warn':'danger');
   safetyHint.textContent=mode==='read-only'?'只读 · 不写入文件':mode==='workspace-write'?'工作区写入 · 当前目录':'高危全权限 · 首次发送需确认';
 }
-let completeAudioCtx;
-function playTaskCompleteSound(){try{const AudioContext=window.AudioContext||window.webkitAudioContext;if(!AudioContext)return;if(!completeAudioCtx)completeAudioCtx=new AudioContext();completeAudioCtx.resume?.();const now=completeAudioCtx.currentTime;const master=completeAudioCtx.createGain();master.gain.setValueAtTime(1.15,now);master.connect(completeAudioCtx.destination);[[660,0,.12],[880,.13,.22]].forEach(([freq,offset,duration])=>{const osc=completeAudioCtx.createOscillator();const gain=completeAudioCtx.createGain();osc.type='triangle';osc.frequency.value=freq;gain.gain.setValueAtTime(0.0001,now+offset);gain.gain.exponentialRampToValueAtTime(0.55,now+offset+0.006);gain.gain.exponentialRampToValueAtTime(0.0001,now+offset+duration);osc.connect(gain);gain.connect(master);osc.start(now+offset);osc.stop(now+offset+duration+.02)})}catch(e){}}
 async function cancelRun(){
   closeComposerPopovers();
   if(currentConversationSource!=='codex'||!currentConversationId||!webRunActive||!activeNativeTurnId||nativeCancelPending)return;

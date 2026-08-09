@@ -153,12 +153,18 @@ export class NativeSessionStore extends EventEmitter {
       this.sessionMetadataCache,
     );
     const nextSubagentEntries = scanSessionFiles(this.sessionsDir, this.titles, this.subagentThreads);
-    const changedIds = [
+    const conversationChangedIds = [
       ...new Set([
         ...changedSessionIds(this.entries, nextEntries),
-        ...changedSessionIds(this.subagentEntries, nextSubagentEntries),
         ...pinnedChangedIds,
         ...goalChangedIds,
+      ]),
+    ];
+    const subagentChangedIds = changedSessionIds(this.subagentEntries, nextSubagentEntries);
+    const changedIds = [
+      ...new Set([
+        ...conversationChangedIds,
+        ...subagentChangedIds,
       ]),
     ];
     this.entries = nextEntries;
@@ -171,7 +177,7 @@ export class NativeSessionStore extends EventEmitter {
 
     if (changedIds.length) {
       this.version += 1;
-      this.emit('change', { version: this.version, changedIds });
+      this.emit('change', { version: this.version, changedIds, conversationChangedIds });
     }
     return this.list();
   }

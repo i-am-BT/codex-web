@@ -353,6 +353,10 @@ test('archived standalone tasks keep a separate task group and filter', () => {
 
 test('history refreshes deferred while a project menu or preview is open', () => {
   assert.match(inlineScript, /let historyRefreshPending=false/);
+  assert.match(inlineScript, /const HISTORY_SESSION_REFRESH_DELAY_MS=700/);
+  assert.match(inlineScript, /function scheduleHistoryRefreshFromSession\(delay=HISTORY_SESSION_REFRESH_DELAY_MS\)/);
+  assert.match(inlineScript, /if\(historySessionRefreshTimer\|\|historySessionRefreshActive\)return/);
+  assert.match(inlineScript, /if\(historySessionRefreshQueued\)scheduleHistoryRefreshFromSession\(delay\)/);
   assert.match(inlineScript, /let historyRefreshPointerId=null/);
   assert.match(inlineScript, /function historyRefreshBlocked\(\)\{return historyRefreshPointerId!==null\|\|activeHistoryProjectMenu\|\|historyProjectPreviewAnchor\|\|historyRenameActive\|\|history\.querySelector\('\.hist\.renaming,\.histRenameInput'\)\}/);
   assert.match(inlineScript, /function beginHistoryRefreshPointerLock\(event\)\{[\s\S]*event\.button!==0\|\|event\.isPrimary===false\|\|!event\.target\.closest\?\.\('\.hist'\)[\s\S]*historyRefreshPointerId=event\.pointerId/);
@@ -364,13 +368,40 @@ test('history refreshes deferred while a project menu or preview is open', () =>
   assert.doesNotMatch(pointerLockSource, /loadConversation\(|preventDefault\(/);
   assert.match(inlineScript, /function flushPendingHistoryRefresh/);
   assert.match(inlineScript, /if\(!historyRefreshPending\|\|historyRefreshBlocked\(\)\)return/);
-  assert.match(inlineScript, /async function refreshHistory\(\)\{\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}[\s\S]*const data=await res\.json\(\);\s*\/\/ A live-session refresh may have started just before the user pressed a row\.\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}\s*pinnedThreadIds=/);
+  assert.match(inlineScript, /async function refreshHistory\(\)\{\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}[\s\S]*if\(historyRefreshInFlight\)\{historyRefreshRerun=true;return historyRefreshInFlight\}[\s\S]*const data=await res\.json\(\);\s*\/\/ A live-session refresh may have started just before the user pressed a row\.\s*if\(historyRefreshBlocked\(\)\)\{historyRefreshPending=true;return\}\s*pinnedThreadIds=/);
+  const renderHistorySource = sourceBetween('function renderHistory', 'function createHistoryRow');
+  assert.match(renderHistorySource, /beginDeferredIconRefresh\(\);\s*try\{/);
+  assert.match(renderHistorySource, /\}finally\{\s*endDeferredIconRefresh\(history\);\s*\}/);
   const rowSource = sourceBetween('function createHistoryRow', 'function updateActiveHistory');
   assert.match(rowSource, /row\.addEventListener\('click',openConversation\)/);
   assert.match(rowSource, /open\.addEventListener\('click',\(e\)=>\{e\.stopPropagation\(\);openConversation\(\)\}\)/);
   assert.match(rowSource, /rename\.addEventListener\('click',\(e\)=>\{e\.preventDefault\(\);e\.stopPropagation\(\);beginHistoryRename/);
   assert.match(rowSource, /del\.addEventListener\('click',\(e\)=>\{e\.stopPropagation\(\);deleteConversation/);
   assert.match(inlineScript, /flushPendingHistoryRefresh\(\)/);
+});
+
+test('session events coalesce native sync and avoid completion sound playback', () => {
+  const sessionSource = sourceBetween('function scheduleChangedNativeSessionSync', 'function nativeMessageElementBySequence');
+  const sessionsListenerStart = sessionSource.indexOf("sessionEvents.addEventListener('sessions'");
+  const runtimeListenerStart = sessionSource.indexOf("sessionEvents.addEventListener('native-runtime'", sessionsListenerStart);
+  assert.ok(sessionsListenerStart >= 0 && runtimeListenerStart > sessionsListenerStart);
+  const sessionsListenerSource = sessionSource.slice(sessionsListenerStart, runtimeListenerStart);
+  assert.match(inlineScript, /let nativeSyncChangedIds = new Set\(\)/);
+  assert.match(nativeSource, /this\.emit\('change', \{ version: this\.version, changedIds, conversationChangedIds \}\)/);
+  assert.match(sessionSource, /for\(const id of changedIds\|\|\[\]\)/);
+  assert.match(sessionSource, /if\(!nativeSyncChangedIds\.size\|\|nativeSyncTimer\)return/);
+  assert.match(sessionSource, /const pendingIds=new Set\(nativeSyncChangedIds\);\s*nativeSyncChangedIds\.clear\(\)/);
+  assert.match(sessionsListenerSource, /conversationChangedIds=Array\.isArray\(parsed\.conversationChangedIds\)\?parsed\.conversationChangedIds:changedIds/);
+  assert.match(sessionsListenerSource, /if\(!changedIds\.length\)return;\s*refreshOpenSubagentTraces\(changedIds\);\s*if\(conversationChangedIds\.length\)\{\s*scheduleHistoryRefreshFromSession\(\);\s*scheduleHistoryCompletionReadSync\(\);\s*\}\s*scheduleChangedNativeSessionSync\(changedIds\)/);
+  assert.doesNotMatch(sessionsListenerSource, /refreshHistory\(\)|syncHistoryCompletionReadFromServer\(\)/);
+  assert.doesNotMatch(inlineScript, /playTaskCompleteSound|completeAudioCtx|AudioContext/);
+});
+
+test('history completion read sync is single-flight and delayed during session churn', () => {
+  assert.match(inlineScript, /let historyCompletionSyncInFlight=null/);
+  assert.match(completionStateSource, /if\(historyCompletionSyncInFlight\)return historyCompletionSyncInFlight/);
+  assert.match(completionStateSource, /function scheduleHistoryCompletionReadSync\(delay=HISTORY_COMPLETION_SYNC_DELAY_MS\)/);
+  assert.match(completionStateSource, /if\(historyCompletionSyncTimer\|\|historyCompletionSyncInFlight\)return/);
 });
 
 test('starting a new task clears inherited project selection', () => {

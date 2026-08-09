@@ -313,7 +313,7 @@ test('runtime text deltas leave sidebar rebuilding to the coalesced session snap
   assert.equal(nativeRuntimeNeedsHistoryRefresh('turn'), true);
   assert.equal(nativeRuntimeNeedsHistoryRefresh('turn-cleared'), true);
   assert.equal(nativeRuntimeNeedsHistoryRefresh('connection-error'), true);
-  assert.match(runtimeHandlerSource, /\/\/ Text deltas[\s\S]*?if\(nativeRuntimeNeedsHistoryRefresh\(runtime\.type\)\)void refreshHistory\(\);/);
+  assert.match(runtimeHandlerSource, /\/\/ Text deltas[\s\S]*?if\(nativeRuntimeNeedsHistoryRefresh\(runtime\.type\)\)scheduleHistoryRefreshFromSession\(\);/);
   assert.doesNotMatch(runtimeHandlerSource, /try\{runtime=JSON\.parse\(event\.data\|\|'\{\}'\)\}catch\(e\)\{\}\s*refreshHistory\(\);/);
 });
 
