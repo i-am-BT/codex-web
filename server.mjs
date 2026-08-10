@@ -20902,6 +20902,9 @@ function processedMessageTitle(seconds,{minimum=0,rounding='round'}={}){
   return'已处理 '+minutes+'m'+(remainder?' '+remainder+'s':'');
 }
 function completionMessageTitle(text,fallbackSeconds=NaN){
+  const status=String(text||'').trim();
+  if(status==='任务失败')return'任务失败';
+  if(status==='任务已暂停'||status==='任务中断')return'已暂停';
   const parsed=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
   const seconds=Number.isFinite(parsed)?parsed:Number(fallbackSeconds);
   return Number.isFinite(seconds)?processedMessageTitle(seconds,{minimum:1}):'已处理';
@@ -21105,6 +21108,9 @@ function resetTurnProcessCollection(){
 function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
   // If a previous turn never received task_complete, keep its assistant progress instead of deleting it.
   const previousTurnId=turnProcessCollectionTurnId||turnProcessElapsedTurnId;
+  let orphanCompletion=null;
+  let orphanFinalAnchor=null;
+  let orphanTerminalElements=[];
   if(collectingTurnProcess&&turnProcessElements.length){
     const orphaned=turnProcessElements.filter((item)=>item?.isConnected);
     if(orphaned.length){
@@ -21123,10 +21129,20 @@ function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
         if(orphanFinal.parentNode!==chat)chat.appendChild(orphanFinal);
         latestFinalAssistantElement=orphanFinal;
       }
-      const processKeep=orphaned.filter((item)=>item!==orphanFinal&&(item.classList?.contains('progressCommentary')||item.classList?.contains('steeringUser')));
-      const completion=createCompletionMessage('任务完成',processKeep,previousTurnId||'',NaN,null);
-      if(orphanFinal?.parentNode===chat)chat.insertBefore(completion,orphanFinal);
-      else chat.appendChild(completion);
+      orphanTerminalElements=orphaned.filter((item)=>(
+        item!==orphanFinal
+        &&item.classList?.contains('process')
+        &&['task_error','turn_aborted','error'].includes(item.dataset?.messageKind||'')
+      ));
+      const processKeep=orphaned.filter((item)=>(
+        item!==orphanFinal
+        &&!orphanTerminalElements.includes(item)
+        &&(item.classList?.contains('progressCommentary')||item.classList?.contains('steeringUser'))
+      ));
+      const failed=orphanTerminalElements.some((item)=>['task_error','error'].includes(item.dataset?.messageKind||''));
+      const interrupted=!failed&&orphanTerminalElements.some((item)=>item.dataset?.messageKind==='turn_aborted');
+      orphanCompletion=createCompletionMessage(failed?'任务失败':interrupted?'任务已暂停':'任务完成',processKeep,previousTurnId||'',NaN,null);
+      orphanFinalAnchor=orphanFinal?.parentNode===chat?orphanFinal:null;
     }
   }
   for(const element of turnProcessElements){
@@ -21134,6 +21150,15 @@ function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
     if(element.parentNode===chat&&!element.classList.contains('assistant'))element.remove();
   }
   clearTurnProcessHeader();
+  if(orphanCompletion){
+    if(orphanFinalAnchor?.parentNode===chat){
+      chat.insertBefore(orphanCompletion,orphanFinalAnchor);
+      for(const element of orphanTerminalElements)chat.insertBefore(element,orphanFinalAnchor);
+    }else{
+      chat.appendChild(orphanCompletion);
+      for(const element of orphanTerminalElements)chat.appendChild(element);
+    }
+  }
   turnProcessElements=[];
   currentActivityCluster=null;
   currentAgentActivityGroup=null;

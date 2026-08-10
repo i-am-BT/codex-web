@@ -566,6 +566,95 @@ test('terminal states remove only the ephemeral progress pill', () => {
   assert.match(inlineScript, /if\(\['error','interrupted'\]\.includes\(runtime\.status\)\)clearLiveTurnProgress\(\)/);
 });
 
+test('a later turn keeps the previous terminal error visible', () => {
+  const beginSource = sourceBetween('function beginTurnProcessCollection', 'function collapseCurrentActivityCluster');
+  const api = new Function(`
+    const classList = (...names) => {
+      const values = new Set(names);
+      return {
+        contains: (name) => values.has(name),
+        remove: (...items) => items.forEach((item) => values.delete(item)),
+      };
+    };
+    const chat = {
+      children: [],
+      querySelectorAll() { return []; },
+      appendChild(element) {
+        const current = this.children.indexOf(element);
+        if (current >= 0) this.children.splice(current, 1);
+        this.children.push(element);
+        element.parentNode = this;
+      },
+      insertBefore(element, reference) {
+        const current = this.children.indexOf(element);
+        if (current >= 0) this.children.splice(current, 1);
+        const index = this.children.indexOf(reference);
+        if (index < 0) throw new Error('missing reference');
+        this.children.splice(index, 0, element);
+        element.parentNode = this;
+      },
+    };
+    const timeline = {};
+    const terminal = {
+      isConnected: true,
+      parentNode: timeline,
+      dataset: { messageKind: 'task_error' },
+      classList: classList('process'),
+      remove() { this.parentNode = null; },
+    };
+    const header = { parentNode: chat, classList: classList('liveProcessPanel') };
+    chat.children.push(header);
+    let completionText = '';
+    let turnProcessHeader = header;
+    let turnProcessCollectionTurnId = 'turn-429';
+    let turnProcessElapsedTurnId = '';
+    let collectingTurnProcess = true;
+    let turnProcessElements = [terminal];
+    let latestFinalAssistantElement = null;
+    let currentActivityCluster = null;
+    let currentAgentActivityGroup = null;
+    let pendingAgentActivityBatches = [];
+    let pendingActivityReasoning = [];
+    function isTurnProcessMessage() { return false; }
+    function createCompletionMessage(text) {
+      completionText = text;
+      return { dataset: {}, classList: classList('completionSummary'), parentNode: null };
+    }
+    function clearTurnProcessHeader() {
+      const index = chat.children.indexOf(turnProcessHeader);
+      if (index >= 0) chat.children.splice(index, 1);
+      turnProcessHeader = null;
+    }
+    function startTurnProcessElapsed() {}
+    function renderThreadGoalBar() {}
+    ${beginSource}
+    return {
+      run: () => beginTurnProcessCollection('', false, 'turn-next'),
+      state: () => ({ chat, terminal, completionText, turnProcessCollectionTurnId }),
+    };
+  `)();
+
+  api.run();
+
+  assert.equal(api.state().completionText, '任务失败');
+  assert.strictEqual(api.state().chat.children[1], api.state().terminal);
+  assert.strictEqual(api.state().terminal.parentNode, api.state().chat);
+  assert.equal(api.state().turnProcessCollectionTurnId, 'turn-next');
+});
+
+test('completion summaries label failed and interrupted turns honestly', () => {
+  const titleSource = sourceBetween('function completionMessageTitle', 'function turnTokenUsageLabel');
+  const completionMessageTitle = new Function(
+    'processedMessageTitle',
+    `${titleSource}; return completionMessageTitle;`,
+  )(() => '已处理');
+
+  assert.equal(completionMessageTitle('任务失败'), '任务失败');
+  assert.equal(completionMessageTitle('任务已暂停'), '已暂停');
+  assert.equal(completionMessageTitle('任务中断'), '已暂停');
+  assert.equal(completionMessageTitle('任务完成'), '已处理');
+});
+
 test('a stop request freezes visible streaming without unlocking the running turn', () => {
   const pauseSource = sourceBetween('function pauseNativeLivePresentationForCancel', 'let turnProcessElapsedFrozen');
   const immediate = [];
