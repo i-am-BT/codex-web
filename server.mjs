@@ -22086,6 +22086,14 @@ function shouldCollapseUserMessage(text){
   const lines=value.split(String.fromCharCode(10)).map((line)=>line.trim()).filter(Boolean);
   return value.length>=280&&lines.length>=10;
 }
+function terminalErrorMessageTitle(text){
+  const value=String(text||'').toLowerCase();
+  if(value.includes('usage limit')||value.includes('quota exceeded')||value.includes('insufficient quota'))return'额度已达上限';
+  if(value.includes('too many requests')||value.includes('rate limit')||/(^|\\D)429(\\D|$)/.test(value))return'请求过于频繁';
+  if(value.includes('unauthorized')||value.includes('invalid api key')||/(^|\\D)401(\\D|$)/.test(value))return'认证失败';
+  if(value.includes('timed out')||value.includes('timeout'))return'请求超时';
+  return'任务失败';
+}
 let longUserMessageSerial=0;
 function bindLongUserMessage(el,body,scrollContainer=chat){
   if(!el||!body||el.querySelector(':scope > .longUserMessageToggle'))return;
@@ -22120,13 +22128,14 @@ function bindLongUserMessage(el,body,scrollContainer=chat){
 }
 function createConversationMessageElement(role,text,options={}){
   const kind=String(options.kind||'');
+  const terminalError=role==='process'&&['task_error','error'].includes(kind);
   const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
   const steeringUser=role==='user'&&kind==='steering_user';
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage(text);
   const collapsible=role==='tool'||role==='thinking'||role==='context';
   const el=document.createElement(collapsible?'details':'div');
-  el.className='msg '+role+(collapsible?' toolDetails':'')+(options.streaming?' streaming':'');
+  el.className='msg '+role+(collapsible?' toolDetails':'')+(terminalError?' terminalError':'')+(options.streaming?' streaming':'');
   if(role==='assistant'&&isTurnProcessMessage(role,kind,text))el.classList.add('progressCommentary');
   if(role==='image'&&inputImage)el.classList.add('inputImage');
   el.dataset.messageText=String(text||'');
@@ -22181,7 +22190,7 @@ function createConversationMessageElement(role,text,options={}){
     else body.textContent=text;
     const actions=document.createElement('div');
     actions.className='msgActions';
-    if(['process','log'].includes(role)){
+    if(['process','log'].includes(role)&&!terminalError){
       const tag=document.createElement('span');
       tag.className='tag';
       tag.textContent=role==='process'?'过程':'日志';
@@ -22262,6 +22271,21 @@ function createConversationMessageElement(role,text,options={}){
       el.appendChild(summary);
       el.appendChild(content);
       el._messageLabel=label;
+    }else if(terminalError){
+      const icon=document.createElement('span');
+      icon.className='terminalErrorIcon';
+      icon.setAttribute('aria-hidden','true');
+      setIconLabel(icon,'circle-alert','',false);
+      const content=document.createElement('div');
+      content.className='terminalErrorContent';
+      const title=document.createElement('strong');
+      title.className='terminalErrorTitle';
+      title.textContent=terminalErrorMessageTitle(text);
+      content.appendChild(title);
+      content.appendChild(body);
+      el.appendChild(icon);
+      el.appendChild(content);
+      el.appendChild(actions);
     }else{
       el.appendChild(body);
       if(browserCommentUser)body.classList.add('browserCommentSource');

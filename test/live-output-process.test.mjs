@@ -322,6 +322,9 @@ test('native connection retries and terminal upstream errors render inside the c
   const { nativeConnectionStatusText } = new Function(
     `${textSource}; return { nativeConnectionStatusText };`,
   )();
+  const errorTitleSource = sourceBetween('function terminalErrorMessageTitle', 'let longUserMessageSerial');
+  const terminalErrorMessageTitle = new Function(`${errorTitleSource}; return terminalErrorMessageTitle;`)();
+  const messageElementSource = sourceBetween('function createConversationMessageElement', 'function addMsg');
   const runtimeHandlerSource = sourceBetween('function connectSessionEvents', 'function nativeMessageElementBySequence');
 
   assert.equal(
@@ -338,7 +341,21 @@ test('native connection retries and terminal upstream errors render inside the c
   assert.match(inlineScript, /let nativeConnectionStatusElement = null;/);
   assert.match(runtimeHandlerSource, /runtime\.type==='connection-error'[\s\S]*?upsertNativeConnectionStatus\(runtime\)/);
   assert.match(inlineScript, /if\(terminalProcess\)clearNativeConnectionStatus\(options\.turnId\)/);
+  assert.equal(terminalErrorMessageTitle("You've hit your usage limit. Try again later."), '额度已达上限');
+  assert.equal(terminalErrorMessageTitle('last status: 429 Too Many Requests'), '请求过于频繁');
+  assert.equal(terminalErrorMessageTitle('401 Unauthorized'), '认证失败');
+  assert.equal(terminalErrorMessageTitle('request timed out'), '请求超时');
+  assert.equal(terminalErrorMessageTitle('provider unavailable'), '任务失败');
+  assert.match(messageElementSource, /const terminalError=role==='process'&&\['task_error','error'\]\.includes\(kind\)/);
+  assert.match(messageElementSource, /terminalError\?' terminalError':''/);
+  assert.match(messageElementSource, /icon\.className='terminalErrorIcon'/);
+  assert.match(messageElementSource, /title\.textContent=terminalErrorMessageTitle\(text\)/);
+  assert.match(messageElementSource, /if\(\['process','log'\]\.includes\(role\)&&!terminalError\)/);
   assert.match(uiStyles, /\.msg\.process\.nativeConnectionStatus[\s\S]*?white-space:\s*pre-wrap/s);
+  assert.match(uiStyles, /\.msg\.process\.terminalError\s*\{[^}]*grid-template-columns:\s*30px minmax\(0, 1fr\) 30px;[^}]*border-left:\s*3px solid var\(--danger\);[^}]*border-radius:\s*7px/s);
+  assert.match(uiStyles, /\.terminalErrorIcon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;[^}]*background:\s*var\(--danger-soft\)/s);
+  assert.match(uiStyles, /\.terminalErrorTitle\s*\{[^}]*color:\s*var\(--danger\);[^}]*font-size:\s*11px/s);
+  assert.match(uiStyles, /\.msg\.process\.terminalError > \.msgActions\s*\{[^}]*min-height:\s*28px;[^}]*margin:\s*-1px 0 0/s);
 });
 
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
