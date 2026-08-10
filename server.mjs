@@ -794,6 +794,23 @@ function readHistoryCompletionReadFile() {
   } catch {}
   return {};
 }
+function historyCompletionReadServerTimestamp(version) {
+  const value = String(version || '');
+  const separator = value.indexOf('|');
+  const timestamp = Date.parse(separator >= 0 ? value.slice(separator + 1) : '');
+  return Number.isFinite(timestamp) ? timestamp : NaN;
+}
+function selectServerHistoryCompletionReadVersion(current, incoming) {
+  if (!current) return incoming;
+  if (!incoming || current === incoming) return current;
+  const currentTimestamp = historyCompletionReadServerTimestamp(current);
+  const incomingTimestamp = historyCompletionReadServerTimestamp(incoming);
+  if (Number.isFinite(currentTimestamp) && Number.isFinite(incomingTimestamp) && currentTimestamp !== incomingTimestamp) {
+    return incomingTimestamp > currentTimestamp ? incoming : current;
+  }
+  if (Number.isFinite(incomingTimestamp) && !Number.isFinite(currentTimestamp)) return incoming;
+  return current;
+}
 function writeHistoryCompletionReadFile() {
   try {
     writeFileSync(HISTORY_COMPLETION_READ_FILE, JSON.stringify(serverHistoryCompletionRead, null, 2));
@@ -811,8 +828,11 @@ app.put('/api/history-completion-read', requireAuth, (req, res) => {
     }
     let changed = false;
     for (const [key, version] of Object.entries(incoming)) {
-      if (key && typeof version === 'string' && version && serverHistoryCompletionRead[key] !== version) {
-        serverHistoryCompletionRead[key] = version;
+      const selected = key && typeof version === 'string' && version
+        ? selectServerHistoryCompletionReadVersion(serverHistoryCompletionRead[key], version)
+        : '';
+      if (selected && serverHistoryCompletionRead[key] !== selected) {
+        serverHistoryCompletionRead[key] = selected;
         changed = true;
       }
     }
@@ -16826,6 +16846,26 @@ function storeHistoryCompletionState(key,state){
 }
 function historyCompletionKey(item){return conversationKey(item?.source==='codex'?'codex':'web',item?.id)}
 function historyCompletionVersion(item){return String(item?.status||'')+'|'+String(item?.updatedAt||item?.recencyAt||item?.createdAt||'')}
+function historyCompletionReadVersionTimestamp(version){
+  const value=String(version||'');
+  const separator=value.indexOf('|');
+  const timestamp=Date.parse(separator>=0?value.slice(separator+1):'');
+  return Number.isFinite(timestamp)?timestamp:NaN;
+}
+function selectHistoryCompletionReadVersion(key,localVersion,remoteVersion){
+  if(!localVersion)return remoteVersion||'';
+  if(!remoteVersion||localVersion===remoteVersion)return localVersion;
+  const seenVersion=historyCompletionSeen.get(key);
+  if(seenVersion===localVersion)return localVersion;
+  if(seenVersion===remoteVersion)return remoteVersion;
+  const localTimestamp=historyCompletionReadVersionTimestamp(localVersion);
+  const remoteTimestamp=historyCompletionReadVersionTimestamp(remoteVersion);
+  if(Number.isFinite(localTimestamp)&&Number.isFinite(remoteTimestamp)&&localTimestamp!==remoteTimestamp){
+    return remoteTimestamp>localTimestamp?remoteVersion:localVersion;
+  }
+  if(Number.isFinite(remoteTimestamp)&&!Number.isFinite(localTimestamp))return remoteVersion;
+  return localVersion;
+}
 function isCompletedHistoryItem(item){return ['done','completed'].includes(String(item?.status||'').toLowerCase())}
 function isCompletedHistoryCompletionVersion(version){return ['done','completed'].includes(String(version||'').split('|',1)[0].toLowerCase())}
 function trackHistoryCompletionState(items){
@@ -16891,12 +16931,11 @@ async function syncHistoryCompletionReadFromServer(){
       const res=await fetch('/api/history-completion-read');
       const data=await res.json();
       if(!res.ok||!data||typeof data.read!=='object')return;
-      const merged=new Map();
-      for(const [key,version] of Object.entries(data.read)){
-        if(key&&typeof version==='string')merged.set(key,version);
-      }
-      for(const [key,version] of historyCompletionRead){
-        if(!merged.has(key))merged.set(key,version);
+      const merged=new Map(historyCompletionRead);
+      for(const [key,remoteVersion] of Object.entries(data.read)){
+        if(!key||typeof remoteVersion!=='string')continue;
+        const selected=selectHistoryCompletionReadVersion(key,merged.get(key),remoteVersion);
+        if(selected)merged.set(key,selected);
       }
       const changed=merged.size!==historyCompletionRead.size
         ||[...merged.entries()].some(([key,version])=>historyCompletionRead.get(key)!==version);
@@ -17426,10 +17465,12 @@ function createHistoryRow(item,projectPath){
   }
   let completionUnread=null;
   if(historyCompletionUnread(item)){
-    completionUnread=document.createElement('span');
+    completionUnread=document.createElement('button');
+    completionUnread.type='button';
     completionUnread.className='histCompletionUnread';
-    completionUnread.title='任务已完成，尚未阅读';
-    completionUnread.setAttribute('aria-label','任务已完成，尚未阅读');
+    completionUnread.title='打开任务并标记已读';
+    completionUnread.setAttribute('aria-label','打开任务并标记已读');
+    completionUnread.addEventListener('click',(e)=>{e.preventDefault();e.stopPropagation();openConversation()});
   }
   if(source==='codex'){
     if(running)row.appendChild(running);

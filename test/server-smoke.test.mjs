@@ -2245,7 +2245,8 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
     assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
     assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*2;[^}]*left:\s*-7px;[^}]*pointer-events:\s*none/s);
-    assert.match(uiStyles, /\.histCompletionUnread\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-7px;[^}]*background:\s*var\(--info\);[^}]*pointer-events:\s*none/s);
+    assert.match(uiStyles, /\.histCompletionUnread\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-18px;[^}]*width:\s*30px;[^}]*height:\s*34px;[^}]*pointer-events:\s*auto/s);
+    assert.match(uiStyles, /\.histCompletionUnread::after\s*\{[^}]*width:\s*8px;[^}]*height:\s*8px;[^}]*background:\s*currentColor/s);
     assert.match(uiStyles, /\.historyProjectFolder\s*\{/);
     assert.match(uiStyles, /\.historyProjectPreview\.visible\s*\{/);
     assert.match(uiStyles, /\.historyProjectItems\s*\{[^}]*padding-left:\s*22px/s);
@@ -2606,6 +2607,26 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.deepEqual((await fetchedCompletionRead.json()).read, {
       'codex:019f4f84-ea9f-73c2-b997-deba7b4aa729': 'done|2026-08-05T00:00:00Z',
     });
+    const newerCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ read: { 'codex:019f4f84-ea9f-73c2-b997-deba7b4aa729': 'done|2026-08-05T01:00:00Z' } }),
+    });
+    assert.equal(newerCompletionRead.status, 200);
+    assert.equal(
+      (await newerCompletionRead.json()).read['codex:019f4f84-ea9f-73c2-b997-deba7b4aa729'],
+      'done|2026-08-05T01:00:00Z',
+    );
+    const staleCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ read: { 'codex:019f4f84-ea9f-73c2-b997-deba7b4aa729': 'done|2026-08-04T23:00:00Z' } }),
+    });
+    assert.equal(staleCompletionRead.status, 200);
+    assert.equal(
+      (await staleCompletionRead.json()).read['codex:019f4f84-ea9f-73c2-b997-deba7b4aa729'],
+      'done|2026-08-05T01:00:00Z',
+    );
     const invalidCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },

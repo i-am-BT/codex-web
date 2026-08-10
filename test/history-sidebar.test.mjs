@@ -112,7 +112,10 @@ test('the pinned section renders above tasks, collapses independently, and marks
   assert.match(uiStyles, /body \.hist\.native\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
   assert.match(uiStyles, /body \.hist\.native\.running\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto auto/s);
   assert.match(uiStyles, /\.histRunning\s*\{[^}]*position:\s*absolute;[^}]*z-index:\s*2;[^}]*left:\s*-7px;[^}]*pointer-events:\s*none/s);
-  assert.match(uiStyles, /\.histCompletionUnread\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-7px;[^}]*background:\s*var\(--info\);[^}]*pointer-events:\s*none/s);
+  assert.match(rowSource, /completionUnread=document\.createElement\('button'\);\s*completionUnread\.type='button'/);
+  assert.match(rowSource, /completionUnread\.addEventListener\('click',\(e\)=>\{e\.preventDefault\(\);e\.stopPropagation\(\);openConversation\(\)\}\)/);
+  assert.match(uiStyles, /\.histCompletionUnread\s*\{[^}]*position:\s*absolute;[^}]*left:\s*-18px;[^}]*width:\s*30px;[^}]*height:\s*34px;[^}]*pointer-events:\s*auto/s);
+  assert.match(uiStyles, /\.histCompletionUnread::after\s*\{[^}]*width:\s*8px;[^}]*height:\s*8px;[^}]*background:\s*currentColor/s);
   assert.match(uiStyles, /\.historyPinned,\s*\.historySidebarTasks,\s*\.historyTasks\s*\{[^}]*display:\s*grid/s);
   assert.match(uiStyles, /\.historyPinnedItems\[hidden\],\s*\.historySidebarItems\[hidden\],\s*\.historyTasksItems\[hidden\]\s*\{[^}]*display:\s*none/s);
   assert.match(uiStyles, /\.historyPinnedHead\[aria-expanded="true"\] \.historyPinnedChevron,[^{]*\{[^}]*transform:\s*rotate\(90deg\)/s);
@@ -160,6 +163,71 @@ test('a read completion stays read when its completed metadata changes', () => {
   assert.equal(api.historyCompletionUnread(doneUnread), true);
   api.trackHistoryCompletionState([doneUnreadAfterMetadataSync]);
   assert.equal(api.historyCompletionUnread(doneUnreadAfterMetadataSync), true);
+});
+
+test('a stale server sync cannot revive a completion dot after it was clicked', async () => {
+  const storage = new Map();
+  const localStorage = {
+    getItem: (key) => storage.get(key) || null,
+    setItem: (key, value) => storage.set(key, value),
+  };
+  const timers = new Map();
+  let nextTimerId = 1;
+  const setTimeout = (callback) => {
+    const id = nextTimerId++;
+    timers.set(id, callback);
+    return id;
+  };
+  const clearTimeout = (id) => timers.delete(id);
+  const key = 'codex:thread-a';
+  const staleVersion = 'done|2026-08-02T00:30:00.000Z';
+  const fetch = async (url, options = {}) => {
+    assert.equal(url, '/api/history-completion-read');
+    assert.equal(options.method, undefined, 'the delayed local push must not have run');
+    return {
+      ok: true,
+      json: async () => ({ read: { [key]: staleVersion } }),
+    };
+  };
+  const api = new Function(
+    'localStorage',
+    'conversationKey',
+    'renderHistory',
+    'fetch',
+    'setTimeout',
+    'clearTimeout',
+    `const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb.historyCompletionRead.v2';
+     const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v2';
+     const HISTORY_COMPLETION_SYNC_DELAY_MS=5000;
+     let historyCompletionRead=new Map();
+     let historyCompletionSeen=new Map();
+     let historyCompletionPushTimer=null;
+     let historyCompletionSyncTimer=null;
+     let historyCompletionSyncInFlight=null;
+     ${completionStateSource}
+     return {
+       trackHistoryCompletionState,
+       markHistoryCompletionRead,
+       syncHistoryCompletionReadFromServer,
+       historyCompletionUnread,
+       readVersion: (completionKey) => historyCompletionRead.get(completionKey),
+     };`,
+  )(localStorage, (source, id) => `${source}:${id}`, () => {}, fetch, setTimeout, clearTimeout);
+
+  const running = { source: 'codex', id: 'thread-a', status: 'running', updatedAt: '2026-08-02T01:00:00.000Z' };
+  const done = { ...running, status: 'done', updatedAt: '2026-08-02T01:05:00.000Z' };
+
+  api.trackHistoryCompletionState([running]);
+  api.trackHistoryCompletionState([done]);
+  assert.equal(api.historyCompletionUnread(done), true);
+
+  api.markHistoryCompletionRead(done);
+  assert.equal(api.historyCompletionUnread(done), false);
+
+  await api.syncHistoryCompletionReadFromServer();
+
+  assert.equal(api.readVersion(key), 'done|2026-08-02T01:05:00.000Z');
+  assert.equal(api.historyCompletionUnread(done), false);
 });
 
 test('history rename uses an inline editor instead of a browser prompt', () => {

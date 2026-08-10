@@ -4368,17 +4368,41 @@ body .histDelete .lucide {
 
 .histCompletionUnread {
   position: absolute;
-  z-index: 2;
+  z-index: 3;
   top: 50%;
-  left: -7px;
+  left: -18px;
+  display: grid;
+  width: 30px;
+  height: 34px;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--info);
+  padding: 0;
+  cursor: pointer;
+  pointer-events: auto;
+  transform: translateY(-50%);
+}
+
+.histCompletionUnread::after {
+  content: "";
   display: block;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--info);
+  background: currentColor;
   box-shadow: 0 0 0 2px var(--surface);
-  pointer-events: none;
-  transform: translateY(-50%);
+  transition: box-shadow 120ms var(--ease), transform 120ms var(--ease);
+}
+
+.histCompletionUnread:hover::after,
+.histCompletionUnread:focus-visible::after {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--primary-soft);
+  transform: scale(1.08);
+}
+
+.histCompletionUnread:focus-visible {
+  outline: none;
 }
 
 body .histSource {
