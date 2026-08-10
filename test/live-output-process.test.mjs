@@ -356,6 +356,7 @@ test('native connection retries and terminal upstream errors render inside the c
   assert.match(uiStyles, /\.terminalErrorIcon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;[^}]*background:\s*var\(--danger-soft\)/s);
   assert.match(uiStyles, /\.terminalErrorTitle\s*\{[^}]*color:\s*var\(--danger\);[^}]*font-size:\s*11px/s);
   assert.match(uiStyles, /\.msg\.process\.terminalError > \.msgActions\s*\{[^}]*min-height:\s*28px;[^}]*margin:\s*-1px 0 0/s);
+  assert.match(uiStyles, /@media \(min-width:\s*821px\)\s*\{\s*\.terminalErrorContent\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*baseline;[^}]*gap:\s*8px;[^}]*\}\s*\.terminalErrorTitle\s*\{[^}]*white-space:\s*nowrap/s);
 });
 
 test('the real exec-wrapped update_plan call becomes a plan event', () => {

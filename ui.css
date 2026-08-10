@@ -5952,6 +5952,21 @@ body[data-theme] .msg.process.terminalError .copyMsg:focus-visible {
   color: var(--danger);
 }
 
+@media (min-width: 821px) {
+  .terminalErrorContent {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding-top: 5px;
+  }
+
+  .terminalErrorTitle {
+    flex: 0 0 auto;
+    margin: 0;
+    white-space: nowrap;
+  }
+}
+
 body .msg.process.completionSummary {
   width: 100%;
   max-width: 100%;
