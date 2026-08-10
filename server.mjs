@@ -117,8 +117,8 @@ const DEFAULT_CWD = process.env.DEFAULT_CWD || homedir();
 const DEFAULT_SANDBOX = process.env.DEFAULT_SANDBOX || 'read-only';
 const DEFAULT_APPROVAL = process.env.DEFAULT_APPROVAL || 'never';
 const FORCE_FULL_ACCESS = parseBoolean(process.env.FORCE_FULL_ACCESS, false);
-const NATIVE_SESSION_MAX_READ_MB = Number(process.env.NATIVE_SESSION_MAX_READ_MB || 32);
-const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAGES || 700);
+const NATIVE_SESSION_MAX_READ_MB = Number(process.env.NATIVE_SESSION_MAX_READ_MB ?? 0);
+const NATIVE_SESSION_MAX_MESSAGES = Number(process.env.NATIVE_SESSION_MAX_MESSAGES ?? 0);
 const NATIVE_SESSION_MAX_ITEMS = Number(process.env.NATIVE_SESSION_MAX_ITEMS || 100);
 const NATIVE_SESSION_POLL_MS = Number(process.env.NATIVE_SESSION_POLL_MS || 3000);
 const APP_SERVER_REQUEST_TIMEOUT_MS = Number(process.env.APP_SERVER_REQUEST_TIMEOUT_MS || 30000);
@@ -794,6 +794,23 @@ function readHistoryCompletionReadFile() {
   } catch {}
   return {};
 }
+function historyCompletionReadServerTimestamp(version) {
+  const value = String(version || '');
+  const separator = value.indexOf('|');
+  const timestamp = Date.parse(separator >= 0 ? value.slice(separator + 1) : '');
+  return Number.isFinite(timestamp) ? timestamp : NaN;
+}
+function selectServerHistoryCompletionReadVersion(current, incoming) {
+  if (!current) return incoming;
+  if (!incoming || current === incoming) return current;
+  const currentTimestamp = historyCompletionReadServerTimestamp(current);
+  const incomingTimestamp = historyCompletionReadServerTimestamp(incoming);
+  if (Number.isFinite(currentTimestamp) && Number.isFinite(incomingTimestamp) && currentTimestamp !== incomingTimestamp) {
+    return incomingTimestamp > currentTimestamp ? incoming : current;
+  }
+  if (Number.isFinite(incomingTimestamp) && !Number.isFinite(currentTimestamp)) return incoming;
+  return current;
+}
 function writeHistoryCompletionReadFile() {
   try {
     writeFileSync(HISTORY_COMPLETION_READ_FILE, JSON.stringify(serverHistoryCompletionRead, null, 2));
@@ -811,8 +828,11 @@ app.put('/api/history-completion-read', requireAuth, (req, res) => {
     }
     let changed = false;
     for (const [key, version] of Object.entries(incoming)) {
-      if (key && typeof version === 'string' && version && serverHistoryCompletionRead[key] !== version) {
-        serverHistoryCompletionRead[key] = version;
+      const selected = key && typeof version === 'string' && version
+        ? selectServerHistoryCompletionReadVersion(serverHistoryCompletionRead[key], version)
+        : '';
+      if (selected && serverHistoryCompletionRead[key] !== selected) {
+        serverHistoryCompletionRead[key] = selected;
         changed = true;
       }
     }
@@ -1134,13 +1154,16 @@ app.get('/api/native-sessions/:id', requireAuth, async (req, res) => {
   try {
     const limit = positiveInteger(req.query.limit);
     const externalizeImages = Boolean(limit) || req.query.images === 'external';
+    const earlierHistoryPage = req.query.history === 'page' && req.query.paging === 'earlier';
     const conversation = nativeSessions.get(cleanNativeThreadId(req.params.id), {
       after: req.query.after,
       generation: req.query.generation,
       limit,
+      historyPage: req.query.history === 'page',
+      completeLatestTurn: req.query.latest === 'complete',
     });
     if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
-    await reconcileNativeTurnStatusFromAppServer(conversation.id, conversation);
+    if (!earlierHistoryPage) await reconcileNativeTurnStatusFromAppServer(conversation.id, conversation);
     requestDesktopThreadSnapshot(conversation.id);
     res.json({ conversation: decorateNativeConversation(conversation, { externalizeImages }) });
   } catch (err) {
@@ -8568,8 +8591,22 @@ let grok2ApiConsoleRequestSeq = 0;
 let conversationLoadSeq = 0;
 let nativeCursor = 0;
 let nativeGeneration = 0;
+const NATIVE_HISTORY_PAGE_SIZE = 60;
+const NATIVE_HISTORY_SCROLL_THRESHOLD = 96;
+const NATIVE_HISTORY_MANUAL_MAX_BATCHES = 1;
+const NATIVE_HISTORY_INITIAL_MAX_BATCHES = 24;
+const NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES = 2;
+const NATIVE_HISTORY_PAGE_OVERFLOW = 24;
+let nativeHistoryPageLimit = NATIVE_HISTORY_PAGE_SIZE;
+let nativeHistoryHasEarlierMessages = false;
+let nativeHistoryPageLoading = false;
+let nativeHistoryLoadReady = false;
+let nativeHistorySyncDeferred = false;
+let nativeHistoryDeferredSyncTimer = null;
+let nativeHistoryNextPageLimit = NATIVE_HISTORY_PAGE_SIZE;
 let sessionEvents = null;
 let nativeSyncTimer = null;
+let nativeSyncChangedIds = new Set();
 let nativeCompletionSync = null;
 let nativeCompletionTimer = null;
 let webRunActive = false;
@@ -8589,6 +8626,8 @@ let nativeRuntimeStreamTurnIds = new Set();
 let nativeRenderedMessageKeys = new Set();
 let nativeLiveScrollTimer = null;
 let nativeLiveFollowBottom = true;
+let nativeLiveReadingHistory = false;
+let nativeLiveTowardLatestUntil = 0;
 let nativeLiveScrollTrackingBound = false;
 let nativeLiveWasBackgrounded = false;
 let nativeSnapshotResumeCatchup = false;
@@ -8763,7 +8802,7 @@ let sideChatCursor = 0;
 let sideChatGeneration = 0;
 let sideChatTabs = null;
 let sideChatView = 'side';
-/** @type {{threadId:string,sourceThreadId:string,title:string,running?:boolean}[]} */
+/** @type {{threadId:string,sourceThreadId:string,title:string,running?:boolean,historyLimit?:number,historyNextLimit?:number,hasEarlierMessages?:boolean,historyLoading?:boolean}[]} */
 let sideChatOpenTabs = [];
 let sideChatActiveTurnId = '';
 const syncCurrentNativeConversation = createTrailingSingleFlight(syncCurrentNativeConversationOnce);
@@ -8827,7 +8866,6 @@ let sideChatRenderedWidth=SIDE_CHAT_WIDTH_DEFAULT;
 let sideChatResizePointerId=null;
 const ACTIVE_CONVERSATION_STORAGE_KEY='codexWeb.activeConversation.v1';
 const NATIVE_FORK_MARKERS_STORAGE_KEY='codexWeb.nativeForkMarkers.v1';
-const NATIVE_INITIAL_MESSAGE_LIMIT=60;
 const DREAM_SKIN_THEME_PROPERTIES=['--canvas','--surface','--surface-raised','--surface-hover','--surface-active','--border','--border-strong','--text','--text-muted','--text-subtle','--primary','--primary-hover','--primary-soft','--primary-line','--info','--thinking','--user-bg','--code-bg','--skin-canvas-wash','--skin-content-wash','--skin-surface','--skin-surface-soft','--skin-surface-strong','--skin-accent-glow','--skin-art-position'];
 let collapsedHistoryProjects=readCollapsedHistoryProjects();
 let historyPinnedCollapsed=readHistoryPinnedCollapsed();
@@ -8839,16 +8877,28 @@ let renamedHistoryProjects=readRenamedHistoryProjects();
 let historyCompletionRead=readHistoryCompletionState(HISTORY_COMPLETION_READ_STORAGE_KEY);
 let historyCompletionSeen=readHistoryCompletionState(HISTORY_COMPLETION_SEEN_STORAGE_KEY);
 let historyCompletionPushTimer=null;
+let historyCompletionSyncTimer=null;
+let historyCompletionSyncInFlight=null;
 let composerModelValueBeforeChange='';
 let activeHistoryProjectMenu=null;
+const HISTORY_SESSION_REFRESH_DELAY_MS=700;
+const HISTORY_COMPLETION_SYNC_DELAY_MS=5000;
+let historySessionRefreshTimer=null;
+let historySessionRefreshActive=false;
+let historySessionRefreshQueued=false;
 let historyRefreshPending=false;
+let historyRefreshInFlight=null;
+let historyRefreshRerun=false;
 let historyRefreshPointerId=null;
 let historyRefreshReleaseTimer=null;
 let historyRenameActive=false;
 let historyProjectPreview=null;
 let historyProjectPreviewAnchor=null;
 let nativeForkMarkers=readNativeForkMarkers();
-function refreshIcons(root=document){if(!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
+let deferredIconRefreshDepth=0;
+function refreshIcons(root=document){if(deferredIconRefreshDepth>0||!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
+function beginDeferredIconRefresh(){deferredIconRefreshDepth+=1}
+function endDeferredIconRefresh(root=document){deferredIconRefreshDepth=Math.max(0,deferredIconRefreshDepth-1);if(deferredIconRefreshDepth===0)refreshIcons(root)}
 function setIconLabel(element,name,label,showLabel=true){if(!element)return;element.replaceChildren();const icon=document.createElement('i');icon.setAttribute('data-lucide',name);icon.setAttribute('aria-hidden','true');element.appendChild(icon);if(showLabel){const text=document.createElement('span');text.className='buttonLabel';text.textContent=label;element.appendChild(text)}if(label&&!element.getAttribute('aria-label'))element.setAttribute('aria-label',label);refreshIcons(element)}
 function createComposerMirrorField(panel,labelText,ariaLabel){
   const field=document.createElement('label');
@@ -9806,6 +9856,123 @@ function sideChatTabLabel(title){
   const clean=String(title||sideChatTitle?.textContent||'Side chat').trim()||'Side chat';
   return clean.length>22?clean.slice(0,21)+'…':clean;
 }
+function normalizeNativeHistoryPageLimit(value){
+  const number=Number(value);
+  if(!Number.isInteger(number)||number<NATIVE_HISTORY_PAGE_SIZE)return NATIVE_HISTORY_PAGE_SIZE;
+  return number;
+}
+function nativeHistoryViewportFilled(container){
+  const height=Number(container?.clientHeight)||0;
+  return height>0&&container.scrollHeight>height+NATIVE_HISTORY_PAGE_OVERFLOW;
+}
+function nativeHistoryPageGrowthTarget(container){
+  const height=Number(container?.clientHeight)||720;
+  return Math.max(320,Math.round(Math.min(height,1200)*0.75));
+}
+function nativeHistoryPageGrowthGoal(container,initialHeight,fillViewport){
+  if(!fillViewport)return nativeHistoryPageGrowthTarget(container);
+  const height=Number(container?.clientHeight)||0;
+  if(!height)return nativeHistoryPageGrowthTarget(container);
+  return Math.max(NATIVE_HISTORY_PAGE_OVERFLOW,height+NATIVE_HISTORY_PAGE_OVERFLOW-Number(initialHeight||0));
+}
+function nativeHistoryNextBatchCount(growth,growthTarget,loadedBatches,maxBatches){
+  const remainingBatches=Math.max(0,Number(maxBatches||0)-Number(loadedBatches||0));
+  if(!remainingBatches)return 0;
+  if(!loadedBatches)return 1;
+  const normalizedGrowth=Math.max(0,Number(growth)||0);
+  const normalizedTarget=Math.max(1,Number(growthTarget)||1);
+  const averageGrowth=normalizedGrowth/loadedBatches;
+  const estimatedBatches=averageGrowth>0
+    ? Math.ceil(Math.max(0,normalizedTarget-normalizedGrowth)/averageGrowth)
+    : NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES;
+  return Math.max(1,Math.min(
+    NATIVE_HISTORY_PAGE_MAX_REQUEST_BATCHES,
+    remainingBatches,
+    estimatedBatches||1,
+  ));
+}
+function clearNativeHistoryDeferredSync(){
+  if(nativeHistoryDeferredSyncTimer)clearTimeout(nativeHistoryDeferredSyncTimer);
+  nativeHistoryDeferredSyncTimer=null;
+}
+function deferNativeSyncForHistoryPage(){
+  if(!nativeHistoryPageLoading&&!nativeHistoryDeferredSyncTimer)return false;
+  nativeHistorySyncDeferred=true;
+  return true;
+}
+function scheduleDeferredNativeHistorySync(threadId){
+  const id=String(threadId||'');
+  clearNativeHistoryDeferredSync();
+  if(!id){nativeHistorySyncDeferred=false;return}
+  nativeHistoryDeferredSyncTimer=setTimeout(()=>{
+    nativeHistoryDeferredSyncTimer=null;
+    nativeHistorySyncDeferred=false;
+    if(currentConversationSource!=='codex'||currentConversationId!==id)return;
+    if(nativeHistoryPageLoading){nativeHistorySyncDeferred=true;return}
+    void syncCurrentNativeConversation();
+  },600);
+}
+function historyNodeHasLayout(node){
+  if(!node||!node.getClientRects().length)return false;
+  const rect=node.getBoundingClientRect();
+  return rect.width>0&&rect.height>0;
+}
+function historySequenceNode(container,sequence){
+  const target=Number(sequence);
+  if(!container||!Number.isInteger(target)||target<1)return null;
+  const matches=[...container.querySelectorAll('[data-native-message-seq]')]
+    .filter((node)=>Number(node.dataset.nativeMessageSeq)===target);
+  return matches.find(historyNodeHasLayout)||null;
+}
+function captureHistoryScrollAnchor(container){
+  if(!container)return null;
+  const containerRect=container.getBoundingClientRect();
+  const nodes=[...container.querySelectorAll('[data-native-message-seq]')].filter(historyNodeHasLayout);
+  const visible=nodes.map((node)=>({node,rect:node.getBoundingClientRect()})).filter(({node,rect})=>{
+    const sequence=Number(node.dataset.nativeMessageSeq);
+    if(!Number.isInteger(sequence)||sequence<1)return false;
+    return rect.bottom>=containerRect.top+1&&rect.top<=containerRect.bottom-1;
+  }).sort((left,right)=>left.rect.top-right.rect.top)[0]?.node;
+  const node=visible||nodes.find((item)=>Number.isInteger(Number(item.dataset.nativeMessageSeq)));
+  const sequence=Number(node?.dataset?.nativeMessageSeq);
+  return{
+    sequence:Number.isInteger(sequence)&&sequence>0?sequence:0,
+    offset:node?node.getBoundingClientRect().top-containerRect.top:0,
+    scrollTop:container.scrollTop,
+    scrollHeight:container.scrollHeight,
+  };
+}
+function restoreHistoryScrollAnchor(container,anchor){
+  if(!container||!anchor)return Promise.resolve();
+  let appliedScrollTop=Number(container.scrollTop)||0;
+  let userMoved=false;
+  const align=()=>{
+    if(userMoved||container.isConnected===false)return false;
+    const currentScrollTop=Number(container.scrollTop)||0;
+    if(Math.abs(currentScrollTop-appliedScrollTop)>2){
+      userMoved=true;
+      return false;
+    }
+    const node=historySequenceNode(container,anchor.sequence);
+    if(node){
+      const offset=node.getBoundingClientRect().top-container.getBoundingClientRect().top;
+      const delta=offset-Number(anchor.offset||0);
+      if(Number.isFinite(delta)&&Math.abs(delta)>0.5)container.scrollTop+=delta;
+    }else{
+      const delta=container.scrollHeight-Number(anchor.scrollHeight||0);
+      container.scrollTop=Math.max(0,Number(anchor.scrollTop||0)+delta);
+    }
+    appliedScrollTop=Number(container.scrollTop)||0;
+    return true;
+  };
+  align();
+  return new Promise((resolve)=>{
+    requestAnimationFrame(()=>{
+      if(!align()){resolve();return}
+      requestAnimationFrame(()=>{align();resolve()});
+    });
+  });
+}
 function upsertSideChatTab(options={}){
   const {threadId,sourceThreadId='',title=''}=options;
   const id=String(threadId||'').trim();
@@ -9816,6 +9983,10 @@ function upsertSideChatTab(options={}){
     if(title)existing.title=String(title).trim()||existing.title;
     if(sourceThreadId)existing.sourceThreadId=String(sourceThreadId);
     if(hasServiceTier)existing.serviceTier=normalizeComposerServiceTier(options.serviceTier);
+    existing.historyLimit=Number.isInteger(existing.historyLimit)&&existing.historyLimit>0?existing.historyLimit:60;
+    existing.historyNextLimit=Number.isInteger(existing.historyNextLimit)&&existing.historyNextLimit>0?existing.historyNextLimit:existing.historyLimit+60;
+    existing.hasEarlierMessages=Boolean(existing.hasEarlierMessages);
+    existing.historyLoading=Boolean(existing.historyLoading);
     return existing;
   }
   const tab={
@@ -9824,6 +9995,10 @@ function upsertSideChatTab(options={}){
     title:String(title||'临时侧聊').trim()||'临时侧聊',
     serviceTier:hasServiceTier?normalizeComposerServiceTier(options.serviceTier):null,
     running:false,
+    historyLimit:60,
+    historyNextLimit:120,
+    hasEarlierMessages:false,
+    historyLoading:false,
   };
   sideChatOpenTabs.push(tab);
   return tab;
@@ -9978,6 +10153,28 @@ function ensureSideChatPane(){
   head.append(copy,actions);
   sideChatMessages=document.createElement('div');
   sideChatMessages.className='sideChatMessages';
+  sideChatMessages.addEventListener('wheel',(event)=>{
+    if(event.deltaY<0&&sideChatMessages.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD)void loadEarlierSideChatHistoryPage();
+  },{passive:true});
+  let sideChatHistoryTouchStartY=0;
+  let sideChatHistoryTouchPageTriggered=false;
+  sideChatMessages.addEventListener('touchstart',(event)=>{
+    sideChatHistoryTouchStartY=Number(event.touches?.[0]?.clientY)||0;
+    sideChatHistoryTouchPageTriggered=false;
+  },{passive:true});
+  sideChatMessages.addEventListener('touchmove',(event)=>{
+    const currentY=Number(event.touches?.[0]?.clientY)||0;
+    if(
+      sideChatHistoryTouchPageTriggered
+      ||currentY-sideChatHistoryTouchStartY<28
+      ||sideChatMessages.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD
+    )return;
+    sideChatHistoryTouchPageTriggered=true;
+    void loadEarlierSideChatHistoryPage();
+  },{passive:true});
+  const resetSideChatHistoryTouch=()=>{sideChatHistoryTouchPageTriggered=false};
+  sideChatMessages.addEventListener('touchend',resetSideChatHistoryTouch,{passive:true});
+  sideChatMessages.addEventListener('touchcancel',resetSideChatHistoryTouch,{passive:true});
   const foot=document.createElement('form');
   foot.className='sideChatComposer';
   foot.addEventListener('submit',(event)=>{
@@ -10039,6 +10236,10 @@ function readSideChatState(){
         title:String(tab?.title||'临时侧聊').trim()||'临时侧聊',
         serviceTier:normalizeComposerServiceTier(tab?.serviceTier),
         running:false,
+        historyLimit:NATIVE_HISTORY_PAGE_SIZE,
+        historyNextLimit:NATIVE_HISTORY_PAGE_SIZE*2,
+        hasEarlierMessages:false,
+        historyLoading:false,
       })).filter((tab)=>tab.threadId);
       if(!tabs.length)return null;
       const activeThreadId=String(parsed.activeThreadId||parsed.threadId||tabs[0].threadId).trim();
@@ -10047,7 +10248,7 @@ function readSideChatState(){
     const threadId=String(parsed.threadId||'').trim();
     if(!threadId)return null;
     return {
-      tabs:[{threadId,sourceThreadId:String(parsed.sourceThreadId||'').trim(),title:'临时侧聊',serviceTier:normalizeComposerServiceTier(parsed.serviceTier),running:false}],
+      tabs:[{threadId,sourceThreadId:String(parsed.sourceThreadId||'').trim(),title:'临时侧聊',serviceTier:normalizeComposerServiceTier(parsed.serviceTier),running:false,historyLimit:NATIVE_HISTORY_PAGE_SIZE,historyNextLimit:NATIVE_HISTORY_PAGE_SIZE*2,hasEarlierMessages:false,historyLoading:false}],
       activeThreadId:threadId,
       view:'side',
     };
@@ -10311,7 +10512,7 @@ function renderSideChatMessages(messages,context={}){
     empty.className='sideChatEmpty';
     empty.textContent='Side chat 已就绪';
     sideChatMessages.appendChild(empty);
-    return;
+    return Promise.resolve();
   }
   const renderContext={
     threadId:String(context.threadId||sideChatThreadId||''),
@@ -10321,6 +10522,8 @@ function renderSideChatMessages(messages,context={}){
   };
   const savedAnnotations=responseAnnotationsByTurn;
   responseAnnotationsByTurn=new Map();
+  const deferIcons=Boolean(context.historyScrollAnchor)||list.length>=NATIVE_HISTORY_PAGE_SIZE;
+  if(deferIcons)beginDeferredIconRefresh();
   let state=null;
   let latestUser=null;
   const ensureState=(message)=>{
@@ -10446,15 +10649,26 @@ function renderSideChatMessages(messages,context={}){
     }
   }finally{
     responseAnnotationsByTurn=savedAnnotations;
+    if(deferIcons)endDeferredIconRefresh(sideChatMessages);
   }
-  refreshIcons(sideChatMessages);
-  sideChatMessages.scrollTop=sideChatMessages.scrollHeight;
+  if(!deferIcons)refreshIcons(sideChatMessages);
+  if(context.historyScrollAnchor)return restoreHistoryScrollAnchor(sideChatMessages,context.historyScrollAnchor);
+  if(context.followBottom!==false)sideChatMessages.scrollTop=sideChatMessages.scrollHeight;
+  return Promise.resolve();
 }
-async function syncSideChatConversation(){
-  if(!sideChatThreadId)return;
+async function syncSideChatConversation(options={}){
+  if(!sideChatThreadId)return false;
   const syncId=sideChatThreadId;
+  const currentTab=getSideChatTab(syncId);
+  if(currentTab?.historyLoading&&!options.historyScrollAnchor)return false;
+  const historyLimit=normalizeNativeHistoryPageLimit(currentTab?.historyLimit);
+  const followBottom=sideChatMessages
+    ? sideChatMessages.scrollHeight-sideChatMessages.scrollTop-sideChatMessages.clientHeight<=140
+    : true;
+  const historyScrollAnchor=options.historyScrollAnchor||(!followBottom?captureHistoryScrollAnchor(sideChatMessages):null);
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external&limit=80');
+    const pagingQuery=options.historyPaging===true?'&paging=earlier':'';
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(syncId)+'?images=external&history=page&latest=complete&limit='+historyLimit+pagingQuery);
     const data=await res.json().catch(()=>({}));
     if(!res.ok)throw new Error(data.error||'Side chat 同步失败');
     if(sideChatThreadId!==syncId)return;
@@ -10463,7 +10677,14 @@ async function syncSideChatConversation(){
     if(sideChatTitle)sideChatTitle.textContent=title;
     if(sideChatPane)sideChatPane.setAttribute('aria-label','Side chat · '+title);
     const tab=getSideChatTab(syncId);
-    if(tab)tab.title=title;
+    if(tab){
+      tab.title=title;
+      tab.historyLimit=normalizeNativeHistoryPageLimit(conversation.historyPageLimit||historyLimit);
+      tab.historyNextLimit=normalizeNativeHistoryPageLimit(
+        Math.max(tab.historyLimit+NATIVE_HISTORY_PAGE_SIZE,Number(conversation.nextHistoryPageLimit)||0),
+      );
+      tab.hasEarlierMessages=Boolean(conversation.hasEarlierMessages);
+    }
     renderTopConversationTitle();
     const metadata=conversation.metadata&&typeof conversation.metadata==='object'?conversation.metadata:{};
     if(tab&&Object.hasOwn(metadata,'serviceTier'))tab.serviceTier=normalizeComposerServiceTier(metadata.serviceTier);
@@ -10477,11 +10698,13 @@ async function syncSideChatConversation(){
       || Boolean(conversation.activeTurnId)
     );
     sideChatActiveTurnId=String(conversation.activeTurnId||'');
-    renderSideChatMessages(messages,{
+    await renderSideChatMessages(messages,{
       threadId:syncId,
       activeTurnId:sideChatActiveTurnId,
       running:sideChatRunning,
       startedAt:conversation.activeTurnStartedAt||conversation.updatedAt||'',
+      historyScrollAnchor,
+      followBottom:Object.hasOwn(options,'followBottom')?Boolean(options.followBottom):followBottom,
     });
     if(tab)tab.running=sideChatRunning;
     const lastAssistant=[...messages].reverse().find((message)=>message.role==='assistant'&&String(message.content||'').trim());
@@ -10508,9 +10731,58 @@ async function syncSideChatConversation(){
     sideChatCursor=Number(conversation.cursor||messages.length||0)||0;
     sideChatGeneration=Number(conversation.generation||0)||0;
     persistSideChatState();
+    return true;
   }catch(error){
     if(sideChatThreadId===syncId&&sideChatStatus)sideChatStatus.textContent=error.message||'Side chat 同步失败';
+    return false;
   }
+}
+async function loadEarlierSideChatHistoryPage(options={}){
+  const fillViewport=options.fillViewport===true;
+  const id=String(sideChatThreadId||'');
+  const tab=getSideChatTab(id);
+  if(!id||!tab||tab.historyLoading||!tab.hasEarlierMessages||!sideChatMessages)return false;
+  if(!sideChatMessages.clientHeight||(!fillViewport&&sideChatMessages.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD))return false;
+  const anchor=captureHistoryScrollAnchor(sideChatMessages);
+  const previousLimit=normalizeNativeHistoryPageLimit(tab.historyLimit);
+  const initialHeight=sideChatMessages.scrollHeight;
+  const growthTarget=nativeHistoryPageGrowthGoal(sideChatMessages,initialHeight,fillViewport);
+  let lastSuccessfulLimit=previousLimit;
+  let loadedAny=false;
+  let loadedBatches=0;
+  const maxBatches=fillViewport?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_MANUAL_MAX_BATCHES;
+  tab.historyLoading=true;
+  sideChatMessages.setAttribute('aria-busy','true');
+  try{
+    while(tab.hasEarlierMessages&&loadedBatches<maxBatches&&sideChatThreadId===id){
+      const growth=Math.max(0,sideChatMessages.scrollHeight-initialHeight);
+      if(loadedAny&&(fillViewport?nativeHistoryViewportFilled(sideChatMessages):growth>=growthTarget))break;
+      const batchCount=nativeHistoryNextBatchCount(growth,growthTarget,loadedBatches,maxBatches);
+      if(!batchCount)break;
+      const adaptiveLimit=lastSuccessfulLimit+NATIVE_HISTORY_PAGE_SIZE*batchCount;
+      const hintedLimit=normalizeNativeHistoryPageLimit(tab.historyNextLimit);
+      const requestedLimit=fillViewport?adaptiveLimit:Math.max(adaptiveLimit,hintedLimit);
+      const requestedBatches=Math.max(
+        batchCount,
+        Math.ceil((requestedLimit-lastSuccessfulLimit)/NATIVE_HISTORY_PAGE_SIZE),
+      );
+      tab.historyLimit=requestedLimit;
+      const loaded=await syncSideChatConversation({historyScrollAnchor:anchor,followBottom:false,historyPaging:true});
+      if(!loaded)break;
+      loadedAny=true;
+      loadedBatches+=fillViewport?requestedBatches:1;
+      lastSuccessfulLimit=normalizeNativeHistoryPageLimit(tab.historyLimit);
+    }
+    return loadedAny;
+  }finally{
+    tab.historyLimit=lastSuccessfulLimit;
+    tab.historyLoading=false;
+    sideChatMessages.removeAttribute('aria-busy');
+  }
+}
+async function fillInitialSideChatHistoryPage(){
+  if(!sideChatMessages||nativeHistoryViewportFilled(sideChatMessages))return false;
+  return loadEarlierSideChatHistoryPage({fillViewport:true});
 }
 function updateSideChatHeadState(status=''){
   if(!sideChatPane||!sideChatStatus)return;
@@ -10553,6 +10825,8 @@ async function activateSideChatTab(threadId,{force=false}={}){
   setSideChatOpen(true);
   persistSideChatState();
   await syncSideChatConversation();
+  await new Promise((resolve)=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  if(sideChatThreadId===id)await fillInitialSideChatHistoryPage();
   scheduleSideChatSync(500);
   sideChatInput?.focus();
 }
@@ -10704,7 +10978,14 @@ async function restoreSideChatIfNeeded(){
   const saved=readSideChatState();
   if(!saved?.tabs?.length)return;
   try{
-    sideChatOpenTabs=saved.tabs.map((tab)=>({...tab,running:false}));
+    sideChatOpenTabs=saved.tabs.map((tab)=>({
+      ...tab,
+      running:false,
+      historyLimit:NATIVE_HISTORY_PAGE_SIZE,
+      historyNextLimit:NATIVE_HISTORY_PAGE_SIZE*2,
+      hasEarlierMessages:false,
+      historyLoading:false,
+    }));
     sideChatView=saved.view==='main'?'main':'side';
     const active=saved.activeThreadId||sideChatOpenTabs[0].threadId;
     await activateSideChatTab(active,{force:true});
@@ -11841,6 +12122,7 @@ function schedulePromptQueueDispatch(threadId,delay=120){
   setTimeout(()=>{if(!promptQueueTurnLocked(threadId))dispatchNextQueuedPrompt(threadId)},delay);
 }
 function showNativePromptOptimistically(item){
+  resumeNativeLiveFollowBottom();
   clearNativeOptimisticElements();
   nativeOptimisticElements.push(addMsg('user',item.message||'请分析上传的附件。'));
   for(const attachment of item.attachments||[]){
@@ -11852,6 +12134,7 @@ function showNativePromptOptimistically(item){
 }
 function showNativeSteerOptimistically(item){
   if(currentConversationSource!=='codex')return null;
+  resumeNativeLiveFollowBottom();
   if(!collectingTurnProcess)beginTurnProcessCollection(item.createdAt);
   const expected=String(item.message||'请分析上传的附件。').trim();
   const existing=[
@@ -15619,16 +15902,41 @@ function flushPendingHistoryRefresh(){
   historyRefreshPending=false;
   queueMicrotask(()=>refreshHistory());
 }
+function scheduleHistoryRefreshFromSession(delay=HISTORY_SESSION_REFRESH_DELAY_MS){
+  historySessionRefreshQueued=true;
+  if(historyRefreshBlocked()){historyRefreshPending=true;return}
+  if(historySessionRefreshTimer||historySessionRefreshActive)return;
+  historySessionRefreshTimer=setTimeout(async()=>{
+    historySessionRefreshTimer=null;
+    historySessionRefreshQueued=false;
+    historySessionRefreshActive=true;
+    try{await refreshHistory()}finally{
+      historySessionRefreshActive=false;
+      if(historySessionRefreshQueued)scheduleHistoryRefreshFromSession(delay);
+    }
+  },Math.max(0,Number(delay)||0));
+}
 async function refreshHistory(){
   if(historyRefreshBlocked()){historyRefreshPending=true;return}
-  historyRefreshPending=false;
-  const res=await fetch('/api/config');
-  if(!res.ok)return;
-  const data=await res.json();
-  // A live-session refresh may have started just before the user pressed a row.
-  if(historyRefreshBlocked()){historyRefreshPending=true;return}
-  pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];
-  renderHistory(data.conversations);
+  if(historySessionRefreshTimer)clearTimeout(historySessionRefreshTimer);
+  historySessionRefreshTimer=null;
+  historySessionRefreshQueued=false;
+  if(historyRefreshInFlight){historyRefreshRerun=true;return historyRefreshInFlight}
+  historyRefreshInFlight=(async()=>{
+    do{
+      historyRefreshRerun=false;
+      if(historyRefreshBlocked()){historyRefreshPending=true;return}
+      historyRefreshPending=false;
+      const res=await fetch('/api/config');
+      if(!res.ok)return;
+      const data=await res.json();
+      // A live-session refresh may have started just before the user pressed a row.
+      if(historyRefreshBlocked()){historyRefreshPending=true;return}
+      pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];
+      renderHistory(data.conversations);
+    }while(historyRefreshRerun);
+  })().finally(()=>{historyRefreshInFlight=null});
+  return historyRefreshInFlight;
 }
 function nativeRuntimeNeedsHistoryRefresh(type){return ['turn','turn-cleared','connection-error'].includes(String(type||''))}
 function composerModelItems(items,selected){const list=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];const selectedModel=String(selected||'').trim();if(selectedModel&&!list.includes(selectedModel))list.push(selectedModel);return list}
@@ -16538,6 +16846,26 @@ function storeHistoryCompletionState(key,state){
 }
 function historyCompletionKey(item){return conversationKey(item?.source==='codex'?'codex':'web',item?.id)}
 function historyCompletionVersion(item){return String(item?.status||'')+'|'+String(item?.updatedAt||item?.recencyAt||item?.createdAt||'')}
+function historyCompletionReadVersionTimestamp(version){
+  const value=String(version||'');
+  const separator=value.indexOf('|');
+  const timestamp=Date.parse(separator>=0?value.slice(separator+1):'');
+  return Number.isFinite(timestamp)?timestamp:NaN;
+}
+function selectHistoryCompletionReadVersion(key,localVersion,remoteVersion){
+  if(!localVersion)return remoteVersion||'';
+  if(!remoteVersion||localVersion===remoteVersion)return localVersion;
+  const seenVersion=historyCompletionSeen.get(key);
+  if(seenVersion===localVersion)return localVersion;
+  if(seenVersion===remoteVersion)return remoteVersion;
+  const localTimestamp=historyCompletionReadVersionTimestamp(localVersion);
+  const remoteTimestamp=historyCompletionReadVersionTimestamp(remoteVersion);
+  if(Number.isFinite(localTimestamp)&&Number.isFinite(remoteTimestamp)&&localTimestamp!==remoteTimestamp){
+    return remoteTimestamp>localTimestamp?remoteVersion:localVersion;
+  }
+  if(Number.isFinite(remoteTimestamp)&&!Number.isFinite(localTimestamp))return remoteVersion;
+  return localVersion;
+}
 function isCompletedHistoryItem(item){return ['done','completed'].includes(String(item?.status||'').toLowerCase())}
 function isCompletedHistoryCompletionVersion(version){return ['done','completed'].includes(String(version||'').split('|',1)[0].toLowerCase())}
 function trackHistoryCompletionState(items){
@@ -16595,25 +16923,40 @@ function markHistoryCompletionRead(item){
   renderHistory();
 }
 async function syncHistoryCompletionReadFromServer(){
-  try{
-    const res=await fetch('/api/history-completion-read');
-    const data=await res.json();
-    if(!res.ok||!data||typeof data.read!=='object')return;
-    const merged=new Map();
-    for(const [key,version] of Object.entries(data.read)){
-      if(key&&typeof version==='string')merged.set(key,version);
-    }
-    for(const [key,version] of historyCompletionRead){
-      if(!merged.has(key))merged.set(key,version);
-    }
-    const changed=merged.size!==historyCompletionRead.size
-      ||[...merged.entries()].some(([key,version])=>historyCompletionRead.get(key)!==version);
-    if(changed){
-      historyCompletionRead=merged;
-      pushHistoryCompletionReadToServer();
-      renderHistory();
-    }
-  }catch{}
+  if(historyCompletionSyncTimer)clearTimeout(historyCompletionSyncTimer);
+  historyCompletionSyncTimer=null;
+  if(historyCompletionSyncInFlight)return historyCompletionSyncInFlight;
+  const pending=(async()=>{
+    try{
+      const res=await fetch('/api/history-completion-read');
+      const data=await res.json();
+      if(!res.ok||!data||typeof data.read!=='object')return;
+      const merged=new Map(historyCompletionRead);
+      for(const [key,remoteVersion] of Object.entries(data.read)){
+        if(!key||typeof remoteVersion!=='string')continue;
+        const selected=selectHistoryCompletionReadVersion(key,merged.get(key),remoteVersion);
+        if(selected)merged.set(key,selected);
+      }
+      const changed=merged.size!==historyCompletionRead.size
+        ||[...merged.entries()].some(([key,version])=>historyCompletionRead.get(key)!==version);
+      if(changed){
+        historyCompletionRead=merged;
+        pushHistoryCompletionReadToServer();
+        renderHistory();
+      }
+    }catch{}
+  })();
+  historyCompletionSyncInFlight=pending;
+  try{return await pending}finally{
+    if(historyCompletionSyncInFlight===pending)historyCompletionSyncInFlight=null;
+  }
+}
+function scheduleHistoryCompletionReadSync(delay=HISTORY_COMPLETION_SYNC_DELAY_MS){
+  if(historyCompletionSyncTimer||historyCompletionSyncInFlight)return;
+  historyCompletionSyncTimer=setTimeout(()=>{
+    historyCompletionSyncTimer=null;
+    void syncHistoryCompletionReadFromServer();
+  },Math.max(0,Number(delay)||0));
 }
 function pushHistoryCompletionReadToServer(){
   if(historyCompletionPushTimer)clearTimeout(historyCompletionPushTimer);
@@ -16986,6 +17329,8 @@ function renderHistory(items){
     return;
   }
   renderComposerProjectOptions();
+  beginDeferredIconRefresh();
+  try{
   const query=String(historyFilter?.value||'').trim().toLocaleLowerCase();
   const candidates=query?historyItems:historyItems.filter((item)=>isStandaloneHistoryItem(item)||!hiddenHistoryProjects.has(historyProjectKey(item.cwd)));
   const visibleItems=query?candidates.filter((item)=>(String(item.title||'')+' '+String(item.cwd||'')+' '+historyProjectName(item.cwd)).toLocaleLowerCase().includes(query)):candidates;
@@ -17074,6 +17419,9 @@ function renderHistory(items){
     });
   }
   history.scrollTop=scrollTop;
+  }finally{
+    endDeferredIconRefresh(history);
+  }
 }
 function createHistoryRow(item,projectPath){
   const source=item.source==='codex'?'codex':'web';
@@ -17117,10 +17465,12 @@ function createHistoryRow(item,projectPath){
   }
   let completionUnread=null;
   if(historyCompletionUnread(item)){
-    completionUnread=document.createElement('span');
+    completionUnread=document.createElement('button');
+    completionUnread.type='button';
     completionUnread.className='histCompletionUnread';
-    completionUnread.title='任务已完成，尚未阅读';
-    completionUnread.setAttribute('aria-label','任务已完成，尚未阅读');
+    completionUnread.title='打开任务并标记已读';
+    completionUnread.setAttribute('aria-label','打开任务并标记已读');
+    completionUnread.addEventListener('click',(e)=>{e.preventDefault();e.stopPropagation();openConversation()});
   }
   if(source==='codex'){
     if(running)row.appendChild(running);
@@ -17580,7 +17930,7 @@ function syncNativeComposerSettings(changes={}){
   nativeComposerSettingsQueue=queued.catch(()=>false);
   return queued;
 }
-function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -17709,6 +18059,7 @@ function scrollChatToLatest(options={}){
   let hiddenRetries=0;
   const run=()=>{
     if(!chat)return;
+    if(currentConversationSource==='codex'&&nativeLiveReadingHistory&&!nativeLiveTowardLatestIntentActive())return;
     // A hidden or zero-size chat cannot scroll meaningfully. Skip the write and retry
     // briefly so a late layout cannot expose the conversation at the top first.
     if(!chatHasLayout()){
@@ -17726,13 +18077,14 @@ function scrollChatToLatest(options={}){
   });
   if(force)setTimeout(run,80);
 }
-function alignChatToBottomStable(maxRounds=12){
+function alignChatToBottomStable(maxRounds=12,expectedLoadSeq=null){
   if(!chat)return;
+  const guardedLoadSeq=Number.isInteger(expectedLoadSeq)?expectedLoadSeq:null;
   if(typeof updateComposerOverlayInset==='function')updateComposerOverlayInset({scroll:false});
   let rounds=0;
   let lastHeight=-1;
   const step=()=>{
-    if(!chat||rounds>=maxRounds)return;
+    if(!chat||(guardedLoadSeq!==null&&guardedLoadSeq!==conversationLoadSeq)||rounds>=maxRounds)return;
     rounds+=1;
     if(!chatHasLayout()){requestAnimationFrame(step);return}
     const height=chat.scrollHeight;
@@ -17746,36 +18098,104 @@ function alignChatToBottomStable(maxRounds=12){
   };
   requestAnimationFrame(step);
 }
-function addNativeHistoryLoadButton(threadId,conversation){
-  const id=String(threadId||'').trim();
-  if(!id||!conversation?.hasEarlierMessages||!chat)return null;
-  const button=document.createElement('button');
-  button.type='button';
-  button.id='nativeHistoryLoadEarlier';
-  button.className='nativeHistoryLoadEarlier';
-  button.title='加载完整记录';
-  button.setAttribute('aria-label','加载完整记录');
-  setIconLabel(button,'history','加载完整记录');
-  button.addEventListener('click',async()=>{
-    if(button.disabled||currentConversationSource!=='codex'||currentConversationId!==id)return;
-    button.disabled=true;
-    button.setAttribute('aria-busy','true');
-    setIconLabel(button,'loader-circle','加载中…');
-    const loaded=await loadConversation(id,'codex',{fullHistory:true});
-    if(!loaded&&button.isConnected){
-      button.disabled=false;
-      button.removeAttribute('aria-busy');
-      setIconLabel(button,'history','重试加载完整记录');
+async function loadEarlierNativeHistoryPage(options={}){
+  const fillViewport=options.fillViewport===true;
+  if(
+    currentConversationSource!=='codex'
+    ||!currentConversationId
+    ||!nativeHistoryLoadReady
+    ||nativeHistoryPageLoading
+    ||!nativeHistoryHasEarlierMessages
+    ||!chat
+    ||!chat.clientHeight
+    ||(!fillViewport&&chat.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD)
+  )return false;
+  const id=currentConversationId;
+  const preserveFollowBottom=fillViewport&&!nativeLiveReadingHistory&&nativeLiveFollowBottom;
+  if(!preserveFollowBottom)setNativeLiveReadingHistory(true);
+  const anchor=captureHistoryScrollAnchor(chat);
+  const previousLimit=nativeHistoryPageLimit;
+  const initialHeight=chat.scrollHeight;
+  const growthTarget=nativeHistoryPageGrowthGoal(chat,initialHeight,fillViewport);
+  let lastSuccessfulLimit=previousLimit;
+  let loadedAny=false;
+  let loadedBatches=0;
+  const maxBatches=fillViewport?NATIVE_HISTORY_INITIAL_MAX_BATCHES:NATIVE_HISTORY_MANUAL_MAX_BATCHES;
+  nativeHistoryPageLoading=true;
+  nativeHistoryLoadReady=false;
+  nativeHistorySyncDeferred=true;
+  clearNativeHistoryDeferredSync();
+  chat.setAttribute('aria-busy','true');
+  try{
+    while(
+      nativeHistoryHasEarlierMessages
+      &&loadedBatches<maxBatches
+      &&currentConversationSource==='codex'
+      &&currentConversationId===id
+    ){
+      const growth=Math.max(0,chat.scrollHeight-initialHeight);
+      if(loadedAny&&(fillViewport?nativeHistoryViewportFilled(chat):growth>=growthTarget))break;
+      const batchCount=nativeHistoryNextBatchCount(growth,growthTarget,loadedBatches,maxBatches);
+      if(!batchCount)break;
+      const adaptiveLimit=lastSuccessfulLimit+NATIVE_HISTORY_PAGE_SIZE*batchCount;
+      const hintedLimit=normalizeNativeHistoryPageLimit(nativeHistoryNextPageLimit);
+      const requestedLimit=fillViewport?adaptiveLimit:Math.max(adaptiveLimit,hintedLimit);
+      const requestedBatches=Math.max(
+        batchCount,
+        Math.ceil((requestedLimit-lastSuccessfulLimit)/NATIVE_HISTORY_PAGE_SIZE),
+      );
+      const loaded=await loadConversation(id,'codex',{
+        historyPageLimit:requestedLimit,
+        historyScrollAnchor:anchor,
+        historyPaging:true,
+        preserveHistoryFollowBottom:preserveFollowBottom,
+        skipPromptQueueSync:true,
+      });
+      if(!loaded)break;
+      loadedAny=true;
+      loadedBatches+=fillViewport?requestedBatches:1;
+      lastSuccessfulLimit=nativeHistoryPageLimit;
     }
-  });
-  chat.appendChild(button);
-  refreshIcons(button);
-  return button;
+    return loadedAny;
+  }finally{
+    const sameConversation=currentConversationSource==='codex'&&currentConversationId===id;
+    const syncDeferred=nativeHistorySyncDeferred;
+    nativeHistorySyncDeferred=false;
+    if(sameConversation){
+      nativeHistoryPageLimit=lastSuccessfulLimit;
+      nativeHistoryLoadReady=true;
+    }
+    nativeHistoryPageLoading=false;
+    chat.removeAttribute('aria-busy');
+    if(sameConversation&&syncDeferred)scheduleDeferredNativeHistorySync(id);
+  }
 }
 async function loadConversation(id,source='web',options={}){
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   const nextConversationSource=source==='codex'?'codex':'web';
   const conversationChanged=id!==currentConversationId||nextConversationSource!==currentConversationSource;
+  const requestedHistoryLimit=Number(options.historyPageLimit);
+  const hasRequestedHistoryLimit=Number.isInteger(requestedHistoryLimit)&&requestedHistoryLimit>0;
+  if(nextConversationSource==='codex'){
+    if(conversationChanged)nativeHistoryPageLimit=hasRequestedHistoryLimit?normalizeNativeHistoryPageLimit(requestedHistoryLimit):NATIVE_HISTORY_PAGE_SIZE;
+    else if(hasRequestedHistoryLimit)nativeHistoryPageLimit=normalizeNativeHistoryPageLimit(requestedHistoryLimit);
+    nativeHistoryLoadReady=false;
+    if(conversationChanged){
+      clearNativeHistoryDeferredSync();
+      nativeHistoryHasEarlierMessages=false;
+      nativeHistoryPageLoading=false;
+      nativeHistorySyncDeferred=false;
+      nativeHistoryNextPageLimit=nativeHistoryPageLimit+NATIVE_HISTORY_PAGE_SIZE;
+    }
+  }else{
+    nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;
+    nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;
+    nativeHistoryHasEarlierMessages=false;
+    nativeHistoryPageLoading=false;
+    nativeHistoryLoadReady=false;
+    nativeHistorySyncDeferred=false;
+    clearNativeHistoryDeferredSync();
+  }
   if(conversationChanged){clearNativeCancelPending();resetComposerProviderChange()}
   if(conversationChanged&&appQueueEditSaving){statusEl.textContent='正在保存队列修改，请稍后切换会话';return false}
   if(conversationChanged&&appQueueEditDraft){appQueueEditDraft=null;input.value='';input.style.height='auto';clearPendingAttachments()}
@@ -17804,15 +18224,19 @@ async function loadConversation(id,source='web',options={}){
   updateActiveHistory();
   statusEl.textContent='Loading...';
   let conversation=options.conversation||null;
+  if(conversation&&nextConversationSource==='codex'){
+    const suppliedMessages=Array.isArray(conversation.messages)?conversation.messages:[];
+    if(suppliedMessages.length>nativeHistoryPageLimit){
+      conversation={...conversation,messages:suppliedMessages.slice(-nativeHistoryPageLimit),hasEarlierMessages:true};
+    }
+  }
   if(!conversation){
     const endpoint=currentConversationSource==='codex'?'/api/native-sessions/':'/api/conversations/';
-    // Rendering several hundred historical messages synchronously blocks the
-    // main thread. Show the current tail first; the explicit history control
-    // keeps the complete transcript available without delaying task switching.
     const nativeHistoryQuery=currentConversationSource==='codex'
-      ? '?images=external'+(options.fullHistory?'':'&limit='+NATIVE_INITIAL_MESSAGE_LIMIT)
+      ? '?images=external&history=page&latest=complete&limit='+nativeHistoryPageLimit
       : '';
-    const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery;
+    const nativeHistoryPagingQuery=currentConversationSource==='codex'&&options.historyPaging===true?'&paging=earlier':'';
+    const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery+nativeHistoryPagingQuery;
     const res=await fetch(requestUrl);
     if(seq!==conversationLoadSeq)return false;
     if(!res.ok){statusEl.textContent='加载失败';return false}
@@ -17827,6 +18251,17 @@ async function loadConversation(id,source='web',options={}){
   try{window.__currentConversationCwd=String(conversation.metadata?.cwd||'')}catch{}
   nativeCursor=Number(conversation.cursor||0);
   nativeGeneration=Number(conversation.generation||0);
+  nativeHistoryHasEarlierMessages=currentConversationSource==='codex'&&Boolean(conversation.hasEarlierMessages);
+  if(currentConversationSource==='codex'){
+    const returnedHistoryLimit=Number(conversation.historyPageLimit);
+    if(Number.isInteger(returnedHistoryLimit)&&returnedHistoryLimit>0){
+      nativeHistoryPageLimit=normalizeNativeHistoryPageLimit(returnedHistoryLimit);
+    }
+    nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit(Math.max(
+      nativeHistoryPageLimit+NATIVE_HISTORY_PAGE_SIZE,
+      Number(conversation.nextHistoryPageLimit)||0,
+    ));
+  }
   const promptQueueLock=reconcilePromptQueueTurnLock(currentConversationId,conversation);
   if(currentConversationSource==='codex'&&conversation.status==='running'&&!promptQueueLock.terminal)markPromptQueueTurnRunning(currentConversationId,conversation.activeTurnId);
   const queueTurnId=promptQueueTurnLock(currentConversationId);
@@ -17841,16 +18276,24 @@ async function loadConversation(id,source='web',options={}){
   }
   applyConversationMode();
   updateActiveHistory();
+  const preserveHistoryFollowBottom=Boolean(options.historyScrollAnchor)&&options.preserveHistoryFollowBottom===true;
+  if(options.historyScrollAnchor&&!preserveHistoryFollowBottom)setNativeLiveReadingHistory(true);
+  else resumeNativeLiveFollowBottom();
   chat.innerHTML='';
-  if(currentConversationSource==='codex')addNativeHistoryLoadButton(currentConversationId,conversation);
   const messages=conversation.messages||[];
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
   const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
   beginTurnProcessCollection();
-  messages.forEach((msg,index)=>{
-    if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
-    addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
-  });
+  const deferHistoryIcons=Boolean(options.historyScrollAnchor)||messages.length>=NATIVE_HISTORY_PAGE_SIZE;
+  if(deferHistoryIcons)beginDeferredIconRefresh();
+  try{
+    messages.forEach((msg,index)=>{
+      if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
+      addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
+    });
+  }finally{
+    if(deferHistoryIcons)endDeferredIconRefresh(chat);
+  }
   if(currentConversationSource==='codex')renderNativeForkDivider(messages);
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(!messages.length&&!webRunActive&&!nativeForkMarkers[currentConversationId])chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
@@ -17861,8 +18304,23 @@ async function loadConversation(id,source='web',options={}){
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
   closeMenu();
   persistActiveConversation(currentConversationId,currentConversationSource);
-  scrollChatToLatest({force:true});
-  alignChatToBottomStable();
+  bindNativeLiveScrollTracking();
+  if(options.historyScrollAnchor){
+    await restoreHistoryScrollAnchor(chat,options.historyScrollAnchor);
+    if(preserveHistoryFollowBottom)resumeNativeLiveFollowBottom();
+    else setNativeLiveReadingHistory(true);
+    nativeHistoryLoadReady=true;
+  }else{
+    scrollChatToLatest({force:true});
+    alignChatToBottomStable(12,seq);
+    const readyId=currentConversationId;
+    const readySource=currentConversationSource;
+    setTimeout(()=>{
+      if(currentConversationId!==readyId||currentConversationSource!==readySource)return;
+      nativeHistoryLoadReady=readySource==='codex';
+      if(readySource==='codex'&&!nativeHistoryViewportFilled(chat))void loadEarlierNativeHistoryPage({fillViewport:true});
+    },180);
+  }
   return true;
 }
 function updateConversationStatus(conversation){
@@ -18001,6 +18459,22 @@ function refreshPromptQueueOnResume(){
   if(document.visibilityState&&document.visibilityState!=='visible')return;
   if(currentConversationSource==='codex'&&currentConversationId)void pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
 }
+function scheduleChangedNativeSessionSync(changedIds){
+  for(const id of changedIds||[]){
+    const clean=String(id||'');
+    if(clean)nativeSyncChangedIds.add(clean);
+  }
+  if(!nativeSyncChangedIds.size||nativeSyncTimer)return;
+  const syncDelay=webRunActive&&currentConversationSource==='codex'?80:260;
+  nativeSyncTimer=setTimeout(async()=>{
+    nativeSyncTimer=null;
+    const pendingIds=new Set(nativeSyncChangedIds);
+    nativeSyncChangedIds.clear();
+    if(currentConversationSource==='codex'&&pendingIds.has(currentConversationId))await syncCurrentNativeConversation();
+    if(sideChatThreadId&&pendingIds.has(sideChatThreadId))scheduleSideChatSync(120);
+    if(nativeSyncChangedIds.size)scheduleChangedNativeSessionSync([]);
+  },syncDelay);
+}
 function flushPromptQueuesBeforeBackground(event){
   if(event?.type!=='pagehide'&&document.visibilityState==='visible')return;
   const beaconBudget={remaining:PROMPT_QUEUE_BEACON_MAX_BYTES};
@@ -18023,26 +18497,26 @@ function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
   sessionEvents.addEventListener('open',async()=>{
-    await refreshHistory();
     syncNativeAfterPageResume();
-    void syncHistoryCompletionReadFromServer();
     if(currentConversationSource==='codex'&&currentConversationId){
       void pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
     }
   });
   sessionEvents.addEventListener('sessions',(event)=>{
     let changedIds=[];
-    try{changedIds=JSON.parse(event.data||'{}').changedIds||[]}catch(e){}
+    let conversationChangedIds=[];
+    try{
+      const parsed=JSON.parse(event.data||'{}');
+      changedIds=Array.isArray(parsed.changedIds)?parsed.changedIds:[];
+      conversationChangedIds=Array.isArray(parsed.conversationChangedIds)?parsed.conversationChangedIds:changedIds;
+    }catch(e){}
+    if(!changedIds.length)return;
     refreshOpenSubagentTraces(changedIds);
-    if(nativeSyncTimer)clearTimeout(nativeSyncTimer);
-    const syncDelay=webRunActive&&currentConversationSource==='codex'?80:260;
-    nativeSyncTimer=setTimeout(async()=>{
-      nativeSyncTimer=null;
-      await refreshHistory();
-      void syncHistoryCompletionReadFromServer();
-      if(currentConversationSource==='codex'&&(!changedIds.length||changedIds.includes(currentConversationId)))await syncCurrentNativeConversation();
-      if(sideChatThreadId&&(!changedIds.length||changedIds.includes(sideChatThreadId)))scheduleSideChatSync(120);
-    },syncDelay);
+    if(conversationChangedIds.length){
+      scheduleHistoryRefreshFromSession();
+      scheduleHistoryCompletionReadSync();
+    }
+    scheduleChangedNativeSessionSync(changedIds);
   });
   sessionEvents.addEventListener('native-runtime',(event)=>{
     let runtime={};
@@ -18053,7 +18527,7 @@ function connectSessionEvents(){
     }
     // Text deltas can arrive many times per second. Their persisted snapshot is already
     // coalesced by the sessions listener, so only refresh the sidebar for lifecycle changes.
-    if(nativeRuntimeNeedsHistoryRefresh(runtime.type))void refreshHistory();
+    if(nativeRuntimeNeedsHistoryRefresh(runtime.type))scheduleHistoryRefreshFromSession();
     if(runtime.threadId!==currentConversationId||currentConversationSource!=='codex')return;
     if(isCompletedNativeRuntimeTurn(runtime.turnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
     if(webRunActive&&activeNativeTurnId&&runtime.turnId&&String(runtime.turnId)!==String(activeNativeTurnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
@@ -18098,7 +18572,6 @@ function connectSessionEvents(){
         removeNativeRunningElement();
         finishAllNativeLiveItems();
         statusEl.textContent=runtime.status==='error'?'Codex App 任务失败':runtime.status==='interrupted'?'Codex App · 已暂停':'Codex App 任务完成';
-        playTaskCompleteSound();
         const completedId=currentConversationId;
         scheduleNativeCompletionSync(completedId,runtimeTurnId,220);
         schedulePromptQueueDispatch(completedId,320);
@@ -18187,26 +18660,38 @@ function nativeResetMessagesForIncrementalSync(conversation){
 }
 async function syncCurrentNativeConversationOnce(){
   if(currentConversationSource!=='codex'||!currentConversationId)return;
+  if(deferNativeSyncForHistoryPage())return;
   const renderSnapshotImmediately=nativeLiveDocumentHidden()||nativeSnapshotResumeCatchup;
   const id=currentConversationId;
   const seq=conversationLoadSeq;
-  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&limit='+NATIVE_INITIAL_MESSAGE_LIMIT+'&after='+nativeCursor+'&generation='+nativeGeneration;
+  const url='/api/native-sessions/'+encodeURIComponent(id)+'?images=external&history=page&latest=complete&limit='+nativeHistoryPageLimit+'&after='+nativeCursor+'&generation='+nativeGeneration;
   const res=await fetch(url);
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(!res.ok){if(res.status===404)statusEl.textContent='Codex App 会话已移除';return}
   const data=await res.json();
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
+  if(deferNativeSyncForHistoryPage())return;
   const conversation=data.conversation;
+  nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit(Math.max(
+    nativeHistoryPageLimit+NATIVE_HISTORY_PAGE_SIZE,
+    Number(conversation.nextHistoryPageLimit)||0,
+  ));
   currentNativeRunStatus=String(conversation.status||'');
   await applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
+  if(deferNativeSyncForHistoryPage())return;
   syncComposerContextWindow(conversation.contextWindow||null);
   syncComposerChrome();
   let syncMessages=conversation.messages||[];
   if(conversation.reset){
     syncMessages=nativeResetMessagesForIncrementalSync(conversation);
     if(!syncMessages){
-      await loadConversation(id,'codex');
+      const historyScrollAnchor=nativeLiveFollowBottom&&nativeLiveNearBottom()?null:captureHistoryScrollAnchor(chat);
+      await loadConversation(id,'codex',{
+        historyPageLimit:nativeHistoryPageLimit,
+        historyScrollAnchor,
+        skipPromptQueueSync:true,
+      });
       if(renderSnapshotImmediately)nativeSnapshotResumeCatchup=false;
       return;
     }
@@ -18314,6 +18799,7 @@ async function reconcileNativeCompletion(){
 function syncNativeAfterPageResume(){
   if(nativeLiveDocumentHidden())return;
   refreshHistory();
+  void syncHistoryCompletionReadFromServer();
   if(currentConversationSource!=='codex'||!currentConversationId)return;
   if(nativeCompletionSync){scheduleNativeCompletionSync(nativeCompletionSync.threadId,nativeCompletionSync.turnId,0);return}
   syncCurrentNativeConversation();
@@ -20457,6 +20943,9 @@ function processedMessageTitle(seconds,{minimum=0,rounding='round'}={}){
   return'已处理 '+minutes+'m'+(remainder?' '+remainder+'s':'');
 }
 function completionMessageTitle(text,fallbackSeconds=NaN){
+  const status=String(text||'').trim();
+  if(status==='任务失败')return'任务失败';
+  if(status==='任务已暂停'||status==='任务中断')return'已暂停';
   const parsed=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
   const seconds=Number.isFinite(parsed)?parsed:Number(fallbackSeconds);
   return Number.isFinite(seconds)?processedMessageTitle(seconds,{minimum:1}):'已处理';
@@ -20660,6 +21149,9 @@ function resetTurnProcessCollection(){
 function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
   // If a previous turn never received task_complete, keep its assistant progress instead of deleting it.
   const previousTurnId=turnProcessCollectionTurnId||turnProcessElapsedTurnId;
+  let orphanCompletion=null;
+  let orphanFinalAnchor=null;
+  let orphanTerminalElements=[];
   if(collectingTurnProcess&&turnProcessElements.length){
     const orphaned=turnProcessElements.filter((item)=>item?.isConnected);
     if(orphaned.length){
@@ -20678,10 +21170,20 @@ function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
         if(orphanFinal.parentNode!==chat)chat.appendChild(orphanFinal);
         latestFinalAssistantElement=orphanFinal;
       }
-      const processKeep=orphaned.filter((item)=>item!==orphanFinal&&(item.classList?.contains('progressCommentary')||item.classList?.contains('steeringUser')));
-      const completion=createCompletionMessage('任务完成',processKeep,previousTurnId||'',NaN,null);
-      if(orphanFinal?.parentNode===chat)chat.insertBefore(completion,orphanFinal);
-      else chat.appendChild(completion);
+      orphanTerminalElements=orphaned.filter((item)=>(
+        item!==orphanFinal
+        &&item.classList?.contains('process')
+        &&['task_error','turn_aborted','error'].includes(item.dataset?.messageKind||'')
+      ));
+      const processKeep=orphaned.filter((item)=>(
+        item!==orphanFinal
+        &&!orphanTerminalElements.includes(item)
+        &&(item.classList?.contains('progressCommentary')||item.classList?.contains('steeringUser'))
+      ));
+      const failed=orphanTerminalElements.some((item)=>['task_error','error'].includes(item.dataset?.messageKind||''));
+      const interrupted=!failed&&orphanTerminalElements.some((item)=>item.dataset?.messageKind==='turn_aborted');
+      orphanCompletion=createCompletionMessage(failed?'任务失败':interrupted?'任务已暂停':'任务完成',processKeep,previousTurnId||'',NaN,null);
+      orphanFinalAnchor=orphanFinal?.parentNode===chat?orphanFinal:null;
     }
   }
   for(const element of turnProcessElements){
@@ -20689,6 +21191,15 @@ function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
     if(element.parentNode===chat&&!element.classList.contains('assistant'))element.remove();
   }
   clearTurnProcessHeader();
+  if(orphanCompletion){
+    if(orphanFinalAnchor?.parentNode===chat){
+      chat.insertBefore(orphanCompletion,orphanFinalAnchor);
+      for(const element of orphanTerminalElements)chat.insertBefore(element,orphanFinalAnchor);
+    }else{
+      chat.appendChild(orphanCompletion);
+      for(const element of orphanTerminalElements)chat.appendChild(element);
+    }
+  }
   turnProcessElements=[];
   currentActivityCluster=null;
   currentAgentActivityGroup=null;
@@ -21120,7 +21631,7 @@ function revealExpandedEditedFilesCard(card){
   const visibleTop=chatRect.top+12;
   const delta=cardRect.top-visibleTop;
   if(delta<=1)return;
-  setNativeLiveFollowBottom(false);
+  setNativeLiveReadingHistory(true);
   const nextTop=Math.max(0,chat.scrollTop+delta);
   if(typeof chat.scrollTo==='function')chat.scrollTo({top:nextTop,behavior:'smooth'});
   else chat.scrollTop=nextTop;
@@ -21575,6 +22086,14 @@ function shouldCollapseUserMessage(text){
   const lines=value.split(String.fromCharCode(10)).map((line)=>line.trim()).filter(Boolean);
   return value.length>=280&&lines.length>=10;
 }
+function terminalErrorMessageTitle(text){
+  const value=String(text||'').toLowerCase();
+  if(value.includes('usage limit')||value.includes('quota exceeded')||value.includes('insufficient quota'))return'额度已达上限';
+  if(value.includes('too many requests')||value.includes('rate limit')||/(^|\\D)429(\\D|$)/.test(value))return'请求过于频繁';
+  if(value.includes('unauthorized')||value.includes('invalid api key')||/(^|\\D)401(\\D|$)/.test(value))return'认证失败';
+  if(value.includes('timed out')||value.includes('timeout'))return'请求超时';
+  return'任务失败';
+}
 let longUserMessageSerial=0;
 function bindLongUserMessage(el,body,scrollContainer=chat){
   if(!el||!body||el.querySelector(':scope > .longUserMessageToggle'))return;
@@ -21609,13 +22128,14 @@ function bindLongUserMessage(el,body,scrollContainer=chat){
 }
 function createConversationMessageElement(role,text,options={}){
   const kind=String(options.kind||'');
+  const terminalError=role==='process'&&['task_error','error'].includes(kind);
   const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
   const steeringUser=role==='user'&&kind==='steering_user';
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage(text);
   const collapsible=role==='tool'||role==='thinking'||role==='context';
   const el=document.createElement(collapsible?'details':'div');
-  el.className='msg '+role+(collapsible?' toolDetails':'')+(options.streaming?' streaming':'');
+  el.className='msg '+role+(collapsible?' toolDetails':'')+(terminalError?' terminalError':'')+(options.streaming?' streaming':'');
   if(role==='assistant'&&isTurnProcessMessage(role,kind,text))el.classList.add('progressCommentary');
   if(role==='image'&&inputImage)el.classList.add('inputImage');
   el.dataset.messageText=String(text||'');
@@ -21670,7 +22190,7 @@ function createConversationMessageElement(role,text,options={}){
     else body.textContent=text;
     const actions=document.createElement('div');
     actions.className='msgActions';
-    if(['process','log'].includes(role)){
+    if(['process','log'].includes(role)&&!terminalError){
       const tag=document.createElement('span');
       tag.className='tag';
       tag.textContent=role==='process'?'过程':'日志';
@@ -21751,6 +22271,21 @@ function createConversationMessageElement(role,text,options={}){
       el.appendChild(summary);
       el.appendChild(content);
       el._messageLabel=label;
+    }else if(terminalError){
+      const icon=document.createElement('span');
+      icon.className='terminalErrorIcon';
+      icon.setAttribute('aria-hidden','true');
+      setIconLabel(icon,'circle-alert','',false);
+      const content=document.createElement('div');
+      content.className='terminalErrorContent';
+      const title=document.createElement('strong');
+      title.className='terminalErrorTitle';
+      title.textContent=terminalErrorMessageTitle(text);
+      content.appendChild(title);
+      content.appendChild(body);
+      el.appendChild(icon);
+      el.appendChild(content);
+      el.appendChild(actions);
     }else{
       el.appendChild(body);
       if(browserCommentUser)body.classList.add('browserCommentSource');
@@ -22007,17 +22542,34 @@ function updateJumpToLatestButton(){
 }
 function scrollToLatestOutput(){
   if(!chat)return;
+  resumeNativeLiveFollowBottom(2400);
   const reducedMotion=Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
   if(typeof chat.scrollTo==='function'){
     chat.scrollTo({top:chat.scrollHeight,behavior:reducedMotion?'auto':'smooth'});
-    if(reducedMotion)setNativeLiveFollowBottom(true);
     return;
   }
   chat.scrollTop=chat.scrollHeight;
+}
+function nativeLiveTowardLatestIntentActive(){
+  return nativeLiveTowardLatestUntil>Date.now();
+}
+function markNativeLiveTowardLatestIntent(duration=1400){
+  nativeLiveTowardLatestUntil=Date.now()+Math.max(0,Number(duration)||0);
+}
+function setNativeLiveReadingHistory(reading){
+  nativeLiveReadingHistory=Boolean(reading);
+  if(nativeLiveReadingHistory){
+    nativeLiveTowardLatestUntil=0;
+    setNativeLiveFollowBottom(false);
+  }
+}
+function resumeNativeLiveFollowBottom(duration=1800){
+  nativeLiveReadingHistory=false;
+  markNativeLiveTowardLatestIntent(duration);
   setNativeLiveFollowBottom(true);
 }
 function setNativeLiveFollowBottom(follow){
-  nativeLiveFollowBottom=Boolean(follow);
+  nativeLiveFollowBottom=Boolean(follow)&&!nativeLiveReadingHistory;
   for(const live of nativeLiveItems.values())live.followBottom=nativeLiveFollowBottom;
   if(!nativeLiveFollowBottom&&nativeLiveScrollTimer){
     clearTimeout(nativeLiveScrollTimer);
@@ -22028,11 +22580,62 @@ function setNativeLiveFollowBottom(follow){
 function bindNativeLiveScrollTracking(){
   if(nativeLiveScrollTrackingBound||!chat)return;
   nativeLiveScrollTrackingBound=true;
-  chat.addEventListener('scroll',()=>setNativeLiveFollowBottom(nativeLiveNearBottom()),{passive:true});
+  const loadEarlierFromTop=()=>{
+    if(typeof loadEarlierNativeHistoryPage==='function')void loadEarlierNativeHistoryPage();
+  };
+  chat.addEventListener('scroll',()=>{
+    const nearBottom=nativeLiveNearBottom();
+    if(!nearBottom){
+      if(!nativeLiveTowardLatestIntentActive())setNativeLiveReadingHistory(true);
+      else setNativeLiveFollowBottom(false);
+      return;
+    }
+    if(nativeLiveTowardLatestIntentActive())nativeLiveReadingHistory=false;
+    setNativeLiveFollowBottom(nearBottom);
+  },{passive:true});
+  chat.addEventListener('wheel',(event)=>{
+    if(event.deltaY<0){
+      setNativeLiveReadingHistory(true);
+      if(chat.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD)loadEarlierFromTop();
+    }else if(event.deltaY>0){
+      markNativeLiveTowardLatestIntent();
+    }
+  },{passive:true});
+  let historyTouchStartY=0;
+  let historyTouchLastY=0;
+  let historyTouchPageTriggered=false;
+  chat.addEventListener('touchstart',(event)=>{
+    historyTouchStartY=Number(event.touches?.[0]?.clientY)||0;
+    historyTouchLastY=historyTouchStartY;
+    historyTouchPageTriggered=false;
+  },{passive:true});
+  chat.addEventListener('touchmove',(event)=>{
+    const currentY=Number(event.touches?.[0]?.clientY)||0;
+    const step=currentY-historyTouchLastY;
+    if(Math.abs(step)<1)return;
+    historyTouchLastY=currentY;
+    if(step>0){
+      setNativeLiveReadingHistory(true);
+      if(
+        !historyTouchPageTriggered
+        &&currentY-historyTouchStartY>=28
+        &&chat.scrollTop<=NATIVE_HISTORY_SCROLL_THRESHOLD
+      ){
+        historyTouchPageTriggered=true;
+        loadEarlierFromTop();
+      }
+    }else{
+      historyTouchStartY=currentY;
+      markNativeLiveTowardLatestIntent();
+    }
+  },{passive:true});
+  const resetHistoryTouch=()=>{historyTouchPageTriggered=false};
+  chat.addEventListener('touchend',resetHistoryTouch,{passive:true});
+  chat.addEventListener('touchcancel',resetHistoryTouch,{passive:true});
 }
 function captureNativeLiveFollowBottom(){
   bindNativeLiveScrollTracking();
-  const follow=nativeLiveNearBottom();
+  const follow=!nativeLiveReadingHistory&&nativeLiveNearBottom();
   setNativeLiveFollowBottom(follow);
   return follow;
 }
@@ -22388,8 +22991,6 @@ function updateSafetyHint(){
   safetyHint.className='safety '+(mode==='read-only'?'safe':mode==='workspace-write'?'warn':'danger');
   safetyHint.textContent=mode==='read-only'?'只读 · 不写入文件':mode==='workspace-write'?'工作区写入 · 当前目录':'高危全权限 · 首次发送需确认';
 }
-let completeAudioCtx;
-function playTaskCompleteSound(){try{const AudioContext=window.AudioContext||window.webkitAudioContext;if(!AudioContext)return;if(!completeAudioCtx)completeAudioCtx=new AudioContext();completeAudioCtx.resume?.();const now=completeAudioCtx.currentTime;const master=completeAudioCtx.createGain();master.gain.setValueAtTime(1.15,now);master.connect(completeAudioCtx.destination);[[660,0,.12],[880,.13,.22]].forEach(([freq,offset,duration])=>{const osc=completeAudioCtx.createOscillator();const gain=completeAudioCtx.createGain();osc.type='triangle';osc.frequency.value=freq;gain.gain.setValueAtTime(0.0001,now+offset);gain.gain.exponentialRampToValueAtTime(0.55,now+offset+0.006);gain.gain.exponentialRampToValueAtTime(0.0001,now+offset+duration);osc.connect(gain);gain.connect(master);osc.start(now+offset);osc.stop(now+offset+duration+.02)})}catch(e){}}
 async function cancelRun(){
   closeComposerPopovers();
   if(currentConversationSource!=='codex'||!currentConversationId||!webRunActive||!activeNativeTurnId||nativeCancelPending)return;
