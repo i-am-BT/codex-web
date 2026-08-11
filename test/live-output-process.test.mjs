@@ -2398,6 +2398,13 @@ test('generation resets reconcile live messages without rebuilding the conversat
   assert.doesNotMatch(completionSyncSource, /loadConversation/);
 });
 
+test('same-conversation refresh keeps the visible status instead of flashing Loading', () => {
+  const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  assert.match(loadConversation, /const conversationChanged=id!==currentConversationId\|\|nextConversationSource!==currentConversationSource/);
+  assert.match(loadConversation, /if\(conversationChanged\)statusEl\.textContent='Loading\.\.\.'/);
+  assert.doesNotMatch(loadConversation, /updateActiveHistory\(\);\s*statusEl\.textContent='Loading\.\.\.'/);
+});
+
 test('rolled-back retry collapse invalidates the open page before appending the latest attempt', () => {
   assert.match(nativeSessionSource, /case 'thread_rolled_back':[\s\S]*?pendingThreadRollbackTurnId/);
   assert.match(nativeSessionSource, /function collapseRolledBackRetryTurn[\s\S]*?cache\.contentMutated = true/);

@@ -18467,7 +18467,7 @@ async function loadConversation(id,source='web',options={}){
   syncComposerContextWindow(null);
   applyConversationMode();
   updateActiveHistory();
-  statusEl.textContent='Loading...';
+  if(conversationChanged)statusEl.textContent='Loading...';
   let conversation=options.conversation||null;
   if(conversation&&nextConversationSource==='codex'){
     const suppliedMessages=Array.isArray(conversation.messages)?conversation.messages:[];
