@@ -126,6 +126,12 @@ const NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS = Math.min(APP_SERVER_REQUEST_TIMEOUT_M
 const NATIVE_TURN_STATUS_SYNC_INTERVAL_MS = 1500;
 const NATIVE_TURN_STATUS_ACTIVITY_GRACE_MS = Math.max(NATIVE_SESSION_POLL_MS * 4, 5 * 60 * 1000);
 const NATIVE_MODEL_CAPABILITIES_CACHE_MS = 5 * 60 * 1000;
+const APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS = Math.min(
+  Number.isFinite(APP_SERVER_REQUEST_TIMEOUT_MS) && APP_SERVER_REQUEST_TIMEOUT_MS > 0
+    ? APP_SERVER_REQUEST_TIMEOUT_MS
+    : 5000,
+  5000,
+);
 const NATIVE_MODEL_CAPABILITIES_TIMEOUT_MS = Math.min(APP_SERVER_REQUEST_TIMEOUT_MS, 8000);
 const CODEX_DESKTOP_IPC_ENABLED = parseBoolean(
   process.env.CODEX_DESKTOP_IPC_ENABLED,
@@ -287,6 +293,10 @@ const desktopSnapshotRequestTimes = new Map();
 const desktopSnapshotRequests = new Map();
 const nativeTurnStatusSyncTimes = new Map();
 const nativeTurnStatusSyncRequests = new Map();
+// Only threads loaded by this Web app-server are tracked here. Desktop-owned
+// turns use a separate IPC connection and must never be unsubscribed by Web.
+const appServerLoadedThreads = new Map();
+const appServerUnsubscribeRequests = new Map();
 const loginAttempts = new Map();
 let activeProcess = null;
 let activeConversationId = '';
@@ -295,6 +305,12 @@ let nativeModelCapabilitiesCache = { models: [], expiresAt: 0 };
 
 nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
+appServerClient.on('ready', () => {
+  // A restart creates a new app-server connection. Any subscriptions owned by
+  // the previous process disappeared with it.
+  appServerLoadedThreads.clear();
+  appServerUnsubscribeRequests.clear();
+});
 appServerClient.on('notification', handleAppServerNotification);
 appServerClient.on('request', handleAppServerRequest);
 appServerClient.on('appServerError', handleAppServerError);
@@ -304,6 +320,8 @@ appServerClient.on('stderr', (content) => {
 });
 appServerClient.on('protocolError', (error) => console.error(error.message));
 appServerClient.on('exit', (error) => {
+  appServerLoadedThreads.clear();
+  appServerUnsubscribeRequests.clear();
   clearAppServerNativeTurns(error.message);
   clearAppServerPendingRequests(error.message);
   broadcastNativeRuntime({ type: 'disconnected', error: error.message });
@@ -1276,6 +1294,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
     return res.status(400).json({ error: '消息序号无效' });
   }
 
+  let loadedForkedThreadId = '';
   try {
     if (!source) return res.status(404).json({ error: 'Codex App 会话不存在' });
     const target = source.messages.find((message) => (
@@ -1296,7 +1315,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       : {};
     const settings = parseNativeThreadSettings(req.body || {}, settingsOptions);
     const result = forkedThroughTurnId
-      ? await appServerClient.request('thread/fork', compactObjectWithServiceTier({
+      ? await requestLoadedAppServerThread('thread/fork', compactObjectWithServiceTier({
         threadId,
         lastTurnId: forkedThroughTurnId,
         cwd: settings.cwd,
@@ -1307,7 +1326,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
         approvalsReviewer: settings.approvalsReviewer,
         threadSource: 'user',
       }, settings.serviceTier))
-      : await appServerClient.request('thread/start', compactObjectWithServiceTier({
+      : await requestLoadedAppServerThread('thread/start', compactObjectWithServiceTier({
         cwd: settings.cwd,
         model: settings.model,
         modelProvider: settings.provider,
@@ -1318,6 +1337,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       }, settings.serviceTier));
     const forkedThreadId = cleanNativeThreadId(result?.thread?.id);
     if (!forkedThreadId) throw new Error('Codex app-server 未返回有效分支 thread id');
+    loadedForkedThreadId = forkedThreadId;
 
     nativeSessions.refresh();
     const persisted = nativeSessions.get(forkedThreadId);
@@ -1339,12 +1359,17 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
     });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `创建 Codex App 历史分支失败: ${err.message}` });
+  } finally {
+    if (loadedForkedThreadId) {
+      await releaseAppServerThreadAfterTurn(loadedForkedThreadId, '', { reason: 'fork-loaded' });
+    }
   }
 });
 
 app.post('/api/native-sessions', requireAuth, async (req, res) => {
   let createdThreadId = '';
   let createdSideChat = false;
+  let turnAccepted = false;
   let queueReservation = null;
   try {
     const turn = parseNativeTurnPayload(req.body || {}, { allowProjectless: true });
@@ -1356,7 +1381,7 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       if (!sourceThreadId) throw promptQueueConflict('队列来源会话无效', getPromptQueueState(sourceThreadId));
       queueReservation = reservePromptQueueItem(sourceThreadId, queueItemId, sideChat ? { allowAppOwned: true } : {});
     }
-    const started = await appServerClient.request('thread/start', compactObjectWithServiceTier({
+    const started = await requestLoadedAppServerThread('thread/start', compactObjectWithServiceTier({
       cwd: turn.cwd,
       model: turn.model,
       modelProvider: turn.provider,
@@ -1376,6 +1401,7 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       nativeSessions.markSideChatThread?.(threadId, { sourceThreadId });
     }
     const turnStarted = await startNativeTurn(threadId, turn);
+    turnAccepted = true;
     const queue = queueReservation ? consumePromptQueueReservation(queueReservation) : null;
     nativeSessions.scheduleRefresh();
     res.status(202).json({
@@ -1406,6 +1432,9 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       ...(recoverableThreadId ? { recoverableThreadId } : {}),
     });
   } finally {
+    if (createdThreadId && !turnAccepted) {
+      await releaseAppServerThreadAfterTurn(createdThreadId, '', { reason: 'create-failed' });
+    }
     releasePromptQueueReservation(queueReservation);
   }
 });
@@ -1542,6 +1571,10 @@ app.post('/api/native-sessions/:id/interrupt', requireAuth, async (req, res) => 
       if (/thread not found|not found|no such thread/i.test(message)) {
         setNativeTurnState(threadId, { turnId, status: 'interrupted', transport: 'local-stale' });
         try { nativeSessions.markTurnTerminal?.(threadId, turnId, 'interrupted'); } catch {}
+        await releaseAppServerThreadAfterTurn(threadId, turnId, {
+          allowRunning: true,
+          reason: 'stale-interrupt',
+        });
         try { nativeSessions.scheduleRefresh?.(); } catch {}
         scheduleServerPromptQueueDispatch(threadId, 160);
         return res.json({ ok: true, threadId, turnId, stale: true });
@@ -1550,6 +1583,10 @@ app.post('/api/native-sessions/:id/interrupt', requireAuth, async (req, res) => 
     }
     if (!turnId) return res.status(409).json({ error: '该会话没有可取消的任务' });
     setNativeTurnState(threadId, { turnId, status: 'interrupted', transport: result?.transport || 'app-server' });
+    await releaseAppServerThreadAfterTurn(threadId, turnId, {
+      allowRunning: true,
+      reason: 'interrupt-route',
+    });
     scheduleServerPromptQueueDispatch(threadId, 160);
     res.json({ ok: true, threadId, turnId });
   } catch (err) {
@@ -1632,7 +1669,7 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
           // Reload app-server so resume can apply the new provider to the thread.
           await appServerClient.restart({ env: buildCodexProcessEnvironment() });
         }
-        await appServerClient.request('thread/resume', {
+        await requestLoadedAppServerThread('thread/resume', {
           threadId,
           modelProvider: provider,
           model,
@@ -1640,7 +1677,7 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
         });
       } else {
         try {
-          await appServerClient.request('thread/resume', { threadId });
+          await requestLoadedAppServerThread('thread/resume', { threadId });
         } catch (resumeErr) {
           // Some already-loaded threads reject resume; still attempt the settings write.
           if (!/not found|unknown thread|no such thread/i.test(String(resumeErr?.message || resumeErr))) {
@@ -1684,6 +1721,10 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
     const hasSettings = hasProvider || hasModel || hasReasoningEffort || hasServiceTier;
     const action = hasSettings && !hasTitle ? '会话设置' : hasTitle && !hasSettings ? '会话标题' : '会话设置';
     res.status(nativeAppErrorStatus(err)).json({ error: `修改 Codex App ${action}失败: ${err.message}` });
+  } finally {
+    if (hasProvider || hasModel || hasReasoningEffort || hasServiceTier) {
+      await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'settings-update' });
+    }
   }
 });
 
@@ -2337,14 +2378,18 @@ server.listen(listenPort, HOST, () => {
 
 let shuttingDown = false;
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => shutdown(signal));
+  process.on(signal, () => { void shutdown(signal); });
 }
 
-function shutdown(signal) {
+async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`${APP_NAME}: stopping on ${signal}`);
   if (activeProcess) terminateProcess(activeProcess);
+  await Promise.race([
+    unsubscribeAllAppServerThreads(),
+    new Promise((resolve) => setTimeout(resolve, Math.min(CODEX_WEB_SHUTDOWN_GRACE_MS, 5000))),
+  ]);
   desktopIpcClient.close();
   appServerClient.close();
   nativeSessions.stop();
@@ -3273,6 +3318,12 @@ function clearPersistedTerminalNativeTurn(threadId) {
   const persistedTerminal = nativeTurnHasPersistedTerminal(conversation, active.turnId);
   const newerTurnRunning = conversation?.status === 'running' && latestTurnId && latestTurnId !== active.turnId;
   if (!persistedTerminal && (active.status === 'running' || !newerTurnRunning)) return false;
+  if (!newerTurnRunning) {
+    void releaseAppServerThreadAfterTurn(cleanId, active.turnId, {
+      allowRunning: persistedTerminal,
+      reason: 'persisted-terminal',
+    });
+  }
   activeNativeTurns.delete(cleanId);
   broadcastNativeRuntime({ type: 'turn-cleared', threadId: cleanId, turnId: active.turnId });
   return true;
@@ -3706,7 +3757,10 @@ function applyAppServerTurnStatus(threadId, turn, conversation = null) {
     startedAt,
     transport: 'app-server-status',
   });
-  if (status !== 'running') scheduleServerPromptQueueDispatch(cleanId, 160);
+  if (status !== 'running') {
+    void releaseAppServerThreadAfterTurn(cleanId, turnId, { reason: 'status-terminal' });
+    scheduleServerPromptQueueDispatch(cleanId, 160);
+  }
   return true;
 }
 
@@ -3828,6 +3882,144 @@ async function respondToNativeRequest(pending, response) {
     default:
       throw new Error(`Codex Desktop 不支持处理 ${pending.method}`);
   }
+}
+
+async function requestLoadedAppServerThread(method, params = {}, options = {}) {
+  const requestedThreadId = cleanNativeThreadId(params.threadId);
+  if (requestedThreadId) await waitForAppServerThreadUnsubscribe(requestedThreadId);
+  const { result, child } = await appServerClient.requestWithConnection(method, params, options);
+  const threadId = cleanNativeThreadId(result?.thread?.id || params.threadId);
+  if (
+    threadId
+    && child
+    && child === appServerClient.child
+    && appServerClient.initialized
+  ) {
+    markAppServerThreadLoaded(threadId, child);
+  }
+  return result;
+}
+
+function markAppServerThreadLoaded(threadId, connection = appServerClient.child) {
+  const cleanId = cleanNativeThreadId(threadId);
+  if (!cleanId || !connection || connection !== appServerClient.child) return false;
+  const previous = appServerLoadedThreads.get(cleanId);
+  appServerLoadedThreads.set(cleanId, {
+    connection,
+    turnId: previous?.connection === connection ? String(previous.turnId || '') : '',
+    loadedAt: Date.now(),
+  });
+  return true;
+}
+
+function markAppServerThreadTurn(threadId, turnId) {
+  const cleanId = cleanNativeThreadId(threadId);
+  const cleanTurnId = String(turnId || '').trim();
+  const record = cleanId ? appServerLoadedThreads.get(cleanId) : null;
+  if (
+    !record
+    || !cleanTurnId
+    || record.connection !== appServerClient.child
+  ) {
+    return false;
+  }
+  record.turnId = cleanTurnId;
+  return true;
+}
+
+async function waitForAppServerThreadUnsubscribe(threadId) {
+  const cleanId = cleanNativeThreadId(threadId);
+  const pending = cleanId ? appServerUnsubscribeRequests.get(cleanId) : null;
+  if (!pending) return;
+  await pending.promise.catch(() => {});
+}
+
+function isAppServerThreadAlreadyUnsubscribedError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return /not subscribed|already unsubscribed|thread\s+not\s+found|unknown thread|no such thread|线程.*(不存在|未订阅)/i.test(message);
+}
+
+async function unsubscribeAppServerThread(
+  threadId,
+  { expectedTurnId = '', allowRunning = false, force = false, reason = 'terminal' } = {},
+) {
+  const cleanId = cleanNativeThreadId(threadId);
+  if (!cleanId) return false;
+  const record = appServerLoadedThreads.get(cleanId);
+  if (!record) return false;
+  const cleanExpectedTurnId = String(expectedTurnId || '').trim();
+  if (cleanExpectedTurnId && record.turnId && record.turnId !== cleanExpectedTurnId) return false;
+
+  const active = activeNativeTurns.get(cleanId);
+  if (!force && active?.status === 'running') {
+    if (!allowRunning || !cleanExpectedTurnId || active.turnId !== cleanExpectedTurnId) return false;
+  }
+
+  const pending = appServerUnsubscribeRequests.get(cleanId);
+  if (pending?.connection === record.connection) return pending.promise;
+
+  let released = false;
+  let promise;
+  // Defer execution by one microtask so the cleanup record exists even when
+  // the app-server connection has already gone away.
+  promise = Promise.resolve().then(async () => {
+    try {
+      // A process replacement already released the old app-server writer.
+      if (record.connection !== appServerClient.child || !appServerClient.initialized) {
+        released = true;
+        return true;
+      }
+      const response = await appServerClient.requestWithConnection(
+        'thread/unsubscribe',
+        { threadId: cleanId },
+        { timeoutMs: APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS },
+      );
+      // If the request crossed a process replacement, the old writer is gone.
+      released = response?.child === record.connection || response?.child !== appServerClient.child;
+      return released;
+    } catch (error) {
+      if (
+        record.connection !== appServerClient.child
+        || isAppServerThreadAlreadyUnsubscribedError(error)
+      ) {
+        released = true;
+        return true;
+      }
+      console.warn(`释放 Web app-server 会话订阅失败 (${cleanId}, ${reason}): ${error.message}`);
+      return false;
+    } finally {
+      if (released && appServerLoadedThreads.get(cleanId) === record) {
+        appServerLoadedThreads.delete(cleanId);
+      }
+      if (appServerUnsubscribeRequests.get(cleanId)?.promise === promise) {
+        appServerUnsubscribeRequests.delete(cleanId);
+      }
+    }
+  });
+  appServerUnsubscribeRequests.set(cleanId, { connection: record.connection, promise });
+  return promise;
+}
+
+async function unsubscribeAllAppServerThreads() {
+  const threadIds = [...appServerLoadedThreads.keys()];
+  await Promise.allSettled(threadIds.map((threadId) => (
+    unsubscribeAppServerThread(threadId, { force: true, reason: 'shutdown' })
+  )));
+}
+
+function releaseAppServerThreadAfterTurn(threadId, turnId, options = {}) {
+  return unsubscribeAppServerThread(threadId, {
+    expectedTurnId: turnId,
+    ...options,
+  }).catch((error) => {
+    console.warn(`释放 Web app-server 回合订阅失败 (${threadId}): ${error.message}`);
+    return false;
+  });
+}
+
+function isAmbiguousAppServerRequestError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return /请求超时|未连接|已关闭|已退出|epipe|econn(reset|aborted)|broken pipe|socket hang up/i.test(message);
 }
 
 function handleAppServerError(params = {}) {
@@ -4167,6 +4359,7 @@ function recordNativeTurnCompletion(threadId, turn = {}) {
   const status = nativeTurnStatus(turn?.status);
   setNativeTurnState(cleanId, { turnId, status });
   // The JSONL watcher may have observed task_complete before this notification.
+  void releaseAppServerThreadAfterTurn(cleanId, turnId, { reason: 'turn-completed' });
   clearPersistedTerminalNativeTurn(cleanId);
   scheduleServerPromptQueueDispatch(cleanId, 160);
   return true;
@@ -4556,6 +4749,10 @@ async function continueNativeTurn(threadId, turn) {
   if (turn.provider !== currentProvider) {
     return resumeNativeTurn(threadId, turn);
   }
+  // A previous Web fallback may have finished without its terminal notification
+  // reaching this process. Release that idle Web subscription before asking the
+  // Desktop owner to continue the thread.
+  await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'before-desktop' });
   const requestedAt = Date.now();
   const echoController = new AbortController();
   const desktopAttempt = desktopIpcClient.startTurn(threadId, buildDesktopTurnStartParams(turn)).then(
@@ -4598,7 +4795,7 @@ async function continueNativeTurn(threadId, turn) {
 }
 
 async function resumeNativeTurn(threadId, turn) {
-  await appServerClient.request('thread/resume', compactObjectWithServiceTier({
+  await requestLoadedAppServerThread('thread/resume', compactObjectWithServiceTier({
     threadId,
     cwd: turn.cwd,
     model: turn.model,
@@ -4731,16 +4928,30 @@ async function steerNativeTurn(threadId, steer, expectedTurnId) {
   }
 
   let turnId = expectedTurnId;
+  let resumedByWeb = false;
   if (!turnId) {
-    const resumed = await appServerClient.request('thread/resume', { threadId });
+    const resumed = await requestLoadedAppServerThread('thread/resume', { threadId });
+    resumedByWeb = true;
     turnId = findInProgressTurnId(resumed?.thread);
   }
-  if (!turnId) throw new Error('该会话没有可引导的运行中任务');
-  const result = await appServerClient.request('turn/steer', {
-    threadId,
-    expectedTurnId: turnId,
-    input: steer.input,
-  });
+  if (!turnId) {
+    if (resumedByWeb) await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'steer-no-turn' });
+    throw new Error('该会话没有可引导的运行中任务');
+  }
+  let result;
+  try {
+    result = await appServerClient.request('turn/steer', {
+      threadId,
+      expectedTurnId: turnId,
+      input: steer.input,
+    });
+  } catch (error) {
+    if (resumedByWeb && !isAmbiguousAppServerRequestError(error)) {
+      await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'steer-failed' });
+    }
+    throw error;
+  }
+  markAppServerThreadTurn(threadId, turnId);
   return { ...result, transport: 'app-server' };
 }
 
@@ -4769,13 +4980,29 @@ async function interruptNativeTurn(threadId, expectedTurnId) {
   }
 
   let turnId = expectedTurnId;
+  let resumedByWeb = false;
   if (!turnId) {
-    const resumed = await appServerClient.request('thread/resume', { threadId });
+    const resumed = await requestLoadedAppServerThread('thread/resume', { threadId });
+    resumedByWeb = true;
     turnId = findInProgressTurnId(resumed?.thread);
   }
-  if (!turnId) throw new Error('该会话没有可取消的任务');
-  await appServerClient.request('turn/interrupt', { threadId, turnId }, {
-    timeoutMs: APP_SERVER_INTERRUPT_TIMEOUT_MS,
+  if (!turnId) {
+    if (resumedByWeb) await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'interrupt-no-turn' });
+    throw new Error('该会话没有可取消的任务');
+  }
+  try {
+    await appServerClient.request('turn/interrupt', { threadId, turnId }, {
+      timeoutMs: APP_SERVER_INTERRUPT_TIMEOUT_MS,
+    });
+  } catch (error) {
+    if (resumedByWeb && !isAmbiguousAppServerRequestError(error)) {
+      await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'interrupt-failed' });
+    }
+    throw error;
+  }
+  await releaseAppServerThreadAfterTurn(threadId, turnId, {
+    allowRunning: true,
+    reason: 'turn-interrupted',
   });
   return { interruptedTurnId: turnId, ok: true, transport: 'app-server' };
 }
@@ -4798,6 +5025,10 @@ async function stopNativeTurnForArchive(threadId) {
     turnId: stoppedTurnId,
     status: 'interrupted',
     transport: result?.transport || 'app-server',
+  });
+  await releaseAppServerThreadAfterTurn(threadId, stoppedTurnId, {
+    allowRunning: true,
+    reason: 'archive-interrupt',
   });
   try { nativeSessions.markTurnTerminal?.(threadId, stoppedTurnId, 'interrupted'); } catch {}
   return stoppedTurnId;
@@ -4839,19 +5070,33 @@ async function notifyDesktopAutomationsChanged() {
 }
 
 async function startNativeTurn(threadId, turn) {
-  const result = await appServerClient.request('turn/start', compactObjectWithServiceTier({
-    threadId,
-    input: turn.input,
-    cwd: turn.cwd,
-    model: turn.model,
-    effort: turn.reasoningEffort,
-    approvalPolicy: turn.approval,
-    approvalsReviewer: turn.approvalsReviewer,
-    sandboxPolicy: turn.sandbox ? nativeSandboxPolicy(turn.sandbox, turn.cwd) : undefined,
-    useAppServerPermissionDefault: turn.permissionMode === 'custom' ? true : undefined,
-  }, turn.serviceTier));
+  let result;
+  try {
+    result = await appServerClient.request('turn/start', compactObjectWithServiceTier({
+      threadId,
+      input: turn.input,
+      cwd: turn.cwd,
+      model: turn.model,
+      effort: turn.reasoningEffort,
+      approvalPolicy: turn.approval,
+      approvalsReviewer: turn.approvalsReviewer,
+      sandboxPolicy: turn.sandbox ? nativeSandboxPolicy(turn.sandbox, turn.cwd) : undefined,
+      useAppServerPermissionDefault: turn.permissionMode === 'custom' ? true : undefined,
+    }, turn.serviceTier));
+  } catch (error) {
+    // A definite turn/start rejection leaves the thread loaded but idle. A
+    // timeout is ambiguous because Codex may have accepted the request.
+    if (!isAmbiguousAppServerRequestError(error)) {
+      await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'turn-start-failed' });
+    }
+    throw error;
+  }
   const turnId = String(result?.turn?.id || '');
-  if (!turnId) throw new Error('Codex app-server 未返回有效 turn id');
+  if (!turnId) {
+    await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'turn-start-invalid-result' });
+    throw new Error('Codex app-server 未返回有效 turn id');
+  }
+  markAppServerThreadTurn(threadId, turnId);
   setNativeTurnState(threadId, {
     turnId,
     status: 'running',

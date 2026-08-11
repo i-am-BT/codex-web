@@ -70,6 +70,14 @@ export class CodexAppServerClient extends EventEmitter {
     return this.sendRequest(method, params, options.timeoutMs);
   }
 
+  async requestWithConnection(method, params = {}, options = {}) {
+    if (this.restartPromise) await this.restartPromise;
+    else await this.start();
+    const child = this.child;
+    const result = await this.sendRequest(method, params, options.timeoutMs);
+    return { result, child };
+  }
+
   async notify(method, params) {
     if (this.restartPromise) await this.restartPromise;
     else await this.start();

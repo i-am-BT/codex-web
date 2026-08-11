@@ -288,6 +288,7 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
     'nativeTurnStatus',
     'setNativeTurnState',
     'clearPersistedTerminalNativeTurn',
+    'releaseAppServerThreadAfterTurn',
     'scheduleServerPromptQueueDispatch',
     'setTimeout',
     `${serverSource.slice(completionStart, completionEnd)}; return { recordNativeTurnCompletion };`,
@@ -300,6 +301,7 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
       activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state });
     },
     () => false,
+    () => Promise.resolve(false),
     (...args) => dispatches.push(args),
     (callback) => { timers.push(callback); return { unref() {} }; },
   );
@@ -334,6 +336,7 @@ test('a matching persisted terminal releases a running turn and schedules the We
     'pendingDeepSeekNativeTurns',
     'accumulateDeepSeekUsage',
     'broadcastNativeRuntime',
+    'releaseAppServerThreadAfterTurn',
     `${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
   )(
     [],
@@ -352,6 +355,7 @@ test('a matching persisted terminal releases a running turn and schedules the We
     new Map(),
     () => false,
     (event) => runtimeEvents.push(event),
+    () => Promise.resolve(false),
   );
 
   api.handleNativeSessionChange({ changedIds: ['thread-a'] });
@@ -425,6 +429,7 @@ test('native terminal overrides clear after their matching persisted record or a
     'cleanNativeThreadId',
     'nativeSessions',
     'broadcastNativeRuntime',
+    'releaseAppServerThreadAfterTurn',
     `${serverSource.slice(terminalStart, terminalEnd)}; return { clearPersistedTerminalNativeTurns };`,
   )(
     activeNativeTurns,
@@ -437,6 +442,7 @@ test('native terminal overrides clear after their matching persisted record or a
           : { messages: [{ turnId: 'turn-other', role: 'process', kind: 'turn_aborted' }] },
     },
     (event) => cleared.push(event),
+    () => Promise.resolve(false),
   );
 
   terminalApi.clearPersistedTerminalNativeTurns({ changedIds: ['thread-a', 'thread-b', 'thread-c'] });
@@ -469,6 +475,7 @@ test('terminal completion clears an already persisted terminal without another w
     'nativeTurnStatus',
     'setNativeTurnState',
     'scheduleServerPromptQueueDispatch',
+    'releaseAppServerThreadAfterTurn',
     `${serverSource.slice(terminalStart, terminalEnd)}; ${serverSource.slice(completionStart, completionEnd)}; return { recordNativeTurnCompletion };`,
   )(
     activeNativeTurns,
@@ -484,6 +491,7 @@ test('terminal completion clears an already persisted terminal without another w
     (value) => String(value || '').toLowerCase() === 'failed' ? 'error' : 'done',
     (threadId, state) => activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state }),
     (...args) => dispatches.push(args),
+    () => Promise.resolve(false),
   );
 
   assert.equal(api.recordNativeTurnCompletion('thread-a', { id: 'turn-current', status: 'completed' }), true);
@@ -741,6 +749,7 @@ test('app-server latest turn status repairs stale JSONL running state after rest
     'NATIVE_TURN_STATUS_ACTIVITY_GRACE_MS',
     'appServerClient',
     'NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS',
+    'releaseAppServerThreadAfterTurn',
     `${serverSource.slice(helperStart, helperEnd)}; return {
       applyAppServerTurnStatus,
       reconcileNativeTurnStatusFromAppServer,
@@ -778,6 +787,7 @@ test('app-server latest turn status repairs stale JSONL running state after rest
       },
     },
     4000,
+    () => Promise.resolve(false),
   );
 
   assert.equal(await api.reconcileNativeTurnStatusFromAppServer('thread-paused', {
@@ -829,6 +839,64 @@ test('app-server latest turn status repairs stale JSONL running state after rest
     status: 'interrupted',
     startedAt: Date.parse('2026-08-07T09:00:00.000Z') / 1000,
   }), false, 'an older persisted terminal state must not stop a newer live turn');
+});
+
+test('stale app-server unsubscribe cleanup cannot suppress a later reload on the same connection', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isAppServerThreadAlreadyUnsubscribedError');
+  const helperEnd = serverSource.indexOf('\nfunction releaseAppServerThreadAfterTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const appServerLoadedThreads = new Map([
+    ['thread-a', { connection, turnId: '', loadedAt: 0 }],
+  ]);
+  const appServerUnsubscribeRequests = new Map();
+  const requests = [];
+  const appServerClient = {
+    child: connection,
+    initialized: false,
+    requestWithConnection: async (method, params, options) => {
+      requests.push({ method, params, options });
+      return { result: {}, child: connection };
+    },
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'appServerLoadedThreads',
+    'appServerUnsubscribeRequests',
+    'activeNativeTurns',
+    'appServerClient',
+    'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
+    'console',
+    `${serverSource.slice(helperStart, helperEnd)}; return { unsubscribeAppServerThread };`,
+  )(
+    (value) => String(value || '').trim(),
+    appServerLoadedThreads,
+    appServerUnsubscribeRequests,
+    new Map(),
+    appServerClient,
+    5000,
+    { warn() {} },
+  );
+
+  assert.equal(await api.unsubscribeAppServerThread('thread-a'), true);
+  assert.equal(appServerLoadedThreads.has('thread-a'), false);
+  assert.equal(
+    appServerUnsubscribeRequests.size,
+    0,
+    'an already-closed connection must not leave a resolved unsubscribe entry behind',
+  );
+
+  appServerClient.initialized = true;
+  appServerLoadedThreads.set('thread-a', { connection, turnId: '', loadedAt: 1 });
+  assert.equal(await api.unsubscribeAppServerThread('thread-a'), true);
+  assert.deepEqual(requests, [{
+    method: 'thread/unsubscribe',
+    params: { threadId: 'thread-a' },
+    options: { timeoutMs: 5000 },
+  }]);
+  assert.equal(appServerUnsubscribeRequests.size, 0);
 });
 
 test('Desktop snapshots and patches synchronize live and terminal turn state', async () => {
@@ -2052,6 +2120,7 @@ if (args[0] === 'app-server') {
       }
       else if (message.method === 'thread/fork') send({ id: message.id, result: { thread: thread(forkedThreadId) } });
       else if (message.method === 'thread/resume') send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
+      else if (message.method === 'thread/unsubscribe') send({ id: message.id, result: {} });
       else if (message.method === 'turn/start') {
         const turnId = '019f4f84-ea9f-73c2-b997-deba7b4aa798';
         const text = (message.params.input || []).find((item) => item.type === 'text')?.text || '';
@@ -5690,6 +5759,7 @@ updated_at = 1784422800000
       new RegExp(`^/api/native-sessions/${nativeSessionId}/images/\\d+\\?generation=\\d+$`),
     );
 
+    const appServerTraceBeforeFirstFork = await readAppServerTrace(appServerTraceFile);
     const nativeImage = await fetch(`${baseUrl}${externalizedImage.content}`, {
       headers: { Cookie: cookie },
     });
@@ -5714,7 +5784,29 @@ updated_at = 1784422800000
     assert.equal(restartedFromFirstPayload.threadId, createdNativeSessionId);
     assert.equal(restartedFromFirstPayload.forkedThroughTurnId, '');
     assert.equal(restartedFromFirstPayload.draft, 'native earlier message');
+    const firstForkCleanup = await waitForAppServerTrace(
+      appServerTraceFile,
+      (messages) => messages.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === createdNativeSessionId
+      )).length > appServerTraceBeforeFirstFork.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === createdNativeSessionId
+      )).length,
+      'thread/start fork did not release its Web app-server subscription',
+    );
+    assert.equal(
+      firstForkCleanup.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === createdNativeSessionId
+      )).length,
+      appServerTraceBeforeFirstFork.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === createdNativeSessionId
+      )).length + 1,
+    );
 
+    const appServerTraceBeforeFork = await readAppServerTrace(appServerTraceFile);
     const forked = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -5735,7 +5827,29 @@ updated_at = 1784422800000
     assert.equal(forkedPayload.forkedThroughTurnId, nativeFirstTurnId);
     assert.equal(forkedPayload.draft, 'native fixture message');
     assert.equal(forkedPayload.conversation.status, 'done');
+    const forkCleanup = await waitForAppServerTrace(
+      appServerTraceFile,
+      (messages) => messages.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === forkedNativeSessionId
+      )).length > appServerTraceBeforeFork.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === forkedNativeSessionId
+      )).length,
+      'thread/fork did not release its Web app-server subscription',
+    );
+    assert.equal(
+      forkCleanup.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === forkedNativeSessionId
+      )).length,
+      appServerTraceBeforeFork.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === forkedNativeSessionId
+      )).length + 1,
+    );
 
+    const appServerTraceBeforeAssistantFork = await readAppServerTrace(appServerTraceFile);
     const continuedFromAssistant = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/fork`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -5753,6 +5867,27 @@ updated_at = 1784422800000
     assert.equal(continuedFromAssistantPayload.threadId, forkedNativeSessionId);
     assert.equal(continuedFromAssistantPayload.forkedThroughTurnId, nativeFirstTurnId);
     assert.equal(continuedFromAssistantPayload.draft, '');
+    const assistantForkCleanup = await waitForAppServerTrace(
+      appServerTraceFile,
+      (messages) => messages.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === forkedNativeSessionId
+      )).length > appServerTraceBeforeAssistantFork.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === forkedNativeSessionId
+      )).length,
+      'second thread/fork did not release its Web app-server subscription',
+    );
+    assert.equal(
+      assistantForkCleanup.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === forkedNativeSessionId
+      )).length,
+      appServerTraceBeforeAssistantFork.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === forkedNativeSessionId
+      )).length + 1,
+    );
 
     const archivedNativeSession = await fetch(`${baseUrl}/api/native-sessions/${archivedNativeSessionId}`, {
       headers: { Cookie: cookie },
@@ -5764,6 +5899,11 @@ updated_at = 1784422800000
     });
     assert.equal(automationNativeSession.status, 404);
 
+    const traceBeforeDesktopContinuation = await readAppServerTrace(appServerTraceFile);
+    const desktopUnsubscribeCountBefore = traceBeforeDesktopContinuation.filter((message) => (
+      message.method === 'thread/unsubscribe'
+      && message.params?.threadId === nativeSessionId
+    )).length;
     const desktopContinued = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -5788,6 +5928,15 @@ updated_at = 1784422800000
     const activeDesktopConversation = (await activeDesktopSession.json()).conversation;
     assert.equal(activeDesktopConversation.activeTurnId, desktopContinuedPayload.turnId);
     assert.match(activeDesktopConversation.activeTurnStartedAt, /^\d{4}-\d{2}-\d{2}T/);
+    const traceAfterDesktopContinuation = await readAppServerTrace(appServerTraceFile);
+    assert.equal(
+      traceAfterDesktopContinuation.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === nativeSessionId
+      )).length,
+      desktopUnsubscribeCountBefore,
+      'Desktop-owned continuation must not be released through Web app-server',
+    );
 
     const desktopSteered = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/steer`, {
       method: 'POST',
@@ -7211,6 +7360,21 @@ updated_at = 1784422800000
       .map((line) => JSON.parse(line))
       .filter((message) => message.method === 'thread/archive' && message.params?.threadId === failedSideChatId);
     assert.equal(failedSideChatArchive.length, 1);
+    const failedSideChatTrace = await waitForAppServerTrace(
+      appServerTraceFile,
+      (messages) => messages.some((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === failedSideChatId
+      )),
+      'failed Web side chat did not release its app-server subscription',
+    );
+    assert.equal(
+      failedSideChatTrace.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === failedSideChatId
+      )).length,
+      1,
+    );
     await writeFile(appServerControlFile, '{}');
     const clearFailedSideChatQueue = await fetch(
       `${baseUrl}/api/prompt-queues/${nativeSessionId}/items/${failedSideChatQueueItem.id}`,
@@ -7285,12 +7449,36 @@ updated_at = 1784422800000
     assert.equal(createdPayload.threadId, createdNativeSessionId);
     assert.ok(createdPayload.turnId);
 
+    const traceBeforeCreatedInterrupt = await readAppServerTrace(appServerTraceFile);
     const interrupted = await fetch(`${baseUrl}/api/native-sessions/${createdNativeSessionId}/interrupt`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({ turnId: createdPayload.turnId }),
     });
     assert.equal(interrupted.status, 200);
+    const createdInterruptTrace = await waitForAppServerTrace(
+      appServerTraceFile,
+      (messages) => messages.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === createdNativeSessionId
+      )).length > traceBeforeCreatedInterrupt.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === createdNativeSessionId
+      )).length,
+      'Web interrupt did not release its app-server subscription',
+    );
+    const createdInterruptUnsubscribeCount = createdInterruptTrace.filter((message) => (
+      message.method === 'thread/unsubscribe'
+      && message.params?.threadId === createdNativeSessionId
+    )).length;
+    const beforeCreatedInterruptUnsubscribeCount = traceBeforeCreatedInterrupt.filter((message) => (
+      message.method === 'thread/unsubscribe'
+      && message.params?.threadId === createdNativeSessionId
+    )).length;
+    assert.ok(
+      createdInterruptUnsubscribeCount > beforeCreatedInterruptUnsubscribeCount,
+      'Web interrupt must release its app-server subscription',
+    );
 
     const renamed = await fetch(`${baseUrl}/api/native-sessions/${createdNativeSessionId}`, {
       method: 'PATCH',
@@ -7337,6 +7525,14 @@ updated_at = 1784422800000
       model: 'switch-model',
       effort: 'xhigh',
     });
+    assert.equal(
+      threadSettingsProtocol.filter((message) => (
+        message.method === 'thread/unsubscribe'
+        && message.params?.threadId === createdNativeSessionId
+      )).length,
+      1,
+      'settings update did not release the temporary Web subscription',
+    );
 
     const protocolBeforeSameProviderUpdate = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
@@ -8069,6 +8265,26 @@ function readPersistedTestEnv(file) {
   } catch {
     return {};
   }
+}
+
+async function readAppServerTrace(file) {
+  try {
+    return (await readFile(file, 'utf8'))
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+async function waitForAppServerTrace(file, predicate, errorMessage) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const messages = await readAppServerTrace(file);
+    if (predicate(messages)) return messages;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(errorMessage);
 }
 
 async function createDesktopIpcFixture(temporary) {
