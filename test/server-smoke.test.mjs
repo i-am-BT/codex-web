@@ -3417,7 +3417,7 @@ updated_at = 1784422800000
     assert.doesNotMatch(page, /async function cancelRun\(\)\{[\s\S]*?clearLiveTurnProgress\(\);[\s\S]*?async function send/);
     assert.match(page, /const cancelPending=conversation\.source==='codex'[\s\S]*?&& running[\s\S]*?nativeCancelPendingMatches\(conversation\.id,conversation\.activeTurnId\)/);
     assert.match(page, /const reportedActiveTurnId=String\(conversation\.activeTurnId\|\|''\);[\s\S]*?conversation\.status!=='running'\|\|reportedActiveTurnId!==nativeCancelPending\.turnId/);
-    assert.match(page, /statusEl\.textContent=cancelPending\?'Codex App · 正在停止…':'Codex App · 运行中'/);
+    assert.match(page, /if\(cancelPending\)statusEl\.textContent='Codex App · 正在停止…';\s*else showNativeRunningTimestamp\(runtime\.updatedAt\)/);
     assert.match(page, /function createActivityCluster/);
     assert.match(page, /function createActivityCluster[\s\S]*?cluster\.open=false;/);
     assert.match(page, /currentActivityCluster\.dataset\.activityLive='true'/);

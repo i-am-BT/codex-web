@@ -18568,6 +18568,14 @@ async function loadConversation(id,source='web',options={}){
   }
   return true;
 }
+function nativeRunningStatusTimestamp(value=Date.now()){
+  const time=new Date(value||Date.now());
+  return (Number.isNaN(time.getTime())?new Date():time).toLocaleString();
+}
+function showNativeRunningTimestamp(value=Date.now()){
+  statusEl.classList.add('running');
+  statusEl.textContent=nativeRunningStatusTimestamp(value);
+}
 function updateConversationStatus(conversation){
   const time=new Date(conversation.updatedAt||conversation.createdAt);
   const stamp=Number.isNaN(time.getTime())?'':time.toLocaleString();
@@ -18585,8 +18593,11 @@ function updateConversationStatus(conversation){
   }
   statusEl.classList.toggle('running',running);
   if(conversation.source==='codex'){
-    const stateLabel=running?'运行中':conversation.status==='interrupted'?'已暂停':conversation.status==='error'?'任务失败':'已同步';
-    statusEl.textContent='Codex App · '+stateLabel+(stamp?' · '+stamp:'');
+    if(running)showNativeRunningTimestamp(conversation.updatedAt||conversation.createdAt);
+    else{
+      const stateLabel=conversation.status==='interrupted'?'已暂停':conversation.status==='error'?'任务失败':'已同步';
+      statusEl.textContent='Codex App · '+stateLabel+(stamp?' · '+stamp:'');
+    }
     nativeNotice.textContent='Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':'');
   }else{
     statusEl.textContent='Loaded '+stamp;
@@ -18824,7 +18835,8 @@ function connectSessionEvents(){
         clearNativeCompletionSync();
         if(!collectingTurnProcess||!turnProcessElapsedMatches(runtimeTurnId))beginTurnProcessCollection(runtime.updatedAt,true,runtimeTurnId);
         else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),runtimeTurnId);
-        statusEl.textContent=cancelPending?'Codex App · 正在停止…':'Codex App · 运行中';
+        if(cancelPending)statusEl.textContent='Codex App · 正在停止…';
+        else showNativeRunningTimestamp(runtime.updatedAt);
       }
       applyConversationMode();
     }
@@ -23067,8 +23079,7 @@ function updateNativeLiveDelta(runtime){
     live={key,source:'runtime',turnId:runtimeTurnId,itemId,role:'assistant',element,text:'',targetText:'',complete:false,renderTimer:null,followBottom};
     nativeLiveItems.set(key,live);
     if(runtimeTurnId)nativeRuntimeStreamTurnIds.add(runtimeTurnId);
-    statusEl.textContent='Codex App · 正在处理';
-    statusEl.classList.add('running');
+    showNativeRunningTimestamp(runtime.updatedAt);
   }
   activateTurnProcessElement(live.element);
   live.targetText+=delta;
@@ -23299,7 +23310,7 @@ async function send(){
   webRunActive=true;
   activeNativeTurnId='';
   applyConversationMode();
-  statusEl.textContent='Codex App · 运行中';
+  showNativeRunningTimestamp(Date.now());
   try{
     const endpoint=existingId?'/api/native-sessions/'+encodeURIComponent(existingId)+'/turns':'/api/native-sessions';
     const requestedProvider=provider.value;
