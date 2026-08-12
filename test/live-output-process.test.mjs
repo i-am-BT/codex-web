@@ -1521,6 +1521,7 @@ test('running native output offers a non-disruptive jump-to-latest control', () 
 
 test('runtime stream and snapshot message adopt into one assistant bubble', () => {
   const liveSource = sourceBetween('function isNativeSnapshotStreamingMessage', 'async function copyText');
+  const runningStatusSource = sourceBetween('function nativeRunningStatusTimestamp', 'function updateConversationStatus');
   const rendered = [];
   const addCalls = [];
   const createElement = () => {
@@ -1586,6 +1587,7 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
       let turnProcessStartedAt = 0;
       let turnProcessElapsedLabel = null;
       const statusEl = { textContent: '', classList: { add() {}, remove() {} } };
+      ${runningStatusSource}
       function beginTurnProcessCollection() {}
       function ensureTurnProcessElapsedRunning() {}
       function turnProcessElapsedMatches() { return true; }
@@ -2396,6 +2398,35 @@ test('generation resets reconcile live messages without rebuilding the conversat
   const completionSyncSource = sourceBetween('async function reconcileNativeCompletion', 'function syncNativeAfterPageResume');
   assert.match(completionSyncSource, /await syncCurrentNativeConversation\(\)/);
   assert.doesNotMatch(completionSyncSource, /loadConversation/);
+});
+
+test('same-conversation refresh keeps the visible status instead of flashing Loading', () => {
+  const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  assert.match(loadConversation, /const conversationChanged=id!==currentConversationId\|\|nextConversationSource!==currentConversationSource/);
+  assert.match(loadConversation, /if\(conversationChanged\)statusEl\.textContent='Loading\.\.\.'/);
+  assert.doesNotMatch(loadConversation, /updateActiveHistory\(\);\s*statusEl\.textContent='Loading\.\.\.'/);
+});
+
+test('running Codex App status shows only the update time', () => {
+  const helperSource = sourceBetween('function nativeRunningStatusTimestamp', 'function updateConversationStatus');
+  const statusSource = sourceBetween('function updateConversationStatus', 'async function applyNativeConversationMetadata');
+  const statusEl = {
+    textContent: '',
+    classList: { add() {} },
+  };
+  const { showNativeRunningTimestamp } = new Function(
+    'statusEl',
+    `${helperSource}; return { showNativeRunningTimestamp };`,
+  )(statusEl);
+  const updatedAt = '2026-08-11T00:58:00.000Z';
+
+  showNativeRunningTimestamp(updatedAt);
+  assert.equal(statusEl.textContent, new Date(updatedAt).toLocaleString());
+  assert.doesNotMatch(statusEl.textContent, /Codex App|运行中|正在处理/);
+  assert.match(statusSource, /if\(running\)showNativeRunningTimestamp\(conversation\.updatedAt\|\|conversation\.createdAt\)/);
+  assert.match(inlineScript, /else showNativeRunningTimestamp\(runtime\.updatedAt\)/);
+  assert.match(inlineScript, /showNativeRunningTimestamp\(Date\.now\(\)\)/);
+  assert.doesNotMatch(inlineScript, /statusEl\.textContent='Codex App · 正在处理'/);
 });
 
 test('rolled-back retry collapse invalidates the open page before appending the latest attempt', () => {
