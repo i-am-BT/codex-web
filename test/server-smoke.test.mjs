@@ -268,6 +268,17 @@ test('DeepSeek quota card hides balance funding breakdown and keeps local totals
   assert.match(uiStyles, /\.deepSeekUsageCalibrationStatus\.success\s*\{[^}]*color:\s*var\(--success\)/s);
 });
 
+test('Codex App quota card omits provider status metadata', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const branchStart = serverSource.indexOf('if(isCodexApp){');
+  const branchEnd = serverSource.indexOf('const isSub2Api=', branchStart);
+  assert.ok(branchStart >= 0 && branchEnd > branchStart);
+  const branch = serverSource.slice(branchStart, branchEnd);
+
+  assert.match(branch, /if\(quota\.message\)appendSubQuotaMeta\(meta,quota\.message\)/);
+  assert.doesNotMatch(branch, /appendSubQuotaMeta\(meta,'状态 /);
+});
+
 test('native queue turns ignore unscoped idle status and stale completions', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const notificationStart = serverSource.indexOf('function handleAppServerNotification');
@@ -1658,6 +1669,24 @@ experimental_bearer_token = "switch-test-token"
       'pinned-thread-ids': [nativeSessionId, archivedNativeSessionId],
       'projectless-thread-ids': [],
       'thread-project-assignments': {},
+      'electron-persisted-atom-state': {
+        'unread-thread-ids-by-host-v1': {
+          local: [
+            nativeSessionId,
+            forkedNativeSessionId,
+            createdNativeSessionId,
+            archivedNativeSessionId,
+            automationNativeSessionId,
+            subagentNativeSessionId,
+            appQueueOwnershipThreadId,
+            appQueueNoIdThreadId,
+            appQueueDuplicateNoIdThreadId,
+            appQueueEditThreadId,
+            appQueueReorderThreadId,
+            appQueueInterruptedThreadId,
+          ],
+        },
+      },
       'queued-follow-ups': {
         [appQueueOwnershipThreadId]: [appOwnedQueueRawItem],
         [appQueueEditThreadId]: [appOwnedEditQueueRawItem],
@@ -2574,6 +2603,8 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.equal(unauthorizedSubQuotaConfig.status, 401);
     const unauthorizedGrok2ApiConsole = await fetch(`${baseUrl}/api/sub-quotas/grok2api/console`);
     assert.equal(unauthorizedGrok2ApiConsole.status, 401);
+    const unauthorizedGrok2ApiSync = await fetch(`${baseUrl}/api/sub-quotas/grok2api/sync`, { method: 'POST' });
+    assert.equal(unauthorizedGrok2ApiSync.status, 401);
     const unauthorizedDeepSeekUsageCalibration = await fetch(`${baseUrl}/api/deepseek-usage-calibration`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -2664,6 +2695,61 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     });
     assert.equal(emptyCompletionRead.status, 200);
     assert.deepEqual((await emptyCompletionRead.json()).read, {});
+    const nativeSessionsForCompletionRead = await fetch(`${baseUrl}/api/native-sessions`, {
+      headers: { Cookie: cookie },
+    });
+    const nativeSessionsForCompletionReadPayload = await nativeSessionsForCompletionRead.json();
+    const nativeCompletionReadSession = nativeSessionsForCompletionReadPayload.sessions
+      .find((session) => session.id === nativeSessionId);
+    assert.ok(nativeCompletionReadSession);
+    assert.equal(nativeCompletionReadSession.status, 'done');
+    const nativeCompletionReadVersion = `${nativeCompletionReadSession.status}|${nativeCompletionReadSession.updatedAt}`;
+    const appStateAfterRead = JSON.parse(await readFile(codexGlobalStateFile, 'utf8'));
+    appStateAfterRead['electron-persisted-atom-state']['unread-thread-ids-by-host-v1'].local =
+      appStateAfterRead['electron-persisted-atom-state']['unread-thread-ids-by-host-v1'].local
+        .filter((id) => id !== nativeSessionId);
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterRead));
+    const appReadCompletion = await fetch(`${baseUrl}/api/history-completion-read`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(appReadCompletion.status, 200);
+    assert.equal(
+      (await appReadCompletion.json()).read[`codex:${nativeSessionId}`],
+      nativeCompletionReadVersion,
+    );
+    appStateAfterRead['electron-persisted-atom-state']['unread-thread-ids-by-host-v1'].local
+      .push(nativeSessionId);
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterRead));
+    const appUnreadCompletion = await fetch(`${baseUrl}/api/history-completion-read`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(
+      (await appUnreadCompletion.json()).read[`codex:${nativeSessionId}`],
+      nativeCompletionReadVersion,
+      'Codex App unread state must not revive a Web-read completion',
+    );
+    const completionReadBeforeInvalidState = await fetch(`${baseUrl}/api/history-completion-read`, {
+      headers: { Cookie: cookie },
+    }).then((response) => response.json());
+    await writeFile(codexGlobalStateFile, '{"electron-persisted-atom-state":');
+    const invalidAppReadCompletion = await fetch(`${baseUrl}/api/history-completion-read`, {
+      headers: { Cookie: cookie },
+    });
+    assert.deepEqual(
+      (await invalidAppReadCompletion.json()).read,
+      completionReadBeforeInvalidState.read,
+      'a partially-written Codex App state must not clear completion dots',
+    );
+    await unlink(codexGlobalStateFile);
+    const missingAppReadCompletion = await fetch(`${baseUrl}/api/history-completion-read`, {
+      headers: { Cookie: cookie },
+    });
+    assert.deepEqual(
+      (await missingAppReadCompletion.json()).read,
+      completionReadBeforeInvalidState.read,
+      'a missing Codex App state must not clear completion dots',
+    );
+    await writeFile(codexGlobalStateFile, JSON.stringify(appStateAfterRead));
     const savedCompletionRead = await fetch(`${baseUrl}/api/history-completion-read`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -3357,7 +3443,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=quota-header-align-20260808b"/);
+    assert.match(page, /href="\/ui\.css\?v=history-unread-bell-20260814c"/);
     assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -3490,7 +3576,7 @@ updated_at = 1784422800000
     assert.match(page, /sideCollapsed/);
     assert.match(page, /function setHistoryProjectExpanded/);
     assert.match(page, /function showHistoryProjectPreview/);
-    assert.match(page, /itemCount\+' 个对话串 · '\+runningCount\+' 个已开启'/);
+    assert.match(page, /itemCount\+' 个对话串，'\+runningCount\+' 个已开启'/);
     assert.match(page, /codexWeb\.historyProjectsCollapsed/);
     assert.match(page, /codexWeb\.historyTasksCollapsed/);
     assert.match(page, /codexWeb\.historyProjectsHidden/);
@@ -3562,7 +3648,9 @@ updated_at = 1784422800000
     assert.match(page, /progressHead\.className='subQuotaCodexPreviewProgressHead'/);
     assert.match(page, /grok2ApiConsoleDialog\.id='grok2ApiConsoleDialog'/);
     assert.match(page, /fetch\('\/api\/sub-quotas\/grok2api\/console\?tail=160'/);
-    assert.match(page, /setIconLabel\(consoleBtn,'terminal-square','控制台'\)/);
+    assert.match(page, /setIconLabel\(syncBtn,'refresh-cw','额度同步'\)/);
+    assert.match(page, /fetch\('\/api\/sub-quotas\/grok2api\/sync'/);
+    assert.doesNotMatch(page, /setIconLabel\(consoleBtn,'terminal-square','控制台'\)/);
     assert.match(page, /function formatCodexAppUsdAmount\(value\)/);
     assert.match(page, /formatCodexAppUsdAmount\(dollars\)/);
     assert.match(page, /urlLabel\.textContent='上游 URL'/);
@@ -3764,11 +3852,11 @@ updated_at = 1784422800000
     assert.match(page, /inputImage/);
     assert.match(page, /boot\(true\)/);
     assert.match(page, /async function boot\(selectRecent=false\)/);
-    const inlineScript = page.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+    const inlineScript = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]).sort((a, b) => b.length - a.length)[0];
     assert.ok(inlineScript);
     const composerModelItemsHelper = inlineScript.match(/(function composerModelItems[\s\S]*?)(?=function selectComposerModel)/)?.[1];
     assert.ok(composerModelItemsHelper);
-    const composerModelItems = new Function(`${composerModelItemsHelper}; return composerModelItems;`)();
+    const composerModelItems = new Function(`let nativeModelCatalogIds=[]; ${composerModelItemsHelper}; return composerModelItems;`)();
     assert.deepEqual(composerModelItems(['gpt-5.5', 'gpt-5.5', ''], 'retired-model'), ['gpt-5.5', 'retired-model']);
     assert.deepEqual(composerModelItems(['gpt-5.5', 'retired-model'], 'retired-model'), ['gpt-5.5', 'retired-model']);
 
@@ -4042,6 +4130,8 @@ updated_at = 1784422800000
       composerLabelHelpers + '; return { composerModelLabel, composerEffortLabel, composerMaximumEffortValue };',
     )(null);
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
+    assert.equal(composerLabels.composerModelLabel('deepseek-v4-flash'), 'DeepSeek V4 Flash');
+    assert.equal(composerLabels.composerModelLabel('grok-4.5'), 'Grok 4.5');
     assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
     assert.equal(composerLabels.composerEffortLabel('ultra'), '超高');
     assert.equal(composerLabels.composerMaximumEffortValue({ options: [
@@ -4069,7 +4159,7 @@ updated_at = 1784422800000
     assert.match(inlineScript, /const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage\(text\)/);
     assert.match(inlineScript, /if\(longUser\)bindLongUserMessage\(el,body,options\.scrollContainer\|\|chat\)/);
     assert.match(inlineScript, /function automationHeartbeatDisplayText\(text\)/);
-    assert.match(inlineScript, /renderMessageMarkdown\(body,automationHeartbeatDisplayText\(text\),\{assistantArtifacts:true\}\)/);
+    assert.match(inlineScript, /const displayText=stripNativeUiProtocolLines\(automationHeartbeatDisplayText\(text\)\);\s*renderMessageMarkdown\(body,displayText,\{assistantArtifacts:true\}\)/);
     const heartbeatDisplayHelper = inlineScript.match(/(function automationHeartbeatDisplayText[\s\S]*?)(?=function automationInstructionDisplayText)/)?.[1];
     assert.ok(heartbeatDisplayHelper);
     class TestHeartbeatDOMParser {
@@ -5233,7 +5323,8 @@ updated_at = 1784422800000
     const modelCapabilities = await modelCapabilitiesResponse.json();
     assert.equal(modelCapabilities.ok, true);
     assert.equal(modelCapabilities.models.length, 2);
-    assert.equal(modelCapabilities.models.every((entry) => !('displayName' in entry)), true);
+    assert.equal(modelCapabilities.models.every((entry) => typeof entry.displayName === 'string' && entry.displayName), true);
+    assert.equal(modelCapabilities.models.find((entry) => entry.id === 'test-model')?.displayName, 'Test model');
     assert.equal(
       modelCapabilities.models
         .find((entry) => entry.id === 'test-model')

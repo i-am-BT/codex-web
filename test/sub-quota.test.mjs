@@ -1339,7 +1339,7 @@ test('normalizes Grok2API account summary into callable and abnormal stats', () 
   assert.equal(quota.quota.remaining, 3);
 });
 
-test('fetches Grok2API summary with admin login and can reset quotas', async () => {
+test('fetches Grok2API summary with admin login and can sync or reset quotas', async () => {
   const calls = [];
   const fetchImpl = async (url, options = {}) => {
     calls.push({ url: String(url), method: options.method || 'GET', body: options.body || null, headers: options.headers || {} });
@@ -1380,6 +1380,27 @@ test('fetches Grok2API summary with admin login and can reset quotas', async () 
         headers: { 'Content-Type': 'application/json' },
       });
     }
+    if (String(url).endsWith('/api/admin/v1/accounts/refresh-billing')) {
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers.Authorization, 'Bearer grok-token');
+      return new Response([
+        'event: progress',
+        'data: {"completed":1,"total":2}',
+        '',
+        'event: complete',
+        'data: {"succeeded":2,"failed":0}',
+        '',
+      ].join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }
+    if (String(url).endsWith('/api/admin/v1/accounts/console/refresh-quotas')) {
+      assert.equal(options.method, 'POST');
+      assert.equal(options.headers.Authorization, 'Bearer grok-token');
+      return new Response([
+        'event: complete',
+        'data: {"succeeded":3,"failed":1}',
+        '',
+      ].join('\n'), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }
     throw new Error(`unexpected url ${url}`);
   };
 
@@ -1408,6 +1429,14 @@ test('fetches Grok2API summary with admin login and can reset quotas', async () 
   assert.equal(listed.quotas[0].accountStats.pools.console.available, 2);
   assert.equal(listed.quotas[0].accountStats.pools.console.total, 2);
   assert.doesNotMatch(JSON.stringify(listed), /secret|grok-token/);
+
+  const synced = await service.syncGrok2ApiQuota(service.sources[0]);
+  assert.equal(synced.ok, true);
+  assert.equal(synced.succeeded, 5);
+  assert.equal(synced.failed, 1);
+  assert.deepEqual(synced.results.map((item) => item.provider), ['grok_build', 'grok_console']);
+  assert.ok(calls.some((item) => item.url.endsWith('/api/admin/v1/accounts/refresh-billing')));
+  assert.ok(calls.some((item) => item.url.endsWith('/api/admin/v1/accounts/console/refresh-quotas')));
 
   const reset = await service.resetGrok2ApiQuota(service.sources[0]);
   assert.equal(reset.ok, true);
