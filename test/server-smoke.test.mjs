@@ -116,137 +116,9 @@ test('Homepage stats expose current and concurrent running task names', async ()
   });
 });
 
-test('DeepSeek local usage persists native turn deduplication without exposing turn ids', async () => {
-  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
-  const helperStart = serverSource.indexOf('function readDeepSeekUsageStats');
-  const helperEnd = serverSource.indexOf('\nfunction saveUploadedBackground', helperStart);
-  assert.ok(helperStart >= 0 && helperEnd > helperStart);
 
-  let persisted = '';
-  const api = new Function(
-    'DEEPSEEK_USAGE_FILE',
-    'existsSync',
-    'readFileSync',
-    'atomicWriteFile',
-    `${serverSource.slice(helperStart, helperEnd)}; return { readDeepSeekUsageStats, accumulateDeepSeekUsage, calibrateDeepSeekUsage };`,
-  )(
-    '/runtime/deepseek-usage.json',
-    () => Boolean(persisted),
-    () => persisted,
-    (_file, content) => { persisted = content; },
-  );
 
-  const usage = { input: 100, cached: 40, output: 25, total: 125, requests: 1 };
-  assert.equal(api.accumulateDeepSeekUsage('deepseek-v4-flash', usage, 'thread-a:turn-1'), true);
-  assert.equal(api.accumulateDeepSeekUsage('deepseek-v4-flash', usage, 'thread-a:turn-1'), true);
-  assert.equal(api.accumulateDeepSeekUsage('deepseek-v4-flash', usage, 'thread-a:turn-2'), true);
-
-  const state = JSON.parse(persisted);
-  assert.equal(state.totalTokens, 250);
-  assert.equal(state.inputTokens, 200);
-  assert.equal(state.cachedInputTokens, 80);
-  assert.equal(state.outputTokens, 50);
-  assert.equal(state.requests, 2);
-  assert.deepEqual(state.countedTurns, ['thread-a:turn-1', 'thread-a:turn-2']);
-  assert.deepEqual(api.readDeepSeekUsageStats(), {
-    totalTokens: 250,
-    inputTokens: 200,
-    outputTokens: 50,
-    cachedInputTokens: 80,
-    requests: 2,
-    updatedAt: state.updatedAt,
-  });
-
-  const calibrated = api.calibrateDeepSeekUsage('123,408,356', '1,020');
-  assert.equal(calibrated.totalTokens, 123408356);
-  assert.equal(calibrated.requests, 1020);
-  const calibratedState = JSON.parse(persisted);
-  assert.equal(calibratedState.inputTokens, 200);
-  assert.equal(calibratedState.cachedInputTokens, 80);
-  assert.equal(calibratedState.outputTokens, 50);
-  assert.deepEqual(calibratedState.countedTurns, ['thread-a:turn-1', 'thread-a:turn-2']);
-  assert.equal(calibratedState.calibratedAt, calibrated.updatedAt);
-  assert.throws(
-    () => api.calibrateDeepSeekUsage('-1', '10'),
-    (error) => error.statusCode === 400 && /累计 Token/.test(error.message),
-  );
-  assert.throws(
-    () => api.calibrateDeepSeekUsage('10', '1.5'),
-    (error) => error.statusCode === 400 && /累计请求/.test(error.message),
-  );
-
-  assert.equal(api.accumulateDeepSeekUsage('deepseek-v4-flash', usage, 'thread-a:turn-3'), true);
-  const advancedState = JSON.parse(persisted);
-  assert.equal(advancedState.totalTokens, 123408481);
-  assert.equal(advancedState.requests, 1021);
-  assert.equal(advancedState.calibratedAt, calibrated.updatedAt);
-});
-
-test('native DeepSeek completions feed the local usage accumulator', async () => {
-  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
-  const helperStart = serverSource.indexOf('function captureDeepSeekNativeTurnUsage');
-  const helperEnd = serverSource.indexOf('\nfunction handleNativeSessionChange', helperStart);
-  assert.ok(helperStart >= 0 && helperEnd > helperStart);
-
-  const pendingDeepSeekNativeTurns = new Map([
-    ['thread-a:turn-1', { threadId: 'thread-a', turnId: 'turn-1', model: 'deepseek-v4-flash' }],
-    ['thread-a:turn-2', { threadId: 'thread-a', turnId: 'turn-2', model: 'deepseek-v4-flash' }],
-  ]);
-  const recorded = [];
-  const captureDeepSeekNativeTurnUsage = new Function(
-    'pendingDeepSeekNativeTurns',
-    'nativeSessions',
-    'accumulateDeepSeekUsage',
-    `${serverSource.slice(helperStart, helperEnd)}; return captureDeepSeekNativeTurnUsage;`,
-  )(
-    pendingDeepSeekNativeTurns,
-    {
-      get: () => ({
-        messages: [
-          {
-            kind: 'task_complete',
-            turnId: 'turn-1',
-            tokenUsage: {
-              inputTokens: 100,
-              cachedInputTokens: 40,
-              outputTokens: 25,
-              totalTokens: 125,
-            },
-          },
-          {
-            kind: 'task_complete',
-            turnId: 'turn-2',
-            tokenUsage: {
-              inputTokens: 200,
-              cachedInputTokens: 80,
-              outputTokens: 50,
-              totalTokens: 250,
-            },
-          },
-        ],
-      }),
-    },
-    (model, usage, turnKey) => {
-      recorded.push({ model, usage, turnKey });
-      return true;
-    },
-  );
-
-  captureDeepSeekNativeTurnUsage({ changedIds: ['thread-a'] });
-  assert.deepEqual(recorded, [{
-    model: 'deepseek-v4-flash',
-    usage: { input: 100, cached: 40, output: 25, total: 125, requests: 1 },
-    turnKey: 'thread-a:turn-1',
-  }, {
-    model: 'deepseek-v4-flash',
-    usage: { input: 200, cached: 80, output: 50, total: 250, requests: 1 },
-    turnKey: 'thread-a:turn-2',
-  }]);
-  assert.equal(pendingDeepSeekNativeTurns.has('thread-a:turn-1'), false);
-  assert.equal(pendingDeepSeekNativeTurns.has('thread-a:turn-2'), false);
-});
-
-test('DeepSeek quota card hides balance funding breakdown and keeps local totals', async () => {
+test('DeepSeek quota card hides balance funding breakdown and local totals', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const uiStyles = await readFile(path.join(ROOT, 'ui.css'), 'utf8');
   const branchStart = serverSource.indexOf("if(quota.provider==='deepseek')");
@@ -254,18 +126,17 @@ test('DeepSeek quota card hides balance funding breakdown and keeps local totals
   assert.ok(branchStart >= 0 && branchEnd > branchStart);
   const branch = serverSource.slice(branchStart, branchEnd);
   assert.doesNotMatch(branch, /grantedBalance|toppedUpBalance|赠送|充值/);
-  assert.match(branch, /累计 Token/);
-  assert.match(branch, /累计请求/);
+  assert.doesNotMatch(branch, /累计 Token/);
+  assert.doesNotMatch(branch, /累计请求/);
+  assert.doesNotMatch(branch, /usageStats/);
   assert.match(branch, /inlineStatus:balanceStatus,showRemainingLabel:false/);
   assert.match(branch, /subQuotaMeta subQuotaMetaDeepSeek/);
-  assert.match(branch, /requests\.className='subQuotaMetaTrailing'/);
   assert.doesNotMatch(branch, /appendSubQuotaMeta\(meta,'状态 /);
   assert.doesNotMatch(serverSource, /subQuotaInlineSeparator/);
+  assert.doesNotMatch(serverSource, /deepSeekUsageCalibration|deepseek-usage-calibration|accumulateDeepSeekUsage/);
   assert.match(uiStyles, /\.subQuotaWindowHeadInline \.subQuotaInlineStatus\s*\{[^}]*margin-left:\s*auto/s);
   assert.match(uiStyles, /\.subQuotaMetaDeepSeek\s*\{[^}]*flex-wrap:\s*nowrap/s);
-  assert.match(uiStyles, /\.subQuotaMetaDeepSeek \.subQuotaMetaTrailing\s*\{[^}]*margin-left:\s*auto/s);
-  assert.match(uiStyles, /\.deepSeekUsageCalibrationFields\s*\{[^}]*grid-template-columns:/s);
-  assert.match(uiStyles, /\.deepSeekUsageCalibrationStatus\.success\s*\{[^}]*color:\s*var\(--success\)/s);
+  assert.doesNotMatch(uiStyles, /\.deepSeekUsageCalibration/);
 });
 
 test('Codex App quota card omits provider status metadata', async () => {
@@ -344,8 +215,6 @@ test('a matching persisted terminal releases a running turn and schedules the We
     'nativeSessions',
     'activeNativeTurns',
     'scheduleServerPromptQueueDispatch',
-    'pendingDeepSeekNativeTurns',
-    'accumulateDeepSeekUsage',
     'broadcastNativeRuntime',
     'releaseAppServerThreadAfterTurn',
     `${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
@@ -363,8 +232,6 @@ test('a matching persisted terminal releases a running turn and schedules the We
     },
     activeNativeTurns,
     (...args) => scheduled.push(args),
-    new Map(),
-    () => false,
     (event) => runtimeEvents.push(event),
     () => Promise.resolve(false),
   );
@@ -393,8 +260,6 @@ test('a terminal record for another turn cannot release a running queue lock', a
     'nativeSessions',
     'activeNativeTurns',
     'scheduleServerPromptQueueDispatch',
-    'pendingDeepSeekNativeTurns',
-    'accumulateDeepSeekUsage',
     'broadcastNativeRuntime',
     `${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
   )(
@@ -411,8 +276,6 @@ test('a terminal record for another turn cannot release a running queue lock', a
     },
     activeNativeTurns,
     (...args) => scheduled.push(args),
-    new Map(),
-    () => false,
     (event) => runtimeEvents.push(event),
   );
 
@@ -1140,7 +1003,7 @@ test('review regressions keep usage, goals, and theme state authoritative', asyn
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
 
   assert.doesNotMatch(serverSource, /trackDeepSeekBalanceSpend|DEEPSEEK_BALANCE_FILE/);
-  assert.match(serverSource, /if \(deepSeekStats\) quota\.usageStats = deepSeekStats/);
+  assert.doesNotMatch(serverSource, /deepSeekStats|usageStats = deepSeekStats|deepseek-usage-calibration|accumulateDeepSeekUsage/);
   assert.equal(
     (serverSource.match(/app\.patch\('\/api\/native-sessions\/:id\/goal'/g) || []).length,
     1,
@@ -2605,13 +2468,6 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.equal(unauthorizedGrok2ApiConsole.status, 401);
     const unauthorizedGrok2ApiSync = await fetch(`${baseUrl}/api/sub-quotas/grok2api/sync`, { method: 'POST' });
     assert.equal(unauthorizedGrok2ApiSync.status, 401);
-    const unauthorizedDeepSeekUsageCalibration = await fetch(`${baseUrl}/api/deepseek-usage-calibration`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ totalTokens: '123,408,356', requests: '1,020' }),
-    });
-    assert.equal(unauthorizedDeepSeekUsageCalibration.status, 401);
-
     const unauthorizedModelCapabilities = await fetch(`${baseUrl}/api/native-model-capabilities`);
     assert.equal(unauthorizedModelCapabilities.status, 401);
     const unauthorizedPlayground = await fetch(`${baseUrl}/playground/`);
@@ -2886,47 +2742,8 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
       && message.params?.clientInfo?.name === 'codex-web-quota'
     )));
 
-    assert.deepEqual(subQuotaConfigPayload.deepSeekUsage, {
-      totalTokens: 0,
-      requests: 0,
-      updatedAt: '',
-    });
-    assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
-
-    const rejectedDeepSeekUsageCalibration = await fetch(`${baseUrl}/api/deepseek-usage-calibration`, {
-      method: 'PUT',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ totalTokens: '123,408,356', requests: '1.5' }),
-    });
-    assert.equal(rejectedDeepSeekUsageCalibration.status, 400);
-    assert.match((await rejectedDeepSeekUsageCalibration.json()).error, /累计请求必须是非负整数/);
-
-    const calibratedDeepSeekUsage = await fetch(`${baseUrl}/api/deepseek-usage-calibration`, {
-      method: 'PUT',
-      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ totalTokens: '123,408,356', requests: '1,020' }),
-    });
-    assert.equal(calibratedDeepSeekUsage.status, 200);
-    const calibratedDeepSeekUsagePayload = await calibratedDeepSeekUsage.json();
-    assert.equal(calibratedDeepSeekUsagePayload.ok, true);
-    assert.equal(calibratedDeepSeekUsagePayload.usage.totalTokens, 123408356);
-    assert.equal(calibratedDeepSeekUsagePayload.usage.requests, 1020);
-    assert.equal(typeof calibratedDeepSeekUsagePayload.usage.updatedAt, 'string');
-    assert.doesNotMatch(JSON.stringify(calibratedDeepSeekUsagePayload), /countedTurns/);
-
-    const calibratedSubQuotaConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
-      headers: { Cookie: cookie },
-    });
-    assert.equal(calibratedSubQuotaConfig.status, 200);
-    const calibratedSubQuotaConfigPayload = await calibratedSubQuotaConfig.json();
-    assert.equal(calibratedSubQuotaConfigPayload.deepSeekUsage.totalTokens, 123408356);
-    assert.equal(calibratedSubQuotaConfigPayload.deepSeekUsage.requests, 1020);
-    assert.equal(
-      calibratedSubQuotaConfigPayload.deepSeekUsage.updatedAt,
-      calibratedDeepSeekUsagePayload.usage.updatedAt,
-    );
-    assert.doesNotMatch(JSON.stringify(calibratedSubQuotaConfigPayload), /countedTurns/);
-
+    assert.equal(subQuotaConfigPayload.deepSeekUsage, undefined);
+    assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key|deepSeekUsage/);
 
     const rejectedSubQuotaUrl = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
@@ -3443,7 +3260,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=history-unread-bell-20260814c"/);
+    assert.match(page, /href="\/ui\.css\?v=subquota-popover-height-20260814d"/);
     assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -3659,11 +3476,6 @@ updated_at = 1784422800000
     assert.match(page, /baseUrlInput\.autocomplete='url'/);
     assert.match(page, /subQuotaSettingsSourceList\.appendChild\(createSourceFields\('cpa-codex','CPA Codex'/);
     assert.match(page, /subQuotaSettingsSourceList\.appendChild\(createSourceFields\('sub2api','Sub2API'/);
-    assert.match(page, /calibrationTitle\.textContent='本地累计校准'/);
-    assert.match(page, /createCalibrationField\('deepSeekTotalTokens','累计 Token'\)/);
-    assert.match(page, /createCalibrationField\('deepSeekTotalRequests','累计请求'\)/);
-    assert.match(page, /fetch\('\/api\/deepseek-usage-calibration'/);
-    assert.match(page, /校准完成，后续本地用量将继续累加/);
     assert.match(page, /footer\.className='subQuotaSettingsFooter'/);
     assert.match(page, /subQuotaSettingsForm\.insertBefore\(inputs\.source,footer\)/);
 

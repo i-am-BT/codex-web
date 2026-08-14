@@ -44,7 +44,6 @@ export class NativeSessionStore extends EventEmitter {
     this.sideChatStateFile = path.resolve(
       options.sideChatStateFile || path.join(this.codexHome, 'codex-web-side-chat.json'),
     );
-    this.deepSeekUsageFile = String(options.deepSeekUsageFile || '').trim();
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.goalsDbFile = path.resolve(options.goalsDbFile || path.join(this.codexHome, 'goals_1.sqlite'));
     this.maxReadBytes = nonNegativeNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
@@ -817,34 +816,6 @@ export class NativeSessionStore extends EventEmitter {
     };
   }
 
-  accumulateDeepSeekUsage(cache, payload) {
-    if (!this.deepSeekUsageFile) return;
-    const model = String(cache?.metadata?.model || '').trim().toLowerCase();
-    if (!model.startsWith('deepseek')) return;
-    const usage = cache?.currentTurnTokenUsage;
-    const total = Number(usage?.totalTokens);
-    if (!Number.isFinite(total) || total <= 0) return;
-    const turnKey = `${String(cache?.id || '')}:${String(payload?.turn_id || payload?.turnId || cache?.latestTurnId || '')}`;
-    if (!turnKey || turnKey.endsWith(':')) return;
-    try {
-      const current = readDeepSeekUsageStatsFile(this.deepSeekUsageFile) || {};
-      const counted = Array.isArray(current.countedTurns) ? current.countedTurns : [];
-      if (counted.includes(turnKey)) return;
-      const input = Math.max(0, Number(usage.inputTokens) || 0);
-      const cached = Math.max(0, Number(usage.cachedInputTokens) || 0);
-      const output = Math.max(0, Number(usage.outputTokens) || 0);
-      const next = {
-        totalTokens: (Number(current.totalTokens) || 0) + total,
-        inputTokens: (Number(current.inputTokens) || 0) + input,
-        outputTokens: (Number(current.outputTokens) || 0) + output,
-        cachedInputTokens: (Number(current.cachedInputTokens) || 0) + cached,
-        requests: (Number(current.requests) || 0) + 1,
-        updatedAt: new Date().toISOString(),
-        countedTurns: [...counted.slice(-999), turnKey],
-      };
-      writeFileSync(this.deepSeekUsageFile, JSON.stringify(next, null, 2));
-    } catch {}
-  }
 
   getConversationFromEntries(id, options = {}, subagent = false) {
     const entries = () => (subagent ? this.subagentEntries : this.entries);
@@ -1015,16 +986,6 @@ function findSubagentEntry(entries, parentId, agentRef) {
     )) || null;
 }
 
-function readDeepSeekUsageStatsFile(file) {
-  try {
-    if (!file || !existsSync(file)) return null;
-    const data = JSON.parse(readFileSync(file, 'utf8'));
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
 
 export function readSessionIndex(file) {
   const titles = new Map();
@@ -1456,7 +1417,6 @@ function applyNativeRecord(cache, record, maxMessages, store) {
   const payload = record.payload || {};
   if (record.type === 'event_msg') {
     applyEventRecord(cache, record, payload, maxMessages, store);
-    if (payload.type === 'task_complete') store?.accumulateDeepSeekUsage(cache, payload);
     return;
   }
   if (record.type !== 'response_item') return;

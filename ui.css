@@ -767,7 +767,7 @@ body .subQuotaClose:hover {
   min-height: 18px;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
 }
 
 .subQuotaStatus {
@@ -780,14 +780,11 @@ body .subQuotaClose:hover {
 }
 
 .subQuotaPrimarySource {
-  min-width: 0;
   flex: 0 0 auto;
-  overflow: hidden;
   color: var(--text);
   font-size: 12px;
   font-weight: 700;
   line-height: 1.45;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -816,6 +813,7 @@ body .subQuotaClose:hover {
   display: grid;
   min-width: 0;
   gap: 12px;
+  overflow: visible;
 }
 
 .subQuotaSource {
@@ -1552,59 +1550,6 @@ body .grok2ApiConsoleIconButton:disabled {
   color: var(--danger);
 }
 
-.deepSeekUsageCalibration {
-  display: grid;
-  min-width: 0;
-  gap: 8px;
-  border-top: 1px dashed var(--border);
-  padding-top: 10px;
-}
-
-.deepSeekUsageCalibrationTitle {
-  margin: 0;
-  color: var(--text);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.4;
-}
-
-.deepSeekUsageCalibrationHint {
-  margin: 0;
-  color: var(--text-subtle);
-  font-size: 10px;
-  line-height: 1.45;
-}
-
-.deepSeekUsageCalibrationFields {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 8px;
-}
-
-.deepSeekUsageCalibrationFields input {
-  font-variant-numeric: tabular-nums;
-}
-
-.deepSeekUsageCalibrationActions {
-  display: flex;
-  justify-content: flex-end;
-}
-
-body .deepSeekUsageCalibrationSubmit {
-  width: max-content;
-  min-width: 132px;
-}
-
-.deepSeekUsageCalibrationStatus {
-  min-height: 15px;
-  color: var(--danger);
-  font-size: 10px;
-  line-height: 1.4;
-}
-
-.deepSeekUsageCalibrationStatus.success {
-  color: var(--success);
-}
 
 .subQuotaSettingsFooter {
   display: grid;
@@ -1662,6 +1607,49 @@ body .deepSeekUsageCalibrationSubmit {
     transform: translateY(0);
   }
 }
+
+@media (max-width: 820px) {
+  .subQuotaPopover {
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    width: min(300px, calc(100vw - 24px));
+    max-height: min(61dvh, 560px);
+    gap: 8px;
+    overflow: hidden;
+    padding: 10px;
+    border-radius: 14px;
+  }
+
+  .subQuotaContent {
+    min-height: 0;
+    gap: 8px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 0;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .subQuotaContent::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none;
+  }
+
+  .subQuotaSource {
+    gap: 8px;
+    padding-bottom: 10px;
+  }
+
+  .subQuotaHead {
+    min-height: 24px;
+    padding-bottom: 6px;
+  }
+
+}
+
 @media (prefers-reduced-motion: reduce) {
   .subQuotaPopover:not(.hidden) {
     animation: none;
@@ -3727,8 +3715,14 @@ body.modalOpen {
 
 /* --- Settings dialog polish --- */
 .settingsDialog {
-  border-radius: 14px;
-  box-shadow: 0 32px 90px rgba(0, 0, 0, 0.32);
+  width: min(760px, calc(100vw - 24px));
+  max-height: min(90vh, 860px);
+  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at top right, color-mix(in srgb, var(--primary) 10%, transparent), transparent 42%),
+    var(--surface);
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.28);
   animation: settingsDialogIn 0.18s var(--ease);
 }
 
@@ -3744,16 +3738,21 @@ body.modalOpen {
 }
 
 .settingsDialogHead {
-  min-height: 62px;
-  flex-basis: 62px;
+  min-height: 68px;
+  flex-basis: 68px;
   padding: 0 16px 0 20px;
-  background: color-mix(in srgb, var(--surface-hover) 52%, var(--surface));
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--surface-hover) 70%, transparent),
+    color-mix(in srgb, var(--surface) 92%, transparent)
+  );
 }
 
 .settingsDialogTitle {
   display: grid;
   min-width: 0;
-  gap: 2px;
+  gap: 3px;
 }
 
 .settingsDialogHead h2 {
@@ -3761,7 +3760,7 @@ body.modalOpen {
   align-items: center;
   gap: 8px;
   font-size: 16px;
-  font-weight: 740;
+  font-weight: 760;
 }
 
 .settingsDialogHead h2 .lucide {
@@ -3774,18 +3773,93 @@ body.modalOpen {
   margin: 0;
   color: var(--text-subtle);
   font-size: 12px;
-  line-height: 1.4;
+  line-height: 1.45;
+}
+
+.settingsDialogClose {
+  width: 36px;
+  height: 36px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+}
+
+.settingsDialogClose:hover {
+  border-color: var(--border);
+  background: var(--surface-hover);
+}
+
+.settingsDialogBody {
+  display: grid;
+  gap: 14px;
+  padding: 16px 16px 18px;
+  background: color-mix(in srgb, var(--canvas) 35%, var(--surface));
+}
+
+.settingsPanelModern,
+#settingsPanel.settingsPanelModern {
+  display: grid;
+  gap: 14px;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.settingsDialog .settingsSection,
+.settingsDialog .settingsCards {
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.settingsDialog .settingsCards {
+  display: grid;
+  gap: 14px;
+}
+
+.settingsDialog .settingsCard,
+.settingsDialog .providerBox.settingsCard,
+.settingsDialog .passwordSettings.settingsCard {
+  display: grid;
+  gap: 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 92%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--surface) 94%, white 6%);
+  box-shadow: 0 1px 0 color-mix(in srgb, #fff 4%, transparent) inset;
+  padding: 14px;
+}
+
+body[data-theme="light"] .settingsDialog .settingsCard,
+body[data-theme="light"] .settingsDialog .providerBox.settingsCard,
+body[data-theme="light"] .settingsDialog .passwordSettings.settingsCard {
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.04);
+}
+
+.settingsDialog .settingsCardBody {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.settingsDialog .settingsCardModel .settingsCardBody {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+}
+
+.settingsDialog .settingsCardModel .settingsCardActions,
+.settingsDialog .settingsCardModel #defaultMsg {
+  grid-column: 1 / -1;
 }
 
 .settingsSectionTitle {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 12px;
+  margin: 0;
   color: var(--text);
   font-size: 12px;
-  font-weight: 720;
-  letter-spacing: 0.04em;
+  font-weight: 740;
+  letter-spacing: 0.02em;
 }
 
 .settingsSectionTitle .lucide {
@@ -3794,30 +3868,101 @@ body.modalOpen {
   color: var(--primary);
 }
 
-/* Ambient effects toggle (light particles + mouse trail). */
-.settingsDialog .settingsToggleRow {
-  display: flex;
-  grid-column: 1 / -1;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+.settingsDialog .settings {
+  display: contents;
+}
+
+.settingsDialog .field {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  margin: 0;
+}
+
+.settingsDialog .field > label,
+.settingsDialog .field > span,
+.settingsDialog .passwordForm .field > span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 680;
+  letter-spacing: 0.01em;
+}
+
+.settingsDialog .field input,
+.settingsDialog .field select,
+.settingsDialog .field textarea,
+.settingsDialog .passwordForm input {
+  width: 100%;
   min-height: 42px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--surface-raised);
   color: var(--text);
-  padding: 0 12px;
+  padding: 10px 12px;
+  transition: border-color 140ms var(--ease), box-shadow 140ms var(--ease), background 140ms var(--ease);
+}
+
+.settingsDialog .field input:hover,
+.settingsDialog .field select:hover,
+.settingsDialog .field textarea:hover,
+.settingsDialog .passwordForm input:hover {
+  border-color: var(--border-strong);
+}
+
+.settingsDialog .field input:focus,
+.settingsDialog .field select:focus,
+.settingsDialog .field textarea:focus,
+.settingsDialog .passwordForm input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+  outline: none;
+}
+
+.settingsDialog .field:has(#cwd) {
+  grid-column: auto;
+}
+
+.settingsDialog .backgroundControls,
+.settingsDialog .backgroundRow {
+  display: grid;
+  gap: 10px;
+}
+
+.settingsDialog .backgroundRow {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.settingsDialog .backgroundDelete {
+  min-height: 42px;
+  border-radius: 12px;
+}
+
+/* Ambient effects toggle (light particles + mouse trail). */
+.settingsDialog .settingsToggleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface-hover) 55%, transparent), transparent),
+    var(--surface-raised);
+  color: var(--text);
+  padding: 0 14px;
   font-size: 13px;
-  font-weight: 620;
+  font-weight: 640;
   cursor: pointer;
 }
 
 .settingsDialog .fxSwitch {
   appearance: none;
   position: relative;
-  width: 40px;
-  height: 22px;
-  flex: 0 0 40px;
+  width: 42px;
+  height: 24px;
+  flex: 0 0 42px;
   border: 0;
   border-radius: 999px;
   background: var(--border-strong);
@@ -3831,8 +3976,8 @@ body.modalOpen {
   position: absolute;
   top: 3px;
   left: 3px;
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
   background: #ffffff;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
@@ -3851,39 +3996,47 @@ body.modalOpen {
   box-shadow: 0 0 0 3px var(--primary-soft);
 }
 
-.settingsDialog .settingsActions {
+.settingsDialog .settingsActions,
+.settingsDialog .settingsCardActions {
   display: flex;
   flex-wrap: wrap;
-  align-items: end;
-  justify-content: flex-end;
+  align-items: stretch;
   gap: 8px;
 }
 
 .settingsDialog .settingsActions .miniSecondary,
-.settingsDialog .settingsActions .miniDanger {
+.settingsDialog .settingsActions .miniDanger,
+.settingsDialog .settingsCardActions .miniSecondary,
+.settingsDialog .settingsCardActions .miniDanger {
   width: auto;
   min-width: 0;
   min-height: 40px;
-  flex: 0 0 auto;
+  flex: 1 1 0;
+  border-radius: 12px;
+}
+
+.settingsDialog #defaultMsg {
+  min-height: 0;
+  margin: 0;
 }
 
 .settingsDialog .providerBox {
   margin: 0;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface-raised);
-  padding: 4px 12px 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 92%, transparent);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--surface) 94%, white 6%);
+  padding: 4px 14px 14px;
 }
 
 .settingsDialog .providerBox summary {
   display: flex;
-  min-height: 44px;
+  min-height: 48px;
   align-items: center;
   gap: 8px;
   cursor: pointer;
   color: var(--text);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 740;
   list-style: none;
 }
 
@@ -3916,9 +4069,9 @@ body.modalOpen {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: end;
-  gap: 10px 12px;
+  gap: 12px;
   border-top: 1px solid var(--border);
-  padding-top: 12px;
+  padding-top: 14px;
 }
 
 .settingsDialog .providerBox form > .field {
@@ -3929,7 +4082,8 @@ body.modalOpen {
 .settingsDialog .providerBox form > .providerFetchBtn {
   align-self: end;
   width: 100%;
-  min-height: 40px;
+  min-height: 42px;
+  border-radius: 12px;
 }
 
 .settingsDialog .providerBox .providerFormFooter {
@@ -3945,12 +4099,108 @@ body.modalOpen {
 
 .settingsDialog .providerBox .providerFormFooter .miniPrimary {
   width: auto;
-  min-width: 160px;
+  min-width: 168px;
+  min-height: 42px;
+  border-radius: 12px;
 }
 
 .settingsDialog .providerBox .providerFormFooter .errorText {
   min-width: 0;
   margin: 0;
+}
+
+.passwordForm {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: end;
+  gap: 12px;
+}
+
+.passwordForm .field {
+  min-width: 0;
+  margin: 0;
+}
+
+.passwordSubmit {
+  grid-column: 1 / -1;
+  width: max-content;
+  min-width: 148px;
+  min-height: 42px;
+  justify-self: end;
+  border-radius: 12px;
+}
+
+.passwordStatus {
+  grid-column: 1 / -1;
+  min-height: 18px;
+  margin: -2px 0 0;
+  text-align: right;
+}
+
+.passwordStatus.success {
+  color: var(--success);
+}
+
+.settingsDialog .dreamSkinGenerator {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  padding: 12px;
+}
+
+@media (max-width: 820px) {
+  .settingsDialog {
+    width: min(420px, calc(100vw - 28px));
+    max-height: min(78dvh, 720px);
+    border-radius: 18px;
+  }
+
+  .settingsDialogBody {
+    gap: 12px;
+    padding: 12px 12px 14px;
+  }
+
+  .settingsDialog .settingsCard,
+  .settingsDialog .providerBox.settingsCard,
+  .settingsDialog .passwordSettings.settingsCard,
+  .settingsDialog .providerBox {
+    border-radius: 14px;
+    padding: 12px;
+  }
+
+  .settingsDialog .settingsCardModel .settingsCardBody,
+  .settingsDialog .providerBox form,
+  .passwordForm {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settingsDialog .settingsCardModel .settingsCardActions,
+  .settingsDialog .settingsCardModel #defaultMsg,
+  .settingsDialog .providerBox form > *,
+  .passwordForm > * {
+    grid-column: 1;
+  }
+
+  .settingsDialog .settingsActions,
+  .settingsDialog .settingsCardActions {
+    justify-content: stretch;
+  }
+
+  .settingsDialog .settingsActions .miniSecondary,
+  .settingsDialog .settingsCardActions .miniSecondary,
+  .settingsDialog .settingsActions .miniDanger,
+  .settingsDialog .settingsCardActions .miniDanger,
+  .settingsDialog .providerBox .providerFormFooter .miniPrimary,
+  .passwordSubmit {
+    width: 100%;
+    flex: 1 1 auto;
+    justify-self: stretch;
+  }
+
+  .settingsDialog .providerBox .providerFormFooter {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }
 
 .smallrow {
@@ -12121,8 +12371,9 @@ body .composer > .box:focus-within {
   }
 
   .settingsOverlay {
-    place-items: end center;
-    padding: 8px;
+    place-items: center;
+    align-content: center;
+    padding: max(16px, env(safe-area-inset-top, 0px)) 14px max(16px, env(safe-area-inset-bottom, 0px));
   }
 
   .grok2ApiConsoleOverlay {
@@ -12166,16 +12417,18 @@ body .composer > .box:focus-within {
 
   .subQuotaSettingsOverlay {
     place-items: center;
-    padding: 16px;
+    align-content: center;
+    padding: max(16px, env(safe-area-inset-top, 0px)) 14px max(16px, env(safe-area-inset-bottom, 0px));
   }
 
   .subQuotaSettingsDialog {
-    width: 100%;
-    max-height: calc(100dvh - 32px);
+    width: min(420px, calc(100vw - 28px));
+    max-height: min(78dvh, 720px);
+    border-radius: 18px;
   }
 
   .subQuotaSettingsBody {
-    padding: 14px;
+    padding: 12px 12px 14px;
   }
 
   .subQuotaSettingsSource {
@@ -12235,49 +12488,8 @@ body .composer > .box:focus-within {
     width: 100%;
   }
 
-  .deepSeekUsageCalibrationFields {
-    grid-template-columns: minmax(0, 1fr);
-  }
 
-  .settingsDialog {
-    width: 100%;
-    max-height: calc(100dvh - 16px);
-  }
 
-  .settingsDialogBody {
-    padding: 14px 14px calc(env(safe-area-inset-bottom, 0px) + 16px);
-  }
-
-  .settingsDialog .settings,
-  .passwordForm {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .settingsDialog .settings > *,
-  .passwordForm > * {
-    grid-column: 1;
-  }
-
-  .settingsDialog .settingsActions {
-    justify-content: stretch;
-  }
-
-  .settingsDialog .settingsActions .miniSecondary {
-    flex: 1 1 0;
-  }
-
-  .settingsDialog .providerBox form {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .settingsDialog .providerBox .providerFormFooter {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .settingsDialog .providerBox .providerFormFooter .miniPrimary {
-    width: 100%;
-  }
 
   .dreamSkinOptions {
     grid-template-columns: minmax(0, 1fr);
