@@ -29,8 +29,16 @@ test('assistant markdown can inline local image paths', () => {
     normalizeLocalImagePath('/Volumes/ikirito/hermes-portrait-gallery/data/references/xiaohongshu/outfit_ref.jpg'),
     '/Volumes/ikirito/hermes-portrait-gallery/data/references/xiaohongshu/outfit_ref.jpg',
   );
+  assert.equal(normalizeLocalImagePath('/tmp/grok-output/first.svg'), '/tmp/grok-output/first.svg');
+  assert.equal(normalizeLocalImagePath('./second.SVG'), './second.SVG');
   assert.equal(normalizeLocalImagePath('/local-refs/xiaohongshu/outfit_ref.jpg'), '');
   assert.match(server, /if\(!standaloneLi&&!standaloneParagraph\)continue/);
+  assert.match(server, /if\(codes\.length<2\)continue/);
+  assert.match(server, /if\(!pathOnly\)continue/);
+  assert.match(server, /if\(figures\.length!==codes\.length\)continue/);
+  assert.match(server, /if\(run\.length<2\)return/);
+  assert.match(server, /row\.className='markdownImageRow'/);
+  assert.match(server, /for\(const fig of run\)row\.appendChild\(fig\)/);
 });
 
 test('queued screenshots prefer embedded image data over a stale local path', () => {

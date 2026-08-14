@@ -749,7 +749,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.doesNotMatch(cancelSource, /freezeTurnProcessElapsed\(|clearLiveTurnProgress\(|webRunActive=false|activeNativeTurnId=''/);
   assert.match(deltaSource, /const cancelPending=nativeCancelPendingMatches\(currentConversationId,runtimeTurnId\);/);
   assert.match(deltaSource, /if\(!live&&cancelPending\)return;/);
-  assert.match(deltaSource, /live\.targetText\+=delta;\s*if\(cancelPending\|\|live\.cancelVisualPaused\)return;/);
+  assert.match(deltaSource, /const nextDelta=nativeRuntimeDeltaText\(live,delta\);\s*if\(!nextDelta\)return;\s*live\.targetText\+=nextDelta;/);
   assert.match(pauseSource, /renderNativeLiveItemImmediately\(live\);\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(scheduleSource, /if\(live\?\.cancelVisualPaused\)return;/);
   assert.match(snapshotSource, /if\(live\.cancelVisualPaused&&nativeCancelPendingMatches\(currentConversationId,pausedTurnId\)\)\{/);
@@ -1632,6 +1632,35 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
   // (Here we only assert the runtime→snapshot adoption path used by live sync.)
   assert.equal(addCalls[0].element.dataset.messageKind, 'message');
   assert.equal(api.state().nativeRenderedMessageKeys.size >= 1, true);
+});
+
+test('runtime stream suppresses a replayed long message without dropping normal repeated text', () => {
+  const deltaTextSource = sourceBetween('function nativeRuntimeDeltaText', 'function updateNativeLiveDelta');
+  const { nativeRuntimeDeltaText, flushNativeRuntimeReplay } = new Function(
+    `${deltaTextSource}; return { nativeRuntimeDeltaText, flushNativeRuntimeReplay };`,
+  )();
+  const content = '我先定位这条会话对应的服务日志和会话记录，确认重复内容来自实时消息重放，而不是模型真的生成了两次。';
+  const live = { targetText: content, runtimeReplay: null };
+
+  assert.equal(nativeRuntimeDeltaText(live, content.slice(0, 18)), '');
+  assert.equal(nativeRuntimeDeltaText(live, content.slice(18)), '');
+  assert.equal(live.runtimeReplay, null, 'a complete replay should be consumed');
+
+  const suffix = '接下来继续检查前端合并逻辑。';
+  assert.equal(nativeRuntimeDeltaText(live, content + suffix), suffix);
+
+  const mismatch = { targetText: content, runtimeReplay: null };
+  const prefix = content.slice(0, 10);
+  assert.equal(nativeRuntimeDeltaText(mismatch, prefix), '');
+  assert.equal(nativeRuntimeDeltaText(mismatch, '这是新的正文'), prefix + '这是新的正文');
+
+  const partial = { targetText: content, runtimeReplay: null };
+  assert.equal(nativeRuntimeDeltaText(partial, prefix), '');
+  flushNativeRuntimeReplay(partial);
+  assert.equal(partial.targetText, content + prefix, 'an incomplete probe must restore buffered text');
+
+  const short = { targetText: '是', runtimeReplay: null };
+  assert.equal(nativeRuntimeDeltaText(short, '是'), '是');
 });
 
 test('streaming output has no blinking text caret', () => {
