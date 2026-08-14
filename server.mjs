@@ -23141,6 +23141,58 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
   return live;
 }
 function nativeRuntimeLiveKey(itemId,turnId){return 'runtime:'+String(turnId||activeNativeTurnId||'')+':'+String(itemId||'')}
+function findSnapshotLiveForRuntimeDelta(turnId,delta){
+  const cleanTurnId=String(turnId||'');
+  const incoming=normalizeAssistantDedupeText(delta);
+  if(!cleanTurnId||!incoming)return null;
+  let best=null;
+  for(const [key,live] of nativeLiveItems){
+    if(live?.source!=='snapshot'||!live.element)continue;
+    if(String(live.turnId||'')!==cleanTurnId)continue;
+    const text=normalizeAssistantDedupeText(live.targetText||live.text||live.element.dataset?.messageText||'');
+    if(!assistantTextsMatch(text,incoming))continue;
+    const score=text===incoming?2:1;
+    if(!best||score>=best.score)best={key,live,text,score};
+  }
+  if(best)return best;
+  for(const element of nativeAssistantBubbleElements().reverse()){
+    if(!element?.dataset?.nativeMessageSeq||element.dataset.nativeLiveSource==='runtime')continue;
+    if(String(element.dataset.turnId||'')!==cleanTurnId)continue;
+    const kind=String(element.dataset.messageKind||'');
+    if(kind&&!['','message','commentary','live_progress','final_answer'].includes(kind))continue;
+    const text=normalizeAssistantDedupeText(element.dataset.messageText||element.textContent||'');
+    if(!assistantTextsMatch(text,incoming))continue;
+    return {
+      key:'snapshot-dom:'+String(element.dataset.nativeMessageSeq||''),
+      text,
+      live:{
+        key:'',source:'snapshot',turnId:cleanTurnId,messageSeq:Number(element.dataset.nativeMessageSeq),
+        role:'assistant',element,text,targetText:text,complete:true,renderTimer:null,
+        followBottom:nativeLiveFollowBottom,
+      },
+    };
+  }
+  return null;
+}
+function adoptSnapshotLiveForRuntimeDelta(itemId,turnId,delta){
+  const match=findSnapshotLiveForRuntimeDelta(turnId,delta);
+  if(!match?.live?.element)return null;
+  const live=match.live;
+  if(match.key&&nativeLiveItems.get(match.key)===live)nativeLiveItems.delete(match.key);
+  if(match.key&&match.key.startsWith('snapshot:'))nativeRenderedMessageKeys.add(match.key);
+  const key=nativeRuntimeLiveKey(itemId,turnId);
+  live.key=key;
+  live.source='runtime';
+  live.turnId=String(turnId||'');
+  live.itemId=String(itemId||'');
+  live.complete=false;
+  live.runtimeBaseAuthoritative=true;
+  live.element.classList.add('streaming');
+  live.element.dataset.nativeLiveSource='runtime';
+  nativeLiveItems.set(key,live);
+  if(live.turnId)nativeRuntimeStreamTurnIds.add(live.turnId);
+  return live;
+}
 function nativeRuntimeDeltaText(live,delta){
   const incoming=String(delta||'');
   if(!incoming)return'';
@@ -23157,11 +23209,12 @@ function nativeRuntimeDeltaText(live,delta){
     return candidate;
   }
   const base=String(live.targetText||'');
-  if(base.length>=48&&incoming.startsWith(base))return incoming.slice(base.length);
+  const replayThreshold=live.runtimeBaseAuthoritative?1:48;
+  if(base.length>=replayThreshold&&incoming.startsWith(base))return incoming.slice(base.length);
   // A second delivery starts again at the beginning of the already accumulated
   // item. Buffer only long-message prefix matches so ordinary repeated words
   // and punctuation remain untouched.
-  if(base.length>=48&&base.startsWith(incoming)){
+  if(base.length>=replayThreshold&&base.startsWith(incoming)){
     if(incoming.length===base.length)return'';
     live.runtimeReplay={base,text:incoming};
     return'';
@@ -23172,6 +23225,7 @@ function flushNativeRuntimeReplay(live){
   const replay=live?.runtimeReplay;
   if(!replay)return;
   live.runtimeReplay=null;
+  if(live.runtimeBaseAuthoritative&&replay.base===String(live.targetText||''))return;
   live.targetText+=replay.text;
 }
 function updateNativeLiveDelta(runtime){
@@ -23186,6 +23240,7 @@ function updateNativeLiveDelta(runtime){
   removeNativeRunningElement();
   if(!collectingTurnProcess||!turnProcessElapsedMatches(runtimeTurnId))beginTurnProcessCollection(runtime.updatedAt,true,runtimeTurnId);
   else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),runtimeTurnId);
+  if(!live)live=adoptSnapshotLiveForRuntimeDelta(itemId,runtimeTurnId,delta);
   if(!live){
     const followBottom=captureNativeLiveFollowBottom();
     const element=addMsg('assistant','',{streaming:true,kind:'live_progress',turnId:runtimeTurnId,autoScroll:false});

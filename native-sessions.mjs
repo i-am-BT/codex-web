@@ -1190,6 +1190,7 @@ function createDetailCache(entry, options) {
     metadata: { workspaceKind: entry.workspaceKind || '' },
     goal: null,
     currentTurnId: '',
+    activeTaskTurnId: '',
     previousTurnId: '',
     status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
     latestTurnId: '',
@@ -1538,13 +1539,16 @@ function applyEventRecord(cache, record, payload, maxMessages) {
   const turnId = String(payload.turn_id || payload.turnId || '');
   if (turnId) cache.latestTurnId = turnId;
   if (payload.type === 'task_started') {
-    updateNativeTurnId(cache, turnId);
+    cache.activeTaskTurnId = turnId;
+    updateNativeTurnId(cache, turnId, true);
     cache.currentTurnTokenUsage = null;
     cache.currentTurnTokenUsageBaseline = tokenUsageBaseline(cache.latestTotalTokenUsage);
     cache.currentTurnFallbackTokenUsage = null;
     const contextWindowTokens = normalizeContextTokenCount(payload.model_context_window);
     if (contextWindowTokens !== null) cache.contextWindowTokens = contextWindowTokens;
   }
+  const terminalTask = TURN_TERMINAL_PROCESS_KINDS.has(payload.type);
+  if (terminalTask && turnId) updateNativeTurnId(cache, turnId, true);
   switch (payload.type) {
     case 'thread_settings_applied': {
       const settings = payload.thread_settings;
@@ -1668,6 +1672,7 @@ function applyEventRecord(cache, record, payload, maxMessages) {
     default:
       break;
   }
+  if (terminalTask && (!turnId || cache.activeTaskTurnId === turnId)) cache.activeTaskTurnId = '';
 }
 
 function nativeEventErrorMessage(error, fallback = '') {
@@ -1813,7 +1818,8 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   const images = contentImages(payload.content);
   if (!text && !images.length) return;
   const turnId = String(
-    payload.internal_chat_message_metadata_passthrough?.turn_id
+    cache.activeTaskTurnId
+    || payload.internal_chat_message_metadata_passthrough?.turn_id
     || payload.internal_chat_message_metadata_passthrough?.turnId
     || cache.currentTurnId
     || '',
@@ -2647,9 +2653,12 @@ function isProgressStyleText(text) {
   return true;
 }
 
-function updateNativeTurnId(cache, value) {
+function updateNativeTurnId(cache, value, force = false) {
   const turnId = String(value || '').trim();
   if (!turnId) return;
+  // Recent runtimes use per-response internal IDs while the app-server stream
+  // keeps the outer task ID. Keep one logical turn until its terminal event.
+  if (!force && cache.activeTaskTurnId && turnId !== cache.activeTaskTurnId) return;
   cache.latestTurnId = turnId;
   if (turnId === cache.currentTurnId) return;
   cache.previousTurnId = cache.currentTurnId || '';

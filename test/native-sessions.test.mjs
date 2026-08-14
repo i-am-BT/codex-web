@@ -102,7 +102,7 @@ test('native session store keeps the complete transcript by default', { timeout:
     }
     await writeFile(sessionFile, jsonl(records));
 
-    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const store = new NativeSessionStore(codexHome, { watchChanges: false });
     assert.equal(store.maxReadBytes, 0);
     assert.equal(store.maxMessages, 0);
 
@@ -143,6 +143,91 @@ test('native session store keeps the complete transcript by default', { timeout:
     assert.equal(completePage.hasEarlierMessages, false);
     assert.equal(completePage.historyPageLimit, conversation.messages.length);
     assert.equal(completePage.nextHistoryPageLimit, conversation.messages.length);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('response item internal turn IDs stay attached to the active task turn', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-task-turn-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019fff1f-abb5-7633-be71-8b74386dda54';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '14');
+  const sessionFile = path.join(sessionDir, `rollout-2026-08-14T07-14-53-${id}.jsonl`);
+  const taskTurnId = '019fff1f-abb5-7633-be71-8b74386dda54';
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(path.join(codexHome, 'session_index.jsonl'), `${JSON.stringify({
+      id,
+      thread_name: '逻辑轮次测试',
+      updated_at: '2026-08-14T07:15:22Z',
+    })}\n`);
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-08-14T07:14:53.000Z',
+        type: 'session_meta',
+        payload: { id, timestamp: '2026-08-14T07:14:53.000Z', cwd: '/workspace' },
+      },
+      {
+        timestamp: '2026-08-14T07:14:53.100Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: taskTurnId },
+      },
+      {
+        timestamp: '2026-08-14T07:14:54.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '检查重复回复' }],
+          internal_chat_message_metadata_passthrough: { turn_id: taskTurnId },
+        },
+      },
+      {
+        timestamp: '2026-08-14T07:14:55.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: '正在检查实时事件。' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'internal-response-a' },
+        },
+      },
+      {
+        timestamp: '2026-08-14T07:15:20.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: '问题已经修复。' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'internal-response-b' },
+        },
+      },
+      {
+        timestamp: '2026-08-14T07:15:21.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: taskTurnId, duration_ms: 27900 },
+      },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const conversation = store.get(id);
+    const taskMessages = conversation.messages.filter((message) => (
+      ['user', 'assistant'].includes(message.role) || message.kind === 'task_complete'
+    ));
+
+    assert.equal(conversation.latestTurnId, taskTurnId);
+    assert.equal(conversation.status, 'done');
+    assert.equal(taskMessages.length, 3);
+    assert.deepEqual([...new Set(taskMessages.map((message) => message.turnId))], [taskTurnId]);
+    assert.equal(
+      taskMessages.find((message) => message.content.includes('问题已经修复。'))?.kind,
+      'final_answer',
+    );
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });
