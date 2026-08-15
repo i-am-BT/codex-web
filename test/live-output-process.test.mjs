@@ -7,7 +7,10 @@ const [serverSource, uiStyles, nativeSessionSource] = await Promise.all([
   readFile(new URL('../ui.css', import.meta.url), 'utf8'),
   readFile(new URL('../native-sessions.mjs', import.meta.url), 'utf8'),
 ]);
-const rawInlineScript = serverSource.match(/<script>([\s\S]*?)<\/script>/)?.[1] || '';
+const rawInlineScript = (() => {
+  const blocks = [...serverSource.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1] || '');
+  return blocks.sort((left, right) => right.length - left.length)[0] || '';
+})();
 const inlineScript = rawInlineScript.replaceAll('\\\\', '\\');
 
 function sourceBetween(start, end) {
@@ -291,7 +294,7 @@ test('response annotations render as hover details and touch toggles', () => {
   assert.equal((inlineScript.match(/responseAnnotations:msg\.responseAnnotations/g) || []).length, 2);
   assert.match(inlineScript, /responseAnnotations:message\.responseAnnotations/);
   assert.match(inlineScript, /function adoptRuntimeLiveForSnapshotMessage\(message\)\{[\s\S]*?rememberResponseAnnotationItems\(pausedTurnId,message\.responseAnnotations\)/s);
-  assert.match(inlineScript, /addMsg\('assistant','',\{streaming:true,kind:'live_progress',turnId:runtimeTurnId,autoScroll:false\}\)/);
+  assert.match(inlineScript, /function ensureNativeRuntimeLiveElement\(live\)[\s\S]*?addMsg\('assistant','',\{streaming:true,kind:'live_progress',turnId:live\.turnId,autoScroll:false\}\)/);
   assert.match(inlineScript, /function newChat\(\)[\s\S]*?responseAnnotationsByTurn=new Map\(\)/);
   assert.match(inlineScript, /function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?clearNativeLiveItems\(\);\s*responseAnnotationsByTurn=new Map\(\);/s);
   assert.match(inlineScript, /document\.querySelectorAll\('\.browserAnnotationCard,\.responseAnnotationCard'\)/);
@@ -323,7 +326,7 @@ test('native connection retries and terminal upstream errors render inside the c
     `${textSource}; return { nativeConnectionStatusText };`,
   )();
   const errorTitleSource = sourceBetween('function terminalErrorMessageTitle', 'let longUserMessageSerial');
-  const terminalErrorMessageTitle = new Function(`${errorTitleSource}; return terminalErrorMessageTitle;`)();
+  const { terminalErrorMessageTitle, isUsageLimitTerminalError, terminalErrorDisplayText, terminalErrorHintText } = new Function(`${errorTitleSource}; return { terminalErrorMessageTitle, isUsageLimitTerminalError, terminalErrorDisplayText, terminalErrorHintText };`)();
   const messageElementSource = sourceBetween('function createConversationMessageElement', 'function addMsg');
   const runtimeHandlerSource = sourceBetween('function connectSessionEvents', 'function nativeMessageElementBySequence');
 
@@ -342,12 +345,22 @@ test('native connection retries and terminal upstream errors render inside the c
   assert.match(runtimeHandlerSource, /runtime\.type==='connection-error'[\s\S]*?upsertNativeConnectionStatus\(runtime\)/);
   assert.match(inlineScript, /if\(terminalProcess\)clearNativeConnectionStatus\(options\.turnId\)/);
   assert.equal(terminalErrorMessageTitle("You've hit your usage limit. Try again later."), '额度已达上限');
+  assert.equal(isUsageLimitTerminalError("You've hit your usage limit. Try again later."), true);
+  assert.equal(terminalErrorDisplayText("You've hit your usage limit. Try again later."), '');
+  assert.equal(terminalErrorHintText("You've hit your usage limit. Try again later."), '');
   assert.equal(terminalErrorMessageTitle('last status: 429 Too Many Requests'), '请求过于频繁');
   assert.equal(terminalErrorMessageTitle('401 Unauthorized'), '认证失败');
   assert.equal(terminalErrorMessageTitle('request timed out'), '请求超时');
   assert.equal(terminalErrorMessageTitle('provider unavailable'), '任务失败');
   assert.match(messageElementSource, /const terminalError=role==='process'&&\['task_error','error'\]\.includes\(kind\)/);
   assert.match(messageElementSource, /terminalError\?' terminalError':''/);
+  assert.match(messageElementSource, /usageLimitError\?' usageLimitError':''/);
+  assert.match(messageElementSource, /terminalErrorContent'\+\(usageLimitError\?' compact':''\)/);
+  assert.match(messageElementSource, /if\(bodyText\)content\.appendChild\(body\)/);
+  assert.match(inlineScript, /Completed-history terminal cards should stay static/);
+  assert.match(inlineScript, /Hold the restore veil through the first history fill/);
+  assert.match(messageElementSource, /terminalErrorDisplayText\(text\)/);
+  assert.match(messageElementSource, /terminalErrorHintText\(text\)/);
   assert.match(messageElementSource, /icon\.className='terminalErrorIcon'/);
   assert.match(messageElementSource, /title\.textContent=terminalErrorMessageTitle\(text\)/);
   assert.match(messageElementSource, /if\(\['process','log'\]\.includes\(role\)&&!terminalError\)/);
@@ -356,7 +369,9 @@ test('native connection retries and terminal upstream errors render inside the c
   assert.match(uiStyles, /\.terminalErrorIcon\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;[^}]*background:\s*var\(--danger-soft\)/s);
   assert.match(uiStyles, /\.terminalErrorTitle\s*\{[^}]*color:\s*var\(--danger\);[^}]*font-size:\s*11px/s);
   assert.match(uiStyles, /\.msg\.process\.terminalError > \.msgActions\s*\{[^}]*min-height:\s*28px;[^}]*margin:\s*-1px 0 0/s);
-  assert.match(uiStyles, /@media \(min-width:\s*821px\)\s*\{\s*\.terminalErrorContent\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*baseline;[^}]*gap:\s*8px;[^}]*\}\s*\.terminalErrorTitle\s*\{[^}]*white-space:\s*nowrap/s);
+  assert.match(uiStyles, /@media \(min-width:\s*821px\)\s*\{\s*\.terminalErrorContent\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*baseline;/s);
+  assert.match(uiStyles, /\.msg\.process\.terminalError\.usageLimitError\s*\{/);
+  assert.match(uiStyles, /@media \(max-width:\s*820px\)\s*\{[\s\S]*?\.msg\.process\.terminalError\.usageLimitError/s);
 });
 
 test('the real exec-wrapped update_plan call becomes a plan event', () => {
@@ -749,7 +764,8 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.doesNotMatch(cancelSource, /freezeTurnProcessElapsed\(|clearLiveTurnProgress\(|webRunActive=false|activeNativeTurnId=''/);
   assert.match(deltaSource, /const cancelPending=nativeCancelPendingMatches\(currentConversationId,runtimeTurnId\);/);
   assert.match(deltaSource, /if\(!live&&cancelPending\)return;/);
-  assert.match(deltaSource, /const nextDelta=nativeRuntimeDeltaText\(live,delta\);\s*if\(!nextDelta\)return;\s*live\.targetText\+=nextDelta;/);
+  assert.match(deltaSource, /if\(!live\)live=adoptSnapshotLiveForRuntimeDelta\(itemId,runtimeTurnId,delta,runtime\.updatedAt\);/);
+  assert.match(deltaSource, /live\.rawText=String\(live\.rawText\|\|''\)\+delta;\s*const targetText=nativeRuntimeTargetText\(live,live\.rawText\);/);
   assert.match(pauseSource, /renderNativeLiveItemImmediately\(live\);\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(scheduleSource, /if\(live\?\.cancelVisualPaused\)return;/);
   assert.match(snapshotSource, /if\(live\.cancelVisualPaused&&nativeCancelPendingMatches\(currentConversationId,pausedTurnId\)\)\{/);
@@ -1320,6 +1336,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
       function nativeCancelPendingMatches() { return false; }
+      function stripNativeUiProtocolLines(value) { return String(value || ''); }
       ${liveSource}
       return {
         shouldStream: isNativeSnapshotStreamingMessage,
@@ -1430,13 +1447,13 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.match(inlineScript, /loadConversation[\s\S]*hydrating:true/);
   assert.match(inlineScript, /nativeRuntimeStreamTurnIds\.has\(String\(msg\.turnId\|\|''\)\)/);
   assert.doesNotMatch(inlineScript, /nativeLiveItems\.size&&\['assistant','thinking'\]/);
-  assert.match(liveSource, /kind:'live_progress',turnId:runtimeTurnId,autoScroll:false/);
+  assert.match(liveSource, /function ensureNativeRuntimeLiveElement\(live\)[\s\S]*?kind:'live_progress',turnId:live\.turnId,autoScroll:false/);
   assert.doesNotMatch(liveSource, /scrollChatToLatest\(/);
   assert.match(liveSource, /function nativeLiveDocumentHidden\(\)/);
   assert.match(liveSource, /if\(!nativeLiveTypewriterEnabled\(\)\)\{\s*renderNativeLiveItemImmediately\(live\);/);
   assert.match(liveSource, /function renderNativeLiveItem\(live\)\{[\s\S]*?_messageBody\.textContent=live\.text/);
   assert.match(liveSource, /function renderNativeLiveItemMarkdown\(live\)\{[\s\S]*?renderAssistantMarkdown\(body,live\.text\);/);
-  assert.match(liveSource, /function settleNativeLiveItem\(live\)\{\s*renderNativeLiveItemMarkdown\(live\);/);
+  assert.match(liveSource, /function settleNativeLiveItem\(live\)\{[\s\S]*?renderNativeLiveItemMarkdown\(live\);/);
   assert.match(inlineScript, /function handleNativeVisibilityChange\(\)[\s\S]*?nativeSnapshotResumeCatchup=true;[\s\S]*?flushNativeLiveItemsToTarget\(\);/);
   assert.match(inlineScript, /if\(nearBottom&&syncMessages\.length\)scheduleNativeLiveScroll\(\)/);
 });
@@ -1580,6 +1597,7 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
       function nativeCancelPendingMatches() { return false; }
+      function stripNativeUiProtocolLines(value) { return String(value || ''); }
       let latestAssistantElement = null;
       let latestFinalAssistantElement = null;
       let collectingTurnProcess = false;
@@ -1690,6 +1708,9 @@ test('late runtime delta adopts an already rendered snapshot bubble', () => {
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
       function nativeCancelPendingMatches() { return false; }
+      function stripNativeUiProtocolLines(value) {
+        return String(value || '').split('\\n').filter((line) => !line.startsWith('::git-')).join('\\n').trim();
+      }
       let latestAssistantElement = null;
       let latestFinalAssistantElement = null;
       let collectingTurnProcess = false;
@@ -1726,7 +1747,9 @@ test('late runtime delta adopts an already rendered snapshot bubble', () => {
   assert.equal(addCalls.length, 1, 'snapshot renders the first and only bubble');
   assert.equal(api.state().nativeLiveItems.size, 0, 'settled snapshots leave only their DOM bubble');
 
-  api.updateDelta({ itemId: 'item-late', turnId: 'turn-active', delta: content, updatedAt: message.at });
+  api.updateDelta({ itemId: 'item-late', turnId: 'turn-active', delta: '::git-status{"state":"clean"}', updatedAt: message.at });
+  assert.equal(addCalls.length, 1, 'a protocol-only delta must not create another bubble');
+  api.updateDelta({ itemId: 'item-late', turnId: 'turn-active', delta: `\n${content}`, updatedAt: message.at });
   assert.equal(addCalls.length, 1, 'late runtime replay must reuse the snapshot DOM bubble');
   assert.equal(api.state().nativeLiveItems.size, 1);
   const [live] = api.state().nativeLiveItems.values();
@@ -1738,33 +1761,27 @@ test('late runtime delta adopts an already rendered snapshot bubble', () => {
   assert.equal(live.targetText, content, 'an incomplete replay probe must not duplicate snapshot text on completion');
 });
 
-test('runtime stream suppresses a replayed long message without dropping normal repeated text', () => {
-  const deltaTextSource = sourceBetween('function nativeRuntimeDeltaText', 'function updateNativeLiveDelta');
-  const { nativeRuntimeDeltaText, flushNativeRuntimeReplay } = new Function(
-    `${deltaTextSource}; return { nativeRuntimeDeltaText, flushNativeRuntimeReplay };`,
-  )();
+test('runtime stream reuses an authoritative snapshot until cumulative output diverges', () => {
+  const targetTextSource = sourceBetween('function nativeRuntimeTargetText', 'function removeNativeLiveElement');
+  const { nativeRuntimeTargetText } = new Function(
+    'nativeLiveDisplayText',
+    `${targetTextSource}; return { nativeRuntimeTargetText };`,
+  )((value) => String(value || ''));
   const content = '我先定位这条会话对应的服务日志和会话记录，确认重复内容来自实时消息重放，而不是模型真的生成了两次。';
-  const live = { targetText: content, runtimeReplay: null };
+  const live = { targetText: content, runtimeBaseText: content, runtimeBaseAuthoritative: true };
 
-  assert.equal(nativeRuntimeDeltaText(live, content.slice(0, 18)), '');
-  assert.equal(nativeRuntimeDeltaText(live, content.slice(18)), '');
-  assert.equal(live.runtimeReplay, null, 'a complete replay should be consumed');
+  assert.equal(nativeRuntimeTargetText(live, content.slice(0, 18)), content);
+  assert.equal(nativeRuntimeTargetText(live, content), content);
+  assert.equal(live.runtimeBaseAuthoritative, true, 'an exact replay keeps the snapshot authoritative');
 
   const suffix = '接下来继续检查前端合并逻辑。';
-  assert.equal(nativeRuntimeDeltaText(live, content + suffix), suffix);
+  assert.equal(nativeRuntimeTargetText(live, content + suffix), content + suffix);
+  assert.equal(live.runtimeBaseAuthoritative, false, 'new cumulative output becomes authoritative');
 
-  const mismatch = { targetText: content, runtimeReplay: null };
+  const mismatch = { targetText: content, runtimeBaseText: content, runtimeBaseAuthoritative: true };
   const prefix = content.slice(0, 10);
-  assert.equal(nativeRuntimeDeltaText(mismatch, prefix), '');
-  assert.equal(nativeRuntimeDeltaText(mismatch, '这是新的正文'), prefix + '这是新的正文');
-
-  const partial = { targetText: content, runtimeReplay: null };
-  assert.equal(nativeRuntimeDeltaText(partial, prefix), '');
-  flushNativeRuntimeReplay(partial);
-  assert.equal(partial.targetText, content + prefix, 'an incomplete probe must restore buffered text');
-
-  const short = { targetText: '是', runtimeReplay: null };
-  assert.equal(nativeRuntimeDeltaText(short, '是'), '是');
+  assert.equal(nativeRuntimeTargetText(mismatch, prefix), content);
+  assert.equal(nativeRuntimeTargetText(mismatch, `${prefix}这是新的正文`), `${prefix}这是新的正文`);
 });
 
 test('streaming output has no blinking text caret', () => {
@@ -1798,9 +1815,10 @@ test('running composer queues follow-ups and keeps steer as an explicit queue ac
   assert.match(steerSource, /applyServerPromptQueue\(threadId,data\.queue\)/);
   assert.match(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:false,dismiss:!isAppOwnedQueuedPrompt\(item\)\}\)/);
   assert.doesNotMatch(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:true\}\)/);
-  assert.ok(steerSource.indexOf('await flushPromptQueueToServer(threadId)') < steerSource.indexOf("fetch('/api/native-sessions/"));
+  assert.doesNotMatch(steerSource, /await flushPromptQueueToServer\(threadId\)/);
+  assert.ok(steerSource.indexOf('showNativeSteerOptimistically(item)') < steerSource.indexOf("fetch('/api/native-sessions/"));
   assert.ok(steerSource.indexOf("fetch('/api/native-sessions/") < steerSource.indexOf('applyServerPromptQueue(threadId,data.queue)'));
-  assert.ok(steerSource.indexOf('applyServerPromptQueue(threadId,data.queue)') < steerSource.indexOf('showNativeSteerOptimistically(item)'));
+  assert.match(steerSource, /if\(optimisticElement&&nativeOptimisticSteering\.get\(item\.id\)===optimisticElement\)/);
   assert.doesNotMatch(steerSource, /const previousItems=|const stillMissing=/);
   assert.match(dispatchSource, /queueGuidingItems\.has\(item\.id\)\|\|steerSubmitting/);
   assert.match(inlineScript, /Array\.isArray\(data\.items\)&&!promptQueueServerSyncPending\.has\(id\)/);
@@ -2109,7 +2127,7 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(syncCurrentNativeConversationOnce, /historyPageLimit:nativeHistoryPageLimit/);
   assert.match(syncCurrentNativeConversationOnce, /nativeLiveFollowBottom&&nativeLiveNearBottom\(\)\?null:captureHistoryScrollAnchor\(chat\)/);
   assert.match(syncCurrentNativeConversationOnce, /historyScrollAnchor,/);
-  assert.match(loadConversation, /chat\.innerHTML='';\s*const messages=conversation\.messages\|\|\[\];/);
+  assert.match(loadConversation, /const messages=conversation\.messages\|\|\[\];[\s\S]*?chat\.replaceChildren\(\);/);
   assert.match(loadConversation, /Number\(conversation\.nextHistoryPageLimit\)\|\|0/);
   assert.doesNotMatch(inlineScript, /addNativeHistoryLoadButton|nativeHistoryLoadEarlier|加载完整记录/);
   assert.doesNotMatch(uiStyles, /nativeHistoryLoadEarlier/);
@@ -2533,11 +2551,31 @@ test('generation resets reconcile live messages without rebuilding the conversat
   assert.doesNotMatch(completionSyncSource, /loadConversation/);
 });
 
+test('boot restores the last conversation chrome before content paints', () => {
+  assert.match(inlineScript, /function restoreBootConversationChrome\(\)/);
+  assert.match(inlineScript, /function persistActiveConversation\(id=currentConversationId,source=currentConversationSource,title=currentConversationTitle\)/);
+  assert.match(inlineScript, /title:normalizeConversationTitle\(title\|\|currentConversationTitle\|\|'',\'Chat'\)/);
+  assert.match(inlineScript, /if\(!restoreBootConversationChrome\(\)\)setCurrentConversationTitle\('新任务'\)/);
+  assert.match(inlineScript, /const modelsReady=loadModels\(provider\.value,data\.defaults\.model\)/);
+  assert.match(inlineScript, /if\(target\)await loadConversation\(target\.id,target\.source\|\|'codex'\);await modelsReady/);
+  assert.match(inlineScript, /chat\.classList\.add\('conversationRestoring'\)/);
+  assert.match(inlineScript, /chat\.replaceChildren\(\)/);
+  assert.match(inlineScript, /chat\.classList\.remove\('conversationRestoring'\)/);
+  assert.match(uiStyles, /\.chat\.conversationRestoring/);
+  assert.match(serverSource, /dataset\.bootRestore='1'/);
+  assert.match(serverSource, /正在同步会话内容…/);
+  assert.match(uiStyles, /html\[data-boot-restore="1"\]/);
+});
+
 test('same-conversation refresh keeps the visible status instead of flashing Loading', () => {
-  const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  const loadConversation = sourceBetween('async function loadConversation', 'function nativeRunningStatusTimestamp');
   assert.match(loadConversation, /const conversationChanged=id!==currentConversationId\|\|nextConversationSource!==currentConversationSource/);
-  assert.match(loadConversation, /if\(conversationChanged\)statusEl\.textContent='Loading\.\.\.'/);
-  assert.doesNotMatch(loadConversation, /updateActiveHistory\(\);\s*statusEl\.textContent='Loading\.\.\.'/);
+  assert.match(loadConversation, /if\(conversationChanged\)scheduleConversationStatusLoading\(seq\); else clearConversationStatusLoading\(\);/);
+  assert.doesNotMatch(loadConversation, /statusEl\.textContent='Loading\.\.\.'/);
+  assert.match(inlineScript, /function scheduleConversationStatusLoading\(seq\)/);
+  assert.match(inlineScript, /Keep the previous status visible for quick switches/);
+  assert.match(inlineScript, /function setModeLabelState\(native\)/);
+  assert.match(inlineScript, /if\(modeLabel\?\.dataset\.mode===label\)return;/);
 });
 
 test('running Codex App status shows only the update time', () => {
@@ -2557,6 +2595,8 @@ test('running Codex App status shows only the update time', () => {
   assert.equal(statusEl.textContent, new Date(updatedAt).toLocaleString());
   assert.doesNotMatch(statusEl.textContent, /Codex App|运行中|正在处理/);
   assert.match(statusSource, /if\(running\)showNativeRunningTimestamp\(conversation\.updatedAt\|\|conversation\.createdAt\)/);
+  assert.match(statusSource, /clearConversationStatusLoading\(\)/);
+  assert.match(statusSource, /setTopStatusText\(/);
   assert.match(inlineScript, /else showNativeRunningTimestamp\(runtime\.updatedAt\)/);
   assert.match(inlineScript, /showNativeRunningTimestamp\(Date\.now\(\)\)/);
   assert.doesNotMatch(inlineScript, /statusEl\.textContent='Codex App · 正在处理'/);
@@ -2627,7 +2667,7 @@ test('mobile composer expands before opening the keyboard', () => {
   assert.match(inlineScript, /try\{input\.focus\(\{preventScroll:true\}\)\}catch\{input\.focus\(\)\}/);
   assert.match(expandedSource, /if\(next&&focus&&input&&!input\.disabled&&document\.activeElement!==input\)/);
   assert.match(clickSource, /document\.activeElement===input/);
-  assert.match(inlineScript, /__composerExpandClickGuard[\s\S]{0,520}event\.stopImmediatePropagation\(\)/);
+  assert.match(inlineScript, /__composerExpandClickGuard[\s\S]{0,1200}event\.stopImmediatePropagation\(\)/);
   assert.match(inlineScript, /const wasCollapsed=dropZone\.classList\.contains\('composerCollapsed'\)/);
   assert.match(inlineScript, /const wasCollapsed=dropZone\.classList\.contains\('composerCollapsed'\);[\s\S]{0,520}if\(event\.target\.closest\('button,a,select,label,\.composerPopover'\)\)\{[\s\S]{0,120}if\(!wasCollapsed\)expandComposer\(\)/);
   assert.match(inlineScript, /if\(wasCollapsed\)\{[\s\S]{0,220}event\.preventDefault\(\);[\s\S]{0,120}expandComposer\(\);[\s\S]{0,80}\}else\{[\s\S]{0,100}expandComposer\(\{focus:true\}\)/);
@@ -2663,7 +2703,7 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   assert.match(uiStyles, /bottom: var\(--keyboard-inset/);
   assert.match(uiStyles, /body\.keyboardOpen \.composer/);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
-  assert.doesNotMatch(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.chat\s*\{[^}]*var\(--keyboard-inset/s);
+  assert.match(uiStyles, /body\.keyboardOpen \.chat[\s\S]{0,240}?var\(--keyboard-inset/);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.app,\s*body\.keyboardOpen \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main:not\(\.sideChatOpen\) > \.composer\s*\{[^}]*bottom:\s*0;[^}]*transition:\s*none/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main\.sideChatOpen > \.composer\s*\{[^}]*bottom:\s*0 !important;[^}]*transition:\s*none/s);
@@ -3072,7 +3112,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(mobileGoalStyles, /body \.composer > \.threadGoalBar\.runtimeOnly,[\s\S]*?display:\s*block;/s);
   const refreshFilesSource = sourceBetween('function refreshLiveEditedFilesResult', 'function createWebPreviewResultCard');
   assert.equal((refreshFilesSource.match(/renderThreadGoalBar\(\)/g) || []).length, 2);
-  assert.match(serverSource, /ui\.css\?v=quota-header-align-20260808b/);
+  assert.match(serverSource, /ui\.css\?v=subquota-popover-height-20260814d/);
 });
 
 test('desktop live plan stays a compact pill with an on-demand detail popup', () => {

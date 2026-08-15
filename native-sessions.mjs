@@ -44,7 +44,6 @@ export class NativeSessionStore extends EventEmitter {
     this.sideChatStateFile = path.resolve(
       options.sideChatStateFile || path.join(this.codexHome, 'codex-web-side-chat.json'),
     );
-    this.deepSeekUsageFile = String(options.deepSeekUsageFile || '').trim();
     this.stateDbFile = path.resolve(options.stateDbFile || path.join(this.codexHome, 'state_5.sqlite'));
     this.goalsDbFile = path.resolve(options.goalsDbFile || path.join(this.codexHome, 'goals_1.sqlite'));
     this.maxReadBytes = nonNegativeNumber(options.maxReadBytes, DEFAULT_MAX_READ_BYTES);
@@ -67,6 +66,7 @@ export class NativeSessionStore extends EventEmitter {
     this.goalsStamp = '';
     this.sessionMetadataCache = new Map();
     this.indexStamp = '';
+    this.globalStateStamp = null;
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
     this.projectThreadIds = new Set();
@@ -143,7 +143,9 @@ export class NativeSessionStore extends EventEmitter {
   refresh() {
     this.refreshTitles();
     const goalChangedIds = this.refreshThreadGoals();
-    const pinnedChangedIds = this.refreshWorkspaceState();
+    const workspaceState = this.refreshWorkspaceState();
+    const pinnedChangedIds = workspaceState.pinnedChangedIds;
+    const completionReadStateChanged = workspaceState.completionReadStateChanged;
     this.refreshAppThreads();
     const nextEntries = scanSessionFiles(
       this.sessionsDir,
@@ -175,14 +177,28 @@ export class NativeSessionStore extends EventEmitter {
       if (!this.entries.has(id) && !this.subagentEntries.has(id)) this.details.delete(id);
     }
 
-    if (changedIds.length) {
+    if (changedIds.length || completionReadStateChanged) {
       this.version += 1;
-      this.emit('change', { version: this.version, changedIds, conversationChangedIds });
+      this.emit('change', {
+        version: this.version,
+        changedIds,
+        conversationChangedIds,
+        completionReadStateChanged,
+      });
     }
     return this.list();
   }
 
   refreshWorkspaceState() {
+    let globalStateStamp = '';
+    try {
+      const stat = statSync(this.globalStateFile);
+      globalStateStamp = `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+    } catch {}
+    const completionReadStateChanged = this.globalStateStamp !== null
+      && this.globalStateStamp !== globalStateStamp;
+    this.globalStateStamp = globalStateStamp;
+
     let state = null;
     try {
       state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
@@ -239,7 +255,7 @@ export class NativeSessionStore extends EventEmitter {
         },
       });
     } catch {}
-    return pinnedChangedIds;
+    return { pinnedChangedIds, completionReadStateChanged };
   }
 
   readLocalSideChatState() {
@@ -683,10 +699,23 @@ export class NativeSessionStore extends EventEmitter {
     if (overlay) {
       const overlayUpdatedAtMs = Number(overlay.updatedAtMs) || 0;
       const persistedMatchesOverlay = threadSettingsMatch(persisted, overlay);
-      const persistedIsNewer = persistedUpdatedAtMs > overlayUpdatedAtMs;
-      if (persistedMatchesOverlay || persistedIsNewer) {
+      // Only drop the overlay when SQLite has actually caught up to the same settings.
+      // Thread row updated_at advances during normal turn activity and must not erase a
+      // newer in-memory model/provider switch that app-server has not persisted yet.
+      if (persistedMatchesOverlay) {
         this.threadSettingsOverrides.delete(threadId);
         overlay = null;
+      } else if (persistedUpdatedAtMs > overlayUpdatedAtMs && Object.keys(persisted).length) {
+        // A truly newer persisted settings snapshot can replace the overlay.
+        const persistedFields = ['modelProvider', 'model', 'reasoningEffort', 'serviceTier']
+          .filter((key) => Object.hasOwn(persisted, key));
+        const overlayFields = ['modelProvider', 'model', 'reasoningEffort', 'serviceTier']
+          .filter((key) => Object.hasOwn(overlay, key));
+        const comparable = persistedFields.filter((key) => overlayFields.includes(key));
+        if (comparable.length && comparable.every((key) => persisted[key] === overlay[key])) {
+          this.threadSettingsOverrides.delete(threadId);
+          overlay = null;
+        }
       }
     }
 
@@ -787,34 +816,6 @@ export class NativeSessionStore extends EventEmitter {
     };
   }
 
-  accumulateDeepSeekUsage(cache, payload) {
-    if (!this.deepSeekUsageFile) return;
-    const model = String(cache?.metadata?.model || '').trim().toLowerCase();
-    if (!model.startsWith('deepseek')) return;
-    const usage = cache?.currentTurnTokenUsage;
-    const total = Number(usage?.totalTokens);
-    if (!Number.isFinite(total) || total <= 0) return;
-    const turnKey = `${String(cache?.id || '')}:${String(payload?.turn_id || payload?.turnId || cache?.latestTurnId || '')}`;
-    if (!turnKey || turnKey.endsWith(':')) return;
-    try {
-      const current = readDeepSeekUsageStatsFile(this.deepSeekUsageFile) || {};
-      const counted = Array.isArray(current.countedTurns) ? current.countedTurns : [];
-      if (counted.includes(turnKey)) return;
-      const input = Math.max(0, Number(usage.inputTokens) || 0);
-      const cached = Math.max(0, Number(usage.cachedInputTokens) || 0);
-      const output = Math.max(0, Number(usage.outputTokens) || 0);
-      const next = {
-        totalTokens: (Number(current.totalTokens) || 0) + total,
-        inputTokens: (Number(current.inputTokens) || 0) + input,
-        outputTokens: (Number(current.outputTokens) || 0) + output,
-        cachedInputTokens: (Number(current.cachedInputTokens) || 0) + cached,
-        requests: (Number(current.requests) || 0) + 1,
-        updatedAt: new Date().toISOString(),
-        countedTurns: [...counted.slice(-999), turnKey],
-      };
-      writeFileSync(this.deepSeekUsageFile, JSON.stringify(next, null, 2));
-    } catch {}
-  }
 
   getConversationFromEntries(id, options = {}, subagent = false) {
     const entries = () => (subagent ? this.subagentEntries : this.entries);
@@ -985,16 +986,6 @@ function findSubagentEntry(entries, parentId, agentRef) {
     )) || null;
 }
 
-function readDeepSeekUsageStatsFile(file) {
-  try {
-    if (!file || !existsSync(file)) return null;
-    const data = JSON.parse(readFileSync(file, 'utf8'));
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
 
 export function readSessionIndex(file) {
   const titles = new Map();
@@ -1426,8 +1417,7 @@ function applyNativeRecord(cache, record, maxMessages, store) {
 
   const payload = record.payload || {};
   if (record.type === 'event_msg') {
-    applyEventRecord(cache, record, payload, maxMessages);
-    if (payload.type === 'task_complete') store?.accumulateDeepSeekUsage(cache, payload);
+    applyEventRecord(cache, record, payload, maxMessages, store);
     return;
   }
   if (record.type !== 'response_item') return;
@@ -1522,20 +1512,30 @@ function applyMetadataRecord(cache, record) {
     };
   } else if (record?.type === 'turn_context') {
     updateNativeTurnId(cache, payload.turn_id || payload.turnId);
+    const previous = cache.metadata || {};
+    const settingsStamp = Number(previous.settingsUpdatedAtMs) || 0;
+    const contextStamp = Date.parse(String(record.timestamp || '')) || 0;
+    // A newer explicit thread settings write must win over in-flight turn_context snapshots.
+    // Otherwise mid-run model switches appear to succeed and then snap back to the old model.
+    const preferSettingsModel = settingsStamp > 0 && (!contextStamp || settingsStamp >= contextStamp);
     cache.metadata = {
-      ...cache.metadata,
-      cwd: payload.cwd || cache.metadata.cwd || '',
-      model: payload.model || cache.metadata.model || '',
-      reasoningEffort: payload.effort || cache.metadata.reasoningEffort || '',
-      approvalPolicy: payload.approval_policy || cache.metadata.approvalPolicy || '',
-      approvalsReviewer: payload.approvals_reviewer || cache.metadata.approvalsReviewer || '',
-      sandboxPolicy: normalizeSandboxPolicy(payload.sandbox_policy) || cache.metadata.sandboxPolicy || '',
-      timezone: payload.timezone || cache.metadata.timezone || '',
+      ...previous,
+      cwd: payload.cwd || previous.cwd || '',
+      model: preferSettingsModel
+        ? (previous.model || payload.model || '')
+        : (payload.model || previous.model || ''),
+      reasoningEffort: preferSettingsModel
+        ? (previous.reasoningEffort || payload.effort || '')
+        : (payload.effort || previous.reasoningEffort || ''),
+      approvalPolicy: payload.approval_policy || previous.approvalPolicy || '',
+      approvalsReviewer: payload.approvals_reviewer || previous.approvalsReviewer || '',
+      sandboxPolicy: normalizeSandboxPolicy(payload.sandbox_policy) || previous.sandboxPolicy || '',
+      timezone: payload.timezone || previous.timezone || '',
     };
   }
 }
 
-function applyEventRecord(cache, record, payload, maxMessages) {
+function applyEventRecord(cache, record, payload, maxMessages, store = null) {
   const turnId = String(payload.turn_id || payload.turnId || '');
   if (turnId) cache.latestTurnId = turnId;
   if (payload.type === 'task_started') {
@@ -1554,13 +1554,19 @@ function applyEventRecord(cache, record, payload, maxMessages) {
       const settings = payload.thread_settings;
       if (!settings || typeof settings !== 'object') break;
       const appliedAtMs = Date.parse(String(record.timestamp || ''));
+      const normalized = normalizeThreadSettings(settings);
       const merged = mergeThreadSettingsMetadata(
         cache.metadata,
-        normalizeThreadSettings(settings),
+        normalized,
         Number.isFinite(appliedAtMs) ? appliedAtMs : 0,
       );
       const next = merged.metadata;
       let changed = merged.changed;
+      // Explicit app-server settings events supersede any temporary composer overlay.
+      if (store?.threadSettingsOverrides instanceof Map) {
+        const threadId = String(cache.id || '').trim().toLowerCase();
+        if (threadId) store.threadSettingsOverrides.delete(threadId);
+      }
       if (Object.hasOwn(settings, 'approval_policy')) {
         const approvalPolicy = String(settings.approval_policy || '').trim();
         if (approvalPolicy) {
@@ -1676,16 +1682,144 @@ function applyEventRecord(cache, record, payload, maxMessages) {
 }
 
 function nativeEventErrorMessage(error, fallback = '') {
-  if (typeof error === 'string') return error.trim() || fallback;
+  if (typeof error === 'string') return stripNativeUiProtocolLines(error) || fallback;
   if (error && typeof error === 'object') {
     const direct = error.message ?? error.error ?? error.detail;
-    if (typeof direct === 'string' && direct.trim()) return direct.trim();
+    if (typeof direct === 'string' && direct.trim()) return stripNativeUiProtocolLines(direct) || fallback;
     try {
       const serialized = JSON.stringify(error, null, 2);
-      if (serialized && serialized !== '{}') return serialized;
+      if (serialized && serialized !== '{}') return stripNativeUiProtocolLines(serialized) || fallback;
     } catch {}
   }
   return fallback;
+}
+
+function nativeUiProtocolLine(line, { allowPartial = false } = {}) {
+  const source = String(line || '').trim();
+  const opener = /^::git-[a-z0-9_-]+\{/i.exec(source);
+  if (!opener) {
+    if (!allowPartial || !source) return false;
+    const prefix = '::git-';
+    return prefix.startsWith(source.toLowerCase()) || /^::git-[a-z0-9_-]*$/i.test(source);
+  }
+  let depth = 0;
+  let quote = '';
+  let escaped = false;
+  for (let index = opener[0].length - 1; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = '';
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return !source.slice(index + 1).trim();
+    }
+  }
+  return allowPartial && depth > 0;
+}
+
+function stripNativeUiProtocolLines(value, { streaming = false } = {}) {
+  const source = String(value || '').replace(/\r\n/g, '\n');
+  if (!source) return '';
+  const lines = source.split('\n');
+  const kept = [];
+  let fence = null;
+  let protocol = null;
+  let protocolLines = [];
+  let removed = false;
+  for (const line of lines) {
+    if (protocol) {
+      protocolLines.push(line);
+      let closedAt = -1;
+      for (let index = 0; index < line.length; index += 1) {
+        const char = line[index];
+        if (protocol.quote) {
+          if (protocol.escaped) protocol.escaped = false;
+          else if (char === '\\') protocol.escaped = true;
+          else if (char === protocol.quote) protocol.quote = '';
+          continue;
+        }
+        if (char === '"' || char === "'") {
+          protocol.quote = char;
+          continue;
+        }
+        if (char === '{') protocol.depth += 1;
+        else if (char === '}') {
+          protocol.depth -= 1;
+          if (protocol.depth === 0) {
+            closedAt = index;
+            break;
+          }
+        }
+      }
+      if (closedAt < 0) continue;
+      if (!line.slice(closedAt + 1).trim()) removed = true;
+      else kept.push(...protocolLines);
+      protocol = null;
+      protocolLines = [];
+      continue;
+    }
+    const trimmed = line.trim();
+    const marker = /^(`{3,}|~{3,})/.exec(trimmed);
+    if (fence) {
+      kept.push(line);
+      if (marker && marker[1][0] === fence.char && marker[1].length >= fence.length) fence = null;
+      continue;
+    }
+    if (marker) {
+      kept.push(line);
+      fence = { char: marker[1][0], length: marker[1].length };
+      continue;
+    }
+    if (nativeUiProtocolLine(trimmed)) {
+      removed = true;
+      continue;
+    }
+    const opener = /^::git-[a-z0-9_-]+\{/i.exec(trimmed);
+    if (opener) {
+      protocol = { depth: 0, quote: '', escaped: false };
+      protocolLines = [line];
+      for (let index = opener[0].length - 1; index < trimmed.length; index += 1) {
+        const char = trimmed[index];
+        if (protocol.quote) {
+          if (protocol.escaped) protocol.escaped = false;
+          else if (char === '\\') protocol.escaped = true;
+          else if (char === protocol.quote) protocol.quote = '';
+          continue;
+        }
+        if (char === '"' || char === "'") {
+          protocol.quote = char;
+          continue;
+        }
+        if (char === '{') protocol.depth += 1;
+        else if (char === '}') protocol.depth -= 1;
+      }
+      if (protocol.depth <= 0) {
+        protocol = null;
+        protocolLines = [];
+      }
+      continue;
+    }
+    if (streaming && nativeUiProtocolLine(trimmed, { allowPartial: true })) {
+      removed = true;
+      continue;
+    }
+    kept.push(line);
+  }
+  if (protocol) {
+    if (streaming) removed = true;
+    else kept.push(...protocolLines);
+  }
+  if (!removed) return source;
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function applyCompactedRecord(cache, record, maxMessages) {
@@ -1832,7 +1966,9 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   const browserCommentMeta = browserComments ? browserCommentsMetadata(text) : null;
   const contexts = payload.role === 'user' ? normalizeInjectedContexts(text) : [];
   if (text && !contexts.length && isInjectedWorkspaceInstructions(payload.role, text)) return;
-  const displayText = payload.role === 'user' ? normalizeUserDisplayText(text) : text;
+  const displayText = payload.role === 'user'
+    ? normalizeUserDisplayText(text)
+    : stripNativeUiProtocolLines(text);
   let messageKind = payload.phase || 'message';
   if (payload.role === 'assistant' && !payload.phase && displayText) {
     // When the runtime omits phase, classify short intermediate chatter as commentary
@@ -2397,7 +2533,10 @@ function appendNativeMessage(cache, role, content, record, maxMessages, kind, me
     : role === 'user' || role === 'assistant'
       ? MESSAGE_TEXT_LIMIT
       : DETAIL_TEXT_LIMIT;
-  const clean = limitText(String(content || '').trim(), limit);
+  const displayContent = ['assistant', 'process'].includes(role)
+    ? stripNativeUiProtocolLines(content)
+    : content;
+  const clean = limitText(String(displayContent || '').trim(), limit);
   if (!clean) return;
   if (tryMergeAssistantMessage(cache, role, clean, record, kind, metadata)) return;
   cache.messages.push({

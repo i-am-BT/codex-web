@@ -77,7 +77,6 @@ const CODEX_APP_CREDIT_LIMIT = (() => {
   const value = Number(process.env.CODEX_APP_CREDIT_LIMIT);
   return Number.isFinite(value) && value > 0 ? value : null;
 })();
-const DEEPSEEK_USAGE_FILE = path.join(RUNTIME_DIR, 'deepseek-usage.json');
 const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com';
 const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
 const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
@@ -252,7 +251,6 @@ const nativeSessions = new NativeSessionStore(CODEX_HOME, {
   pollIntervalMs: NATIVE_SESSION_POLL_MS,
   runningWindowMs: Number(process.env.NATIVE_SESSION_RUNNING_WINDOW_MS || 6 * 60 * 60 * 1000),
   sideChatStateFile: path.join(RUNTIME_DIR, 'side-chat-threads.json'),
-  deepSeekUsageFile: DEEPSEEK_USAGE_FILE,
 });
 const automationStore = new AutomationStore(CODEX_HOME);
 const SUB2API_ADMIN_API_KEY = String(process.env.SUB2API_ADMIN_API_KEY || '').trim();
@@ -280,7 +278,6 @@ const desktopIpcClient = new CodexDesktopIpcClient({
 });
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
-const pendingDeepSeekNativeTurns = new Map();
 const nativeTurnReservations = new Set();
 const promptQueueItemReservations = new Map();
 const serverPromptQueueDispatchTimers = new Map();
@@ -771,14 +768,6 @@ app.get('/api/sub-quotas', requireAuth, async (req, res) => {
       subQuotaService.list({ refresh }),
       readCodexAppCredits({ refresh }),
     ]);
-    if (Array.isArray(data.quotas)) {
-      const deepSeekStats = readDeepSeekUsageStats();
-      for (const quota of data.quotas) {
-        if (quota.provider === 'deepseek') {
-          if (deepSeekStats) quota.usageStats = deepSeekStats;
-        }
-      }
-    }
     res.json({
       ...data,
       codexApp: { ...codexApp, visible: codexAppQuotaVisible },
@@ -804,7 +793,29 @@ app.get('/api/sub-quotas/grok2api/console', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/api/sub-quotas/grok2api/sync', requireAuth, async (_req, res) => {
+  res.setHeader('Cache-Control', 'private, no-store');
+  try {
+    const source = configuredSubQuotaConfigs().find((item) => item.provider === 'grok2api');
+    if (!source) {
+      res.status(400).json({ error: '尚未配置 Grok2API 额度来源' });
+      return;
+    }
+    const sync = await subQuotaService.syncGrok2ApiQuota(source);
+    const quotas = await subQuotaService.list({ refresh: true });
+    res.json({
+      ok: true,
+      sync,
+      quotas,
+    });
+  } catch (err) {
+    const status = Number(err?.statusCode || 0);
+    res.status(status >= 400 && status < 600 ? status : 502).json({ error: `同步 Grok2API 额度失败: ${err.message}` });
+  }
+});
+
 const HISTORY_COMPLETION_READ_FILE = path.join(RUNTIME_DIR, 'history-completion-read.json');
+const CODEX_APP_GLOBAL_STATE_FILE = path.join(CODEX_HOME, '.codex-global-state.json');
 let serverHistoryCompletionRead = readHistoryCompletionReadFile();
 function readHistoryCompletionReadFile() {
   try {
@@ -835,8 +846,48 @@ function writeHistoryCompletionReadFile() {
     writeFileSync(HISTORY_COMPLETION_READ_FILE, JSON.stringify(serverHistoryCompletionRead, null, 2));
   } catch {}
 }
+function readCodexAppUnreadThreadIds() {
+  try {
+    const state = JSON.parse(readFileSync(CODEX_APP_GLOBAL_STATE_FILE, 'utf8'));
+    const unread = state?.['electron-persisted-atom-state']?.['unread-thread-ids-by-host-v1']?.local;
+    if (!Array.isArray(unread)) return null;
+    const ids = [];
+    for (const value of unread) {
+      if (typeof value !== 'string') return null;
+      const id = cleanNativeThreadId(value);
+      if (!id) return null;
+      ids.push(id);
+    }
+    return new Set(ids);
+  } catch {
+    return null;
+  }
+}
+function serverHistoryCompletionVersion(item) {
+  return String(item?.status || '') + '|' + String(item?.updatedAt || item?.recencyAt || item?.createdAt || '');
+}
+function syncServerHistoryCompletionReadFromCodexApp() {
+  const appUnreadThreadIds = readCodexAppUnreadThreadIds();
+  if (!appUnreadThreadIds) return false;
+  let changed = false;
+  for (const item of nativeSessionSummaries()) {
+    const id = cleanNativeThreadId(item?.id);
+    const status = String(item?.status || '').toLowerCase();
+    if (!id || !['done', 'completed'].includes(status) || appUnreadThreadIds.has(id)) continue;
+    const key = `codex:${id}`;
+    const version = serverHistoryCompletionVersion(item);
+    const selected = selectServerHistoryCompletionReadVersion(serverHistoryCompletionRead[key], version);
+    if (selected && serverHistoryCompletionRead[key] !== selected) {
+      serverHistoryCompletionRead[key] = selected;
+      changed = true;
+    }
+  }
+  if (changed) writeHistoryCompletionReadFile();
+  return changed;
+}
 app.get('/api/history-completion-read', requireAuth, (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
+  syncServerHistoryCompletionReadFromCodexApp();
   res.json({ ok: true, read: serverHistoryCompletionRead });
 });
 app.put('/api/history-completion-read', requireAuth, (req, res) => {
@@ -895,9 +946,7 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   const sources = publicSubQuotaConfigs();
   const primary = sources.find((source) => source.configured) || sources[0];
-  const codexApp = publicCodexAppQuotaConfig();
-  const deepSeekUsage = readDeepSeekUsageStats() || {};
-  res.json({
+  const codexApp = publicCodexAppQuotaConfig();  res.json({
     baseUrl: primary?.baseUrl || '',
     provider: configuredSubQuotaConfigs().length > 1 ? 'multi' : currentSubQuotaProvider(),
     providerLabel: configuredSubQuotaConfigs().length > 1
@@ -909,23 +958,7 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
     visibleCount: sources.filter((source) => source.visible).length + (codexApp.visible ? 1 : 0),
     codexApp,
     sources,
-    deepSeekUsage: {
-      totalTokens: Number(deepSeekUsage.totalTokens) || 0,
-      requests: Number(deepSeekUsage.requests) || 0,
-      updatedAt: String(deepSeekUsage.updatedAt || ''),
-    },
   });
-});
-
-app.put('/api/deepseek-usage-calibration', requireAuth, (req, res) => {
-  res.setHeader('Cache-Control', 'private, no-store');
-  try {
-    const usage = calibrateDeepSeekUsage(req.body?.totalTokens, req.body?.requests);
-    res.json({ ok: true, usage });
-  } catch (err) {
-    const status = Number(err?.statusCode) || 500;
-    res.status(status).json({ error: `校准 DeepSeek 本地累计失败: ${err.message}` });
-  }
 });
 
 app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
@@ -1493,6 +1526,17 @@ app.post('/api/native-sessions/:id/steer', requireAuth, async (req, res) => {
     let steer = null;
     const queueItemId = String(req.body?.queueItemId || '').trim();
     if (queueItemId) {
+      const currentQueue = getPromptQueueState(threadId);
+      const queued = currentQueue.items.some((item) => String(item?.id || '').trim() === queueItemId);
+      if (!queued && req.body?.queueItem) {
+        const requestItemId = String(req.body.queueItem?.id || '').trim();
+        if (requestItemId !== queueItemId) {
+          const error = new Error('队列条目 ID 不一致');
+          error.statusCode = 400;
+          throw error;
+        }
+        appendWebPromptQueueItem(threadId, req.body.queueItem, { scheduleDispatch: false });
+      }
       queueReservation = reservePromptQueueItem(threadId, queueItemId, { allowAppOwned: true });
       if (queueReservation.appOwned) {
         queueReservation.appClaim = await claimAppQueuedFollowUp(threadId, queueItemId);
@@ -2274,9 +2318,6 @@ app.post('/api/chat', requireAuth, (req, res) => {
   writeEvent(res, { type: 'process', content: startContent, kind: 'task_started' });
   writeEvent(res, { type: 'tool', content: `执行 codex\n${redactArgs(args).join(' ')}`, kind: 'codex_exec' });
 
-  const deepSeekActive = isDeepSeekCodexProvider(provider);
-  const deepSeekTurnUsage = { input: 0, cached: 0, output: 0, total: 0, requests: 0, seen: 0 };
-
   const child = spawn(CODEX_BIN, args, {
     cwd,
     env: { ...process.env, ...buildCodexProcessEnvironment() },
@@ -2302,7 +2343,6 @@ app.post('/api/chat', requireAuth, (req, res) => {
   child.stdin.end(buildConversationPrompt(convo, model));
 
   const processCodexLine = (line) => {
-    if (deepSeekActive) captureDeepSeekTurnUsage(line, deepSeekTurnUsage);
     parseCodexEvent(line, res, convo, (text) => {
       finalText = text;
       if (text !== lastText) {
@@ -2338,9 +2378,6 @@ app.post('/api/chat', requireAuth, (req, res) => {
   child.on('close', (code) => {
     finished = true;
     if (rawBuffer.trim()) processCodexLine(rawBuffer);
-    if (deepSeekActive && deepSeekTurnUsage.total > 0) {
-      accumulateDeepSeekUsage(model, deepSeekTurnUsage);
-    }
     activeProcess = null;
     activeConversationId = '';
     convo.status = code === 0 ? 'done' : 'error';
@@ -2628,137 +2665,6 @@ function saveAppearance(next) {
     : cleanChatBackground(next.chatBackground, appearance.customBackgrounds);
   writeFileSync(APPEARANCE_FILE, JSON.stringify(appearance, null, 2), { mode: 0o600 });
   return appearance;
-}
-
-function isDeepSeekCodexProvider(providerName) {
-  const name = cleanValue(providerName);
-  if (!name) return false;
-  const detail = readProviderDetails().find((item) => item.name === name);
-  return Boolean(detail && String(detail.baseUrl || '').includes('api.deepseek.com'));
-}
-
-function captureDeepSeekTurnUsage(line, usage) {
-  if (!usage || !line) return;
-  let event;
-  try {
-    event = JSON.parse(line);
-  } catch {
-    return;
-  }
-  const payload = event?.payload || event?.item || event?.msg || event;
-  if (String(payload?.type || event?.type || '') !== 'token_count') return;
-  const info = payload?.info && typeof payload.info === 'object' && !Array.isArray(payload.info) ? payload.info : {};
-  const u = info.total_token_usage || info.last_token_usage;
-  if (!u || typeof u !== 'object' || Array.isArray(u)) return;
-  const total = Number(u.total_tokens);
-  if (!Number.isFinite(total) || total <= 0) return;
-  if (total > usage.seen) {
-    usage.requests += 1;
-    usage.seen = total;
-    usage.input = Math.max(usage.input, Number(u.input_tokens) || 0);
-    usage.cached = Math.max(usage.cached, Number(u.cached_input_tokens) || 0);
-    usage.output = Math.max(usage.output, Number(u.output_tokens) || 0);
-    usage.total = Math.max(usage.total, total);
-  }
-}
-
-function readDeepSeekUsageStats() {
-  const state = readDeepSeekUsageState();
-  if (!state) return null;
-  return {
-    totalTokens: state.totalTokens,
-    inputTokens: state.inputTokens,
-    outputTokens: state.outputTokens,
-    cachedInputTokens: state.cachedInputTokens,
-    requests: state.requests,
-    updatedAt: state.updatedAt,
-  };
-}
-
-function readDeepSeekUsageState() {
-  try {
-    if (!existsSync(DEEPSEEK_USAGE_FILE)) return null;
-    const data = JSON.parse(readFileSync(DEEPSEEK_USAGE_FILE, 'utf8'));
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
-    return {
-      totalTokens: Number(data.totalTokens) || 0,
-      inputTokens: Number(data.inputTokens) || 0,
-      outputTokens: Number(data.outputTokens) || 0,
-      cachedInputTokens: Number(data.cachedInputTokens) || 0,
-      requests: Number(data.requests) || 0,
-      updatedAt: String(data.updatedAt || ''),
-      calibratedAt: String(data.calibratedAt || ''),
-      countedTurns: Array.isArray(data.countedTurns)
-        ? [...new Set(data.countedTurns.map((item) => String(item || '').trim()).filter(Boolean))]
-        : [],
-    };
-  } catch {
-    return null;
-  }
-}
-
-function accumulateDeepSeekUsage(model, usage, turnKey = '') {
-  if (!usage || !(Number(usage.total) > 0)) return false;
-  try {
-    const current = readDeepSeekUsageState() || {};
-    const key = String(turnKey || '').trim().slice(0, 160);
-    const countedTurns = Array.isArray(current.countedTurns) ? current.countedTurns : [];
-    if (key && countedTurns.includes(key)) return true;
-    const next = {
-      totalTokens: (Number(current.totalTokens) || 0) + usage.total,
-      inputTokens: (Number(current.inputTokens) || 0) + usage.input,
-      outputTokens: (Number(current.outputTokens) || 0) + usage.output,
-      cachedInputTokens: (Number(current.cachedInputTokens) || 0) + usage.cached,
-      requests: (Number(current.requests) || 0) + (Number(usage.requests) || 1),
-      updatedAt: new Date().toISOString(),
-      ...(current.calibratedAt ? { calibratedAt: current.calibratedAt } : {}),
-      countedTurns: key ? [...countedTurns, key] : countedTurns,
-    };
-    atomicWriteFile(DEEPSEEK_USAGE_FILE, JSON.stringify(next, null, 2) + '\n');
-    return true;
-  } catch {
-    // 用量统计失败不应阻塞聊天流程
-    return false;
-  }
-}
-
-function deepSeekCalibrationInteger(value, label) {
-  const compact = String(value ?? '').trim().replace(/[,，\s]/g, '');
-  if (!/^\d+$/.test(compact)) {
-    const error = new Error(`${label}必须是非负整数`);
-    error.statusCode = 400;
-    throw error;
-  }
-  const number = Number(compact);
-  if (!Number.isSafeInteger(number)) {
-    const error = new Error(`${label}超出安全整数范围`);
-    error.statusCode = 400;
-    throw error;
-  }
-  return number;
-}
-
-function calibrateDeepSeekUsage(totalTokensValue, requestsValue) {
-  const totalTokens = deepSeekCalibrationInteger(totalTokensValue, '累计 Token');
-  const requests = deepSeekCalibrationInteger(requestsValue, '累计请求');
-  const current = readDeepSeekUsageState() || {};
-  const calibratedAt = new Date().toISOString();
-  const next = {
-    totalTokens,
-    inputTokens: Number(current.inputTokens) || 0,
-    outputTokens: Number(current.outputTokens) || 0,
-    cachedInputTokens: Number(current.cachedInputTokens) || 0,
-    requests,
-    updatedAt: calibratedAt,
-    calibratedAt,
-    countedTurns: Array.isArray(current.countedTurns) ? current.countedTurns : [],
-  };
-  atomicWriteFile(DEEPSEEK_USAGE_FILE, JSON.stringify(next, null, 2) + '\n');
-  return {
-    totalTokens: next.totalTokens,
-    requests: next.requests,
-    updatedAt: next.updatedAt,
-  };
 }
 
 function saveUploadedBackground(body) {
@@ -3248,36 +3154,11 @@ function broadcastNativeSessionChange(change) {
   for (const client of sessionEventClients) writeNamedEvent(client, 'sessions', change);
 }
 
-function captureDeepSeekNativeTurnUsage(change) {
-  for (const threadId of change?.changedIds || []) {
-    const conversation = nativeSessions.get(threadId);
-    for (const [turnKey, pending] of pendingDeepSeekNativeTurns) {
-      if (pending.threadId !== threadId) continue;
-      const completion = [...(conversation?.messages || [])].reverse().find((message) => (
-        message.kind === 'task_complete'
-        && String(message.turnId || '') === pending.turnId
-        && Number(message.tokenUsage?.totalTokens) > 0
-      ));
-      if (!completion) continue;
-      const tokenUsage = completion.tokenUsage;
-      const recorded = accumulateDeepSeekUsage(pending.model, {
-        input: Number(tokenUsage.inputTokens) || 0,
-        cached: Number(tokenUsage.cachedInputTokens) || 0,
-        output: Number(tokenUsage.outputTokens) || 0,
-        total: Number(tokenUsage.totalTokens) || 0,
-        requests: 1,
-      }, turnKey);
-      if (recorded) pendingDeepSeekNativeTurns.delete(turnKey);
-    }
-  }
-}
-
 function handleNativeSessionChange(change) {
   clearPersistedTerminalNativeTurns(change);
   scheduleTerminalPromptQueueDispatches(change);
   // Session snapshots can briefly report idle before the matching turn completion
   // notification arrives. They must not release the turn lock used by queue dispatch.
-  captureDeepSeekNativeTurnUsage(change);
   broadcastNativeSessionChange(change);
 }
 
@@ -4327,18 +4208,6 @@ function setNativeTurnState(threadId, state) {
   if (Object.hasOwn(state, 'serviceTier')) next.serviceTier = cleanServiceTier(state.serviceTier);
   else if (Object.hasOwn(current || {}, 'serviceTier')) next.serviceTier = current.serviceTier;
   activeNativeTurns.set(cleanId, next);
-  const deepSeekTurnKey = `${cleanId}:${next.turnId}`;
-  if (next.status === 'running' && next.turnId) {
-    if (isDeepSeekCodexProvider(next.provider)) {
-      pendingDeepSeekNativeTurns.set(deepSeekTurnKey, {
-        threadId: cleanId,
-        turnId: next.turnId,
-        model: next.model,
-      });
-    }
-  } else if (next.status === 'error' || next.status === 'interrupted') {
-    pendingDeepSeekNativeTurns.delete(deepSeekTurnKey);
-  }
   if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
   broadcastNativeRuntime({ type: 'turn', threadId: cleanId, ...next });
   nativeSessions.scheduleRefresh();
@@ -6379,9 +6248,11 @@ async function readNativeModelCapabilities() {
         description: String(tier?.description || '').trim(),
       }))
       .filter((tier) => tier.id);
+    const displayName = String(model?.displayName || model?.display_name || '').trim();
     return {
       id: id || modelId,
       model: modelId || id,
+      displayName: displayName || id || modelId,
       serviceTiers,
       defaultServiceTier: String(model?.defaultServiceTier || '').trim().toLowerCase() === 'priority' ? 'priority' : null,
     };
@@ -8401,7 +8272,7 @@ function markServerPromptQueueItemUncertain(threadId, item, error) {
   return { items, updatedAt, revision };
 }
 
-function appendWebPromptQueueItem(threadId, item) {
+function appendWebPromptQueueItem(threadId, item, { scheduleDispatch = true } = {}) {
   const id = cleanNativeThreadId(threadId);
   if (!id) throw new Error('会话 ID 无效');
   const rawId = String(item?.id || '').trim();
@@ -8421,7 +8292,7 @@ function appendWebPromptQueueItem(threadId, item) {
   // their order. Unlike PUT, this can safely run while the first item is reserved.
   const current = getPromptQueueState(id);
   if (current.items.some((entry) => String(entry?.id || '').trim() === rawId)) {
-    scheduleServerPromptQueueDispatch(id);
+    if (scheduleDispatch) scheduleServerPromptQueueDispatch(id);
     return current;
   }
   if (current.items.length >= 50) {
@@ -8437,7 +8308,7 @@ function appendWebPromptQueueItem(threadId, item) {
   // A duplicate that was already dismissed must remain dismissed even if a
   // delayed mobile beacon arrives after the user removed it elsewhere.
   if (!cleanItems.some((entry) => String(entry?.id || '').trim() === rawId)) {
-    scheduleServerPromptQueueDispatch(id);
+    if (scheduleDispatch) scheduleServerPromptQueueDispatch(id);
     return current;
   }
   const updatedAt = new Date().toISOString();
@@ -8445,7 +8316,7 @@ function appendWebPromptQueueItem(threadId, item) {
   queues[id] = { updatedAt, revision, items: cleanItems };
   savePromptQueuesWithDismissed(queues, dismissed);
   broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision, source: 'background-append' });
-  scheduleServerPromptQueueDispatch(id);
+  if (scheduleDispatch) scheduleServerPromptQueueDispatch(id);
   return { items: cleanItems, updatedAt, revision };
 }
 
@@ -8783,7 +8654,7 @@ function pageHtml(authenticated) {
 body[data-theme="light"]{color-scheme:light;--bg:#f6f8fb;--panel:#ffffff;--panel2:#eef3f8;--line:#d6deea;--text:#172033;--muted:#627084;--blue:#2563eb;--green:#16a34a;--red:#dc2626;--user:#2563eb}
 *{box-sizing:border-box}body{margin:0;height:100vh;background:radial-gradient(circle at top left,#172033,#080b10 46%);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.hidden{display:none!important}
 button,input,textarea,select{font:inherit}button{border:0;cursor:pointer}.login{height:100vh;display:grid;place-items:center;padding:24px}.card{width:min(420px,100%);background:rgba(15,20,29,.88);border:1px solid var(--line);border-radius:22px;padding:28px;box-shadow:0 24px 90px rgba(0,0,0,.42);backdrop-filter:blur(18px)}.brand{font-size:28px;font-weight:780;letter-spacing:-.04em}.sub{margin:8px 0 24px;color:var(--muted)}.field{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}.field label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}.field input,.field textarea,.field select{width:100%;background:#090d14;color:var(--text);border:1px solid var(--line);border-radius:12px;padding:12px 13px;outline:none}.field input:focus,.field textarea:focus,.field select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(106,168,255,.12)}.primary{width:100%;padding:12px 16px;border-radius:12px;background:linear-gradient(135deg,#2f81f7,#7c5cff);color:white;font-weight:700}.errorText{color:var(--red);font-size:13px;min-height:18px;margin-top:12px}
-.app{height:100vh;display:grid;grid-template-columns:292px 1fr}.side{background:rgba(8,12,18,.82);border-right:1px solid var(--line);padding:18px;display:flex;flex-direction:column;gap:16px;overflow:auto}.brandRow{display:flex;align-items:center;justify-content:space-between;gap:10px}.logo{font-weight:800;font-size:22px;letter-spacing:-.04em}.pill{display:inline-flex;align-items:center;gap:6px;background:#122017;color:#94f0b1;border:1px solid #214c2c;border-radius:999px;padding:4px 9px;font-size:12px}.sideActions{display:grid;gap:10px;align-items:center}.themeToggle{display:grid;place-items:center;flex:0 0 auto;width:34px;height:34px;border-radius:11px;background:#172033;color:var(--text);border:1px solid var(--line);font-size:17px;font-weight:800}.themeToggle:hover{border-color:var(--blue);background:#1b2533}.settings{display:grid;gap:11px}.settings .field{margin:0}.smallrow{display:grid;grid-template-columns:1fr 1fr;gap:9px}.backgroundControls{display:grid;gap:8px;align-items:end}.backgroundRow{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}.backgroundControls .field{margin:0}.providerBox{background:rgba(18,25,38,.74);border:1px solid var(--line);border-radius:14px;padding:10px}.providerBox summary{cursor:pointer;color:var(--text);font-weight:700;font-size:13px}.providerBox form{margin-top:12px}.miniPrimary{width:100%;padding:10px;border-radius:11px;background:var(--blue);color:#06101f;font-weight:800}.miniSecondary{align-self:end;width:100%;padding:10px;border-radius:11px;background:#1b2533;color:var(--text);border:1px solid var(--line);font-weight:700}.miniDanger{width:100%;padding:10px;border-radius:11px;background:#221114;color:#ff9da5;border:1px solid #613039;font-weight:800}.miniDanger:hover{background:#3a161c}.backgroundDelete{width:auto;min-width:56px;align-self:end}.history{flex:1.35;overflow:auto;display:flex;flex-direction:column;gap:15px;min-height:220px}.historyProject{display:grid;gap:7px;min-width:0}.historyProjectHead{display:grid;gap:2px;min-width:0;padding:0 2px}.historyProjectTitle{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.historyProjectName{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-size:12px;font-weight:800;letter-spacing:0}.historyProjectCount{flex:0 0 auto;color:var(--muted);font-size:10px;font-variant-numeric:tabular-nums}.historyProjectPath{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font:10px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}.historyProjectItems{display:grid;gap:7px}.hist{display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--muted);font-size:13px;min-height:48px;cursor:pointer}.hist.native{grid-template-columns:minmax(0,1fr) auto auto auto}.hist:hover{border-color:var(--blue);color:var(--text);background:#151d2b}.hist.active{border-color:var(--blue);color:var(--text);background:rgba(106,168,255,.14);box-shadow:inset 3px 0 0 var(--blue)}.histOpen{background:transparent;color:inherit;border:0;text-align:left;padding:0;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.35;cursor:pointer}.histSource{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:24px;border:1px solid #31527a;border-radius:6px;background:#0b1a2a;color:#8fc3ff;font-size:10px;font-weight:800}.histRename{background:#172033;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px 7px;font-size:12px}.histRename:hover{border-color:var(--blue);background:#1b2533}.histDelete{background:#221114;color:#ff9da5;border:1px solid #613039;border-radius:6px;padding:5px 7px;font-size:12px}.histDelete:hover{background:#3a161c}.logout{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:11px;padding:10px}
+.app{height:100vh;display:grid;grid-template-columns:292px 1fr}.side{background:rgba(8,12,18,.82);border-right:1px solid var(--line);padding:18px;display:flex;flex-direction:column;gap:16px;overflow:auto}.brandRow{display:flex;align-items:center;justify-content:space-between;gap:10px}.brandControls{position:relative;display:inline-flex;align-items:center;gap:6px;flex:0 0 auto}.historyUnreadToggle{display:grid;place-items:center;position:relative;flex:0 0 auto;width:34px;height:34px;border-radius:11px;background:#172033;color:var(--text);border:1px solid var(--line);padding:0}.historyUnreadToggle .lucide{width:16px;height:16px}.historyUnreadBadge{position:absolute;top:-4px;right:-4px;min-width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;background:#ef4444;color:#fff;font-size:9px;font-weight:800;padding:0 4px}.historyUnreadBadge[hidden]{display:none!important}.historyUnreadPopover{position:absolute;z-index:95;top:calc(100% + 4px);right:0;display:grid;width:min(248px,calc(100vw - 28px));max-height:min(320px,56vh);gap:2px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel,#121821);color:var(--text);padding:5px;box-shadow:0 16px 42px rgba(0,0,0,.2)}.historyUnreadPopover[hidden]{display:none!important}.historyUnreadHead{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:24px;padding:4px 8px 2px;color:var(--muted);font-size:10px;font-weight:700}.historyUnreadList{display:grid;gap:2px}.historyUnreadEmpty{padding:12px 10px;color:var(--muted);font-size:12px;text-align:center}.historyUnreadItem{display:grid;width:100%;min-height:40px;grid-template-columns:minmax(0,1fr) 16px;align-items:center;gap:8px;border:0;border-radius:8px;background:transparent;color:var(--text);padding:8px 9px;text-align:left;cursor:pointer}.historyUnreadItem:hover{background:rgba(255,255,255,.04)}.historyUnreadItemCopy{display:grid;min-width:0;gap:2px}.historyUnreadItemCopy strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}.historyUnreadItemCopy span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}.logo{font-weight:800;font-size:22px;letter-spacing:-.04em}.pill{display:inline-flex;align-items:center;gap:6px;background:#122017;color:#94f0b1;border:1px solid #214c2c;border-radius:999px;padding:4px 9px;font-size:12px}.sideActions{display:grid;gap:10px;align-items:center}.themeToggle{display:grid;place-items:center;flex:0 0 auto;width:34px;height:34px;border-radius:11px;background:#172033;color:var(--text);border:1px solid var(--line);font-size:17px;font-weight:800}.themeToggle:hover{border-color:var(--blue);background:#1b2533}.settings{display:grid;gap:11px}.settings .field{margin:0}.smallrow{display:grid;grid-template-columns:1fr 1fr;gap:9px}.backgroundControls{display:grid;gap:8px;align-items:end}.backgroundRow{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}.backgroundControls .field{margin:0}.providerBox{background:rgba(18,25,38,.74);border:1px solid var(--line);border-radius:14px;padding:10px}.providerBox summary{cursor:pointer;color:var(--text);font-weight:700;font-size:13px}.providerBox form{margin-top:12px}.miniPrimary{width:100%;padding:10px;border-radius:11px;background:var(--blue);color:#06101f;font-weight:800}.miniSecondary{align-self:end;width:100%;padding:10px;border-radius:11px;background:#1b2533;color:var(--text);border:1px solid var(--line);font-weight:700}.miniDanger{width:100%;padding:10px;border-radius:11px;background:#221114;color:#ff9da5;border:1px solid #613039;font-weight:800}.miniDanger:hover{background:#3a161c}.backgroundDelete{width:auto;min-width:56px;align-self:end}.history{flex:1.35;overflow:auto;display:flex;flex-direction:column;gap:15px;min-height:220px}.historyProject{display:grid;gap:7px;min-width:0}.historyProjectHead{display:grid;gap:2px;min-width:0;padding:0 2px}.historyProjectTitle{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.historyProjectName{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-size:12px;font-weight:800;letter-spacing:0}.historyProjectCount{flex:0 0 auto;color:var(--muted);font-size:10px;font-variant-numeric:tabular-nums}.historyProjectPath{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font:10px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}.historyProjectItems{display:grid;gap:7px}.hist{display:grid;grid-template-columns:1fr auto auto;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--muted);font-size:13px;min-height:48px;cursor:pointer}.hist.native{grid-template-columns:minmax(0,1fr) auto auto auto}.hist:hover{border-color:var(--blue);color:var(--text);background:#151d2b}.hist.active{border-color:var(--blue);color:var(--text);background:rgba(106,168,255,.14);box-shadow:inset 3px 0 0 var(--blue)}.histOpen{background:transparent;color:inherit;border:0;text-align:left;padding:0;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.35;cursor:pointer}.histSource{display:inline-flex;align-items:center;justify-content:center;min-width:30px;height:24px;border:1px solid #31527a;border-radius:6px;background:#0b1a2a;color:#8fc3ff;font-size:10px;font-weight:800}.histRename{background:#172033;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px 7px;font-size:12px}.histRename:hover{border-color:var(--blue);background:#1b2533}.histDelete{background:#221114;color:#ff9da5;border:1px solid #613039;border-radius:6px;padding:5px 7px;font-size:12px}.histDelete:hover{background:#3a161c}.logout{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:11px;padding:10px}
 .main{display:flex;flex-direction:column;min-width:0}.top{height:62px;border-bottom:1px solid var(--line);background:rgba(15,20,29,.75);display:flex;align-items:center;justify-content:space-between;padding:0 22px}.title{font-weight:720}.meta{color:var(--muted);font-size:13px}.chat{flex:1;overflow:auto;padding:26px;display:flex;flex-direction:column;gap:18px}.empty{margin:auto;text-align:center;color:var(--muted)}.empty b{display:block;color:var(--text);font-size:30px;letter-spacing:-.05em;margin-bottom:8px}.msg{max-width:min(880px,88%);border-radius:18px;padding:14px 16px;line-height:1.65;word-break:break-word}.msg.user{align-self:flex-end;background:linear-gradient(135deg,var(--user),#7147e8);color:white}.msg.assistant{align-self:flex-start;background:rgba(18,25,38,.86);border:1px solid var(--line)}.msg.log{align-self:flex-start;background:#0b1119;border:1px dashed var(--line);color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.msgActions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:8px -4px -4px 0}.msgActions .tag{margin:0;margin-right:auto}.copyMsg,.rollbackMsg{display:grid;place-items:center;flex:0 0 auto;width:26px;height:24px;border:1px solid rgba(139,152,168,.28);border-radius:8px;background:rgba(8,12,18,.38);color:var(--muted);padding:0;font-size:13px;line-height:1}.copyMsg:hover,.rollbackMsg:hover{border-color:var(--blue);color:var(--text);background:rgba(106,168,255,.12)}.msg.user .copyMsg,.msg.user .rollbackMsg{border-color:rgba(255,255,255,.22);background:rgba(255,255,255,.1);color:rgba(255,255,255,.76)}.msg.user .copyMsg:hover,.msg.user .rollbackMsg:hover{color:#fff;background:rgba(255,255,255,.18)}.msgBody{white-space:pre-wrap}.markdownBody{min-width:0;white-space:normal}.markdownBody>:first-child{margin-top:0}.markdownBody>:last-child{margin-bottom:0}.markdownBody p{margin:0 0 10px}.markdownBody h1,.markdownBody h2,.markdownBody h3,.markdownBody h4,.markdownBody h5,.markdownBody h6{margin:16px 0 8px;line-height:1.3;letter-spacing:0}.markdownBody h1{font-size:18px}.markdownBody h2{font-size:16px}.markdownBody h3{font-size:14px}.markdownBody h4,.markdownBody h5,.markdownBody h6{font-size:13px}.markdownBody ul,.markdownBody ol{margin:6px 0 10px;padding-left:22px}.markdownBody li+li{margin-top:3px}.markdownBody li>p{margin-bottom:4px}.markdownBody blockquote{margin:10px 0;padding:2px 0 2px 12px;border-left:3px solid var(--blue);color:var(--muted)}.markdownBody a{color:var(--blue);text-decoration-thickness:1px;text-underline-offset:2px}.markdownBody code{border:1px solid var(--line);border-radius:5px;background:var(--panel2);padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;word-break:break-word}.markdownBody pre{max-width:100%;margin:10px 0;overflow:auto;border:1px solid var(--line);border-radius:7px;background:#080d14;padding:11px 12px;color:#d9e6f2}.markdownBody pre code{border:0;background:transparent;padding:0;color:inherit;word-break:normal}.markdownBody table{display:block;max-width:100%;margin:10px 0;overflow-x:auto;border-collapse:collapse}.markdownBody th,.markdownBody td{min-width:90px;border:1px solid var(--line);padding:6px 9px;text-align:left}.markdownBody th{background:var(--panel2);font-weight:800}.markdownBody hr{height:1px;margin:14px 0;border:0;background:var(--line)}.composer{border-top:1px solid var(--line);background:rgba(15,20,29,.9);padding:16px 22px}.nativeNotice{margin-bottom:10px;border:1px solid #31527a;border-radius:10px;background:#0b1a2a;color:#9bc9ff;padding:9px 11px;font-size:12px;font-weight:700}.box{display:flex;gap:12px;align-items:flex-end}.box textarea{flex:1;min-height:52px;max-height:180px;resize:none;background:#090d14;border:1px solid var(--line);color:var(--text);border-radius:16px;padding:14px;outline:none}.box textarea:disabled{cursor:not-allowed;color:var(--muted);background:#0b1119}.box.drag textarea{border-color:var(--blue);box-shadow:0 0 0 3px rgba(106,168,255,.14)}.attachBtn{width:52px;height:52px;border-radius:16px;background:#172033;color:var(--text);border:1px solid var(--line);font-size:24px;line-height:1}.attachBtn:hover{border-color:var(--blue);background:#1b2533}.attachBtn:disabled{opacity:.45;cursor:not-allowed}.attachmentTray{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.attachmentChip{display:flex;align-items:center;gap:8px;max-width:280px;background:#0b1119;border:1px solid var(--line);border-radius:12px;padding:6px 8px;color:var(--muted);font-size:12px}.attachmentChip img,.attachmentIcon{width:42px;height:42px;flex:0 0 42px;border-radius:8px}.attachmentChip img{object-fit:cover}.attachmentIcon{display:grid;place-items:center;background:#172033;border:1px solid var(--line);color:var(--blue);font-weight:800;font-size:11px;text-transform:uppercase}.attachmentText{min-width:0;display:flex;flex-direction:column;gap:2px}.attachmentText span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.attachmentMeta{color:#627084;font-size:11px}.attachmentChip button{display:grid;place-items:center;width:22px;height:22px;border-radius:7px;background:#221114;color:#ff9da5;border:1px solid #613039}.composerControls{display:flex;align-items:end;flex-wrap:wrap;gap:8px;margin-top:10px}.composerControls .field{width:96px;margin:0;gap:5px}.composerControls .field label{font-size:10px}.composerControls .field select{padding:6px 7px;border-radius:9px;font-size:12px}.send{width:92px;height:52px;border-radius:16px;background:var(--green);color:#07100a;font-weight:800}.send:disabled{opacity:.55;cursor:not-allowed}.hint{margin-top:8px;color:var(--muted);font-size:12px}.safety{flex:1 1 360px;min-width:260px;border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;line-height:1.35;background:#0b1119;color:var(--muted)}.safety.safe{border-color:#254a33;color:#9ee8b5}.safety.warn{border-color:#6f5522;color:#ffd98a}.safety.danger{border-color:#743232;color:#ffabab;background:#190d0d}.spinner{display:inline-block;width:10px;height:10px;border:2px solid #405064;border-top-color:var(--blue);border-radius:50%;animation:spin .9s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:820px){.app{grid-template-columns:1fr}.side{display:none}.chat{padding:16px}.msg{max-width:100%}.composerControls .field{width:calc(50% - 4px)}.safety{flex-basis:100%;min-width:0}}
 .menuBtn{display:none}.scrim{display:none}@media(max-width:820px){html,body{height:100%;overflow:hidden}.app{display:block;height:100dvh;overflow:hidden}.main{height:100dvh;display:flex;flex-direction:column;overflow:hidden}.menuBtn{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border-radius:13px;background:#101722;border:1px solid var(--line);color:var(--text);font-size:24px;line-height:1}.side{display:flex;position:fixed;z-index:30;left:0;top:0;bottom:0;width:min(86vw,330px);transform:translateX(-105%);transition:transform .22s ease;background:rgba(8,12,18,.96);box-shadow:26px 0 80px rgba(0,0,0,.45)}.app.menuOpen .side{transform:translateX(0)}.scrim{display:block;position:fixed;z-index:20;inset:0;background:rgba(0,0,0,.48);opacity:0;pointer-events:none;transition:opacity .2s}.app.menuOpen .scrim{opacity:1;pointer-events:auto}.top{flex:0 0 auto;min-height:58px;height:auto;padding:calc(env(safe-area-inset-top,0px) + 8px) 14px 8px;gap:12px;justify-content:flex-start}.top .meta:last-child{margin-left:auto}.chat{flex:1 1 auto;min-height:0;overflow:auto;padding:14px}.composer{flex:0 0 auto;padding:12px 12px calc(env(safe-area-inset-bottom,0px) + 12px)}.box{gap:8px}.send{width:72px}.msg{max-width:100%}}
 .msg.image{padding:6px;background:rgba(18,25,38,.86);border:1px solid var(--line);width:fit-content;max-width:min(148px,46%)}.msg.image img{display:block;width:120px;max-width:120px;height:150px;object-fit:cover;object-position:center top;border-radius:12px;cursor:zoom-in}
@@ -8792,16 +8663,52 @@ button,input,textarea,select{font:inherit}button{border:0;cursor:pointer}.login{
 .msg.tool,.msg.thinking{flex:0 0 auto;min-width:0;padding:0;overflow:hidden}.toolDetails{min-width:0}.toolDetails summary{display:list-item;min-height:34px;padding:8px 10px;cursor:pointer;outline:none}.toolDetails summary::marker{color:currentColor}.toolDetails summary:hover,.toolDetails[open] summary{background:rgba(106,168,255,.08)}.toolDetails summary:focus-visible{box-shadow:inset 0 0 0 2px var(--blue)}.toolSummaryRow{display:inline-flex;align-items:center;gap:8px;width:calc(100% - 18px);min-width:0;vertical-align:middle}.toolSummaryTag{display:inline-flex!important;flex:0 0 auto;margin:0!important}.toolSummaryText{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:inherit;font-weight:700}.toolContent{padding:8px 10px 10px;border-top:1px dashed var(--line)}.toolContent .msgBody{max-height:min(52vh,520px);overflow:auto;overscroll-behavior:contain;padding-right:4px}.toolContent .msgActions{margin-bottom:-2px}.msg.thinking.streaming{border-style:solid;box-shadow:0 0 0 1px rgba(184,168,255,.16)}.msg.thinking.streaming .toolSummaryText::after{content:' · 输出中';color:var(--muted);font-weight:500}
 .settingsToggle{width:100%;padding:10px;border-radius:11px;background:#172033;color:var(--text);border:1px solid var(--line);font-weight:800}.settingsToggle:hover{border-color:var(--blue)}.settingsPanel{display:none;gap:12px}.settingsPanel.open{display:grid}
 .requestOverlay{position:fixed;z-index:100;inset:0;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.62)}.requestPanel{width:min(680px,100%);max-height:min(82vh,760px);overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel);box-shadow:0 26px 90px rgba(0,0,0,.5);padding:20px}.requestHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.requestTitle{font-size:17px;font-weight:800}.requestMeta{margin-top:4px;color:var(--muted);font-size:12px}.requestDetail{max-height:260px;overflow:auto;margin:0 0 14px;padding:12px;border:1px solid var(--line);border-radius:7px;background:#080d14;color:#cbd6e2;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.requestFields{display:grid;gap:12px}.requestField{display:grid;gap:6px}.requestField label{font-size:12px;color:var(--muted)}.requestField input,.requestField select,.requestField textarea{width:100%;border:1px solid var(--line);border-radius:7px;background:#090d14;color:var(--text);padding:10px}.requestActions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;margin-top:16px}.requestAction{padding:9px 12px;border:1px solid var(--line);border-radius:7px;background:#172033;color:var(--text);font-weight:700}.requestAction.primary{background:var(--green);color:#07100a;border-color:transparent}.requestAction.danger{background:#3a161c;color:#ffb1b7;border-color:#74353e}.requestAction:disabled{opacity:.5;cursor:not-allowed}.requestLink{color:var(--blue);word-break:break-all}
-body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body[data-theme="light"] .card{background:rgba(255,255,255,.9);box-shadow:0 24px 70px rgba(31,41,55,.16)}body[data-theme="light"] .side{background:rgba(247,250,252,.92)}body[data-theme="light"] .top,body[data-theme="light"] .composer{background:rgba(255,255,255,.9)}body[data-theme="light"] .field input,body[data-theme="light"] .field textarea,body[data-theme="light"] .field select,body[data-theme="light"] .box textarea{background:#fff}body[data-theme="light"] .providerBox,body[data-theme="light"] .hist,body[data-theme="light"] .msg.assistant,body[data-theme="light"] .msg.image{background:rgba(255,255,255,.86)}body[data-theme="light"] .hist:hover{background:#eef4ff}body[data-theme="light"] .hist.active{background:rgba(37,99,235,.1)}body[data-theme="light"] .miniSecondary,body[data-theme="light"] .settingsToggle,body[data-theme="light"] .themeToggle,body[data-theme="light"] .histRename,body[data-theme="light"] .attachBtn,body[data-theme="light"] .menuBtn{background:#eef3f8}body[data-theme="light"] .msg.log,body[data-theme="light"] .attachmentChip,body[data-theme="light"] .safety{background:#f8fafc}body[data-theme="light"] .msg.log{color:#526273}body[data-theme="light"] .msg.process{background:#edfdf2;color:#216a3b;border-color:#8fc6a0}body[data-theme="light"] .msg.tool{background:#eef7ff;color:#175f87;border-color:#8ab9d4}body[data-theme="light"] .msg.thinking{background:#f5f1ff;color:#5d429b;border-color:#b2a3dc}body[data-theme="light"] .nativeNotice{background:#eef7ff;color:#175f87;border-color:#8ab9d4}
+body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body[data-theme="light"] .card{background:rgba(255,255,255,.9);box-shadow:0 24px 70px rgba(31,41,55,.16)}body[data-theme="light"] .side{background:rgba(247,250,252,.92)}body[data-theme="light"] .top,body[data-theme="light"] .composer{background:rgba(255,255,255,.9)}body[data-theme="light"] .field input,body[data-theme="light"] .field textarea,body[data-theme="light"] .field select,body[data-theme="light"] .box textarea{background:#fff}body[data-theme="light"] .providerBox,body[data-theme="light"] .hist,body[data-theme="light"] .msg.assistant,body[data-theme="light"] .msg.image{background:rgba(255,255,255,.86)}body[data-theme="light"] .hist:hover{background:#eef4ff}body[data-theme="light"] .hist.active{background:rgba(37,99,235,.1)}body[data-theme="light"] .miniSecondary,body[data-theme="light"] .settingsToggle,body[data-theme="light"] .themeToggle,body[data-theme="light"] .historyUnreadToggle,body[data-theme="light"] .histRename,body[data-theme="light"] .attachBtn,body[data-theme="light"] .menuBtn{background:#eef3f8}body[data-theme="light"] .msg.log,body[data-theme="light"] .attachmentChip,body[data-theme="light"] .safety{background:#f8fafc}body[data-theme="light"] .msg.log{color:#526273}body[data-theme="light"] .msg.process{background:#edfdf2;color:#216a3b;border-color:#8fc6a0}body[data-theme="light"] .msg.tool{background:#eef7ff;color:#175f87;border-color:#8ab9d4}body[data-theme="light"] .msg.thinking{background:#f5f1ff;color:#5d429b;border-color:#b2a3dc}body[data-theme="light"] .nativeNotice{background:#eef7ff;color:#175f87;border-color:#8ab9d4}
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=quota-header-align-20260808b">
+<link rel="stylesheet" href="/ui.css?v=subquota-popover-height-20260814d">
   <link rel="stylesheet" href="/image-prompt.css?v=top-context-padding-20260801b">
-</head>
+<script>
+(()=>{try{
+  const raw=localStorage.getItem('codexWeb.activeConversation.v1');
+  if(!raw)return;
+  const saved=JSON.parse(raw);
+  const id=String(saved?.id||'').trim();
+  if(!id)return;
+  const title=String(saved?.title||'').trim();
+  const source=saved?.source==='web'?'web':'codex';
+  document.documentElement.dataset.bootRestore='1';
+  const apply=()=>{
+    const titleEl=document.querySelector('.title');
+    const statusEl=document.getElementById('status');
+    const modeEl=document.getElementById('modeLabel');
+    const chat=document.getElementById('chat');
+    const empty=chat&&chat.querySelector('.empty');
+    if(titleEl&&title){titleEl.textContent=title;titleEl.dataset.restored='1';}
+    if(statusEl&&(!statusEl.textContent||statusEl.textContent==='Ready'))statusEl.textContent='同步中';
+    if(modeEl&&source==='codex'&&(!modeEl.textContent||modeEl.textContent==='Codex App'||modeEl.textContent==='Web')){
+      // leave label text; class handled later
+    }
+    if(chat)chat.classList.add('conversationRestoring');
+    if(empty){
+      empty.classList.add('conversationRestoring');
+      const heading=empty.querySelector('b');
+      const detail=empty.querySelector('span');
+      if(heading)heading.textContent=title||'正在恢复会话';
+      if(detail)detail.textContent='正在同步会话内容…';
+    }
+  };
+  if(document.readyState==='loading'){
+    const mo=new MutationObserver(()=>{if(document.querySelector('.title')||document.getElementById('chat')){apply();mo.disconnect();}});
+    mo.observe(document.documentElement,{childList:true,subtree:true});
+    document.addEventListener('DOMContentLoaded',()=>{apply();mo.disconnect();},{once:true});
+  }else apply();
+}catch{}})();
+</script></head>
 <body data-theme="${initialTheme}" data-theme-mode="${initialThemeMode}" data-fx="${initialFxEnabled ? 'on' : 'off'}"><a class="skipLink" href="#chat">跳到对话</a>
 <section id="login" class="login ${authenticated ? 'hidden' : ''}"><div class="loginBg" aria-hidden="true"><div class="loginBlob loginBlobOne"></div><div class="loginBlob loginBlobTwo"></div><div class="loginBlob loginBlobThree"></div></div><div class="card"><div class="loginBrand"><div class="loginLogo"><i data-lucide="sparkles" aria-hidden="true"></i></div><div class="brand">${appName}</div></div><div class="sub">输入访问密码后使用本机 Codex App。</div><form id="loginForm"><div class="field"><label>密码</label><input id="password" type="password" autocomplete="current-password" autofocus></div><button class="primary">登录</button><div id="loginError" class="errorText"></div></form><div class="loginFooter">Codex App · 本地会话保护</div></div></section>
-<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button><button id="automationToggle" class="automationToggle" type="button">自动化安排</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><label class="settingsToggleRow"><span>光粒与鼠标光线特效</span><input id="fxEnabled" type="checkbox" class="fxSwitch"></label><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><div class="settingsActions"><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button></div><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><button type="button" id="fetchNewModels" class="miniSecondary providerFetchBtn">获取模型</button><div class="providerFormFooter"><div id="providerMsg" class="errorText"></div><button class="miniPrimary">保存并设为默认</button></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="automationView" class="automationView hidden" aria-labelledby="automationViewTitle"><div class="automationViewInner"><header class="automationViewHeader"><div><h1 id="automationViewTitle">已安排的任务</h1><p>让 Codex 安排任务、设置提醒或监测更新</p></div><button id="automationCreate" class="automationCreate" type="button"><i data-lucide="plus" aria-hidden="true"></i><span>新建自动化</span></button></header><div class="automationToolbar"><label class="automationSearch"><span class="srOnly">搜索已安排任务</span><i data-lucide="search" aria-hidden="true"></i><input id="automationSearch" type="search" placeholder="搜索已安排任务" autocomplete="off"></label><label class="automationFilter"><span class="srOnly">状态</span><select id="automationFilter"><option value="">全部状态</option><option value="ACTIVE">运行中</option><option value="PAUSED">已暂停</option></select></label><button id="automationRefresh" class="automationRefresh" type="button"><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button></div><div id="automationStatus" class="automationStatus" role="status" aria-live="polite"></div><div id="automationList" class="automationList"></div></div><div id="automationEditor" class="automationEditor hidden" role="presentation"><form id="automationForm" class="automationForm" aria-label="新建自动化安排"><div class="automationFormBody"><label class="automationTitleField"><span class="srOnly">已安排任务标题</span><input id="automationName" maxlength="120" required placeholder="已安排任务标题" autocomplete="off"></label><label class="automationPromptField"><span class="srOnly">任务说明</span><textarea id="automationPrompt" rows="3" maxlength="12000" required placeholder="描述 ChatGPT 应该做什么"></textarea></label><section class="automationFormSection" aria-labelledby="automationDetailsTitle"><h3 id="automationDetailsTitle">详情</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>运行于</span><select id="automationRunAt" aria-label="运行于"><option value="new-task">新任务</option></select></label><label class="automationSettingRow"><span>项目</span><select id="automationCwd" aria-label="项目"><option value="">无</option></select></label><label class="automationSettingRow"><span>模型</span><select id="automationModel" aria-label="模型"><option value="">默认模型</option></select></label><label class="automationSettingRow"><span>推理</span><select id="automationReasoning" aria-label="推理"><option value="">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option><option value="ultra">极高</option></select></label></div></section><section class="automationFormSection" aria-labelledby="automationFrequencyTitle"><h3 id="automationFrequencyTitle">频率</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>重复</span><select id="automationFrequency" aria-label="重复"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option><option value="hourly">每隔数小时</option></select></label><label id="automationDayField" class="automationSettingRow hidden"><span>星期</span><select id="automationDay" aria-label="星期"><option value="MO">周一</option><option value="TU">周二</option><option value="WE">周三</option><option value="TH">周四</option><option value="FR">周五</option><option value="SA">周六</option><option value="SU">周日</option></select></label><label id="automationIntervalField" class="automationSettingRow hidden"><span>间隔</span><select id="automationInterval" aria-label="间隔小时"><option value="1">每小时</option><option value="2">每 2 小时</option><option value="3" selected>每 3 小时</option><option value="4">每 4 小时</option><option value="6">每 6 小时</option><option value="8">每 8 小时</option><option value="12">每 12 小时</option><option value="24">每 24 小时</option></select></label><label id="automationTimeField" class="automationSettingRow"><span>时间</span><span class="automationTimeControl"><span id="automationTimeDisplay">9:00</span><i data-lucide="chevron-down" aria-hidden="true"></i><input id="automationTime" type="time" value="09:00" required aria-label="时间"></span></label><label class="automationSettingRow"><span>通知</span><select id="automationNotification" aria-label="通知"><option value="always">所有运行</option><option value="failed_runs_only">仅失败时</option></select></label></div></section><input id="automationStartPaused" type="checkbox" class="hidden" aria-hidden="true" tabindex="-1"><div class="automationFormActions"><div id="automationFormMessage" class="automationFormMessage" role="alert"></div><button id="automationFormClose" class="automationEditorBack" type="button">取消</button><button id="automationFormSubmit" class="automationEditorSave" type="submit"><i data-lucide="calendar-plus" aria-hidden="true"></i><span>创建自动化</span></button></div></div></form></div></section><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>直接输入任务；项目路径可选。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box composerExpanded" data-composer-state="expanded"><textarea id="input" rows="1" placeholder="向 Codex 提问"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
+<section id="app" class="app ${authenticated ? '' : 'hidden'}"><div id="scrim" class="scrim"></div><aside id="sidePanel" class="side"><div><div class="brandRow"><div class="logo">${appName}</div><div class="brandControls"><button id="historyUnreadToggle" class="historyUnreadToggle" type="button" title="未读已完成任务" aria-label="未读已完成任务" aria-controls="historyUnreadPopover" aria-expanded="false" aria-haspopup="dialog"><i data-lucide="bell" aria-hidden="true"></i><span id="historyUnreadBadge" class="historyUnreadBadge" hidden></span></button><button id="themeToggle" class="themeToggle" type="button" title="切换黑暗模式" aria-label="切换黑暗模式">☾</button><section id="historyUnreadPopover" class="historyUnreadPopover" role="dialog" aria-label="未读已完成任务" tabindex="-1" hidden></section></div></div><div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div></div><div class="sideActions"><button id="newChat" class="miniPrimary">新建会话</button><button id="archiveToggle" class="archiveToggle" type="button">已归档任务</button><button id="automationToggle" class="automationToggle" type="button">自动化安排</button></div><button id="settingsToggle" class="settingsToggle">设置</button><div id="settingsPanel" class="settingsPanel"><div class="settings"><div class="backgroundControls"><div class="backgroundRow"><div class="field"><label>会话背景</label><select id="chatBackground"><option value="default">默认</option><option value="dream-skin">Dream Skin</option><option value="custom">自定义</option></select></div><button id="deleteBackground" class="miniDanger backgroundDelete hidden" type="button">删除</button></div><input id="chatBackgroundFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div><label class="settingsToggleRow"><span>光粒与鼠标光线特效</span><input id="fxEnabled" type="checkbox" class="fxSwitch"></label><div class="field"><label>Provider</label><select id="provider"><option value="">默认</option></select></div><div class="field"><label>Model</label><select id="model"></select></div><div class="field"><label>思考档位</label><select id="reasoningEffort"><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option><option value="ultra">ultra</option></select></div><div class="settingsActions"><button id="refreshProviderModels" class="miniSecondary" type="button">更新模型</button><button id="saveDefault" class="miniSecondary">保存默认设置</button><button id="deleteProvider" class="miniDanger" type="button">删除服务商</button></div><div id="defaultMsg" class="errorText"></div><div class="field"><label>工作目录</label><input id="cwd" value="${escapeHtml(DEFAULT_CWD)}"></div></div><details id="providerManager" class="providerBox"><summary>添加服务商</summary><form id="providerForm"><div class="field"><label>名称</label><input id="newProviderName" placeholder="例如 Chy"></div><div class="field"><label>Base URL</label><input id="newProviderUrl" placeholder="https://example.com/v1"></div><div class="field"><label>API Key</label><input id="newProviderKey" type="password" placeholder="sk-..."></div><div class="field"><label>API</label><select id="newProviderWire"><option value="responses">responses</option><option value="chat">chat</option></select></div><div class="field"><label>模型</label><select id="newProviderModel"><option value="">先获取模型</option></select></div><button type="button" id="fetchNewModels" class="miniSecondary providerFetchBtn">获取模型</button><div class="providerFormFooter"><div id="providerMsg" class="errorText"></div><button class="miniPrimary">保存并设为默认</button></div></form></details></div><div class="meta">最近会话</div><div id="history" class="history"></div><button id="logout" class="logout">退出登录</button></aside><main class="main"><div class="top"><button id="menuBtn" class="menuBtn" type="button" aria-controls="sidePanel" aria-expanded="true" aria-label="收起侧栏">☰</button><div><div class="title">Chat</div><div id="status" class="meta">Ready</div></div><div id="modeLabel" class="meta">Codex App</div></div><section id="automationView" class="automationView hidden" aria-labelledby="automationViewTitle"><div class="automationViewInner"><header class="automationViewHeader"><div><h1 id="automationViewTitle">已安排的任务</h1><p>让 Codex 安排任务、设置提醒或监测更新</p></div><button id="automationCreate" class="automationCreate" type="button"><i data-lucide="plus" aria-hidden="true"></i><span>新建自动化</span></button></header><div class="automationToolbar"><label class="automationSearch"><span class="srOnly">搜索已安排任务</span><i data-lucide="search" aria-hidden="true"></i><input id="automationSearch" type="search" placeholder="搜索已安排任务" autocomplete="off"></label><label class="automationFilter"><span class="srOnly">状态</span><select id="automationFilter"><option value="">全部状态</option><option value="ACTIVE">运行中</option><option value="PAUSED">已暂停</option></select></label><button id="automationRefresh" class="automationRefresh" type="button"><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button></div><div id="automationStatus" class="automationStatus" role="status" aria-live="polite"></div><div id="automationList" class="automationList"></div></div><div id="automationEditor" class="automationEditor hidden" role="presentation"><form id="automationForm" class="automationForm" aria-label="新建自动化安排"><div class="automationFormBody"><label class="automationTitleField"><span class="srOnly">已安排任务标题</span><input id="automationName" maxlength="120" required placeholder="已安排任务标题" autocomplete="off"></label><label class="automationPromptField"><span class="srOnly">任务说明</span><textarea id="automationPrompt" rows="3" maxlength="12000" required placeholder="描述 ChatGPT 应该做什么"></textarea></label><section class="automationFormSection" aria-labelledby="automationDetailsTitle"><h3 id="automationDetailsTitle">详情</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>运行于</span><select id="automationRunAt" aria-label="运行于"><option value="new-task">新任务</option></select></label><label class="automationSettingRow"><span>项目</span><select id="automationCwd" aria-label="项目"><option value="">无</option></select></label><label class="automationSettingRow"><span>模型</span><select id="automationModel" aria-label="模型"><option value="">默认模型</option></select></label><label class="automationSettingRow"><span>推理</span><select id="automationReasoning" aria-label="推理"><option value="">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option><option value="max">最高</option><option value="ultra">极高</option></select></label></div></section><section class="automationFormSection" aria-labelledby="automationFrequencyTitle"><h3 id="automationFrequencyTitle">频率</h3><div class="automationSettingsGroup"><label class="automationSettingRow"><span>重复</span><select id="automationFrequency" aria-label="重复"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekly">每周</option><option value="hourly">每隔数小时</option></select></label><label id="automationDayField" class="automationSettingRow hidden"><span>星期</span><select id="automationDay" aria-label="星期"><option value="MO">周一</option><option value="TU">周二</option><option value="WE">周三</option><option value="TH">周四</option><option value="FR">周五</option><option value="SA">周六</option><option value="SU">周日</option></select></label><label id="automationIntervalField" class="automationSettingRow hidden"><span>间隔</span><select id="automationInterval" aria-label="间隔小时"><option value="1">每小时</option><option value="2">每 2 小时</option><option value="3" selected>每 3 小时</option><option value="4">每 4 小时</option><option value="6">每 6 小时</option><option value="8">每 8 小时</option><option value="12">每 12 小时</option><option value="24">每 24 小时</option></select></label><label id="automationTimeField" class="automationSettingRow"><span>时间</span><span class="automationTimeControl"><span id="automationTimeDisplay">9:00</span><i data-lucide="chevron-down" aria-hidden="true"></i><input id="automationTime" type="time" value="09:00" required aria-label="时间"></span></label><label class="automationSettingRow"><span>通知</span><select id="automationNotification" aria-label="通知"><option value="always">所有运行</option><option value="failed_runs_only">仅失败时</option></select></label></div></section><input id="automationStartPaused" type="checkbox" class="hidden" aria-hidden="true" tabindex="-1"><div class="automationFormActions"><div id="automationFormMessage" class="automationFormMessage" role="alert"></div><button id="automationFormClose" class="automationEditorBack" type="button">取消</button><button id="automationFormSubmit" class="automationEditorSave" type="submit"><i data-lucide="calendar-plus" aria-hidden="true"></i><span>创建自动化</span></button></div></div></form></div></section><section id="archiveView" class="archiveView hidden" aria-labelledby="archiveViewTitle"><div class="archiveViewInner"><header class="archiveViewHeader"><div><div class="archiveEyebrow">任务</div><h1 id="archiveViewTitle">已归档任务</h1><p>恢复任务后会重新出现在 Codex App 与此处的最近任务中。</p></div><button id="archiveDeleteAll" class="archiveDeleteAll" type="button">永久删除全部</button></header><div class="archiveToolbar"><label class="archiveSearch" aria-label="搜索已归档任务"><i data-lucide="search" aria-hidden="true"></i><input id="archiveSearch" type="search" placeholder="搜索任务或路径" autocomplete="off"></label><label class="archiveProjectFilter"><span>项目</span><select id="archiveProjectFilter"><option value="">所有项目</option></select></label><button id="archiveRefresh" class="archiveRefresh" type="button">刷新</button></div><div id="archiveStatus" class="archiveStatus" role="status" aria-live="polite"></div><div id="archiveList" class="archiveList"></div></div></section><div id="chat" class="chat"><div class="empty"><b>Ask Codex</b><span>直接输入任务；项目路径可选。</span></div></div><div class="composer"><div id="nativeNotice" class="nativeNotice">Codex App 会话 · 双向同步</div><div id="dropZone" class="box composerExpanded" data-composer-state="expanded"><textarea id="input" rows="1" placeholder="向 Codex 提问"></textarea><button id="attachFile" class="attachBtn" type="button" title="上传附件" aria-label="上传附件">＋</button><input id="fileInput" class="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json,.txt,.md,.json,.jsonl,.csv,.log,.pdf,.xml,.yaml,.yml,.toml,.ini,.html,.css,.js,.mjs,.cjs,.ts,.tsx,.jsx,.py,.sh,.bash,.zsh,.go,.rs,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sql" multiple><button id="send" class="send">发送</button><button id="cancelRun" class="send hidden" style="background:#ff6b6b;color:#1b0909">取消</button></div><div id="attachmentTray" class="attachmentTray hidden"></div><div class="composerControls"><div class="field"><label>权限模式</label><select id="sandbox"><option value="read-only">只读</option><option value="workspace-write">工作区写入</option><option value="danger-full-access">高危全权限</option></select></div><div class="field"><label>确认策略</label><select id="approval"><option value="never">从不询问</option><option value="on-request">按需询问</option><option value="untrusted">不可信时询问</option></select></div><div id="safetyHint" class="safety safe"></div></div><div class="hint">按需确认会直接显示在当前 Web 页面。</div></div></main></section>
 <div id="nativeRequestModal" class="requestOverlay hidden" role="presentation"><div class="requestPanel" role="dialog" aria-modal="true" aria-labelledby="nativeRequestTitle"><div class="requestHead"><div><div id="nativeRequestTitle" class="requestTitle">Codex 请求确认</div><div id="nativeRequestMeta" class="requestMeta"></div></div></div><pre id="nativeRequestDetail" class="requestDetail"></pre><form id="nativeRequestForm"><div id="nativeRequestFields" class="requestFields"></div><div id="nativeRequestActions" class="requestActions"></div></form></div></div>
 <script src="/vendor/marked.js"></script>
 <script src="/vendor/purify.js"></script>
@@ -8841,7 +8748,7 @@ let archiveConfirmOverlay = null, archiveConfirmDialog = null, archiveConfirmNam
 let archiveConfirmPending = null, archiveConfirmReturnFocus = null, archiveConfirmReturnKey = '', archiveConfirmAdjacentKey = '', archiveConfirmSubmitting = false;
 const menuBtn = document.getElementById('menuBtn'), sidePanel = document.getElementById('sidePanel');
 const providerManager = document.getElementById('providerManager'), saveDefault = document.getElementById('saveDefault'), deleteProviderButton = document.getElementById('deleteProvider');
-const themeToggle = document.getElementById('themeToggle'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
+const themeToggle = document.getElementById('themeToggle'), historyUnreadToggle = document.getElementById('historyUnreadToggle'), historyUnreadBadge = document.getElementById('historyUnreadBadge'), historyUnreadPopover = document.getElementById('historyUnreadPopover'), chatBackground = document.getElementById('chatBackground'), chatBackgroundFile = document.getElementById('chatBackgroundFile'), deleteBackground = document.getElementById('deleteBackground');
 const fxEnabledInput = document.getElementById('fxEnabled');
 const modeLabel = document.getElementById('modeLabel'), nativeNotice = document.getElementById('nativeNotice');
 const nativeRequestModal = document.getElementById('nativeRequestModal'), nativeRequestTitle = document.getElementById('nativeRequestTitle'), nativeRequestMeta = document.getElementById('nativeRequestMeta'), nativeRequestDetail = document.getElementById('nativeRequestDetail'), nativeRequestForm = document.getElementById('nativeRequestForm'), nativeRequestFields = document.getElementById('nativeRequestFields'), nativeRequestActions = document.getElementById('nativeRequestActions');
@@ -9014,6 +8921,8 @@ let composerServiceTier = null;
 let defaultComposerServiceTier = null;
 let nativeModelCapabilitiesLoaded = false;
 let nativeModelServiceTiers = new Map();
+let nativeModelDisplayNames = new Map();
+let nativeModelCatalogIds = [];
 let composerSlashPanel = null;
 let composerSlashList = null;
 let composerSlashStatus = null;
@@ -9200,8 +9109,23 @@ function syncComposerSelect(source,target){
   target.disabled=source.disabled;
 }
 function composerModelLabel(value){
-  const clean=String(value||'默认模型').replace(/^gpt-/i,'').replace(/[-_]+/g,' ').trim();
-  return(clean||'默认模型').replace(/\\bsol\\b/i,'Sol').replace(/\\bcodex\\b/i,'Codex');
+  const raw=String(value||'').trim();
+  if(!raw)return'默认模型';
+  const labels=(typeof nativeModelDisplayNames!=='undefined'&&nativeModelDisplayNames&&typeof nativeModelDisplayNames.get==='function')
+    ?nativeModelDisplayNames
+    :null;
+  const mapped=labels?String(labels.get(raw.toLowerCase())||'').trim():'';
+  if(mapped){
+    return mapped.replace(/^GPT-/i,'').replace(/\\s+/g,' ').trim()||mapped;
+  }
+  const clean=raw.replace(/^gpt-/i,'').replace(/[-_]+/g,' ').trim();
+  const titled=(clean||'默认模型').split(/\\s+/).map((part)=>{
+    if(!part)return part;
+    if(/^[0-9]+(\.[0-9]+)?$/.test(part))return part;
+    if(/^v\\d/i.test(part))return part.toUpperCase().replace(/^V/,'V');
+    return part.charAt(0).toUpperCase()+part.slice(1);
+  }).join(' ');
+  return titled.replace(/\\bDeepseek\\b/g,'DeepSeek');
 }
 function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'超高'})[String(value||'')]||String(value||'默认')}
 function composerModelSwitchConfirm(previous,next){
@@ -9342,15 +9266,37 @@ async function loadNativeModelCapabilities(){
     const data=await res.json().catch(()=>({}));
     if(!res.ok)throw new Error(data.error||'Fast 模型能力读取失败');
     const tiers=new Map();
+    const labels=new Map();
+    const catalog=[];
     for(const entry of Array.isArray(data.models)?data.models:[]){
+      const id=String(entry?.id||entry?.model||'').trim();
+      const modelId=String(entry?.model||entry?.id||'').trim();
+      const displayName=String(entry?.displayName||entry?.display_name||'').trim();
       const values=(Array.isArray(entry?.serviceTiers)?entry.serviceTiers:[]).map((tier)=>String(tier?.id||'').trim().toLowerCase()).filter(Boolean);
-      for(const key of [entry?.id,entry?.model].map((item)=>String(item||'').trim().toLowerCase()).filter(Boolean))tiers.set(key,values);
+      for(const key of [id,modelId].map((item)=>String(item||'').trim()).filter(Boolean)){
+        const lower=key.toLowerCase();
+        tiers.set(lower,values);
+        if(displayName)labels.set(lower,displayName);
+      }
+      if(id)catalog.push(id);
+      else if(modelId)catalog.push(modelId);
     }
     nativeModelServiceTiers=tiers;
+    nativeModelDisplayNames=labels;
+    nativeModelCatalogIds=[...new Set(catalog.filter(Boolean))];
     nativeModelCapabilitiesLoaded=true;
     reconcileComposerFastSupport();
+    if(modelOptionsProvider!==null){
+      const selected=String(model.value||'').trim();
+      const cached=modelListCache.get(String(modelOptionsProvider||''));
+      if(cached)applyComposerModels(modelOptionsProvider,cached,selected);
+    }else{
+      syncComposerChrome();
+    }
   }catch(e){
     nativeModelCapabilitiesLoaded=false;
+    nativeModelDisplayNames=new Map();
+    nativeModelCatalogIds=[];
     renderComposerFastToggle();
   }
 }
@@ -10005,6 +9951,29 @@ function selectComposerProjectPath(value){
   statusEl.textContent=path?'新任务项目 · '+historyProjectName(path):'新任务 · 使用默认工作目录';
   input.focus();
 }
+function startNewTaskInProject(projectPath,{expand=true}={}){
+  const path=normalizeProjectPath(projectPath);
+  if(!path){
+    statusEl.textContent='项目路径无效';
+    return false;
+  }
+  closeHistoryProjectMenu(false);
+  hideHistoryProjectPreview();
+  newChat();
+  cwd.value=path;
+  currentNativeWorkspaceKind='';
+  syncComposerChrome();
+  statusEl.textContent='新任务项目 · '+historyProjectName(path);
+  if(expand){
+    const groupKey=historyProjectKey(path);
+    collapsedHistoryProjects.delete(groupKey);
+    storeCollapsedHistoryProjects();
+    const group=[...history.querySelectorAll('.historyProject')].find((node)=>normalizeProjectPath(node.dataset.projectPath)===path);
+    if(group)setHistoryProjectExpanded(group,true);
+  }
+  input.focus();
+  return true;
+}
 function renderComposerProjectOptions(){
   if(!composerProjectOptions)return;
   composerProjectOptions.replaceChildren();
@@ -10304,6 +10273,12 @@ function renderTopConversationTitle(){
 }
 function setCurrentConversationTitle(value,fallback='新任务'){
   currentConversationTitle=normalizeConversationTitle(value,fallback);
+  if(currentConversationId){
+    try{
+      const saved=readActiveConversationPreference();
+      if(saved&&saved.id===currentConversationId)persistActiveConversation(currentConversationId,currentConversationSource,currentConversationTitle);
+    }catch{}
+  }
   return renderTopConversationTitle();
 }
 function renderSideChatTabs(){
@@ -12489,19 +12464,25 @@ async function steerQueuedPrompt(threadId,itemId,preloadedItem=null){
   renderPromptQueue();
   applyConversationMode();
   statusEl.textContent='正在发送引导...';
+  const optimisticElement=showNativeSteerOptimistically(item);
   try{
-    await flushPromptQueueToServer(threadId);
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(threadId)+'/steer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:item.message,attachments:item.attachments,turnId:activeNativeTurnId,queueItemId:item.id,queueItemCreatedAt:item.createdAt})});
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(threadId)+'/steer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:item.message,attachments:item.attachments,turnId:activeNativeTurnId,queueItemId:item.id,queueItemCreatedAt:item.createdAt,queueItem:item})});
     const data=await res.json();
     if(!res.ok)throw Object.assign(new Error(data.error||res.statusText),{status:res.status});
     activeNativeTurnId=data.turnId||activeNativeTurnId;
     if(!applyServerPromptQueue(threadId,data.queue))removeQueuedPromptLocal(threadId,item,{persist:false,dismiss:!isAppOwnedQueuedPrompt(item)});
-    showNativeSteerOptimistically(item);
     statusEl.textContent='Codex App · 已发送引导';
     setTimeout(syncCurrentNativeConversation,180);
     refreshHistory();
   }catch(e){
+    if(optimisticElement&&nativeOptimisticSteering.get(item.id)===optimisticElement){
+      nativeOptimisticSteering.delete(item.id);
+      turnProcessElements=turnProcessElements.filter((element)=>element!==optimisticElement);
+      if(latestUserElement===optimisticElement)latestUserElement=null;
+      optimisticElement.remove();
+    }
     statusEl.textContent=e.status===409?'当前任务已结束，消息仍保留在队列':'引导失败: '+e.message;
+    void pullPromptQueueFromServer(threadId,{render:true,preferServer:true});
     if(e.status===409){
       webRunActive=false;
       activeNativeTurnId='';
@@ -14021,6 +14002,9 @@ function enhanceComposer(){
     if(!suppressClick&&guard.pointerId!==null&&typeof event.pointerId==='number'&&event.pointerId!==guard.pointerId)return;
     window.__composerExpandClickGuard=null;
     window.clearTimeout(window.__composerExpandClickGuardTimer);
+    // Keep intentional toolbar controls clickable even when the first tap also
+    // expands the collapsed capsule (mic/send/attach/cancel/etc).
+    if(event.target?.closest?.('.composerMicBtn,.send,.cancelButton,.attachBtn,#attachFile,.composerPermissionToggle,.composerModelToggle,.composerContextToggle,.composerGoalIndicator,.composerProjectToggle'))return;
     if(!suppressClick&&(event.target===guard.target||guard.target?.contains?.(event.target)))return;
     // The capsule grows during pointerdown. Ignore a trailing click that would
     // otherwise land on a newly revealed toolbar control after that reflow.
@@ -14075,25 +14059,76 @@ function enhanceComposer(){
   function speechRecognitionCtor(){
   return window.SpeechRecognition||window.webkitSpeechRecognition||null;
 }
-function stopComposerSpeech({restoreTitle=true}={}){
+function composerSpeechPreferredLang(){
+  const lang=String(navigator.language||navigator.userLanguage||'zh-CN').trim();
+  if(/^zh\\b/i.test(lang))return 'zh-CN';
+  return lang||'zh-CN';
+}
+function setComposerSpeechStatus(message,{error=false}={}){
+  const text=String(message||'').trim();
+  if(statusEl&&text){
+    statusEl.classList.toggle('running',false);
+    statusEl.textContent=text;
+  }
+  if(composerMicBtn&&text){
+    composerMicBtn.title=text;
+    if(error)composerMicBtn.setAttribute('data-speech-state','error');
+    else if(composerSpeechListening)composerMicBtn.setAttribute('data-speech-state','listening');
+    else composerMicBtn.removeAttribute('data-speech-state');
+  }
+  showComposerSpeechToast(text,{error});
+}
+function showComposerSpeechToast(message,{error=false}={}){
+  const text=String(message||'').trim();
+  if(!text||!dropZone)return;
+  let toast=dropZone.querySelector('.composerSpeechToast');
+  if(!toast){
+    toast=document.createElement('div');
+    toast.className='composerSpeechToast';
+    toast.setAttribute('role','status');
+    toast.setAttribute('aria-live','polite');
+    dropZone.appendChild(toast);
+  }
+  toast.textContent=text;
+  toast.classList.toggle('error',Boolean(error));
+  toast.classList.add('show');
+  window.clearTimeout(window.__composerSpeechToastTimer);
+  window.__composerSpeechToastTimer=window.setTimeout(()=>{
+    toast.classList.remove('show');
+  }, error?3600:2200);
+}
+function joinComposerSpeechText(base,piece){
+  const left=String(base||'');
+  const right=String(piece||'').replace(/\\s+/g,' ').trim();
+  if(!right)return left;
+  if(!left)return right;
+  if(/\\s$/.test(left)||/^[,.!?;:，。！？、；：]/.test(right))return left+right;
+  // CJK characters do not need a Latin-style space separator.
+  if(/[\\u3400-\\u9fff]$/.test(left)&&/^[\\u3400-\\u9fff]/.test(right))return left+right;
+  return left+' '+right;
+}
+function stopComposerSpeech({restoreTitle=true,statusText=''}={}){
   composerSpeechListening=false;
-  composerSpeechInterim="";
+  composerSpeechInterim='';
   try{composerSpeechRecognition?.stop?.()}catch{}
   try{composerSpeechRecognition?.abort?.()}catch{}
   if(composerMicBtn){
     composerMicBtn.classList.remove('listening');
     composerMicBtn.setAttribute('aria-pressed','false');
+    composerMicBtn.removeAttribute('data-speech-state');
     if(restoreTitle){
       composerMicBtn.title='语音输入';
       composerMicBtn.setAttribute('aria-label','语音输入');
     }
   }
+  if(statusText)setComposerSpeechStatus(statusText);
+  else if(statusEl&&statusEl.textContent==='正在听写…')statusEl.textContent='语音输入已结束';
 }
 function applyComposerSpeechText(){
   if(!input)return;
-  const base=String(composerSpeechBaseText||"");
-  const interim=String(composerSpeechInterim||"").trim();
-  const next=interim?(base&&!/s$/.test(base)?base+" "+interim:base+interim):base;
+  const base=String(composerSpeechBaseText||'');
+  const interim=String(composerSpeechInterim||'').trim();
+  const next=interim?joinComposerSpeechText(base,interim):base;
   if(input.value!==next){
     input.value=next;
     input.dispatchEvent(new Event('input',{bubbles:true}));
@@ -14107,20 +14142,21 @@ function ensureComposerSpeechRecognition(){
   const rec=new Ctor();
   rec.continuous=true;
   rec.interimResults=true;
-  rec.lang=(navigator.language||'zh-CN');
+  rec.lang=composerSpeechPreferredLang();
   rec.onstart=()=>{
     composerSpeechListening=true;
     if(composerMicBtn){
       composerMicBtn.classList.add('listening');
       composerMicBtn.setAttribute('aria-pressed','true');
+      composerMicBtn.dataset.speechState='listening';
       composerMicBtn.title='停止语音输入';
       composerMicBtn.setAttribute('aria-label','停止语音输入');
     }
-    if(statusEl)statusEl.textContent='正在听写…';
+    setComposerSpeechStatus('正在听写…');
   };
   rec.onresult=(event)=>{
-    let interim="";
-    let finalChunk="";
+    let interim='';
+    let finalChunk='';
     for(let i=event.resultIndex;i<event.results.length;i++){
       const result=event.results[i];
       const text=String(result?.[0]?.transcript||'');
@@ -14128,66 +14164,95 @@ function ensureComposerSpeechRecognition(){
       if(result.isFinal)finalChunk+=text; else interim+=text;
     }
     if(finalChunk){
-      const piece=finalChunk.replace(/\\s+/g," ").trim();
-      if(piece){
-        const base=String(composerSpeechBaseText||"");
-        composerSpeechBaseText=base?(/s$/.test(base)?base+piece:base+" "+piece):piece;
-      }
+      const piece=finalChunk.replace(/\\s+/g,' ').trim();
+      if(piece)composerSpeechBaseText=joinComposerSpeechText(composerSpeechBaseText,piece);
     }
     composerSpeechInterim=interim;
     applyComposerSpeechText();
   };
   rec.onerror=(event)=>{
     const err=String(event?.error||'error');
-    if(err==='aborted'||err==='no-speech'){ if(err==='aborted')stopComposerSpeech(); return; }
-    stopComposerSpeech();
-    if(statusEl){
-      if(err==='not-allowed'||err==='service-not-allowed')statusEl.textContent='麦克风权限被拒绝，无法语音输入';
-      else if(err==='audio-capture')statusEl.textContent='未检测到可用麦克风';
-      else if(err==='network')statusEl.textContent='语音识别网络错误，请稍后重试';
-      else statusEl.textContent='语音输入失败：'+err;
+    if(err==='no-speech')return;
+    if(err==='aborted'){
+      stopComposerSpeech();
+      return;
     }
+    stopComposerSpeech({restoreTitle:true});
+    if(err==='not-allowed'||err==='service-not-allowed')setComposerSpeechStatus('麦克风权限被拒绝，请在浏览器设置中允许后重试',{error:true});
+    else if(err==='audio-capture')setComposerSpeechStatus('未检测到可用麦克风',{error:true});
+    else if(err==='network')setComposerSpeechStatus('语音识别网络错误，请稍后重试',{error:true});
+    else setComposerSpeechStatus('语音输入失败：'+err,{error:true});
   };
   rec.onend=()=>{
-    if(composerSpeechListening){ try{rec.start();return}catch{} }
+    if(composerSpeechListening){
+      try{rec.start();return}catch{}
+    }
     stopComposerSpeech();
-    if(statusEl&&statusEl.textContent==='正在听写…')statusEl.textContent='语音输入已结束';
   };
   composerSpeechRecognition=rec;
   return rec;
 }
-function toggleComposerSpeech(){
+async function ensureComposerMicrophoneAccess(){
+  if(!navigator?.mediaDevices?.getUserMedia)return true;
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    for(const track of stream.getTracks?.()||[]){
+      try{track.stop()}catch{}
+    }
+    return true;
+  }catch(error){
+    const name=String(error?.name||error?.message||'');
+    if(/NotAllowed|Permission|Denied/i.test(name))setComposerSpeechStatus('麦克风权限被拒绝，请在浏览器设置中允许后重试',{error:true});
+    else if(/NotFound|DevicesNotFound/i.test(name))setComposerSpeechStatus('未检测到可用麦克风',{error:true});
+    else setComposerSpeechStatus('无法访问麦克风：'+(error?.message||name||'未知错误'),{error:true});
+    return false;
+  }
+}
+async function toggleComposerSpeech(){
   // Voice input should not steal focus from a mobile toolbar tap. The
   // recognition API does not require the textarea to be focused, and keeping
   // it unfocused prevents a transient keyboard from appearing beside the mic.
   expandComposer();
   if(composerSpeechListening){
-    stopComposerSpeech();
-    if(statusEl)statusEl.textContent='已停止语音输入';
+    stopComposerSpeech({statusText:'已停止语音输入'});
     return;
   }
   const Ctor=speechRecognitionCtor();
   if(!Ctor){
-    if(statusEl)statusEl.textContent='当前浏览器不支持语音识别（需 Chrome/Edge 等 Web Speech API）';
+    setComposerSpeechStatus('当前浏览器不支持语音识别（需 Chrome/Edge 等 Web Speech API）',{error:true});
     return;
   }
   if(window.isSecureContext===false){
-    if(statusEl)statusEl.textContent='语音输入需要安全上下文（localhost 或 HTTPS）';
+    setComposerSpeechStatus('语音输入需要安全上下文（localhost 或 HTTPS）',{error:true});
     return;
   }
-  composerSpeechBaseText=String(input?.value||"");
-  composerSpeechInterim="";
+  if(composerMicBtn){
+    composerMicBtn.disabled=true;
+    composerMicBtn.classList.add('pending');
+  }
+  setComposerSpeechStatus('正在请求麦克风权限…');
+  const allowed=await ensureComposerMicrophoneAccess();
+  if(composerMicBtn){
+    composerMicBtn.disabled=false;
+    composerMicBtn.classList.remove('pending');
+  }
+  if(!allowed)return;
+  composerSpeechBaseText=String(input?.value||'');
+  composerSpeechInterim='';
   const rec=ensureComposerSpeechRecognition();
   if(!rec)return;
   try{
+    rec.lang=composerSpeechPreferredLang();
     composerSpeechListening=true;
     rec.start();
   }catch(error){
     try{rec.stop()}catch{}
-    try{ rec.start(); }
-    catch(err2){
+    try{
+      composerSpeechListening=true;
+      rec.start();
+    }catch(err2){
       stopComposerSpeech();
-      if(statusEl)statusEl.textContent=err2?.message||error?.message||'无法启动语音输入';
+      setComposerSpeechStatus(err2?.message||error?.message||'无法启动语音输入',{error:true});
     }
   }
 }
@@ -14196,9 +14261,28 @@ if(!composerMicBtn){
     composerMicBtn.type='button';
     composerMicBtn.className='composerMicBtn';
     composerMicBtn.setAttribute('aria-label','语音输入');
+    composerMicBtn.setAttribute('aria-pressed','false');
     composerMicBtn.title='语音输入';
     setIconLabel(composerMicBtn,'mic','语音输入',false);
-    composerMicBtn.addEventListener('click',(event)=>{event.preventDefault();event.stopPropagation();toggleComposerSpeech()});
+    composerMicBtn.addEventListener('pointerdown',(event)=>{
+      // Prevent the collapsed-composer expand guard from eating the mic click.
+      event.stopPropagation();
+    });
+    composerMicBtn.addEventListener('click',(event)=>{
+      event.preventDefault();
+      event.stopPropagation();
+      void toggleComposerSpeech();
+    });
+  }
+  // Surface capability up front so the control is not a silent no-op.
+  if(!speechRecognitionCtor()){
+    composerMicBtn.title='当前浏览器不支持语音识别';
+    composerMicBtn.setAttribute('aria-label','当前浏览器不支持语音识别');
+    composerMicBtn.dataset.speechState='unsupported';
+  }else if(window.isSecureContext===false){
+    composerMicBtn.title='语音输入需要 localhost 或 HTTPS';
+    composerMicBtn.setAttribute('aria-label','语音输入需要 localhost 或 HTTPS');
+    composerMicBtn.dataset.speechState='insecure';
   }
   // Keep mic immediately before send/stop so both collapsed and expanded toolbars match the reference.
   if(composerMicBtn.parentNode!==dropZone||composerMicBtn.nextElementSibling!==sendBtn){
@@ -14623,61 +14707,7 @@ function ensureSubQuotaSettingsDialog(){
     keyField.appendChild(credentialHint);
     fields.append(urlField,keyField);
     source.append(sourceHead,fields);
-    let calibration=null;
-    if(provider==='deepseek'){
-      const panel=document.createElement('div');
-      panel.className='deepSeekUsageCalibration';
-      const calibrationTitle=document.createElement('h4');
-      calibrationTitle.className='deepSeekUsageCalibrationTitle';
-      calibrationTitle.textContent='本地累计校准';
-      const calibrationHint=document.createElement('p');
-      calibrationHint.className='deepSeekUsageCalibrationHint';
-      calibrationHint.textContent='填写 DeepSeek 官网当前显示值；校准后，新的本地调用会继续累加。';
-      const calibrationFields=document.createElement('div');
-      calibrationFields.className='deepSeekUsageCalibrationFields';
-      const createCalibrationField=(name,labelText)=>{
-        const field=document.createElement('label');
-        field.className='field';
-        const label=document.createElement('span');
-        label.textContent=labelText;
-        const input=document.createElement('input');
-        input.name=name;
-        input.type='text';
-        input.inputMode='numeric';
-        input.autocomplete='off';
-        input.maxLength=32;
-        input.placeholder='0';
-        field.appendChild(label);
-        field.appendChild(input);
-        calibrationFields.appendChild(field);
-        return input;
-      };
-      const totalTokensInput=createCalibrationField('deepSeekTotalTokens','累计 Token');
-      const requestsInput=createCalibrationField('deepSeekTotalRequests','累计请求');
-      const actions=document.createElement('div');
-      actions.className='deepSeekUsageCalibrationActions';
-      const calibrateButton=document.createElement('button');
-      calibrateButton.type='button';
-      calibrateButton.className='miniSecondary deepSeekUsageCalibrationSubmit';
-      setIconLabel(calibrateButton,'crosshair','校准累计量');
-      const calibrationStatus=document.createElement('div');
-      calibrationStatus.className='deepSeekUsageCalibrationStatus';
-      calibrationStatus.setAttribute('role','status');
-      calibrationStatus.setAttribute('aria-live','polite');
-      actions.appendChild(calibrateButton);
-      panel.appendChild(calibrationTitle);
-      panel.appendChild(calibrationHint);
-      panel.appendChild(calibrationFields);
-      panel.appendChild(actions);
-      panel.appendChild(calibrationStatus);
-      source.appendChild(panel);
-      calibration={totalTokensInput,requestsInput,calibrateButton,calibrationStatus};
-      calibrateButton.addEventListener('click',submitDeepSeekUsageCalibration);
-      for(const input of [totalTokensInput,requestsInput]){
-        input.addEventListener('keydown',(event)=>{if(event.key==='Enter'){event.preventDefault();calibrateButton.click()}});
-      }
-    }
-    subQuotaSettingsInputs.set(provider,{baseUrlInput,apiKeyInput,credentialHint,source,stateBadge:sourceIdentity.stateBadge,visibilityToggle,calibration});
+    subQuotaSettingsInputs.set(provider,{baseUrlInput,apiKeyInput,credentialHint,source,stateBadge:sourceIdentity.stateBadge,visibilityToggle});
     return source;
   };
   subQuotaSettingsSourceList=document.createElement('div');
@@ -14753,22 +14783,70 @@ function enhanceSettingsModal(){
   body.className='settingsDialogBody';
   const general=settingsPanel.querySelector('.settings');
   if(general){
-    general.classList.add('settingsSection');
-    general.prepend(settingsSectionTitle('默认配置','sliders-horizontal'));
-    createDreamSkinGenerator(general);
+    general.classList.add('settingsSection','settingsCards');
+    const labelMap=new Map([
+      ['chatBackground','会话背景'],
+      ['provider','服务商'],
+      ['model','模型'],
+      ['reasoningEffort','思考档位'],
+      ['cwd','工作目录'],
+    ]);
+    for(const [id,text] of labelMap){
+      const field=general.querySelector('.field:has(#'+id+')');
+      const label=field?.querySelector('label,span');
+      if(label)label.textContent=text;
+    }
+    const makeCard=(titleText,iconName,className='')=>{
+      const card=document.createElement('section');
+      card.className=('settingsCard'+(className?' '+className:'')).trim();
+      card.appendChild(settingsSectionTitle(titleText,iconName));
+      const content=document.createElement('div');
+      content.className='settingsCardBody';
+      card.appendChild(content);
+      return {card,content};
+    };
+    const appearance=makeCard('外观与体验','palette','settingsCardAppearance');
+    const modelCard=makeCard('模型默认值','cpu','settingsCardModel');
+    const workspace=makeCard('工作区','folder-cog','settingsCardWorkspace');
+    const backgroundControls=general.querySelector('.backgroundControls');
+    const fxToggle=general.querySelector('.settingsToggleRow');
+    const providerField=general.querySelector('.field:has(#provider)');
+    const modelField=general.querySelector('.field:has(#model)');
+    const effortField=general.querySelector('.field:has(#reasoningEffort)');
+    const actions=general.querySelector('.settingsActions');
+    const defaultMsg=general.querySelector('#defaultMsg');
+    const cwdField=general.querySelector('.field:has(#cwd)');
+    if(backgroundControls)appearance.content.appendChild(backgroundControls);
+    if(fxToggle)appearance.content.appendChild(fxToggle);
+    if(providerField)modelCard.content.appendChild(providerField);
+    if(modelField)modelCard.content.appendChild(modelField);
+    if(effortField)modelCard.content.appendChild(effortField);
+    if(actions){
+      actions.classList.add('settingsCardActions');
+      modelCard.content.appendChild(actions);
+    }
+    if(defaultMsg)modelCard.content.appendChild(defaultMsg);
+    if(cwdField)workspace.content.appendChild(cwdField);
+    general.replaceChildren(appearance.card,modelCard.card,workspace.card);
+    createDreamSkinGenerator(appearance.content);
   }
-  providerManager?.classList.add('settingsSection','providerSettings');
+  providerManager?.classList.add('settingsSection','providerSettings','settingsCard');
   const providerSummary=providerManager?.querySelector('summary');
-  if(providerSummary&&!providerSummary.querySelector('[data-lucide]')){
-    const providerIcon=document.createElement('i');
-    providerIcon.setAttribute('data-lucide','plug-zap');
-    providerIcon.setAttribute('aria-hidden','true');
-    providerSummary.prepend(providerIcon);
-    refreshIcons(providerSummary);
+  if(providerSummary){
+    providerSummary.textContent='添加服务商';
+    if(!providerSummary.querySelector('[data-lucide]')){
+      const providerIcon=document.createElement('i');
+      providerIcon.setAttribute('data-lucide','plug-zap');
+      providerIcon.setAttribute('aria-hidden','true');
+      providerSummary.prepend(providerIcon);
+      refreshIcons(providerSummary);
+    }
   }
   const passwordSection=document.createElement('section');
-  passwordSection.className='settingsSection passwordSettings';
+  passwordSection.className='settingsSection passwordSettings settingsCard';
   passwordSection.appendChild(settingsSectionTitle('Web 密码','key-round'));
+  const passwordBody=document.createElement('div');
+  passwordBody.className='settingsCardBody';
   passwordForm=document.createElement('form');
   passwordForm.id='passwordForm';
   passwordForm.className='passwordForm';
@@ -14802,8 +14880,10 @@ function enhanceSettingsModal(){
   passwordStatus.setAttribute('role','status');
   passwordForm.appendChild(savePassword);
   passwordForm.appendChild(passwordStatus);
-  passwordSection.appendChild(passwordForm);
+  passwordBody.appendChild(passwordForm);
+  passwordSection.appendChild(passwordBody);
   settingsPanel.classList.remove('open');
+  settingsPanel.classList.add('settingsPanelModern');
   settingsPanel.appendChild(passwordSection);
   body.appendChild(settingsPanel);
   settingsDialog.appendChild(head);
@@ -14815,6 +14895,7 @@ function enhanceSettingsModal(){
   settingsOverlay.addEventListener('click',(event)=>{if(event.target===settingsOverlay)closeSettings()});
   settingsDialog.addEventListener('keydown',trapSettingsFocus);
   passwordForm.addEventListener('submit',submitPasswordChange);
+  refreshIcons(settingsDialog);
 }
 function moveSubQuotaSource(source,delta){
   if(!source||!subQuotaSettingsSourceList)return;
@@ -14897,14 +14978,6 @@ async function syncSubQuotaSettings(){
       inputs.credentialHint.textContent=source.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，可先保存 URL';
       syncSubQuotaSourceState(inputs,source);
     }
-    const calibration=subQuotaSettingsInputs.get('deepseek')?.calibration;
-    if(calibration){
-      const usage=data.deepSeekUsage||{};
-      calibration.totalTokensInput.value=Number(usage.totalTokens||0).toLocaleString('en-US',{maximumFractionDigits:0});
-      calibration.requestsInput.value=Number(usage.requests||0).toLocaleString('en-US',{maximumFractionDigits:0});
-      calibration.calibrationStatus.textContent='';
-      calibration.calibrationStatus.classList.remove('success');
-    }
     if(Array.isArray(data.sources)&&data.sources.length){
       const footer=subQuotaSettingsForm.querySelector('.subQuotaSettingsFooter');
       for(const item of data.sources){
@@ -14918,29 +14991,6 @@ async function syncSubQuotaSettings(){
     }
     void syncCodexAppCredits();
   }catch(error){subQuotaSettingsStatus.textContent=String(error?.message||'读取设置失败')}
-}
-async function submitDeepSeekUsageCalibration(){
-  const calibration=subQuotaSettingsInputs.get('deepseek')?.calibration;
-  if(!calibration)return;
-  const {totalTokensInput,requestsInput,calibrateButton,calibrationStatus}=calibration;
-  calibrateButton.disabled=true;
-  calibrationStatus.classList.remove('success');
-  calibrationStatus.textContent='正在校准本地累计…';
-  try{
-    const response=await fetch('/api/deepseek-usage-calibration',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({totalTokens:totalTokensInput.value,requests:requestsInput.value})});
-    const data=await response.json().catch(()=>({}));
-    if(!response.ok)throw new Error(data.error||'校准失败');
-    const usage=data.usage||{};
-    totalTokensInput.value=Number(usage.totalTokens||0).toLocaleString('en-US',{maximumFractionDigits:0});
-    requestsInput.value=Number(usage.requests||0).toLocaleString('en-US',{maximumFractionDigits:0});
-    calibrationStatus.classList.add('success');
-    calibrationStatus.textContent='校准完成，后续本地用量将继续累加';
-    void loadSubQuota({refresh:true});
-  }catch(error){
-    calibrationStatus.textContent=String(error?.message||'校准失败');
-  }finally{
-    calibrateButton.disabled=false;
-  }
 }
 async function submitSubQuotaSettings(event){
   event.preventDefault();
@@ -15351,7 +15401,7 @@ async function resetGrok2ApiQuota(button){
   button.disabled=true;
   const findResetProgress=()=>{
     const actions=button.closest('.subQuotaActions')||subQuotaContent?.querySelector('.subQuotaActions');
-    return actions?.querySelector('.subQuotaResetProgress')||null;
+    return actions?.querySelector('.subQuotaActionProgress')||null;
   };
   const setResetProgress=(text,state)=>{
     const progress=findResetProgress();
@@ -15401,6 +15451,70 @@ async function resetGrok2ApiQuota(button){
     if(subQuotaStatus){
       subQuotaStatus.dataset.state='error';
       subQuotaStatus.textContent=String(error?.message||'重置失败');
+    }
+  }finally{
+    button.disabled=false;
+  }
+}
+async function syncGrok2ApiQuota(button){
+  if(!button||button.disabled)return;
+  button.disabled=true;
+  const findProgress=()=>{
+    const actions=button.closest('.subQuotaActions')||subQuotaContent?.querySelector('.subQuotaActions');
+    return actions?.querySelector('.subQuotaActionProgress')||null;
+  };
+  const setProgress=(text,state)=>{
+    const progress=findProgress();
+    if(!progress)return null;
+    if(text){
+      progress.hidden=false;
+      progress.textContent=text;
+      if(state)progress.dataset.state=state;
+      else delete progress.dataset.state;
+    }else{
+      progress.hidden=true;
+      progress.textContent='';
+      delete progress.dataset.state;
+    }
+    return progress;
+  };
+  setProgress('同步中…','loading');
+  if(subQuotaStatus){
+    subQuotaStatus.dataset.state='loading';
+    subQuotaStatus.textContent='正在同步 Grok2API Build 与 Console 额度…';
+  }
+  try{
+    const response=await fetch('/api/sub-quotas/grok2api/sync',{
+      method:'POST',
+      headers:{Accept:'application/json'},
+    });
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||'同步失败');
+    if(data.quotas)renderSubQuota(data.quotas);
+    else await loadSubQuota({refresh:true});
+    const succeeded=Number(data.sync?.succeeded||0);
+    const failed=Number(data.sync?.failed||0);
+    const providerFailures=Number(data.sync?.providerFailures||0);
+    let successText='同步完成';
+    if(succeeded||failed)successText+=' · 成功 '+succeeded+(failed?(' · 失败 '+failed):'');
+    if(providerFailures)successText+=' · '+providerFailures+' 个渠道失败';
+    const freshButton=subQuotaContent?.querySelector('button.subQuotaSync');
+    if(freshButton)button=freshButton;
+    setProgress(successText,providerFailures?'error':'success');
+    window.setTimeout(()=>{
+      const progress=findProgress();
+      if(progress&&(progress.dataset.state==='success'||progress.dataset.state==='error'))setProgress('','');
+    },5000);
+    if(subQuotaStatus){
+      if(providerFailures)subQuotaStatus.dataset.state='error';
+      else delete subQuotaStatus.dataset.state;
+      subQuotaStatus.textContent=successText;
+    }
+  }catch(error){
+    setProgress(String(error?.message||'同步失败'),'error');
+    if(subQuotaStatus){
+      subQuotaStatus.dataset.state='error';
+      subQuotaStatus.textContent=String(error?.message||'同步失败');
     }
   }finally{
     button.disabled=false;
@@ -15520,7 +15634,6 @@ function renderSubQuota(data){
       const meta=document.createElement('div');
       meta.className='subQuotaMeta';
       if(quota.message)appendSubQuotaMeta(meta,quota.message);
-      if(quota.status&&quota.status!=='active')appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
       if(meta.childElementCount)source.appendChild(meta);
       if(detailCount||meta.childElementCount){
         subQuotaContent.appendChild(source);
@@ -15570,14 +15683,14 @@ function renderSubQuota(data){
       if(quota.supportsReset!==false){
         const actions=document.createElement('div');
         actions.className='subQuotaActions';
-        const consoleBtn=document.createElement('button');
-        consoleBtn.type='button';
-        consoleBtn.className='subQuotaConsole';
-        consoleBtn.dataset.provider='grok2api';
-        consoleBtn.title='查看 Grok2API Docker 控制台';
-        setIconLabel(consoleBtn,'terminal-square','控制台');
-        consoleBtn.addEventListener('click',()=>openGrok2ApiConsole(consoleBtn));
-        actions.appendChild(consoleBtn);
+        const syncBtn=document.createElement('button');
+        syncBtn.type='button';
+        syncBtn.className='subQuotaSync';
+        syncBtn.dataset.provider='grok2api';
+        syncBtn.title='同步 Grok2API Build 与 Console 账号额度';
+        setIconLabel(syncBtn,'refresh-cw','额度同步');
+        syncBtn.addEventListener('click',()=>syncGrok2ApiQuota(syncBtn));
+        actions.appendChild(syncBtn);
         const resetBtn=document.createElement('button');
         resetBtn.type='button';
         resetBtn.className='subQuotaReset';
@@ -15586,11 +15699,11 @@ function renderSubQuota(data){
         resetBtn.title='重置 Grok2API 账号额度/冷却状态';
         resetBtn.addEventListener('click',()=>resetGrok2ApiQuota(resetBtn));
         actions.appendChild(resetBtn);
-        const resetProgress=document.createElement('span');
-        resetProgress.className='subQuotaResetProgress';
-        resetProgress.hidden=true;
-        resetProgress.setAttribute('aria-live','polite');
-        actions.appendChild(resetProgress);
+        const actionProgress=document.createElement('span');
+        actionProgress.className='subQuotaActionProgress';
+        actionProgress.hidden=true;
+        actionProgress.setAttribute('aria-live','polite');
+        actions.appendChild(actionProgress);
         source.appendChild(actions);
       }
       if(detailCount || meta.childElementCount){
@@ -15607,13 +15720,7 @@ function renderSubQuota(data){
       if(balanceValue!==null)detailCount+=appendSubQuotaWindow(source,'余额',{remaining:balanceValue},currency,{fixedCurrency:false,inlineStatus:balanceStatus,showRemainingLabel:false})?1:0;
       const meta=document.createElement('div');
       meta.className='subQuotaMeta subQuotaMetaDeepSeek';
-      const stats=quota.usageStats||{};
-      if(Number.isFinite(Number(stats.totalTokens))&&Number(stats.totalTokens)>0)appendSubQuotaMeta(meta,'累计 Token '+Number(stats.totalTokens).toLocaleString('zh-CN'));
       if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
-      if(Number.isFinite(Number(stats.requests))&&Number(stats.requests)>0){
-        const requests=appendSubQuotaMeta(meta,'累计请求 '+Number(stats.requests).toLocaleString('zh-CN'));
-        requests.className='subQuotaMetaTrailing';
-      }
       if(meta.childElementCount)source.appendChild(meta);
       if(detailCount||meta.childElementCount){
         subQuotaContent.appendChild(source);
@@ -15919,8 +16026,8 @@ function enhanceInterface(){
   enhanceComposer();
   setIconLabel(loginForm?.querySelector('.primary'),'log-in','登录');
   refreshIcons(login);
-  setCurrentConversationTitle('新任务');
   statusEl?.classList.add('topStatus');
+  if(!restoreBootConversationChrome())setCurrentConversationTitle('新任务');
   const historyTitle=history?.previousElementSibling;
   if(historyTitle){
     historyTitle.className='historyTitle';
@@ -15948,7 +16055,7 @@ function enhanceInterface(){
   window.addEventListener('resize',()=>{hideHistoryProjectPreview();renderSidebarWidth();renderSideChatWidth()},{passive:true});
   desktopSidebarMedia.addEventListener('change',()=>hideHistoryProjectPreview());
   const empty=document.querySelector('.empty');
-  if(empty){
+  if(empty&&!empty.classList.contains('conversationRestoring')){
     const heading=empty.querySelector('b');
     const detail=empty.querySelector('span');
     if(heading)heading.textContent='新任务';
@@ -15969,8 +16076,10 @@ archiveProjectFilter?.addEventListener('change',renderArchivedTasks);
 archiveRefresh?.addEventListener('click',()=>loadArchivedTasks({force:true}));
 archiveDeleteAll?.addEventListener('click',deleteAllArchivedTasks);
 automationToggle?.addEventListener('click',openAutomationView);
+historyUnreadToggle?.addEventListener('click',(event)=>{event.preventDefault();event.stopPropagation();toggleHistoryUnreadPopover()});
 document.addEventListener('click',(event)=>{
   if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')&&!subQuotaPopover.contains(event.target)&&!subQuotaToggle?.contains(event.target))hideSubQuotaPreview();
+  if(historyUnreadPopover&&!historyUnreadPopover.hidden&&!historyUnreadPopover.contains(event.target)&&!historyUnreadToggle?.contains(event.target))closeHistoryUnreadPopover();
 });
 automationSearch?.addEventListener('input',renderAutomations);
 automationFilter?.addEventListener('change',renderAutomations);
@@ -15989,7 +16098,7 @@ document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();finishSideChatResize();app.classList.remove('menuOpen');renderSidebarWidth();renderSideChatWidth();syncMenuButton()});
 document.addEventListener('pointerdown',(event)=>{if(!promptQueueMenu||promptQueueMenu.classList.contains('hidden'))return;if(promptQueueMenu.contains(event.target)||event.target.closest?.('.promptQueueIconButton[aria-label="队列操作"]'))return;closePromptQueueMenu()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(grok2ApiConsoleOverlay&&!grok2ApiConsoleOverlay.classList.contains('hidden')){closeGrok2ApiConsole();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(historyUnreadPopover&&!historyUnreadPopover.hidden){closeHistoryUnreadPopover({restoreFocus:true});return}if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(grok2ApiConsoleOverlay&&!grok2ApiConsoleOverlay.classList.contains('hidden')){closeGrok2ApiConsole();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',()=>{void requestComposerProviderChange(provider.value)});
@@ -16142,7 +16251,7 @@ async function handleCustomBackground(file){if(!file){await saveAppearance({chat
 async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
 document.addEventListener('click',(event)=>{if(!event.target.closest('.msg.user, .msg.assistant, .msgActions'))clearMessageActionsOpen()});
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();await loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(selectRecent&&data.conversations.length){const saved=readActiveConversationPreference();const conversations=Array.isArray(data.conversations)?data.conversations:[];const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=match||conversations[0];if(target)await loadConversation(target.id,target.source||'codex');}await restoreSideChatIfNeeded()}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();const conversations=Array.isArray(data.conversations)?data.conversations:[];const saved=selectRecent?readActiveConversationPreference():null;const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=selectRecent&&conversations.length?(match||conversations[0]):null;if(target){if(saved?.title||target.title)setCurrentConversationTitle(saved?.title||target.title,'Chat');setTopStatusText('同步中',{running:false});chat?.classList?.add('conversationRestoring');}const modelsReady=loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(target)await loadConversation(target.id,target.source||'codex');await modelsReady;await restoreSideChatIfNeeded()}
 function historyRefreshBlocked(){return historyRefreshPointerId!==null||activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')}
 function beginHistoryRefreshPointerLock(event){
   if(event.button!==0||event.isPrimary===false||!event.target.closest?.('.hist'))return;
@@ -16213,7 +16322,23 @@ async function refreshHistory(){
   return historyRefreshInFlight;
 }
 function nativeRuntimeNeedsHistoryRefresh(type){return ['turn','turn-cleared','connection-error'].includes(String(type||''))}
-function composerModelItems(items,selected){const list=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];const selectedModel=String(selected||'').trim();if(selectedModel&&!list.includes(selectedModel))list.push(selectedModel);return list}
+function composerModelItems(items,selected){
+  const providerItems=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];
+  const selectedModel=String(selected||'').trim();
+  const providerSet=new Set(providerItems.map((item)=>item.toLowerCase()));
+  const catalog=(nativeModelCatalogIds||[]).map((item)=>String(item||'').trim()).filter(Boolean);
+  let list;
+  if(catalog.length){
+    // Prefer Codex model catalog order/labels for the picker, keep provider-only extras after it.
+    const catalogVisible=catalog.filter((item)=>!providerSet.size || providerSet.has(item.toLowerCase()) || item===selectedModel);
+    const extras=providerItems.filter((item)=>!catalog.some((entry)=>entry.toLowerCase()===item.toLowerCase()));
+    list=[...catalogVisible,...extras];
+  }else{
+    list=providerItems;
+  }
+  if(selectedModel&&!list.some((item)=>item===selectedModel))list.push(selectedModel);
+  return [...new Set(list)];
+}
 function selectComposerModel(selected){const selectedModel=String(selected||'').trim();if(!selectedModel)return false;if(![...model.options].some((option)=>option.value===selectedModel)){const option=document.createElement('option');option.value=selectedModel;option.textContent=selectedModel;model.appendChild(option)}model.value=selectedModel;return true}
 function applyComposerModels(providerName,items,selected){const list=composerModelItems(items,selected);fillSelect(model,list,selected||list[0]||'');modelOptionsProvider=String(providerName||'')}
 function loadModels(providerName,selected,{force=false}={}){
@@ -16326,11 +16451,11 @@ function setMainView(view){
   if(archived){
     closeComposerPopovers();
     statusEl.textContent=archivedLoading?'正在读取归档列表...':'Codex App · 已归档';
-    setIconLabel(modeLabel,'archive','已归档');
+    modeLabel.dataset.mode='已归档';setIconLabel(modeLabel,'archive','已归档');
   }else if(automated){
     closeComposerPopovers();
     statusEl.textContent=automationLoading?'正在读取自动化...':'Codex App · 自动化';
-    setIconLabel(modeLabel,'calendar-clock','自动化');
+    modeLabel.dataset.mode='自动化';setIconLabel(modeLabel,'calendar-clock','自动化');
   }else applyConversationMode();
   updateJumpToLatestButton();
   renderTopConversationTitle();
@@ -17186,6 +17311,93 @@ function historyCompletionUnread(item){
   const key=historyCompletionKey(item);
   return Boolean(key&&historyCompletionRead.get(key)!==historyCompletionVersion(item));
 }
+function historyUnreadItems(){
+  return historyItems
+    .filter(historyCompletionUnread)
+    .sort((left,right)=>{
+      const leftTime=Date.parse(left?.updatedAt||left?.recencyAt||left?.createdAt||'')||0;
+      const rightTime=Date.parse(right?.updatedAt||right?.recencyAt||right?.createdAt||'')||0;
+      return rightTime-leftTime;
+    });
+}
+function historyUnreadTime(item){
+  const value=item?.updatedAt||item?.recencyAt||item?.createdAt;
+  const date=new Date(value||'');
+  if(Number.isNaN(date.getTime()))return'';
+  return date.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
+}
+function closeHistoryUnreadPopover({restoreFocus=false}={}){
+  if(!historyUnreadPopover||historyUnreadPopover.hidden)return;
+  historyUnreadPopover.hidden=true;
+  historyUnreadToggle?.setAttribute('aria-expanded','false');
+  if(restoreFocus)historyUnreadToggle?.focus();
+}
+function renderHistoryUnreadPopover(){
+  if(!historyUnreadToggle||!historyUnreadBadge||!historyUnreadPopover)return;
+  const unread=historyUnreadItems();
+  historyUnreadBadge.hidden=unread.length===0;
+  historyUnreadBadge.textContent=unread.length>99?'99+':String(unread.length);
+  historyUnreadToggle.classList.toggle('hasUnread',unread.length>0);
+  const label=unread.length?'未读已完成任务，'+unread.length+' 个':'没有未读已完成任务';
+  historyUnreadToggle.title=label;
+  historyUnreadToggle.setAttribute('aria-label',label);
+  historyUnreadPopover.replaceChildren();
+  const head=document.createElement('header');
+  head.className='historyUnreadHead';
+  const title=document.createElement('strong');
+  title.textContent='已完成';
+  const count=document.createElement('span');
+  count.textContent=unread.length+' 个未读';
+  head.appendChild(title);
+  head.appendChild(count);
+  historyUnreadPopover.appendChild(head);
+  const list=document.createElement('div');
+  list.className='historyUnreadList';
+  if(!unread.length){
+    const empty=document.createElement('div');
+    empty.className='historyUnreadEmpty';
+    empty.textContent='暂无未读完成任务';
+    list.appendChild(empty);
+  }else{
+    for(const item of unread){
+      const button=document.createElement('button');
+      button.type='button';
+      button.className='historyUnreadItem';
+      const copy=document.createElement('span');
+      copy.className='historyUnreadItemCopy';
+      const itemTitle=document.createElement('strong');
+      itemTitle.textContent=item.title||'未命名任务';
+      const meta=document.createElement('span');
+      meta.textContent=[item.source==='codex'?'Codex App':'Web',historyUnreadTime(item)].filter(Boolean).join(' · ');
+      copy.appendChild(itemTitle);
+      copy.appendChild(meta);
+      const arrow=document.createElement('i');
+      arrow.setAttribute('data-lucide','chevron-right');
+      arrow.setAttribute('aria-hidden','true');
+      button.appendChild(copy);
+      button.appendChild(arrow);
+      button.addEventListener('click',()=>{
+        markHistoryCompletionRead(item);
+        closeHistoryUnreadPopover();
+        void loadConversation(item.id,item.source==='codex'?'codex':'web');
+      });
+      list.appendChild(button);
+    }
+  }
+  historyUnreadPopover.appendChild(list);
+  refreshIcons(historyUnreadPopover);
+}
+function toggleHistoryUnreadPopover(){
+  if(!historyUnreadPopover||!historyUnreadToggle)return;
+  if(!historyUnreadPopover.hidden){
+    closeHistoryUnreadPopover();
+    return;
+  }
+  renderHistoryUnreadPopover();
+  historyUnreadPopover.hidden=false;
+  historyUnreadToggle.setAttribute('aria-expanded','true');
+  requestAnimationFrame(()=>historyUnreadPopover.querySelector('.historyUnreadItem')?.focus()||historyUnreadPopover.focus());
+}
 function markHistoryCompletionRead(item){
   if(!isCompletedHistoryItem(item))return;
   const key=historyCompletionKey(item);
@@ -17267,7 +17479,7 @@ function appendHistoryProjectPreviewRow(container,iconName,text,className=''){
   container.appendChild(row);
   return row;
 }
-function showHistoryProjectPreview(anchor,{projectName,projectPath,itemCount,runningCount}){
+function showHistoryProjectPreview(anchor,{projectName,projectPath,itemCount,runningCount,groupKey=''}){
   if(!desktopSidebarMedia.matches||activeHistoryProjectMenu)return;
   const preview=ensureHistoryProjectPreview();
   preview.replaceChildren();
@@ -17291,11 +17503,37 @@ function showHistoryProjectPreview(anchor,{projectName,projectPath,itemCount,run
   heading.appendChild(identity);
   heading.appendChild(pin);
   preview.appendChild(heading);
-  appendHistoryProjectPreviewRow(preview,'message-circle',itemCount+' 个对话串 · '+runningCount+' 个已开启','historyProjectPreviewStats');
+  appendHistoryProjectPreviewRow(preview,'message-circle',itemCount+' 个任务','historyProjectPreviewStats');
   const divider=document.createElement('div');
   divider.className='historyProjectPreviewDivider';
   preview.appendChild(divider);
   appendHistoryProjectPreviewRow(preview,'folder',projectPath||'路径未知','historyProjectPreviewPath');
+  const actions=document.createElement('div');
+  actions.className='historyProjectPreviewActions';
+  const editButton=document.createElement('button');
+  editButton.type='button';
+  editButton.className='historyProjectPreviewAction';
+  setIconLabel(editButton,'settings-2','编辑项目');
+  editButton.addEventListener('click',(event)=>{
+    event.preventDefault();
+    event.stopPropagation();
+    hideHistoryProjectPreview();
+    renameHistoryProject(groupKey||historyProjectKey(projectPath),projectPath,projectName);
+  });
+  const newTaskButton=document.createElement('button');
+  newTaskButton.type='button';
+  newTaskButton.className='historyProjectPreviewAction primary';
+  newTaskButton.disabled=!projectPath;
+  setIconLabel(newTaskButton,'plus','新建任务');
+  newTaskButton.addEventListener('click',(event)=>{
+    event.preventDefault();
+    event.stopPropagation();
+    hideHistoryProjectPreview();
+    startNewTaskInProject(projectPath);
+  });
+  actions.appendChild(editButton);
+  actions.appendChild(newTaskButton);
+  preview.appendChild(actions);
   refreshIcons(preview);
   historyProjectPreviewAnchor=anchor;
   preview.hidden=false;
@@ -17377,12 +17615,38 @@ function createHistoryProjectMenu(groupKey,groupData,projectName){
   menu.setAttribute('aria-label','项目 '+projectName+' 的操作');
   menu.hidden=true;
   addHistoryProjectMenuAction(menu,'pencil','重命名项目',()=>renameHistoryProject(groupKey,groupData.path,projectName));
+  addHistoryProjectMenuAction(menu,'plus','在此路径新建任务',()=>startNewTaskInProject(groupData.path),{disabled:!groupData.path});
   addHistoryProjectMenuAction(menu,'archive','归档项目任务',()=>archiveHistoryProject(groupData.path,projectName,groupData.items),{disabled:!groupData.path});
   const hidden=hiddenHistoryProjects.has(groupKey);
   addHistoryProjectMenuAction(menu,hidden?'undo-2':'x',hidden?'恢复项目':'移除项目',()=>toggleHistoryProjectHidden(groupKey,projectName,groupData.items.length),{danger:!hidden});
   button.addEventListener('click',(event)=>{event.stopPropagation();toggleHistoryProjectMenu(button,menu)});
   menu.addEventListener('click',(event)=>event.stopPropagation());
-  return{button,menu};
+  const editButton=document.createElement('button');
+  editButton.type='button';
+  editButton.className='historyProjectMenuButton historyProjectEditButton';
+  editButton.title='编辑项目';
+  editButton.setAttribute('aria-label','编辑项目 '+projectName);
+  setIconLabel(editButton,'pencil','编辑项目',false);
+  editButton.addEventListener('click',(event)=>{
+    event.preventDefault();
+    event.stopPropagation();
+    closeHistoryProjectMenu(false);
+    hideHistoryProjectPreview();
+    renameHistoryProject(groupKey,groupData.path,projectName);
+  });
+  const newTaskButton=document.createElement('button');
+  newTaskButton.type='button';
+  newTaskButton.className='historyProjectMenuButton historyProjectNewTaskButton';
+  newTaskButton.title='在此路径新建任务';
+  newTaskButton.setAttribute('aria-label','在项目 '+projectName+' 路径新建任务');
+  newTaskButton.disabled=!groupData.path;
+  setIconLabel(newTaskButton,'plus','在此路径新建任务',false);
+  newTaskButton.addEventListener('click',(event)=>{
+    event.preventDefault();
+    event.stopPropagation();
+    startNewTaskInProject(groupData.path);
+  });
+  return{button,menu,editButton,newTaskButton};
 }
 function renameHistoryProject(groupKey,projectPath,projectName){
   const next=prompt('重命名项目（留空恢复默认名称）',projectName);
@@ -17598,6 +17862,7 @@ function appendStandaloneHistoryTasks(items,{query=false}={}){
 function renderHistory(items){
   if(Array.isArray(items))historyItems=items.filter((item)=>!item?.sideChat && String(item?.workspaceKind||'')!=='sidechat');
   trackHistoryCompletionState(historyItems);
+  renderHistoryUnreadPopover();
   if(historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')){
     historyRefreshPending=true;
     return;
@@ -17665,10 +17930,15 @@ function renderHistory(items){
     head.appendChild(title);
     head.appendChild(chevron);
     const projectMenu=createHistoryProjectMenu(groupKey,groupData,projectName);
+    const projectActions=document.createElement('div');
+    projectActions.className='historyProjectActions';
+    projectActions.appendChild(projectMenu.button);
+    if(projectMenu.editButton)projectActions.appendChild(projectMenu.editButton);
+    if(projectMenu.newTaskButton)projectActions.appendChild(projectMenu.newTaskButton);
     header.appendChild(head);
-    header.appendChild(projectMenu.button);
+    header.appendChild(projectActions);
     header.appendChild(projectMenu.menu);
-    const previewData={projectName,projectPath:groupData.path,itemCount:groupData.items.length,runningCount};
+    const previewData={projectName,projectPath:groupData.path,itemCount:groupData.items.length,runningCount,groupKey};
     header.addEventListener('pointerenter',()=>showHistoryProjectPreview(header,previewData));
     header.addEventListener('pointerleave',()=>hideHistoryProjectPreview(header));
     header.addEventListener('focusin',()=>showHistoryProjectPreview(header,previewData));
@@ -18118,9 +18388,9 @@ function applyConversationMode(){
   for(const control of [provider,model,reasoningEffort])control.disabled=legacyLocked;
   sandbox.disabled=legacyLocked||forceFullAccess;
   approval.disabled=legacyLocked||forceFullAccess;
-  nativeNotice.classList.toggle('hidden',!native);
-  setIconLabel(modeLabel,native?'app-window':'globe-2',native?'Codex App':'Web');
-  statusEl.classList.toggle('running',webRunActive);
+  setNativeNoticeText(nativeNotice?.textContent||'Codex App 会话 · 双向同步',{visible:native});
+  if(activeMainView==='chat')setModeLabelState(native);
+  if(activeMainView==='chat')statusEl.classList.toggle('running',webRunActive);
   input.placeholder=queueStarting?'正在发送队列消息...':steerSubmitting?'正在发送引导...':cancelPending?'正在停止当前任务...':webRunActive&&native?'排队消息':'向 Codex 提问';
   cancelBtn.classList.toggle('hidden',!webRunActive||!native);
   cancelBtn.disabled=!webRunActive||cancelPending;
@@ -18204,7 +18474,7 @@ function syncNativeComposerSettings(changes={}){
   nativeComposerSettingsQueue=queued.catch(()=>false);
   return queued;
 }
-function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';nativeNotice.textContent='Codex App 会话 · 双向同步';statusEl.textContent='Ready';input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';setNativeNoticeText('Codex App 会话 · 双向同步',{visible:true});setTopStatusText('Ready',{running:false});input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -18212,10 +18482,11 @@ function readActiveConversationPreference(){
     const id=String(parsed.id||'').trim();
     if(!id)return null;
     const source=parsed.source==='web'?'web':'codex';
-    return{id,source};
+    const title=normalizeConversationTitle(parsed.title||'','');
+    return{id,source,title};
   }catch(e){return null}
 }
-function persistActiveConversation(id=currentConversationId,source=currentConversationSource){
+function persistActiveConversation(id=currentConversationId,source=currentConversationSource,title=currentConversationTitle){
   try{
     const cleanId=String(id||'').trim();
     if(!cleanId){
@@ -18225,9 +18496,31 @@ function persistActiveConversation(id=currentConversationId,source=currentConver
     localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY,JSON.stringify({
       id:cleanId,
       source:source==='web'?'web':'codex',
+      title:normalizeConversationTitle(title||currentConversationTitle||'','Chat'),
       at:Date.now(),
     }));
   }catch(e){}
+}
+function restoreBootConversationChrome(){
+  const saved=readActiveConversationPreference();
+  if(!saved?.id)return null;
+  currentConversationId=saved.id;
+  currentConversationSource=saved.source==='web'?'web':'codex';
+  if(saved.title)setCurrentConversationTitle(saved.title,'Chat');
+  else setCurrentConversationTitle('Chat','Chat');
+  setNativeNoticeText('Codex App 会话 · 双向同步',{visible:currentConversationSource==='codex'});
+  if(activeMainView==='chat')setModeLabelState(currentConversationSource==='codex');
+  const empty=chat?.querySelector?.('.empty')||document.querySelector('.empty');
+  if(empty){
+    empty.classList.add('conversationRestoring');
+    const heading=empty.querySelector('b');
+    const detail=empty.querySelector('span');
+    if(heading)heading.textContent=saved.title||'正在恢复会话';
+    if(detail)detail.textContent='正在同步会话内容…';
+  }
+  chat?.classList?.add('conversationRestoring');
+  setTopStatusText(statusEl?.textContent&&statusEl.textContent!=='Ready'?statusEl.textContent:'同步中',{running:false});
+  return saved;
 }
 function readNativeForkMarkers(){
   try{
@@ -18491,12 +18784,19 @@ async function loadConversation(id,source='web',options={}){
   currentConversationId=id;
   currentConversationSource=source==='codex'?'codex':'web';
   currentNativeRunStatus='';
+  // Drop previous run chrome immediately so the header does not keep pulsing
+  // the old conversation while the next one is still loading.
+  if(conversationChanged){
+    webRunActive=false;
+    steerSubmitting=false;
+    activeNativeTurnId='';
+  }
   nativeCursor=0;
   nativeGeneration=0;
   syncComposerContextWindow(null);
   applyConversationMode();
   updateActiveHistory();
-  if(conversationChanged)statusEl.textContent='Loading...';
+  if(conversationChanged)scheduleConversationStatusLoading(seq); else clearConversationStatusLoading();
   let conversation=options.conversation||null;
   if(conversation&&nextConversationSource==='codex'){
     const suppliedMessages=Array.isArray(conversation.messages)?conversation.messages:[];
@@ -18513,7 +18813,7 @@ async function loadConversation(id,source='web',options={}){
     const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery+nativeHistoryPagingQuery;
     const res=await fetch(requestUrl);
     if(seq!==conversationLoadSeq)return false;
-    if(!res.ok){statusEl.textContent='加载失败';return false}
+    if(!res.ok){clearConversationStatusLoading();setTopStatusText('加载失败',{running:false});return false}
     const data=await res.json();
     if(seq!==conversationLoadSeq)return false;
     conversation=data.conversation;
@@ -18553,20 +18853,28 @@ async function loadConversation(id,source='web',options={}){
   const preserveHistoryFollowBottom=Boolean(options.historyScrollAnchor)&&options.preserveHistoryFollowBottom===true;
   if(options.historyScrollAnchor&&!preserveHistoryFollowBottom)setNativeLiveReadingHistory(true);
   else resumeNativeLiveFollowBottom();
-  chat.innerHTML='';
   const messages=conversation.messages||[];
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
   const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
-  beginTurnProcessCollection();
+  // Only open a live process shell for an actually running turn. Idle history hydration
+  // should paint static transcript cards and must not mount an empty live panel.
+  if(webRunActive)beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);
+  else resetTurnProcessCollection();
   const deferHistoryIcons=Boolean(options.historyScrollAnchor)||messages.length>=NATIVE_HISTORY_PAGE_SIZE;
+  const restorePaint=conversationChanged||chat.classList.contains('conversationRestoring');
+  if(restorePaint)chat.classList.add('conversationRestoring');
   if(deferHistoryIcons)beginDeferredIconRefresh();
   try{
+    // Clear only when the next snapshot is ready to render, so refresh/boot does not
+    // flash an empty Ask Codex / 新任务 shell between title restore and content paint.
+    chat.replaceChildren();
     messages.forEach((msg,index)=>{
       if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
       addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
     });
   }finally{
     if(deferHistoryIcons)endDeferredIconRefresh(chat);
+    // conversationRestoring is cleared after the first stable paint/history fill.
   }
   if(currentConversationSource==='codex')renderNativeForkDivider(messages);
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
@@ -18577,23 +18885,37 @@ async function loadConversation(id,source='web',options={}){
   else renderPromptQueue();
   if(currentConversationSource==='codex'&&!webRunActive)schedulePromptQueueDispatch(currentConversationId,180);
   closeMenu();
-  persistActiveConversation(currentConversationId,currentConversationSource);
+  persistActiveConversation(currentConversationId,currentConversationSource,currentConversationTitle);
   bindNativeLiveScrollTracking();
   if(options.historyScrollAnchor){
     await restoreHistoryScrollAnchor(chat,options.historyScrollAnchor);
     if(preserveHistoryFollowBottom)resumeNativeLiveFollowBottom();
     else setNativeLiveReadingHistory(true);
     nativeHistoryLoadReady=true;
+    if(!chat.classList.contains('conversationRestoring'))refreshIcons(chat);
   }else{
     scrollChatToLatest({force:true});
     alignChatToBottomStable(12,seq);
     const readyId=currentConversationId;
     const readySource=currentConversationSource;
-    setTimeout(()=>{
+    const finishRestorePaint=()=>{
       if(currentConversationId!==readyId||currentConversationSource!==readySource)return;
-      nativeHistoryLoadReady=readySource==='codex';
-      if(readySource==='codex'&&!nativeHistoryViewportFilled(chat))void loadEarlierNativeHistoryPage({fillViewport:true});
-    },180);
+      chat.classList.remove('conversationRestoring');
+      refreshIcons(chat);
+    };
+    // Hold the restore veil through the first history fill so usage-limit cards do not
+    // pop/reshape while older pages are pulled in.
+    if(readySource==='codex'){
+      nativeHistoryLoadReady=true;
+      const needsFill=!nativeHistoryViewportFilled(chat)&&nativeHistoryHasEarlierMessages;
+      if(needsFill){
+        void loadEarlierNativeHistoryPage({fillViewport:true}).finally(finishRestorePaint);
+      }else{
+        finishRestorePaint();
+      }
+    }else{
+      finishRestorePaint();
+    }
   }
   return true;
 }
@@ -18601,11 +18923,52 @@ function nativeRunningStatusTimestamp(value=Date.now()){
   const time=new Date(value||Date.now());
   return (Number.isNaN(time.getTime())?new Date():time).toLocaleString();
 }
+function setTopStatusText(text,{running=null}={}){
+  const next=String(text||'');
+  if(statusEl.textContent!==next)statusEl.textContent=next;
+  if(running===null)return;
+  statusEl.classList.toggle('running',Boolean(running));
+}
+function setNativeNoticeText(text,{visible=null}={}){
+  if(!nativeNotice)return;
+  const next=String(text||'');
+  if(nativeNotice.textContent!==next)nativeNotice.textContent=next;
+  if(visible===null)return;
+  const hide=!visible;
+  if(nativeNotice.classList.contains('hidden')!==hide)nativeNotice.classList.toggle('hidden',hide);
+}
+function setModeLabelState(native){
+  const label=native?'Codex App':'Web';
+  const icon=native?'app-window':'globe-2';
+  if(modeLabel?.dataset.mode===label)return;
+  modeLabel.dataset.mode=label;
+  setIconLabel(modeLabel,icon,label);
+}
+let conversationStatusLoadTimer=null;
+let conversationStatusLoadSeq=0;
+function clearConversationStatusLoading(){
+  if(conversationStatusLoadTimer){
+    clearTimeout(conversationStatusLoadTimer);
+    conversationStatusLoadTimer=0;
+  }
+}
+function scheduleConversationStatusLoading(seq){
+  clearConversationStatusLoading();
+  conversationStatusLoadSeq=seq;
+  // Keep the previous status visible for quick switches so the header does not flash.
+  conversationStatusLoadTimer=setTimeout(()=>{
+    conversationStatusLoadTimer=0;
+    if(seq!==conversationLoadSeq)return;
+    setTopStatusText('加载中…',{running:false});
+  },180);
+}
 function showNativeRunningTimestamp(value=Date.now()){
+  const next=nativeRunningStatusTimestamp(value);
+  if(statusEl.textContent!==next)statusEl.textContent=next;
   statusEl.classList.add('running');
-  statusEl.textContent=nativeRunningStatusTimestamp(value);
 }
 function updateConversationStatus(conversation){
+  clearConversationStatusLoading();
   const time=new Date(conversation.updatedAt||conversation.createdAt);
   const stamp=Number.isNaN(time.getTime())?'':time.toLocaleString();
   const running=conversation.source==='codex'
@@ -18615,21 +18978,20 @@ function updateConversationStatus(conversation){
     && running
     && nativeCancelPendingMatches(conversation.id,conversation.activeTurnId);
   if(cancelPending){
-    statusEl.classList.add('running');
-    statusEl.textContent='Codex App · 正在停止…';
-    nativeNotice.textContent='Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':'');
+    setTopStatusText('Codex App · 正在停止…',{running:true});
+    setNativeNoticeText('Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':''),{visible:true});
     return;
   }
-  statusEl.classList.toggle('running',running);
   if(conversation.source==='codex'){
     if(running)showNativeRunningTimestamp(conversation.updatedAt||conversation.createdAt);
     else{
       const stateLabel=conversation.status==='interrupted'?'已暂停':conversation.status==='error'?'任务失败':'已同步';
-      statusEl.textContent='Codex App · '+stateLabel+(stamp?' · '+stamp:'');
+      setTopStatusText('Codex App · '+stateLabel+(stamp?' · '+stamp:''),{running:false});
     }
-    nativeNotice.textContent='Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':'');
+    setNativeNoticeText('Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':''),{visible:true});
   }else{
-    statusEl.textContent='Loaded '+stamp;
+    setTopStatusText('Loaded '+stamp,{running:false});
+    setNativeNoticeText(nativeNotice?.textContent||'',{visible:false});
   }
 }
 async function applyNativeConversationMetadata(metadata,{preserveProviderModel=false,preservePermissions=preserveProviderModel}={}){
@@ -18790,18 +19152,22 @@ function connectSessionEvents(){
   sessionEvents.addEventListener('sessions',(event)=>{
     let changedIds=[];
     let conversationChangedIds=[];
+    let completionReadStateChanged=false;
     try{
       const parsed=JSON.parse(event.data||'{}');
       changedIds=Array.isArray(parsed.changedIds)?parsed.changedIds:[];
       conversationChangedIds=Array.isArray(parsed.conversationChangedIds)?parsed.conversationChangedIds:changedIds;
+      completionReadStateChanged=parsed.completionReadStateChanged===true;
     }catch(e){}
-    if(!changedIds.length)return;
-    refreshOpenSubagentTraces(changedIds);
+    if(!changedIds.length&&!completionReadStateChanged)return;
+    if(changedIds.length)refreshOpenSubagentTraces(changedIds);
     if(conversationChangedIds.length){
       scheduleHistoryRefreshFromSession();
+    }
+    if(conversationChangedIds.length||completionReadStateChanged){
       scheduleHistoryCompletionReadSync();
     }
-    scheduleChangedNativeSessionSync(changedIds);
+    if(changedIds.length)scheduleChangedNativeSessionSync(changedIds);
   });
   sessionEvents.addEventListener('native-runtime',(event)=>{
     let runtime={};
@@ -18899,7 +19265,13 @@ function reconcileNativeResetMessage(message){
   if(message?.role==='image')return refreshNativeResetImage(message);
   const existing=nativeMessageElementBySequence(message?.seq);
   if(!existing)return false;
-  const text=String(message.content||'');
+  const text=['assistant','process'].includes(message.role)
+    ?stripNativeUiProtocolLines(message.content)
+    :String(message.content||'');
+  if(!text&&String(message.content||'').trim()){
+    existing.remove();
+    return true;
+  }
   if(message.role==='user')rememberResponseAnnotations(message.turnId,text);
   if(message.responseAnnotations)rememberResponseAnnotationItems(message.turnId,message.responseAnnotations);
   const before=normalizeAssistantDedupeText(existing.dataset.messageText||'');
@@ -19657,6 +20029,116 @@ function renderBrowserCommentMessageBody(body,text){
   }
   renderMessageMarkdown(body,source);
 }
+function nativeUiProtocolLine(line,{allowPartial=false}={}){
+  const source=String(line||'').trim();
+  const opener=/^::git-[a-z0-9_-]+\\{/i.exec(source);
+  if(!opener){
+    if(!allowPartial||!source)return false;
+    const prefix='::git-';
+    return prefix.startsWith(source.toLowerCase())||/^::git-[a-z0-9_-]*$/i.test(source);
+  }
+  let depth=0;
+  let quote='';
+  let escaped=false;
+  for(let index=opener[0].length-1;index<source.length;index++){
+    const char=source[index];
+    if(quote){
+      if(escaped)escaped=false;
+      else if(char==='\\\\')escaped=true;
+      else if(char===quote)quote='';
+      continue;
+    }
+    if(char==='"'||char==="'"){quote=char;continue}
+    if(char==='{')depth+=1;
+    else if(char==='}'){
+      depth-=1;
+      if(depth===0)return!source.slice(index+1).trim();
+    }
+  }
+  return allowPartial&&depth>0;
+}
+function stripNativeUiProtocolLines(value,{streaming=false}={}){
+  const source=String(value||'').replace(/\\r\\n/g,'\\n');
+  if(!source)return'';
+  const kept=[];
+  let fence=null;
+  let protocol=null;
+  let protocolLines=[];
+  let removed=false;
+  for(const line of source.split('\\n')){
+    if(protocol){
+      protocolLines.push(line);
+      let closedAt=-1;
+      for(let index=0;index<line.length;index++){
+        const char=line[index];
+        if(protocol.quote){
+          if(protocol.escaped)protocol.escaped=false;
+          else if(char==='\\\\')protocol.escaped=true;
+          else if(char===protocol.quote)protocol.quote='';
+          continue;
+        }
+        if(char==='"'||char==="'"){protocol.quote=char;continue}
+        if(char==='{')protocol.depth+=1;
+        else if(char==='}'){
+          protocol.depth-=1;
+          if(protocol.depth===0){closedAt=index;break}
+        }
+      }
+      if(closedAt<0)continue;
+      if(!line.slice(closedAt+1).trim())removed=true;
+      else kept.push(...protocolLines);
+      protocol=null;
+      protocolLines=[];
+      continue;
+    }
+    const trimmed=line.trim();
+    const marker=new RegExp('^('+String.fromCharCode(96)+'{3,}|~{3,})').exec(trimmed);
+    if(fence){
+      kept.push(line);
+      if(marker&&marker[1][0]===fence.char&&marker[1].length>=fence.length)fence=null;
+      continue;
+    }
+    if(marker){
+      kept.push(line);
+      fence={char:marker[1][0],length:marker[1].length};
+      continue;
+    }
+    if(nativeUiProtocolLine(trimmed)){
+      removed=true;
+      continue;
+    }
+    const opener=/^::git-[a-z0-9_-]+\\{/i.exec(trimmed);
+    if(opener){
+      protocol={depth:0,quote:'',escaped:false};
+      protocolLines=[line];
+      for(let index=opener[0].length-1;index<trimmed.length;index++){
+        const char=trimmed[index];
+        if(protocol.quote){
+          if(protocol.escaped)protocol.escaped=false;
+          else if(char==='\\\\')protocol.escaped=true;
+          else if(char===protocol.quote)protocol.quote='';
+          continue;
+        }
+        if(char==='"'||char==="'"){protocol.quote=char;continue}
+        if(char==='{')protocol.depth+=1;
+        else if(char==='}')protocol.depth-=1;
+      }
+      if(protocol.depth<=0){protocol=null;protocolLines=[]}
+      continue;
+    }
+    if(streaming&&nativeUiProtocolLine(trimmed,{allowPartial:true})){
+      removed=true;
+      continue;
+    }
+    kept.push(line);
+  }
+  if(protocol){
+    if(streaming)removed=true;
+    else kept.push(...protocolLines);
+  }
+  if(!removed)return source;
+  return kept.join('\\n').replace(/\\n{3,}/g,'\\n\\n').trim();
+}
 function automationHeartbeatDisplayText(text){
   const original=String(text||'');
   const openTag='<heartbeat>';
@@ -19734,7 +20216,8 @@ function automationInstructionDisplayText(text){
   }catch(e){return original}
 }
 function renderAssistantMarkdown(body,text,turnId=''){
-  renderMessageMarkdown(body,automationHeartbeatDisplayText(text),{assistantArtifacts:true});
+  const displayText=stripNativeUiProtocolLines(automationHeartbeatDisplayText(text));
+  renderMessageMarkdown(body,displayText,{assistantArtifacts:true});
   const messageTurnId=String(turnId||body?.closest?.('.msg')?.dataset?.turnId||'');
   enhanceResponseAnnotationDirectives(body,responseAnnotationsForTurn(messageTurnId));
 }
@@ -21199,12 +21682,16 @@ function appendTurnTool(text,options={}){
   let visibleBatch=null;
   if(imageViews.length){
     visibleBatch=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',true,activityOptions);
+    if(Number.isInteger(options.nativeMessageSeq)&&!folded.length)visibleBatch.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+    if(options.turnId)visibleBatch.dataset.turnId=String(options.turnId);
     activateTurnProcessElement(visibleBatch);
     refreshIcons(visibleBatch);
   }
   if(!folded.length){moveTurnReasoningStatusToEnd();return visibleBatch}
   const activityKind=folded.some((presentation)=>presentation.variant==='agent')?'agent_activity':'tool_activity';
   const batch=createActivityBatch(folded,text,activityKind,true,activityOptions);
+  if(Number.isInteger(options.nativeMessageSeq))batch.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+  if(options.turnId)batch.dataset.turnId=String(options.turnId);
   if(visibleBatch)batch._relatedActivityBatches=[visibleBatch];
   activateTurnProcessElement(batch);
   if(folded.some((presentation)=>['已编辑','已新增','已删除'].includes(presentation.verb)))refreshLiveEditedFilesResult();
@@ -21226,11 +21713,13 @@ function settleTurnTool(batch){
     updateAgentActivityGroupStatus(item._agentActivityGroup||item.closest('.agentActivityGroup'));
   }
 }
-function appendTurnProcessActivity(text,kind){
+function appendTurnProcessActivity(text,kind,options={}){
   const presentation=kind==='context_compacted'
     ?{verb:'上下文已自动压缩',icon:'scan-text',expandable:false}
     :{verb:String(text||'过程'),icon:'activity',expandable:false};
   const batch=createActivityBatch([presentation],text,kind);
+  if(Number.isInteger(options.nativeMessageSeq))batch.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+  if(options.turnId)batch.dataset.turnId=String(options.turnId);
   activateTurnProcessElement(batch);
   refreshIcons(batch);
   return batch;
@@ -21251,9 +21740,12 @@ function completionMessageTitle(text,fallbackSeconds=NaN){
   const status=String(text||'').trim();
   if(status==='任务失败')return'任务失败';
   if(status==='任务已暂停'||status==='任务中断')return'已暂停';
-  const parsed=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
-  const seconds=Number.isFinite(parsed)?parsed:Number(fallbackSeconds);
+  const seconds=completionElapsedSeconds(text,fallbackSeconds);
   return Number.isFinite(seconds)?processedMessageTitle(seconds,{minimum:1}):'已处理';
+}
+function completionElapsedSeconds(text,fallbackSeconds=NaN){
+  const parsed=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
+  return Number.isFinite(parsed)?parsed:Number(fallbackSeconds);
 }
 function turnTokenUsageLabel(tokenUsage){
   const total=Number(tokenUsage?.totalTokens);
@@ -21452,6 +21944,12 @@ function resetTurnProcessCollection(){
   if(typeof renderThreadGoalBar==='function')renderThreadGoalBar();
 }
 function beginTurnProcessCollection(startedAt='',showElapsed=false,turnId=''){
+  const incomingTurnId=String(turnId||'');
+  if(incomingTurnId&&typeof completionMessageForTurn==='function'&&completionMessageForTurn(incomingTurnId)){
+    collectingTurnProcess=false;
+    turnProcessCollectionTurnId='';
+    return;
+  }
   // If a previous turn never received task_complete, keep its assistant progress instead of deleting it.
   const previousTurnId=turnProcessCollectionTurnId||turnProcessElapsedTurnId;
   let orphanCompletion=null;
@@ -21806,7 +22304,7 @@ function organizeTurnArtifactsForCompletion(artifacts=[],anchor=null){
     isProgressArtifact,
   };
 }
-function createCompletionMessage(text,processElements=[],turnId='',elapsedSeconds=NaN,tokenUsage=null){
+function createCompletionMessage(text,processElements=[],turnId='',elapsedSeconds=NaN,tokenUsage=null,nativeMessageSeq=null){
   // User/steer bubbles stay in the main chat stream; completed commentary and tool history fold together.
   const items=settleTurnProcessHistory(processElements).filter((item)=>Boolean(item)&&!item.classList?.contains('user')&&!item.classList?.contains('steeringUser'));
   const collapsible=items.length>0;
@@ -21815,17 +22313,21 @@ function createCompletionMessage(text,processElements=[],turnId='',elapsedSecond
   el.dataset.messageText=String(text||'');
   el.dataset.turnId=String(turnId||'');
   el.dataset.messageKind='task_complete';
+  if(Number.isInteger(nativeMessageSeq))el.dataset.nativeMessageSeq=String(nativeMessageSeq);
+  const resolvedElapsed=completionElapsedSeconds(text,elapsedSeconds);
+  if(Number.isFinite(resolvedElapsed))el.dataset.elapsedSeconds=String(resolvedElapsed);
   if(collapsible)el.open=false;
   const head=document.createElement(collapsible?'summary':'div');
   head.className=collapsible?'':'completionRow';
   const label=document.createElement('span');
   label.className='completionLabel';
-  label.textContent=completionMessageTitle(text,elapsedSeconds);
+  label.textContent=completionMessageTitle(text,resolvedElapsed);
   const tokenLabel=turnTokenUsageLabel(tokenUsage);
   const usage=document.createElement('span');
   usage.className='completionTokenUsage';
   usage.textContent=tokenLabel?'· '+tokenLabel:'';
   usage.classList.toggle('hidden',!tokenLabel);
+  if(tokenLabel)el.dataset.tokenUsageLabel=tokenLabel;
   head.appendChild(label);
   head.appendChild(usage);
   if(collapsible){
@@ -21846,6 +22348,34 @@ function createCompletionMessage(text,processElements=[],turnId='',elapsedSecond
     el.appendChild(content);
   }
   return el;
+}
+function completionMessageForTurn(turnId){
+  const id=String(turnId||'');
+  if(!id)return null;
+  return [...chat.querySelectorAll('.completionSummary')].reverse().find((item)=>String(item.dataset.turnId||'')===id)||null;
+}
+function updateCompletionMessage(completion,text,elapsedSeconds=NaN,tokenUsage=null,nativeMessageSeq=null){
+  if(!completion)return null;
+  const message=String(text||completion.dataset.messageText||'');
+  completion.dataset.messageText=message;
+  if(Number.isInteger(nativeMessageSeq))completion.dataset.nativeMessageSeq=String(nativeMessageSeq);
+  const previousElapsed=Number(completion.dataset.elapsedSeconds);
+  const incomingElapsed=completionElapsedSeconds(message,elapsedSeconds);
+  const resolvedElapsed=Number.isFinite(previousElapsed)&&Number.isFinite(incomingElapsed)
+    ?Math.max(previousElapsed,incomingElapsed)
+    :Number.isFinite(incomingElapsed)?incomingElapsed:previousElapsed;
+  if(Number.isFinite(resolvedElapsed))completion.dataset.elapsedSeconds=String(resolvedElapsed);
+  const label=completion.querySelector(':scope > summary .completionLabel, :scope > .completionRow .completionLabel');
+  if(label)label.textContent=completionMessageTitle(message,resolvedElapsed);
+  const incomingTokenLabel=turnTokenUsageLabel(tokenUsage);
+  if(incomingTokenLabel)completion.dataset.tokenUsageLabel=incomingTokenLabel;
+  const tokenLabel=incomingTokenLabel||String(completion.dataset.tokenUsageLabel||'');
+  const usage=completion.querySelector(':scope > summary .completionTokenUsage, :scope > .completionRow .completionTokenUsage');
+  if(usage){
+    usage.textContent=tokenLabel?'· '+tokenLabel:'';
+    usage.classList.toggle('hidden',!tokenLabel);
+  }
+  return completion;
 }
 function editedFilesFromTurnArtifacts(elements){
   const files=new Map();
@@ -22249,15 +22779,34 @@ function appendInputImageToUser(userElement,source,at){
   return item;
 }
 function completionTimelineForTurn(turnId){
-  const id=String(turnId||'');
-  if(!id)return null;
-  const completion=[...chat.querySelectorAll('.completionSummary')].reverse().find((item)=>item.dataset.turnId===id);
+  const completion=completionMessageForTurn(turnId);
   if(!completion)return null;
-  let content=completion.querySelector(':scope > .completionContent');
+  let target=completion;
+  if(target.tagName!=='DETAILS'){
+    const replacement=document.createElement('details');
+    replacement.className=target.className+' collapsible';
+    for(const [key,value] of Object.entries(target.dataset||{}))replacement.dataset[key]=value;
+    const row=target.querySelector(':scope > .completionRow');
+    const summary=document.createElement('summary');
+    if(row){
+      while(row.firstChild)summary.appendChild(row.firstChild);
+    }
+    const chevron=document.createElement('i');
+    chevron.className='completionChevron';
+    chevron.setAttribute('data-lucide','chevron-right');
+    chevron.setAttribute('aria-hidden','true');
+    summary.appendChild(chevron);
+    replacement.appendChild(summary);
+    target.parentNode?.replaceChild(replacement,target);
+    target=replacement;
+  }
+  target.classList.add('collapsible');
+  target.open=false;
+  let content=target.querySelector(':scope > .completionContent');
   if(!content){
     content=document.createElement('div');
     content.className='completionContent';
-    completion.appendChild(content);
+    target.appendChild(content);
   }
   let timeline=content.querySelector(':scope > .completionTimeline');
   if(!timeline){
@@ -22266,6 +22815,97 @@ function completionTimelineForTurn(turnId){
     content.appendChild(timeline);
   }
   return timeline;
+}
+function completionArtifactBySequence(completion,nativeMessageSeq){
+  if(!completion||!Number.isInteger(nativeMessageSeq))return null;
+  return [...completion.querySelectorAll('[data-native-message-seq]')]
+    .find((item)=>Number(item.dataset.nativeMessageSeq)===nativeMessageSeq)||null;
+}
+function appendCompletedTurnArtifact(turnId,element,{groupTools=false}={}){
+  if(!element)return null;
+  const completion=completionMessageForTurn(turnId);
+  if(!completion)return null;
+  const nativeMessageSeq=Number(element.dataset?.nativeMessageSeq);
+  const existing=completionArtifactBySequence(completion,Number.isInteger(nativeMessageSeq)?nativeMessageSeq:null);
+  if(existing)return existing;
+  const timeline=completionTimelineForTurn(turnId);
+  if(!timeline)return null;
+  element.classList?.remove('streaming');
+  const items=groupTools?regroupTurnToolArtifacts([element]):settleTurnProcessHistory([element]);
+  for(const item of items)timeline.appendChild(item);
+  refreshIcons(completionMessageForTurn(turnId));
+  return items.at(-1)||element;
+}
+function completedTurnFinalAssistant(turnId){
+  const id=String(turnId||'');
+  if(!id)return null;
+  const candidates=[...chat.querySelectorAll('.msg.assistant')].filter((item)=>String(item.dataset.turnId||'')===id);
+  return candidates.find((item)=>(item.dataset.messageKind||'')==='final_answer')
+    ||[...candidates].reverse().find((item)=>!isTurnProcessMessage('assistant',item.dataset.messageKind||'',item.dataset.messageText||item.textContent||''))
+    ||null;
+}
+function upsertCompletedTurnAssistant(text,options={}){
+  const turnId=String(options.turnId||'');
+  const process=isTurnProcessMessage('assistant',options.kind||'',text);
+  if(process){
+    const element=createConversationMessageElement('assistant',text,options);
+    element.classList.add('progressCommentary');
+    return appendCompletedTurnArtifact(turnId,element);
+  }
+  let element=findDuplicateAssistantBubble(text,options)||completedTurnFinalAssistant(turnId);
+  if(element){
+    const targetText=String(text||'');
+    element.dataset.messageText=targetText;
+    element.dataset.messageKind=String(options.kind||element.dataset.messageKind||'final_answer');
+    element.dataset.turnId=turnId;
+    if(Number.isInteger(options.nativeMessageSeq))element.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+    if(options.at)element.dataset.messageAt=String(options.at);
+    element.classList.remove('progressCommentary','streaming');
+    if(element._messageBody)renderAssistantMarkdown(element._messageBody,targetText,turnId);
+  }else{
+    element=createConversationMessageElement('assistant',text,{...options,kind:options.kind||'final_answer'});
+    const completion=completionMessageForTurn(turnId);
+    if(completion?.parentNode===chat)chat.insertBefore(element,completion.nextSibling);
+    else chat.appendChild(element);
+  }
+  latestAssistantElement=element;
+  latestFinalAssistantElement=element;
+  refreshIcons(element);
+  return element;
+}
+function appendCompletedTurnTool(text,options={}){
+  const turnId=String(options.turnId||'');
+  const completion=completionMessageForTurn(turnId);
+  if(!completion)return null;
+  const existing=completionArtifactBySequence(completion,options.nativeMessageSeq);
+  if(existing)return existing;
+  const structuredFileChanges=nativeFileChangePresentations(options.fileChanges);
+  const presentations=structuredFileChanges.length?structuredFileChanges:toolActivityPresentations(text);
+  const plan=presentations.find((presentation)=>presentation.variant==='plan');
+  if(plan)return completion;
+  const imageViews=presentations.filter(isImageViewActivityPresentation);
+  const folded=presentations.filter((presentation)=>!isImageViewActivityPresentation(presentation));
+  let last=null;
+  if(imageViews.length){
+    const imageUrls=nativeToolImageUrls(imageViews,options.nativeMessageSeq);
+    const visible=createActivityBatch(imageViews.map((presentation,index)=>({...presentation,expandable:true,galleryOnly:true,imageUrls:index===0?imageUrls:[]})),text,'image_view_activity',false);
+    if(Number.isInteger(options.nativeMessageSeq)&&!folded.length)visible.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+    visible.dataset.turnId=turnId;
+    const final=completedTurnFinalAssistant(turnId);
+    if(final?.parentNode===chat)chat.insertBefore(visible,final);
+    else if(completion.parentNode===chat)chat.insertBefore(visible,completion.nextSibling);
+    else chat.appendChild(visible);
+    last=visible;
+  }
+  if(folded.length){
+    const kind=folded.some((presentation)=>presentation.variant==='agent')?'agent_activity':'tool_activity';
+    const batch=createActivityBatch(folded,text,kind,false,{parentThreadId:currentConversationId,autoTrack:false});
+    if(Number.isInteger(options.nativeMessageSeq))batch.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+    batch.dataset.turnId=turnId;
+    last=appendCompletedTurnArtifact(turnId,batch,{groupTools:true})||last;
+  }
+  refreshIcons(chat);
+  return last;
 }
 function reconcileNativeSteeringElement(element,options={}){
   if(!element)return null;
@@ -22399,6 +23039,22 @@ function terminalErrorMessageTitle(text){
   if(value.includes('timed out')||value.includes('timeout'))return'请求超时';
   return'任务失败';
 }
+function isUsageLimitTerminalError(text){
+  const value=String(text||'').toLowerCase();
+  return value.includes('usage limit')||value.includes('quota exceeded')||value.includes('insufficient quota');
+}
+function terminalErrorDisplayText(text){
+  const raw=String(text||'').trim();
+  if(!raw)return'';
+  // Usage-limit cards keep title + badge only; hide the middle explanation block.
+  if(isUsageLimitTerminalError(raw))return'';
+  return raw;
+}
+function terminalErrorHintText(text){
+  // Keep usage-limit cards compact: no secondary middle copy.
+  if(isUsageLimitTerminalError(text))return'';
+  return'';
+}
 let longUserMessageSerial=0;
 function bindLongUserMessage(el,body,scrollContainer=chat){
   if(!el||!body||el.querySelector(':scope > .longUserMessageToggle'))return;
@@ -22434,13 +23090,14 @@ function bindLongUserMessage(el,body,scrollContainer=chat){
 function createConversationMessageElement(role,text,options={}){
   const kind=String(options.kind||'');
   const terminalError=role==='process'&&['task_error','error'].includes(kind);
+  const usageLimitError=terminalError&&isUsageLimitTerminalError(text);
   const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
   const steeringUser=role==='user'&&kind==='steering_user';
   const inputImage=role==='image'&&['input_image','steering_input_image'].includes(kind);
   const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage(text);
   const collapsible=role==='tool'||role==='thinking'||role==='context';
   const el=document.createElement(collapsible?'details':'div');
-  el.className='msg '+role+(collapsible?' toolDetails':'')+(terminalError?' terminalError':'')+(options.streaming?' streaming':'');
+  el.className='msg '+role+(collapsible?' toolDetails':'')+(terminalError?' terminalError':'')+(usageLimitError?' usageLimitError':'')+(options.streaming?' streaming':'');
   if(role==='assistant'&&isTurnProcessMessage(role,kind,text))el.classList.add('progressCommentary');
   if(role==='image'&&inputImage)el.classList.add('inputImage');
   el.dataset.messageText=String(text||'');
@@ -22492,7 +23149,7 @@ function createConversationMessageElement(role,text,options={}){
     if(browserCommentUser)renderBrowserCommentMessageBody(body,text);
     else if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text,options.turnId);
     else if(role==='user')renderMessageMarkdown(body,automationInstructionDisplayText(text));
-    else body.textContent=text;
+    else body.textContent=terminalError?terminalErrorDisplayText(text):text;
     const actions=document.createElement('div');
     actions.className='msgActions';
     if(['process','log'].includes(role)&&!terminalError){
@@ -22580,14 +23237,32 @@ function createConversationMessageElement(role,text,options={}){
       const icon=document.createElement('span');
       icon.className='terminalErrorIcon';
       icon.setAttribute('aria-hidden','true');
-      setIconLabel(icon,'circle-alert','',false);
+      setIconLabel(icon,usageLimitError?'gauge':'circle-alert','',false);
       const content=document.createElement('div');
-      content.className='terminalErrorContent';
+      content.className='terminalErrorContent'+(usageLimitError?' compact':'');
       const title=document.createElement('strong');
       title.className='terminalErrorTitle';
       title.textContent=terminalErrorMessageTitle(text);
       content.appendChild(title);
-      content.appendChild(body);
+      const bodyText=String(body.textContent||'').trim();
+      if(bodyText)content.appendChild(body);
+      else body.remove();
+      const hint=terminalErrorHintText(text);
+      if(hint){
+        const tip=document.createElement('small');
+        tip.className='terminalErrorHint';
+        tip.textContent=hint;
+        content.appendChild(tip);
+      }
+      if(usageLimitError){
+        const meta=document.createElement('div');
+        meta.className='terminalErrorMeta';
+        const badge=document.createElement('span');
+        badge.className='terminalErrorBadge';
+        badge.textContent='USAGE LIMIT';
+        meta.appendChild(badge);
+        content.appendChild(meta);
+      }
       el.appendChild(icon);
       el.appendChild(content);
       el.appendChild(actions);
@@ -22649,6 +23324,14 @@ function addMsg(role,text,options={}){
     if(!options.hydrating&&currentConversationSource==='codex'&&webRunActive&&options.turnId&&activeNativeTurnId&&String(options.turnId)!==String(activeNativeTurnId))return null;
     const showElapsed=options.autoTrackAgent||(currentConversationSource!=='codex'&&webRunActive);
     if(showElapsed&&collectingTurnProcess&&turnProcessElapsedLabel&&options.turnId&&turnProcessElapsedMatches(options.turnId)){ensureTurnProcessElapsedRunning(options.at,Date.now(),options.turnId);return null}
+    // Hydrating a finished conversation does not need a live process shell; creating one
+    // causes terminal error cards to jump in and out while history pages fill.
+    if(options.hydrating&&!webRunActive&&!showElapsed){
+      latestToolElement=null;
+      latestAssistantElement=null;
+      latestFinalAssistantElement=null;
+      return null;
+    }
     beginTurnProcessCollection(options.at,showElapsed,options.turnId);
     latestToolElement=null;
     latestAssistantElement=null;
@@ -22803,9 +23486,15 @@ function addMsg(role,text,options={}){
     // Only live mid-turn steers join the active process timeline.
     if(!completedSteeringTimeline)activateTurnProcessElement(el);
   }else if(isTurnProcessMessage(role,kind,text)){
-    activateTurnProcessElement(el);
+    const terminalHistory=Boolean(options.hydrating)
+      &&!webRunActive
+      &&['task_error','error','turn_aborted','task_complete'].includes(kind);
+    // Completed-history terminal cards should stay static in the transcript. Routing them
+    // through the live process panel makes usage-limit cards mount/unmount during refresh.
+    if(!terminalHistory)activateTurnProcessElement(el);
   }
-  refreshIcons(el);
+  if(!options.hydrating || !document.getElementById('chat')?.classList.contains('conversationRestoring'))refreshIcons(el);
+  else if(deferredIconRefreshDepth<=0)refreshIcons(el);
   if(role==='tool')latestToolElement=el;
   if(role==='assistant'){
     latestAssistantElement=el;
@@ -22828,6 +23517,9 @@ function isNativeSnapshotStreamingMessage(message,conversation){
     && ['','message','commentary','final_answer'].includes(kind)
     && Boolean(activeTurnId)
     && String(message.turnId||'')===activeTurnId;
+}
+function nativeLiveDisplayText(value,{streaming=false}={}){
+  return stripNativeUiProtocolLines(value,{streaming});
 }
 function nativeLiveNearBottom(threshold=140){
   if(!chat)return false;
@@ -22971,7 +23663,7 @@ function assistantTextsMatch(a,b){
 }
 function findRuntimeLiveForSnapshotMessage(message){
   const turnId=String(message?.turnId||'');
-  const target=normalizeAssistantDedupeText(message?.content||'');
+  const target=normalizeAssistantDedupeText(nativeLiveDisplayText(message?.content||''));
   if(!turnId||!target)return null;
   let best=null;
   for(const live of nativeLiveItems.values()){
@@ -23002,7 +23694,12 @@ function findRuntimeLiveForSnapshotMessage(message){
 function adoptRuntimeLiveForSnapshotMessage(message){
   const live=findRuntimeLiveForSnapshotMessage(message);
   if(!live?.element)return null;
-  const targetText=String(message.content||'');
+  const targetText=nativeLiveDisplayText(message.content||'');
+  if(!targetText){
+    removeNativeLiveElement(live);
+    if(live.key)nativeLiveItems.delete(live.key);
+    return null;
+  }
   if(live.renderTimer){clearTimeout(live.renderTimer);live.renderTimer=null}
   live.complete=true;
   live.targetText=targetText;
@@ -23093,7 +23790,8 @@ function nativeSnapshotLiveKey(message,conversation){
 function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately=false}={}){
   const key=nativeSnapshotLiveKey(message,conversation);
   if(!message?.seq||!String(message.content||''))return null;
-  const targetText=String(message.content||'');
+  const targetText=nativeLiveDisplayText(message.content||'');
+  if(!targetText)return null;
   const cancelPending=nativeCancelPendingMatches(currentConversationId,message.turnId);
   // Prefer adopting the runtime stream bubble so live deltas and history never create twins.
   const adopted=adoptRuntimeLiveForSnapshotMessage(message);
@@ -23143,7 +23841,7 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
 function nativeRuntimeLiveKey(itemId,turnId){return 'runtime:'+String(turnId||activeNativeTurnId||'')+':'+String(itemId||'')}
 function findSnapshotLiveForRuntimeDelta(turnId,delta){
   const cleanTurnId=String(turnId||'');
-  const incoming=normalizeAssistantDedupeText(delta);
+  const incoming=normalizeAssistantDedupeText(nativeLiveDisplayText(delta,{streaming:true}));
   if(!cleanTurnId||!incoming)return null;
   let best=null;
   for(const [key,live] of nativeLiveItems){
@@ -23174,10 +23872,11 @@ function findSnapshotLiveForRuntimeDelta(turnId,delta){
   }
   return null;
 }
-function adoptSnapshotLiveForRuntimeDelta(itemId,turnId,delta){
+function adoptSnapshotLiveForRuntimeDelta(itemId,turnId,delta,updatedAt=''){
   const match=findSnapshotLiveForRuntimeDelta(turnId,delta);
   if(!match?.live?.element)return null;
   const live=match.live;
+  if(live.renderTimer){clearTimeout(live.renderTimer);live.renderTimer=null}
   if(match.key&&nativeLiveItems.get(match.key)===live)nativeLiveItems.delete(match.key);
   if(match.key&&match.key.startsWith('snapshot:'))nativeRenderedMessageKeys.add(match.key);
   const key=nativeRuntimeLiveKey(itemId,turnId);
@@ -23185,48 +23884,49 @@ function adoptSnapshotLiveForRuntimeDelta(itemId,turnId,delta){
   live.source='runtime';
   live.turnId=String(turnId||'');
   live.itemId=String(itemId||'');
-  live.complete=false;
+  live.rawText='';
+  live.runtimeBaseText=String(match.text||live.targetText||live.text||'');
   live.runtimeBaseAuthoritative=true;
+  live.complete=false;
+  live.updatedAt=updatedAt;
   live.element.classList.add('streaming');
   live.element.dataset.nativeLiveSource='runtime';
   nativeLiveItems.set(key,live);
   if(live.turnId)nativeRuntimeStreamTurnIds.add(live.turnId);
   return live;
 }
-function nativeRuntimeDeltaText(live,delta){
-  const incoming=String(delta||'');
-  if(!incoming)return'';
-  const replay=live.runtimeReplay;
-  if(replay){
-    const candidate=replay.text+incoming;
-    if(replay.base.startsWith(candidate)){
-      if(candidate.length===replay.base.length)live.runtimeReplay=null;
-      else replay.text=candidate;
-      return'';
-    }
-    live.runtimeReplay=null;
-    if(candidate.startsWith(replay.base))return candidate.slice(replay.base.length);
-    return candidate;
-  }
-  const base=String(live.targetText||'');
-  const replayThreshold=live.runtimeBaseAuthoritative?1:48;
-  if(base.length>=replayThreshold&&incoming.startsWith(base))return incoming.slice(base.length);
-  // A second delivery starts again at the beginning of the already accumulated
-  // item. Buffer only long-message prefix matches so ordinary repeated words
-  // and punctuation remain untouched.
-  if(base.length>=replayThreshold&&base.startsWith(incoming)){
-    if(incoming.length===base.length)return'';
-    live.runtimeReplay={base,text:incoming};
-    return'';
-  }
+function nativeRuntimeTargetText(live,rawText){
+  const incoming=nativeLiveDisplayText(rawText,{streaming:true});
+  if(!live?.runtimeBaseAuthoritative)return incoming;
+  const base=String(live.runtimeBaseText||live.targetText||'');
+  if(!incoming||base.startsWith(incoming))return base;
+  live.runtimeBaseAuthoritative=false;
+  delete live.runtimeBaseText;
   return incoming;
 }
-function flushNativeRuntimeReplay(live){
-  const replay=live?.runtimeReplay;
-  if(!replay)return;
-  live.runtimeReplay=null;
-  if(live.runtimeBaseAuthoritative&&replay.base===String(live.targetText||''))return;
-  live.targetText+=replay.text;
+function removeNativeLiveElement(live){
+  const element=live?.element;
+  if(!element)return;
+  if(element.parentNode)element.remove();
+  turnProcessElements=turnProcessElements.filter((item)=>item!==element);
+  if(latestAssistantElement===element)latestAssistantElement=null;
+  if(latestFinalAssistantElement===element)latestFinalAssistantElement=null;
+  live.element=null;
+  live.text='';
+  live.markdownText=null;
+}
+function ensureNativeRuntimeLiveElement(live){
+  if(!live||live.element||!live.targetText)return live?.element||null;
+  removeNativeRunningElement();
+  if(!collectingTurnProcess||!turnProcessElapsedMatches(live.turnId))beginTurnProcessCollection(live.updatedAt,true,live.turnId);
+  else ensureTurnProcessElapsedRunning(live.updatedAt,Date.now(),live.turnId);
+  live.followBottom=captureNativeLiveFollowBottom();
+  live.element=addMsg('assistant','',{streaming:true,kind:'live_progress',turnId:live.turnId,autoScroll:false});
+  if(!live.element)return null;
+  activateTurnProcessElement(live.element);
+  if(live.turnId)nativeRuntimeStreamTurnIds.add(live.turnId);
+  showNativeRunningTimestamp(live.updatedAt);
+  return live.element;
 }
 function updateNativeLiveDelta(runtime){
   const itemId=String(runtime.itemId||'');
@@ -23237,23 +23937,28 @@ function updateNativeLiveDelta(runtime){
   const key=nativeRuntimeLiveKey(itemId,runtimeTurnId);
   let live=nativeLiveItems.get(key);
   if(!live&&cancelPending)return;
-  removeNativeRunningElement();
-  if(!collectingTurnProcess||!turnProcessElapsedMatches(runtimeTurnId))beginTurnProcessCollection(runtime.updatedAt,true,runtimeTurnId);
-  else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),runtimeTurnId);
-  if(!live)live=adoptSnapshotLiveForRuntimeDelta(itemId,runtimeTurnId,delta);
+  if(live&&!live.element&&!live.targetText){
+    const bufferedRawText=String(live.rawText||'');
+    const adopted=adoptSnapshotLiveForRuntimeDelta(itemId,runtimeTurnId,bufferedRawText+delta,runtime.updatedAt);
+    if(adopted){adopted.rawText=bufferedRawText;live=adopted}
+  }
+  if(!live)live=adoptSnapshotLiveForRuntimeDelta(itemId,runtimeTurnId,delta,runtime.updatedAt);
   if(!live){
-    const followBottom=captureNativeLiveFollowBottom();
-    const element=addMsg('assistant','',{streaming:true,kind:'live_progress',turnId:runtimeTurnId,autoScroll:false});
-    if(element?.dataset)element.dataset.nativeLiveSource='runtime';
-    live={key,source:'runtime',turnId:runtimeTurnId,itemId,role:'assistant',element,text:'',targetText:'',complete:false,renderTimer:null,followBottom};
+    live={key,source:'runtime',turnId:runtimeTurnId,itemId,role:'assistant',element:null,text:'',targetText:'',rawText:'',complete:false,renderTimer:null,followBottom:nativeLiveFollowBottom,updatedAt:runtime.updatedAt};
     nativeLiveItems.set(key,live);
     if(runtimeTurnId)nativeRuntimeStreamTurnIds.add(runtimeTurnId);
-    showNativeRunningTimestamp(runtime.updatedAt);
   }
-  activateTurnProcessElement(live.element);
-  const nextDelta=nativeRuntimeDeltaText(live,delta);
-  if(!nextDelta)return;
-  live.targetText+=nextDelta;
+  live.updatedAt=runtime.updatedAt||live.updatedAt;
+  live.rawText=String(live.rawText||'')+delta;
+  const targetText=nativeRuntimeTargetText(live,live.rawText);
+  if(!targetText.startsWith(live.text))live.text='';
+  live.targetText=targetText;
+  if(!targetText){
+    removeNativeLiveElement(live);
+    return;
+  }
+  ensureNativeRuntimeLiveElement(live);
+  if(!live.element)return;
   if(cancelPending||live.cancelVisualPaused)return;
   scheduleNativeLiveRender(live);
 }
@@ -23291,6 +23996,7 @@ function pumpNativeLiveRender(live){
   }
 }
 function renderNativeLiveItem(live){
+  if(!live?.element)return;
   live.element.dataset.messageText=live.text;
   // Markdown parsing also enhances links, images, code blocks, and embedded cards. During
   // a typewriter stream, updating a text node is substantially cheaper; settle renders the
@@ -23321,7 +24027,7 @@ function renderNativeLiveItemImmediately(live){
   }
   if(live.text!==live.targetText){
     live.text=live.targetText;
-    renderNativeLiveItem(live);
+    if(live.element)renderNativeLiveItem(live);
   }
   if(live.complete)settleNativeLiveItem(live);
 }
@@ -23329,6 +24035,7 @@ function flushNativeLiveItemsToTarget(){
   for(const live of [...nativeLiveItems.values()])renderNativeLiveItemImmediately(live);
 }
 function settleNativeLiveItem(live){
+  if(!live?.element)return;
   renderNativeLiveItemMarkdown(live);
   live.element.classList.remove('streaming');
   if(live.source==='snapshot'){
@@ -23340,16 +24047,38 @@ function finishNativeLiveItem(itemId,turnId=''){
   const key=nativeRuntimeLiveKey(itemId,turnId);
   const live=nativeLiveItems.get(key)||[...nativeLiveItems.values()].find((item)=>item.source==='runtime'&&item.itemId===String(itemId||''));
   if(!live)return;
-  flushNativeRuntimeReplay(live);
   live.complete=true;
+  if(Object.hasOwn(live,'rawText')){
+    live.targetText=nativeRuntimeTargetText(live,live.rawText);
+    delete live.rawText;
+    delete live.runtimeBaseText;
+    delete live.runtimeBaseAuthoritative;
+  }
+  if(!live.targetText){
+    removeNativeLiveElement(live);
+    nativeLiveItems.delete(live.key);
+    return;
+  }
+  ensureNativeRuntimeLiveElement(live);
   if(live.text.length<live.targetText.length)scheduleNativeLiveRender(live);else settleNativeLiveItem(live);
 }
 function finishAllNativeLiveItems(){
   for(const live of [...nativeLiveItems.values()]){
     if(live.renderTimer)clearTimeout(live.renderTimer);
     live.renderTimer=null;
-    flushNativeRuntimeReplay(live);
     live.complete=true;
+    if(Object.hasOwn(live,'rawText')){
+      live.targetText=nativeRuntimeTargetText(live,live.rawText);
+      delete live.rawText;
+      delete live.runtimeBaseText;
+      delete live.runtimeBaseAuthoritative;
+    }
+    if(!live.targetText){
+      removeNativeLiveElement(live);
+      if(live.source==='runtime')nativeLiveItems.delete(live.key);
+      continue;
+    }
+    if(live.source==='runtime')ensureNativeRuntimeLiveElement(live);
     if(live.text!==live.targetText){live.text=live.targetText;renderNativeLiveItem(live)}
     settleNativeLiveItem(live);
     if(live.source==='runtime')nativeLiveItems.delete(live.key);

@@ -8,7 +8,10 @@ const [serverSource, nativeSource, uiStyles] = await Promise.all([
   readFile(new URL('../native-sessions.mjs', import.meta.url), 'utf8'),
   readFile(new URL('../ui.css', import.meta.url), 'utf8'),
 ]);
-const rawInlineScript = serverSource.match(/<script>([\s\S]*?)<\/script>/)?.[1] || '';
+const rawInlineScript = (() => {
+  const blocks = [...serverSource.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1] || '');
+  return blocks.sort((left, right) => right.length - left.length)[0] || '';
+})();
 const inlineScript = rawInlineScript.replaceAll('\\\\', '\\');
 
 function sourceBetween(start, end) {
@@ -455,12 +458,13 @@ test('session events coalesce native sync and avoid completion sound playback', 
   assert.ok(sessionsListenerStart >= 0 && runtimeListenerStart > sessionsListenerStart);
   const sessionsListenerSource = sessionSource.slice(sessionsListenerStart, runtimeListenerStart);
   assert.match(inlineScript, /let nativeSyncChangedIds = new Set\(\)/);
-  assert.match(nativeSource, /this\.emit\('change', \{ version: this\.version, changedIds, conversationChangedIds \}\)/);
+  assert.match(nativeSource, /this\.emit\('change', \{\s*version: this\.version,\s*changedIds,\s*conversationChangedIds,\s*completionReadStateChanged,/);
   assert.match(sessionSource, /for\(const id of changedIds\|\|\[\]\)/);
   assert.match(sessionSource, /if\(!nativeSyncChangedIds\.size\|\|nativeSyncTimer\)return/);
   assert.match(sessionSource, /const pendingIds=new Set\(nativeSyncChangedIds\);\s*nativeSyncChangedIds\.clear\(\)/);
   assert.match(sessionsListenerSource, /conversationChangedIds=Array\.isArray\(parsed\.conversationChangedIds\)\?parsed\.conversationChangedIds:changedIds/);
-  assert.match(sessionsListenerSource, /if\(!changedIds\.length\)return;\s*refreshOpenSubagentTraces\(changedIds\);\s*if\(conversationChangedIds\.length\)\{\s*scheduleHistoryRefreshFromSession\(\);\s*scheduleHistoryCompletionReadSync\(\);\s*\}\s*scheduleChangedNativeSessionSync\(changedIds\)/);
+  assert.match(sessionsListenerSource, /completionReadStateChanged=parsed\.completionReadStateChanged===true/);
+  assert.match(sessionsListenerSource, /if\(!changedIds\.length&&!completionReadStateChanged\)return;\s*if\(changedIds\.length\)refreshOpenSubagentTraces\(changedIds\);\s*if\(conversationChangedIds\.length\)\{\s*scheduleHistoryRefreshFromSession\(\);\s*\}\s*if\(conversationChangedIds\.length\|\|completionReadStateChanged\)\{\s*scheduleHistoryCompletionReadSync\(\);\s*\}\s*if\(changedIds\.length\)scheduleChangedNativeSessionSync\(changedIds\)/);
   assert.doesNotMatch(sessionsListenerSource, /refreshHistory\(\)|syncHistoryCompletionReadFromServer\(\)/);
   assert.doesNotMatch(inlineScript, /playTaskCompleteSound|completeAudioCtx|AudioContext/);
 });
@@ -470,6 +474,21 @@ test('history completion read sync is single-flight and delayed during session c
   assert.match(completionStateSource, /if\(historyCompletionSyncInFlight\)return historyCompletionSyncInFlight/);
   assert.match(completionStateSource, /function scheduleHistoryCompletionReadSync\(delay=HISTORY_COMPLETION_SYNC_DELAY_MS\)/);
   assert.match(completionStateSource, /if\(historyCompletionSyncTimer\|\|historyCompletionSyncInFlight\)return/);
+});
+
+test('project headers can start a new task in the current project path', () => {
+  assert.match(inlineScript, /function startNewTaskInProject\(projectPath/);
+  assert.match(inlineScript, /newChat\(\);\s*cwd\.value=path;/);
+  assert.match(inlineScript, /historyProjectEditButton/);
+  assert.match(inlineScript, /historyProjectNewTaskButton/);
+  assert.match(inlineScript, /在此路径新建任务/);
+  assert.match(inlineScript, /startNewTaskInProject\(groupData\.path\)/);
+  assert.match(inlineScript, /if\(projectMenu\.editButton\)projectActions\.appendChild\(projectMenu\.editButton\)/);
+  assert.match(inlineScript, /if\(projectMenu\.newTaskButton\)projectActions\.appendChild\(projectMenu\.newTaskButton\)/);
+  assert.match(inlineScript, /historyProjectPreviewActions/);
+  assert.match(inlineScript, /setIconLabel\(newTaskButton,'plus','新建任务'\)/);
+  assert.match(uiStyles, /\.historyProjectActions\s*\{/);
+  assert.match(uiStyles, /\.historyProjectPreviewActions\s*\{/);
 });
 
 test('starting a new task clears inherited project selection', () => {

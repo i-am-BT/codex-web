@@ -3,6 +3,8 @@ const DEFAULT_CACHE_TTL_MS = 30000;
 const ERROR_CACHE_TTL_MS = 5000;
 const LAST_GOOD_TTL_MS = 5 * 60 * 1000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
+const GROK2API_SYNC_TIMEOUT_MS = 15 * 60 * 1000;
+const GROK2API_SYNC_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 const ENV_KEY_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
 const RATE_LIMIT_WINDOWS = new Set(['5h', '1d', '7d', '30d']);
@@ -166,6 +168,56 @@ export class SubQuotaService {
     };
   }
 
+  async syncGrok2ApiQuota(source) {
+    if (!source || source.provider !== 'grok2api') throw new Error('未配置 Grok2API 额度来源');
+    if (!source.apiKey) throw new Error(`缺少环境变量 ${source.apiKeyEnv || 'GROK2API_ADMIN_PASSWORD'}`);
+    const targets = [
+      {
+        provider: 'grok_build',
+        label: 'Build',
+        path: '/api/admin/v1/accounts/refresh-billing',
+      },
+      {
+        provider: 'grok_console',
+        label: 'Console',
+        path: '/api/admin/v1/accounts/console/refresh-quotas',
+      },
+    ];
+    const results = [];
+    for (const target of targets) {
+      try {
+        const payload = await this.requestGrok2ApiEventStream(source, target.path);
+        results.push({
+          provider: target.provider,
+          label: target.label,
+          succeeded: nonNegativeInteger(payload?.succeeded ?? payload?.completed) ?? 0,
+          failed: nonNegativeInteger(payload?.failed) ?? 0,
+        });
+      } catch (error) {
+        results.push({
+          provider: target.provider,
+          label: target.label,
+          succeeded: 0,
+          failed: 0,
+          error: formatFetchError(error),
+        });
+      }
+    }
+    this.cache = null;
+    const providerFailures = results.filter((item) => item.error);
+    if (providerFailures.length === results.length) {
+      throw new Error(providerFailures.map((item) => `${item.label}: ${item.error}`).join('；'));
+    }
+    return {
+      ok: providerFailures.length === 0,
+      partial: providerFailures.length > 0,
+      succeeded: results.reduce((total, item) => total + item.succeeded, 0),
+      failed: results.reduce((total, item) => total + item.failed, 0),
+      providerFailures: providerFailures.length,
+      results,
+    };
+  }
+
   async requestGrok2ApiJson(source, path, options = {}) {
     const { username, password } = parseGrok2ApiCredentials(source.apiKey);
     if (!password) throw new Error('Grok2API 管理员密码不能为空');
@@ -193,6 +245,49 @@ export class SubQuotaService {
           Authorization: `Bearer ${retryToken}`,
         },
       });
+    }
+  }
+
+  async requestGrok2ApiEventStream(source, path) {
+    const { username, password } = parseGrok2ApiCredentials(source.apiKey);
+    if (!password) throw new Error('Grok2API 管理员密码不能为空');
+    const requestWithToken = async (token) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), Math.max(this.timeoutMs, GROK2API_SYNC_TIMEOUT_MS));
+      try {
+        const response = await this.fetchImpl(`${source.baseUrl}${path}`, {
+          method: 'POST',
+          headers: {
+            Accept: 'text/event-stream',
+            Authorization: `Bearer ${token}`,
+          },
+          redirect: 'error',
+          signal: controller.signal,
+        });
+        const declaredLength = Number(response.headers?.get?.('content-length') || 0);
+        if (declaredLength > GROK2API_SYNC_MAX_RESPONSE_BYTES) {
+          await response.body?.cancel?.().catch(() => {});
+          throw new Error('响应内容过大');
+        }
+        const bodyText = await readLimitedBody(response, GROK2API_SYNC_MAX_RESPONSE_BYTES);
+        if (!response.ok) {
+          const detail = grok2ApiResponseError(bodyText);
+          const error = new Error(detail ? `HTTP ${response.status}: ${detail}` : `HTTP ${response.status}`);
+          error.statusCode = response.status;
+          throw error;
+        }
+        return parseGrok2ApiTaskResult(bodyText);
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+    try {
+      const token = await this.loginGrok2Api(source, username, password);
+      return await requestWithToken(token);
+    } catch (error) {
+      if (Number(error?.statusCode || 0) !== 401) throw error;
+      const retryToken = await this.loginGrok2Api(source, username, password, { force: true });
+      return requestWithToken(retryToken);
     }
   }
 
@@ -1190,6 +1285,47 @@ function parseMaybeJson(value) {
   } catch {
     return value;
   }
+}
+
+function parseGrok2ApiTaskResult(bodyText) {
+  const direct = parseMaybeJson(bodyText);
+  if (isRecord(direct)) return unwrapGrok2ApiData(direct);
+  let completed = null;
+  let failure = '';
+  for (const block of String(bodyText || '').split(/\r?\n\r?\n/)) {
+    let eventName = 'message';
+    const dataLines = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('event:')) eventName = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+    }
+    if (!dataLines.length) continue;
+    const payload = parseMaybeJson(dataLines.join('\n'));
+    if (eventName === 'complete' && isRecord(payload)) completed = unwrapGrok2ApiData(payload);
+    if (eventName === 'error') {
+      failure = cleanText(
+        payload?.message
+        || payload?.error?.message
+        || payload?.error
+        || payload?.code
+        || dataLines.join(' '),
+        160,
+      );
+    }
+  }
+  if (isRecord(completed)) return completed;
+  throw new Error(failure || 'Grok2API 额度同步未返回完成结果');
+}
+
+function grok2ApiResponseError(bodyText) {
+  const payload = parseMaybeJson(bodyText);
+  return cleanText(
+    payload?.error?.message
+    || payload?.message
+    || payload?.error
+    || '',
+    160,
+  );
 }
 
 function formatFetchError(error) {

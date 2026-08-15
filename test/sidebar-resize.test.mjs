@@ -6,7 +6,10 @@ const [serverSource, uiStyles] = await Promise.all([
   readFile(new URL('../server.mjs', import.meta.url), 'utf8'),
   readFile(new URL('../ui.css', import.meta.url), 'utf8'),
 ]);
-const rawInlineScript = serverSource.match(/<script>([\s\S]*?)<\/script>/)?.[1] || '';
+const rawInlineScript = (() => {
+  const blocks = [...serverSource.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1] || '');
+  return blocks.sort((left, right) => right.length - left.length)[0] || '';
+})();
 const inlineScript = rawInlineScript.replaceAll('\\\\', '\\');
 
 function sourceLine(name) {

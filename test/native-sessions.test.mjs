@@ -7,6 +7,42 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { NativeSessionStore } from '../native-sessions.mjs';
 
+test('Codex App global state changes emit a completion-read-only event', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-completion-read-'));
+  const codexHome = path.join(temporary, '.codex');
+  const globalStateFile = path.join(codexHome, '.codex-global-state.json');
+  let store;
+
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(globalStateFile, JSON.stringify({
+      'electron-persisted-atom-state': {
+        'unread-thread-ids-by-host-v1': { local: [] },
+      },
+    }));
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const changes = [];
+    store.on('change', (change) => changes.push(change));
+
+    await writeFile(globalStateFile, JSON.stringify({
+      'electron-persisted-atom-state': {
+        'unread-thread-ids-by-host-v1': {
+          local: ['019fa850-285e-7fb0-9734-13aa71810dc6'],
+        },
+      },
+    }));
+    store.refresh();
+
+    assert.equal(changes.length, 1);
+    assert.equal(changes[0].completionReadStateChanged, true);
+    assert.deepEqual(changes[0].changedIds, []);
+    assert.deepEqual(changes[0].conversationChangedIds, []);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('native session store keeps the complete transcript by default', { timeout: 10000 }, async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-full-history-'));
   const codexHome = path.join(temporary, '.codex');
@@ -1087,6 +1123,75 @@ test('native session store restores service tier from thread settings events', a
     }]));
     store.refresh();
     assert.equal(store.get(id)?.metadata.serviceTier, null);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+
+test('mid-run model switch overlay survives newer turn_context and stale sqlite timestamps', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-model-switch-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f99cf-949c-7b10-a5a9-84d4a0f15a99';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '14');
+  const sessionFile = path.join(sessionDir, `rollout-2026-08-14T10-00-00-${id}.jsonl`);
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-08-14T10:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace', source: 'vscode', model_provider: 'custom' },
+      },
+      {
+        timestamp: '2026-08-14T10:00:00.100Z',
+        type: 'turn_context',
+        payload: { turn_id: 'turn-1', model: 'gpt-5.6-sol', effort: 'ultra' },
+      },
+      {
+        timestamp: '2026-08-14T10:00:00.200Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-1' },
+      },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.equal(store.get(id)?.metadata.model, 'gpt-5.6-sol');
+
+    store.applyThreadSettings({
+      threadId: id,
+      modelProvider: 'custom',
+      model: 'grok-4.5',
+      effort: 'high',
+    });
+    assert.equal(store.get(id)?.metadata.model, 'grok-4.5');
+    assert.equal(store.get(id)?.metadata.reasoningEffort, 'high');
+
+    // In-flight turn snapshots must not clobber a newer explicit settings write.
+    await appendFile(sessionFile, jsonl([{
+      timestamp: '2026-08-14T10:00:01.000Z',
+      type: 'turn_context',
+      payload: { turn_id: 'turn-1', model: 'gpt-5.6-sol', effort: 'ultra' },
+    }]));
+    store.refresh();
+    assert.equal(store.get(id)?.metadata.model, 'grok-4.5');
+    assert.equal(store.get(id)?.metadata.reasoningEffort, 'high');
+
+    // A later settings event still applies normally.
+    await appendFile(sessionFile, jsonl([{
+      timestamp: '2026-08-14T10:00:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: { model: 'gpt-5.6-terra', reasoning_effort: 'xhigh' },
+      },
+    }]));
+    store.refresh();
+    assert.equal(store.get(id)?.metadata.model, 'gpt-5.6-terra');
+    assert.equal(store.get(id)?.metadata.reasoningEffort, 'xhigh');
   } finally {
     store?.stop();
     await rm(temporary, { recursive: true, force: true });
@@ -3003,71 +3108,6 @@ Each item contains text selected from an earlier Codex response and may include 
   }
 });
 
-test('native sessions accumulate DeepSeek usage once per completed turn', { timeout: 10000 }, async () => {
-  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-deepseek-'));
-  const codexHome = path.join(temporary, '.codex');
-  const usageFile = path.join(temporary, 'deepseek-usage.json');
-  const id = '019f6f84-ea9f-73c2-b997-deba7b4aa888';
-  const sessionDir = path.join(codexHome, 'sessions', '2026', '07', '12');
-  const sessionFile = path.join(sessionDir, `rollout-2026-07-12T12-00-00-${id}.jsonl`);
-
-  try {
-    await mkdir(sessionDir, { recursive: true });
-    await writeFile(path.join(codexHome, 'session_index.jsonl'),
-      JSON.stringify({ id, thread_name: 'deepseek 用量', updated_at: '2026-07-12T04:00:00Z' }) + '\n');
-    await writeFile(sessionFile, jsonl([
-      {
-        timestamp: '2026-07-12T04:00:00.000Z',
-        type: 'session_meta',
-        payload: { id, timestamp: '2026-07-12T04:00:00.000Z', cwd: '/workspace', model_provider: 'custom' },
-      },
-      {
-        timestamp: '2026-07-12T04:00:01.000Z',
-        type: 'turn_context',
-        payload: { turn_id: 'turn-1', model: 'deepseek-v4-flash' },
-      },
-      {
-        timestamp: '2026-07-12T04:00:02.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_started', turn_id: 'turn-1' },
-      },
-      {
-        timestamp: '2026-07-12T04:00:03.000Z',
-        type: 'event_msg',
-        payload: {
-          type: 'token_count',
-          info: {
-            last_token_usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 2000, total_tokens: 3000 },
-          },
-        },
-      },
-      {
-        timestamp: '2026-07-12T04:00:04.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_complete', turn_id: 'turn-1' },
-      },
-    ]));
-
-    const makeStore = () => new NativeSessionStore(codexHome, {
-      watchChanges: false,
-      maxMessages: 100,
-      deepSeekUsageFile: usageFile,
-    });
-
-    let store = makeStore();
-    store.get(id);
-    const stats = JSON.parse(await readFile(usageFile, 'utf8'));
-    assert.equal(stats.requests, 1);
-    assert.equal(stats.totalTokens, 3000);
-
-    store = makeStore();
-    store.get(id);
-    const again = JSON.parse(await readFile(usageFile, 'utf8'));
-    assert.equal(again.requests, 1);
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
-  }
-});
 
 test('automation heartbeat messages are not classified as steering', { timeout: 10000 }, async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-heartbeat-'));
