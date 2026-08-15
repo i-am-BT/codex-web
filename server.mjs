@@ -203,6 +203,7 @@ const TOOL_IMAGE_TYPES = new Map([
   ['.webp', 'image/webp'],
   ['.gif', 'image/gif'],
   ['.avif', 'image/avif'],
+  ['.svg', 'image/svg+xml'],
 ]);
 const DESKTOP_PENDING_PREFIX = 'desktop:';
 const DESKTOP_INTERACTIVE_METHODS = new Set([
@@ -1287,6 +1288,7 @@ app.get('/api/native-sessions/:id/tool-images/:seq/:index', requireAuth, (req, r
       || decodeNativeToolImageOutput(adjacentOutput, imageIndex);
     if (!image) return res.status(404).json({ error: '工具图片不存在或不受支持' });
     res.setHeader('Cache-Control', 'private, max-age=300');
+    setLocalImageSecurityHeaders(res, image.type);
     res.type(image.type).send(image.data);
   } catch (err) {
     res.status(500).json({ error: `读取工具图片失败: ${err.message}` });
@@ -1307,6 +1309,7 @@ app.get('/api/local-image', requireAuth, (req, res) => {
     const image = readNativeToolImage(rawPath, cwd);
     if (!image) return res.status(404).json({ error: '图片不存在或不受支持' });
     res.setHeader('Cache-Control', 'private, max-age=300');
+    setLocalImageSecurityHeaders(res, image.type);
     res.type(image.type).send(image.data);
   } catch (err) {
     res.status(500).json({ error: `读取本地图片失败: ${err.message}` });
@@ -2563,9 +2566,10 @@ function extractProcessEvent(event) {
     const cached = u.cached_input_tokens != null ? `, cached ${u.cached_input_tokens}` : '';
     return { role: 'process', type: 'token_count', content: `Token 用量\ninput ${u.input_tokens ?? '-'}${cached}\noutput ${u.output_tokens ?? '-'}\nreasoning ${u.reasoning_output_tokens ?? '-'}\ntotal ${u.total_tokens ?? '-'}` };
   }
-  if (type === 'agent_message' && payload.phase && payload.phase !== 'final_answer') {
-    return { role: 'process', type: `agent_${payload.phase}`, content: `Codex ${payload.phase}\n${payload.message || ''}` };
-  }
+  // Codex JSONL mirrors assistant commentary as both event_msg.agent_message and
+  // response_item.message. The latter is the canonical message record; rendering
+  // this event as a second process bubble makes one reply appear twice in /api/chat.
+  if (type === 'agent_message') return null;
   if (type === 'reasoning') return null;
   if (type === 'function_call') {
     const args = typeof payload.arguments === 'string' ? payload.arguments : JSON.stringify(payload.arguments || {});
@@ -4471,7 +4475,7 @@ function extractNativeToolImagePaths(message) {
     }
   }
   if (paths.length) return paths;
-  if (!/view_image/i.test(source) && !/\.(?:png|jpe?g|webp|gif|avif)/i.test(source)) return [];
+  if (!/view_image/i.test(source) && !/\.(?:png|jpe?g|webp|gif|avif|svg)/i.test(source)) return [];
   try {
     const rawDetail = source.slice(source.indexOf('\n') + 1); const jsonStart = rawDetail.indexOf('{'); const jsonEnd = rawDetail.lastIndexOf('}'); const jsonText = jsonStart >= 0 && jsonEnd > jsonStart ? rawDetail.slice(jsonStart, jsonEnd + 1) : rawDetail.split('\n').filter((line) => line.trim() && !/^call_id=/.test(line.trim()) && !/^workdir=/.test(line.trim())).join('\n'); const input = JSON.parse(jsonText);
     if (typeof input?.path === 'string' && input.path.trim()) return [input.path.trim()]; if (Array.isArray(input?.paths)) return input.paths.map((item) => String(item || '').trim()).filter(Boolean); if (Array.isArray(input?.images)) return input.images.map((item) => String(item?.path || item || '').trim()).filter(Boolean); return [];
@@ -4491,9 +4495,34 @@ function readNativeToolImage(filePath, cwd) {
     if (!type) return null;
     const stats = statSync(resolved);
     if (!stats.isFile() || stats.size < 1 || stats.size > TOOL_IMAGE_MAX_BYTES) return null;
-    return { type, data: readFileSync(resolved) };
+    const data = readFileSync(resolved);
+    if (type === 'image/svg+xml' && !isSvgImageData(data)) return null;
+    return { type, data };
   } catch {
     return null;
+  }
+}
+
+function isSvgImageData(data) {
+  if (!Buffer.isBuffer(data) || data.length < 5) return false;
+  let source = data.subarray(0, Math.min(data.length, 4096)).toString('utf8').replace(/^\uFEFF/, '').trimStart();
+  if (/^<\?xml(?:\s|\?)/i.test(source)) {
+    const declarationEnd = source.indexOf('?>');
+    if (declarationEnd < 0) return false;
+    source = source.slice(declarationEnd + 2).trimStart();
+  }
+  while (source.startsWith('<!--')) {
+    const commentEnd = source.indexOf('-->');
+    if (commentEnd < 0) return false;
+    source = source.slice(commentEnd + 3).trimStart();
+  }
+  return /^<svg(?:\s|>)/i.test(source);
+}
+
+function setLocalImageSecurityHeaders(res, type) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (type === 'image/svg+xml') {
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:");
   }
 }
 
@@ -19490,7 +19519,7 @@ function looksLikeLocalImagePath(value){
 }
 function localImageHasExt(clean){
   const lower=String(clean||'').toLowerCase();
-  const exts=['.png','.jpg','.jpeg','.webp','.gif','.avif'];
+  const exts=['.png','.jpg','.jpeg','.webp','.gif','.avif','.svg'];
   for(const ext of exts){if(lower.endsWith(ext))return true}
   return false;
 }
@@ -19605,6 +19634,25 @@ function enhanceMarkdownImages(body){
       img.addEventListener('click',()=>openImagePreview(proxy,img.alt||pathValue,img));
     }
   }
+  for(const paragraph of [...body.querySelectorAll('p')]){
+    const codes=[...paragraph.children].filter((child)=>child.matches&&child.matches('code'));
+    if(codes.length<2)continue;
+    const pathOnly=[...paragraph.childNodes].every((node)=>{
+      if(node.nodeType===Node.TEXT_NODE)return !String(node.nodeValue||'').trim();
+      if(node.nodeType!==Node.ELEMENT_NODE)return false;
+      if(node.matches&&node.matches('br'))return true;
+      return node.matches&&node.matches('code')&&Boolean(normalizeLocalImagePath(node.textContent||''));
+    });
+    if(!pathOnly)continue;
+    const figures=codes.map((code)=>{
+      const pathValue=normalizeLocalImagePath(code.textContent||'');
+      return pathValue?createMarkdownImage(pathValue,pathValue.split('/').pop()):null;
+    }).filter(Boolean);
+    if(figures.length!==codes.length)continue;
+    const fragment=document.createDocumentFragment();
+    for(const figure of figures)fragment.appendChild(figure);
+    paragraph.replaceWith(fragment);
+  }
   for(const code of [...body.querySelectorAll('code')]){
     if(code.closest('pre,a,figure.markdownImage'))continue;
     const pathValue=normalizeLocalImagePath(code.textContent||'');
@@ -19626,13 +19674,13 @@ function enhanceMarkdownImages(body){
     if(!node||!node.nodeValue||!node.parentElement)continue;
     if(node.parentElement.closest('a,pre,script,style,textarea,figure.markdownImage,code'))continue;
     const nv=String(node.nodeValue||'').toLowerCase();
-    if(nv.includes('.png')||nv.includes('.jpg')||nv.includes('.jpeg')||nv.includes('.webp')||nv.includes('.gif')||nv.includes('.avif'))textNodes.push(node);
+    if(nv.includes('.png')||nv.includes('.jpg')||nv.includes('.jpeg')||nv.includes('.webp')||nv.includes('.gif')||nv.includes('.avif')||nv.includes('.svg'))textNodes.push(node);
   }
   for(const node of textNodes){
     const value=String(node.nodeValue||'');
     const hits=[];
     const lower=value.toLowerCase();
-    const exts=['.png','.jpg','.jpeg','.webp','.gif','.avif'];
+    const exts=['.png','.jpg','.jpeg','.webp','.gif','.avif','.svg'];
     for(let i=0;i<value.length;i++){
       let hitExt='';
       for(const ext of exts){
@@ -23423,6 +23471,7 @@ function addMsg(role,text,options={}){
         duplicate.classList.remove('progressCommentary');
         latestFinalAssistantElement=duplicate;
       }
+      moveAssistantBubbleToMainChat(duplicate,options.kind,targetText);
       latestAssistantElement=duplicate;
       if(options.autoScroll!==false)scrollChatToLatest();
       return duplicate;
@@ -23630,10 +23679,10 @@ function findRuntimeLiveForSnapshotMessage(message){
     }
   }
   if(best)return best;
-  for(const item of [...chat.querySelectorAll('.msg.assistant')].reverse()){
+  for(const item of nativeAssistantBubbleElements().reverse()){
     if(!item)continue;
     if(item.dataset.turnId&&item.dataset.turnId!==turnId)continue;
-    if(item.dataset.nativeMessageSeq)continue;
+    if(item.dataset.nativeMessageSeq&&item.dataset.nativeLiveSource!=='runtime')continue;
     const kind=item.dataset.messageKind||'';
     if(kind&&!['','message','commentary','live_progress','final_answer'].includes(kind))continue;
     const liveText=normalizeAssistantDedupeText(item.dataset.messageText||item.textContent||'');
@@ -23669,11 +23718,15 @@ function adoptRuntimeLiveForSnapshotMessage(message){
   live.element.dataset.messageText=targetText;
   live.element.dataset.messageKind=String(message.kind||live.element.dataset.messageKind||'message');
   live.element.dataset.turnId=String(message.turnId||live.turnId||'');
+  delete live.element.dataset.nativeLiveSource;
   if(message.responseAnnotations)rememberResponseAnnotationItems(pausedTurnId,message.responseAnnotations);
   if(Number.isInteger(message.seq))live.element.dataset.nativeMessageSeq=String(message.seq);
   if(message.at)live.element.dataset.messageAt=String(message.at);
   if(live.element._messageBody)renderAssistantMarkdown(live.element._messageBody,targetText);
-  if(live.key&&nativeLiveItems.has(live.key))nativeLiveItems.delete(live.key);
+  moveAssistantBubbleToMainChat(live.element,message.kind,targetText);
+  // Keep the completed runtime item as a replay guard until the turn settles.
+  // Some app-server subscription races can replay the same delta stream after
+  // the persisted snapshot has already adopted this bubble.
   if(Number.isInteger(message.seq)){
     const snapshotKey=nativeSnapshotLiveKey(message,{generation:nativeGeneration});
     nativeRenderedMessageKeys.add(snapshotKey);
@@ -23689,12 +23742,39 @@ function adoptRuntimeLiveForSnapshotMessage(message){
   latestAssistantElement=live.element;
   return live.element;
 }
+function nativeAssistantBubbleElements(){
+  const roots=[chat];
+  if(typeof turnProcessHeader!=='undefined'&&turnProcessHeader&&!roots.includes(turnProcessHeader))roots.push(turnProcessHeader);
+  const elements=[];
+  const seen=new Set();
+  for(const root of roots){
+    for(const item of root?.querySelectorAll?.('.msg.assistant')||[]){
+      if(seen.has(item))continue;
+      seen.add(item);
+      elements.push(item);
+    }
+  }
+  return elements;
+}
+function assistantMessageBelongsInProcess(kind,text){
+  const messageKind=String(kind||'');
+  if(messageKind==='final_answer')return false;
+  if(['commentary','live_progress'].includes(messageKind))return true;
+  if(!['','message'].includes(messageKind))return false;
+  return typeof isProgressStyleAssistantText==='function'&&isProgressStyleAssistantText(text);
+}
+function moveAssistantBubbleToMainChat(element,kind,text){
+  if(!element||assistantMessageBelongsInProcess(kind,text)||element.parentNode===chat)return element;
+  if(typeof turnProcessHeader!=='undefined'&&turnProcessHeader?.parentNode===chat&&typeof chat.insertBefore==='function')chat.insertBefore(element,turnProcessHeader);
+  else chat?.appendChild?.(element);
+  return element;
+}
 function findDuplicateAssistantBubble(text,options={}){
   const target=normalizeAssistantDedupeText(text);
   if(!target)return null;
   const turnId=String(options.turnId||'');
   const seq=Number.isInteger(options.nativeMessageSeq)?Number(options.nativeMessageSeq):null;
-  const candidates=[...chat.querySelectorAll('.msg.assistant')].reverse();
+  const candidates=nativeAssistantBubbleElements().reverse();
   for(const item of candidates){
     if(!item)continue;
     if(turnId&&item.dataset.turnId&&item.dataset.turnId!==turnId)continue;
@@ -23896,6 +23976,7 @@ function finishNativeLiveItem(itemId,turnId=''){
   const key=nativeRuntimeLiveKey(itemId,turnId);
   const live=nativeLiveItems.get(key)||[...nativeLiveItems.values()].find((item)=>item.source==='runtime'&&item.itemId===String(itemId||''));
   if(!live)return;
+  flushNativeRuntimeReplay(live);
   live.complete=true;
   if(Object.hasOwn(live,'rawText')){
     live.targetText=nativeLiveDisplayText(live.rawText,{streaming:true});
@@ -23913,6 +23994,7 @@ function finishAllNativeLiveItems(){
   for(const live of [...nativeLiveItems.values()]){
     if(live.renderTimer)clearTimeout(live.renderTimer);
     live.renderTimer=null;
+    flushNativeRuntimeReplay(live);
     live.complete=true;
     if(Object.hasOwn(live,'rawText')){
       live.targetText=nativeLiveDisplayText(live.rawText,{streaming:true});

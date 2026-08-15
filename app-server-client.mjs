@@ -5,12 +5,16 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_INITIALIZE_TIMEOUT_MS = 15000;
 const DEFAULT_INITIALIZE_RETRY_COUNT = 1;
 const DEFAULT_INITIALIZE_RETRY_DELAY_MS = 150;
+const DEFAULT_APP_SERVER_ARGS = ['--disable', 'code_mode_host'];
 
 export class CodexAppServerClient extends EventEmitter {
   constructor(options = {}) {
     super();
     this.bin = options.bin || 'codex';
     this.cwd = options.cwd || process.cwd();
+    this.appServerArgs = options.appServerArgs === undefined
+      ? [...DEFAULT_APP_SERVER_ARGS]
+      : normalizeArgs(options.appServerArgs);
     this.envOverrides = { ...(options.env || {}) };
     this.clientInfo = {
       name: options.clientName || 'codex-web',
@@ -140,7 +144,7 @@ export class CodexAppServerClient extends EventEmitter {
   async spawnAndInitialize() {
     this.closing = false;
     this.stdoutBuffer = '';
-    const child = spawn(this.bin, ['app-server', '--stdio'], {
+    const child = spawn(this.bin, ['app-server', ...this.appServerArgs, '--stdio'], {
       cwd: this.cwd,
       env: this.buildEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -296,6 +300,11 @@ function positiveTimeout(value, fallback) {
 function nonNegativeInteger(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
+}
+
+function normalizeArgs(value) {
+  if (!Array.isArray(value)) throw new TypeError('appServerArgs must be an array');
+  return value.map((arg) => String(arg));
 }
 
 function isInitializeTimeout(error) {

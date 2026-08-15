@@ -13,6 +13,38 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+test('legacy agent_message commentary mirrors are not rendered as a second reply', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const start = serverSource.indexOf('function extractProcessEvent');
+  const end = serverSource.indexOf('\nfunction writeEvent', start);
+  assert.ok(start >= 0 && end > start);
+  const { extractProcessEvent, extractText } = new Function(
+    `${serverSource.slice(start, end)}; return { extractProcessEvent, extractText };`,
+  )();
+
+  const commentary = {
+    type: 'event_msg',
+    payload: {
+      type: 'agent_message',
+      phase: 'commentary',
+      message: '同一段中间回复',
+    },
+  };
+  assert.equal(extractProcessEvent(commentary), null);
+  assert.equal(extractText(commentary), '');
+
+  const final = {
+    type: 'event_msg',
+    payload: {
+      type: 'agent_message',
+      phase: 'final_answer',
+      message: '唯一正式回复',
+    },
+  };
+  assert.equal(extractProcessEvent(final), null);
+  assert.equal(extractText(final), '唯一正式回复');
+});
+
 test('app-server terminal errors broadcast full detail before closing the turn', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const start = serverSource.indexOf('function handleAppServerError');
@@ -1203,6 +1235,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const imagePromptFetchFixture = path.join(temporary, 'image-prompt-fetch-fixture.mjs');
   const webEnv = path.join(temporary, 'web.env');
   const toolImagePath = path.join(temporary, 'tool-preview.png');
+  const svgImagePath = path.join(temporary, 'grok-preview.svg');
+  const invalidSvgImagePath = path.join(temporary, 'not-really-svg.svg');
   let externalImageRoot = '';
   let externalImagePath = '';
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
@@ -1494,6 +1528,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
       toolImagePath,
       Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
     );
+    await writeFile(svgImagePath, '<?xml version="1.0"?>\n<!-- Grok SVG -->\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8"/></svg>');
+    await writeFile(invalidSvgImagePath, '<html><body>not an SVG image</body></html>');
     await writeFile(externalImagePath, await readFile(toolImagePath));
     await writeFile(imagePromptFetchFixture, `
 const originalFetch = globalThis.fetch;
@@ -5595,6 +5631,23 @@ updated_at = 1784422800000
     );
     assert.equal(configuredRootLocalImage.status, 200);
     assert.equal(configuredRootLocalImage.headers.get('content-type'), 'image/png');
+    const svgLocalImage = await fetch(
+      `${baseUrl}/api/local-image?${new URLSearchParams({ path: svgImagePath, cwd: temporary })}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(svgLocalImage.status, 200);
+    assert.equal(svgLocalImage.headers.get('content-type'), 'image/svg+xml');
+    assert.equal(svgLocalImage.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(
+      svgLocalImage.headers.get('content-security-policy'),
+      "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+    );
+    assert.match(await svgLocalImage.text(), /<svg\b/);
+    const invalidSvgLocalImage = await fetch(
+      `${baseUrl}/api/local-image?${new URLSearchParams({ path: invalidSvgImagePath, cwd: temporary })}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(invalidSvgLocalImage.status, 404);
     // ...but must reject an absolute path outside both the session cwd and the OS temp
     // dir, or any authenticated user could read arbitrary image files on the host that
     // have nothing to do with the current Codex session.

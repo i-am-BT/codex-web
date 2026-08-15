@@ -6,6 +6,7 @@
   --surface-raised: #171b20;
   --surface-hover: #1d2228;
   --surface-active: #222932;
+  --surface-subtle: #0e1216;
   --border: #2a3038;
   --border-strong: #3b4450;
   --text: #f1f3f5;
@@ -54,6 +55,7 @@ body[data-theme="light"] {
   --surface-raised: #f8f9fb;
   --surface-hover: #eef1f4;
   --surface-active: #e8edf5;
+  --surface-subtle: #f6f8fb;
   --border: #dfe3e8;
   --border-strong: #c6ccd4;
   --text: #1d232b;

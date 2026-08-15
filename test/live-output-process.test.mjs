@@ -764,7 +764,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.doesNotMatch(cancelSource, /freezeTurnProcessElapsed\(|clearLiveTurnProgress\(|webRunActive=false|activeNativeTurnId=''/);
   assert.match(deltaSource, /const cancelPending=nativeCancelPendingMatches\(currentConversationId,runtimeTurnId\);/);
   assert.match(deltaSource, /if\(!live&&cancelPending\)return;/);
-  assert.match(deltaSource, /live\.targetText\+=delta;\s*if\(cancelPending\|\|live\.cancelVisualPaused\)return;/);
+  assert.match(deltaSource, /const nextDelta=nativeRuntimeDeltaText\(live,delta\);\s*if\(!nextDelta\)return;\s*live\.targetText\+=nextDelta;/);
   assert.match(pauseSource, /renderNativeLiveItemImmediately\(live\);\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(scheduleSource, /if\(live\?\.cancelVisualPaused\)return;/);
   assert.match(snapshotSource, /if\(live\.cancelVisualPaused&&nativeCancelPendingMatches\(currentConversationId,pausedTurnId\)\)\{/);
@@ -1647,6 +1647,139 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
   // (Here we only assert the runtime→snapshot adoption path used by live sync.)
   assert.equal(addCalls[0].element.dataset.messageKind, 'message');
   assert.equal(api.state().nativeRenderedMessageKeys.size >= 1, true);
+});
+
+test('late runtime delta adopts an already rendered snapshot bubble', () => {
+  const liveSource = sourceBetween('function isNativeSnapshotStreamingMessage', 'async function copyText');
+  const runningStatusSource = sourceBetween('function nativeRunningStatusTimestamp', 'function updateConversationStatus');
+  const addCalls = [];
+  const createElement = () => {
+    const classes = new Set(['msg', 'assistant', 'streaming']);
+    return {
+      dataset: { messageKind: 'commentary' },
+      _messageBody: { textContent: '' },
+      classList: {
+        add: (...names) => names.forEach((name) => classes.add(name)),
+        remove: (...names) => names.forEach((name) => classes.delete(name)),
+        contains: (name) => classes.has(name),
+      },
+    };
+  };
+  const addMsg = (role, text, options) => {
+    const element = createElement();
+    element.dataset.messageText = text;
+    if (options?.kind) element.dataset.messageKind = String(options.kind);
+    if (options?.turnId) element.dataset.turnId = String(options.turnId);
+    if (Number.isInteger(options?.nativeMessageSeq)) element.dataset.nativeMessageSeq = String(options.nativeMessageSeq);
+    addCalls.push({ role, text, options, element });
+    return element;
+  };
+  const chat = {
+    scrollHeight: 1000,
+    clientHeight: 400,
+    scrollTop: 600,
+    addEventListener() {},
+    querySelectorAll(selector) {
+      if (selector !== '.msg.assistant') return [];
+      return addCalls.map((call) => call.element);
+    },
+  };
+  const api = new Function(
+    'setTimeout',
+    'clearTimeout',
+    'addMsg',
+    'renderAssistantMarkdown',
+    'scrollChatToLatest',
+    'chat',
+    `
+      let nativeGeneration = 4;
+      let nativeCompletionSync = null;
+      let nativeLiveItems = new Map();
+      let nativeRuntimeStreamTurnIds = new Set();
+      let nativeRenderedMessageKeys = new Set();
+      let nativeLiveScrollTimer = null;
+      let nativeLiveFollowBottom = true;
+      let nativeLiveReadingHistory = false;
+      let nativeLiveTowardLatestUntil = 0;
+      let nativeLiveScrollTrackingBound = false;
+      let currentConversationId = 'thread-active';
+      let activeNativeTurnId = 'turn-active';
+      function nativeCancelPendingMatches() { return false; }
+      let latestAssistantElement = null;
+      let latestFinalAssistantElement = null;
+      let collectingTurnProcess = false;
+      let turnProcessElapsedTurnId = '';
+      let turnProcessStartedAt = 0;
+      let turnProcessElapsedLabel = null;
+      const statusEl = { textContent: '', classList: { add() {}, remove() {} } };
+      ${runningStatusSource}
+      function beginTurnProcessCollection() {}
+      function ensureTurnProcessElapsedRunning() {}
+      function turnProcessElapsedMatches() { return true; }
+      function activateTurnProcessElement() {}
+      function removeNativeRunningElement() {}
+      ${liveSource}
+      return {
+        updateDelta: updateNativeLiveDelta,
+        finishItem: finishNativeLiveItem,
+        upsert: upsertNativeSnapshotLiveMessage,
+        state: () => ({ nativeLiveItems, nativeRuntimeStreamTurnIds, nativeRenderedMessageKeys }),
+      };
+    `,
+  )(() => 1, () => {}, addMsg, (body, text) => { body.textContent = text; }, () => {}, chat);
+
+  const content = '我会按目前这张 RTX 2060 Super 8GB 来筛选，并核对近期模型的官方显存要求与量化方案。';
+  const message = {
+    seq: 44,
+    role: 'assistant',
+    kind: 'commentary',
+    turnId: 'turn-active',
+    content,
+    at: '2026-08-14T07:04:04.513Z',
+  };
+  api.upsert(message, { status: 'running', activeTurnId: 'turn-active', generation: 4 }, { renderImmediately: true });
+  assert.equal(addCalls.length, 1, 'snapshot renders the first and only bubble');
+  assert.equal(api.state().nativeLiveItems.size, 0, 'settled snapshots leave only their DOM bubble');
+
+  api.updateDelta({ itemId: 'item-late', turnId: 'turn-active', delta: content, updatedAt: message.at });
+  assert.equal(addCalls.length, 1, 'late runtime replay must reuse the snapshot DOM bubble');
+  assert.equal(api.state().nativeLiveItems.size, 1);
+  const [live] = api.state().nativeLiveItems.values();
+  assert.equal(live.source, 'runtime');
+  assert.equal(live.element, addCalls[0].element);
+  assert.equal(live.targetText, content, 'runtime replay must not append the authoritative snapshot text');
+
+  api.finishItem('item-late', 'turn-active');
+  assert.equal(live.targetText, content, 'an incomplete replay probe must not duplicate snapshot text on completion');
+});
+
+test('runtime stream suppresses a replayed long message without dropping normal repeated text', () => {
+  const deltaTextSource = sourceBetween('function nativeRuntimeDeltaText', 'function updateNativeLiveDelta');
+  const { nativeRuntimeDeltaText, flushNativeRuntimeReplay } = new Function(
+    `${deltaTextSource}; return { nativeRuntimeDeltaText, flushNativeRuntimeReplay };`,
+  )();
+  const content = '我先定位这条会话对应的服务日志和会话记录，确认重复内容来自实时消息重放，而不是模型真的生成了两次。';
+  const live = { targetText: content, runtimeReplay: null };
+
+  assert.equal(nativeRuntimeDeltaText(live, content.slice(0, 18)), '');
+  assert.equal(nativeRuntimeDeltaText(live, content.slice(18)), '');
+  assert.equal(live.runtimeReplay, null, 'a complete replay should be consumed');
+
+  const suffix = '接下来继续检查前端合并逻辑。';
+  assert.equal(nativeRuntimeDeltaText(live, content + suffix), suffix);
+
+  const mismatch = { targetText: content, runtimeReplay: null };
+  const prefix = content.slice(0, 10);
+  assert.equal(nativeRuntimeDeltaText(mismatch, prefix), '');
+  assert.equal(nativeRuntimeDeltaText(mismatch, '这是新的正文'), prefix + '这是新的正文');
+
+  const partial = { targetText: content, runtimeReplay: null };
+  assert.equal(nativeRuntimeDeltaText(partial, prefix), '');
+  flushNativeRuntimeReplay(partial);
+  assert.equal(partial.targetText, content + prefix, 'an incomplete probe must restore buffered text');
+
+  const short = { targetText: '是', runtimeReplay: null };
+  assert.equal(nativeRuntimeDeltaText(short, '是'), '是');
 });
 
 test('streaming output has no blinking text caret', () => {

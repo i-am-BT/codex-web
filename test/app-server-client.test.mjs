@@ -36,7 +36,10 @@ test('app-server restart applies the latest environment before requests continue
   const traceFile = path.join(temporary, 'trace.jsonl');
   await writeFile(fakeCodex, `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
-appendFileSync(process.env.TRACE_FILE, JSON.stringify({ marker: process.env.RESTART_MARKER }) + '\\n');
+appendFileSync(process.env.TRACE_FILE, JSON.stringify({
+  marker: process.env.RESTART_MARKER,
+  args: process.argv.slice(2),
+}) + '\\n');
 let buffer = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
@@ -79,6 +82,14 @@ process.stdin.on('data', (chunk) => {
     assert.deepEqual(
       (await readFile(traceFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line).marker),
       ['first', 'second', 'latest'],
+    );
+    assert.deepEqual(
+      (await readFile(traceFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line).args),
+      [
+        ['app-server', '--disable', 'code_mode_host', '--stdio'],
+        ['app-server', '--disable', 'code_mode_host', '--stdio'],
+        ['app-server', '--disable', 'code_mode_host', '--stdio'],
+      ],
     );
   } finally {
     client.close();
