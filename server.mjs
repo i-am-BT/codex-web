@@ -23839,6 +23839,71 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
   return live;
 }
 function nativeRuntimeLiveKey(itemId,turnId){return 'runtime:'+String(turnId||activeNativeTurnId||'')+':'+String(itemId||'')}
+function findSnapshotLiveForRuntimeDelta(turnId,delta){
+  const cleanTurnId=String(turnId||'');
+  const incoming=normalizeAssistantDedupeText(nativeLiveDisplayText(delta,{streaming:true}));
+  if(!cleanTurnId||!incoming)return null;
+  let best=null;
+  for(const [key,live] of nativeLiveItems){
+    if(live?.source!=='snapshot'||!live.element)continue;
+    if(String(live.turnId||'')!==cleanTurnId)continue;
+    const text=normalizeAssistantDedupeText(live.targetText||live.text||live.element.dataset?.messageText||'');
+    if(!assistantTextsMatch(text,incoming))continue;
+    const score=text===incoming?2:1;
+    if(!best||score>=best.score)best={key,live,text,score};
+  }
+  if(best)return best;
+  for(const element of nativeAssistantBubbleElements().reverse()){
+    if(!element?.dataset?.nativeMessageSeq||element.dataset.nativeLiveSource==='runtime')continue;
+    if(String(element.dataset.turnId||'')!==cleanTurnId)continue;
+    const kind=String(element.dataset.messageKind||'');
+    if(kind&&!['','message','commentary','live_progress','final_answer'].includes(kind))continue;
+    const text=normalizeAssistantDedupeText(element.dataset.messageText||element.textContent||'');
+    if(!assistantTextsMatch(text,incoming))continue;
+    return {
+      key:'snapshot-dom:'+String(element.dataset.nativeMessageSeq||''),
+      text,
+      live:{
+        key:'',source:'snapshot',turnId:cleanTurnId,messageSeq:Number(element.dataset.nativeMessageSeq),
+        role:'assistant',element,text,targetText:text,complete:true,renderTimer:null,
+        followBottom:nativeLiveFollowBottom,
+      },
+    };
+  }
+  return null;
+}
+function adoptSnapshotLiveForRuntimeDelta(itemId,turnId,delta,updatedAt=''){
+  const match=findSnapshotLiveForRuntimeDelta(turnId,delta);
+  if(!match?.live?.element)return null;
+  const live=match.live;
+  if(live.renderTimer){clearTimeout(live.renderTimer);live.renderTimer=null}
+  if(match.key&&nativeLiveItems.get(match.key)===live)nativeLiveItems.delete(match.key);
+  if(match.key&&match.key.startsWith('snapshot:'))nativeRenderedMessageKeys.add(match.key);
+  const key=nativeRuntimeLiveKey(itemId,turnId);
+  live.key=key;
+  live.source='runtime';
+  live.turnId=String(turnId||'');
+  live.itemId=String(itemId||'');
+  live.rawText='';
+  live.runtimeBaseText=String(match.text||live.targetText||live.text||'');
+  live.runtimeBaseAuthoritative=true;
+  live.complete=false;
+  live.updatedAt=updatedAt;
+  live.element.classList.add('streaming');
+  live.element.dataset.nativeLiveSource='runtime';
+  nativeLiveItems.set(key,live);
+  if(live.turnId)nativeRuntimeStreamTurnIds.add(live.turnId);
+  return live;
+}
+function nativeRuntimeTargetText(live,rawText){
+  const incoming=nativeLiveDisplayText(rawText,{streaming:true});
+  if(!live?.runtimeBaseAuthoritative)return incoming;
+  const base=String(live.runtimeBaseText||live.targetText||'');
+  if(!incoming||base.startsWith(incoming))return base;
+  live.runtimeBaseAuthoritative=false;
+  delete live.runtimeBaseText;
+  return incoming;
+}
 function removeNativeLiveElement(live){
   const element=live?.element;
   if(!element)return;
@@ -23872,6 +23937,12 @@ function updateNativeLiveDelta(runtime){
   const key=nativeRuntimeLiveKey(itemId,runtimeTurnId);
   let live=nativeLiveItems.get(key);
   if(!live&&cancelPending)return;
+  if(live&&!live.element&&!live.targetText){
+    const bufferedRawText=String(live.rawText||'');
+    const adopted=adoptSnapshotLiveForRuntimeDelta(itemId,runtimeTurnId,bufferedRawText+delta,runtime.updatedAt);
+    if(adopted){adopted.rawText=bufferedRawText;live=adopted}
+  }
+  if(!live)live=adoptSnapshotLiveForRuntimeDelta(itemId,runtimeTurnId,delta,runtime.updatedAt);
   if(!live){
     live={key,source:'runtime',turnId:runtimeTurnId,itemId,role:'assistant',element:null,text:'',targetText:'',rawText:'',complete:false,renderTimer:null,followBottom:nativeLiveFollowBottom,updatedAt:runtime.updatedAt};
     nativeLiveItems.set(key,live);
@@ -23879,7 +23950,7 @@ function updateNativeLiveDelta(runtime){
   }
   live.updatedAt=runtime.updatedAt||live.updatedAt;
   live.rawText=String(live.rawText||'')+delta;
-  const targetText=nativeLiveDisplayText(live.rawText,{streaming:true});
+  const targetText=nativeRuntimeTargetText(live,live.rawText);
   if(!targetText.startsWith(live.text))live.text='';
   live.targetText=targetText;
   if(!targetText){
@@ -23976,11 +24047,12 @@ function finishNativeLiveItem(itemId,turnId=''){
   const key=nativeRuntimeLiveKey(itemId,turnId);
   const live=nativeLiveItems.get(key)||[...nativeLiveItems.values()].find((item)=>item.source==='runtime'&&item.itemId===String(itemId||''));
   if(!live)return;
-  flushNativeRuntimeReplay(live);
   live.complete=true;
   if(Object.hasOwn(live,'rawText')){
-    live.targetText=nativeLiveDisplayText(live.rawText,{streaming:true});
+    live.targetText=nativeRuntimeTargetText(live,live.rawText);
     delete live.rawText;
+    delete live.runtimeBaseText;
+    delete live.runtimeBaseAuthoritative;
   }
   if(!live.targetText){
     removeNativeLiveElement(live);
@@ -23994,11 +24066,12 @@ function finishAllNativeLiveItems(){
   for(const live of [...nativeLiveItems.values()]){
     if(live.renderTimer)clearTimeout(live.renderTimer);
     live.renderTimer=null;
-    flushNativeRuntimeReplay(live);
     live.complete=true;
     if(Object.hasOwn(live,'rawText')){
-      live.targetText=nativeLiveDisplayText(live.rawText,{streaming:true});
+      live.targetText=nativeRuntimeTargetText(live,live.rawText);
       delete live.rawText;
+      delete live.runtimeBaseText;
+      delete live.runtimeBaseAuthoritative;
     }
     if(!live.targetText){
       removeNativeLiveElement(live);

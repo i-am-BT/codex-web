@@ -294,7 +294,7 @@ test('response annotations render as hover details and touch toggles', () => {
   assert.equal((inlineScript.match(/responseAnnotations:msg\.responseAnnotations/g) || []).length, 2);
   assert.match(inlineScript, /responseAnnotations:message\.responseAnnotations/);
   assert.match(inlineScript, /function adoptRuntimeLiveForSnapshotMessage\(message\)\{[\s\S]*?rememberResponseAnnotationItems\(pausedTurnId,message\.responseAnnotations\)/s);
-  assert.match(inlineScript, /addMsg\('assistant','',\{streaming:true,kind:'live_progress',turnId:runtimeTurnId,autoScroll:false\}\)/);
+  assert.match(inlineScript, /function ensureNativeRuntimeLiveElement\(live\)[\s\S]*?addMsg\('assistant','',\{streaming:true,kind:'live_progress',turnId:live\.turnId,autoScroll:false\}\)/);
   assert.match(inlineScript, /function newChat\(\)[\s\S]*?responseAnnotationsByTurn=new Map\(\)/);
   assert.match(inlineScript, /function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?clearNativeLiveItems\(\);\s*responseAnnotationsByTurn=new Map\(\);/s);
   assert.match(inlineScript, /document\.querySelectorAll\('\.browserAnnotationCard,\.responseAnnotationCard'\)/);
@@ -764,7 +764,8 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.doesNotMatch(cancelSource, /freezeTurnProcessElapsed\(|clearLiveTurnProgress\(|webRunActive=false|activeNativeTurnId=''/);
   assert.match(deltaSource, /const cancelPending=nativeCancelPendingMatches\(currentConversationId,runtimeTurnId\);/);
   assert.match(deltaSource, /if\(!live&&cancelPending\)return;/);
-  assert.match(deltaSource, /const nextDelta=nativeRuntimeDeltaText\(live,delta\);\s*if\(!nextDelta\)return;\s*live\.targetText\+=nextDelta;/);
+  assert.match(deltaSource, /if\(!live\)live=adoptSnapshotLiveForRuntimeDelta\(itemId,runtimeTurnId,delta,runtime\.updatedAt\);/);
+  assert.match(deltaSource, /live\.rawText=String\(live\.rawText\|\|''\)\+delta;\s*const targetText=nativeRuntimeTargetText\(live,live\.rawText\);/);
   assert.match(pauseSource, /renderNativeLiveItemImmediately\(live\);\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(scheduleSource, /if\(live\?\.cancelVisualPaused\)return;/);
   assert.match(snapshotSource, /if\(live\.cancelVisualPaused&&nativeCancelPendingMatches\(currentConversationId,pausedTurnId\)\)\{/);
@@ -1335,6 +1336,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
       function nativeCancelPendingMatches() { return false; }
+      function stripNativeUiProtocolLines(value) { return String(value || ''); }
       ${liveSource}
       return {
         shouldStream: isNativeSnapshotStreamingMessage,
@@ -1445,13 +1447,13 @@ test('persisted active commentary renders progressively and deduplicates by sequ
   assert.match(inlineScript, /loadConversation[\s\S]*hydrating:true/);
   assert.match(inlineScript, /nativeRuntimeStreamTurnIds\.has\(String\(msg\.turnId\|\|''\)\)/);
   assert.doesNotMatch(inlineScript, /nativeLiveItems\.size&&\['assistant','thinking'\]/);
-  assert.match(liveSource, /kind:'live_progress',turnId:runtimeTurnId,autoScroll:false/);
+  assert.match(liveSource, /function ensureNativeRuntimeLiveElement\(live\)[\s\S]*?kind:'live_progress',turnId:live\.turnId,autoScroll:false/);
   assert.doesNotMatch(liveSource, /scrollChatToLatest\(/);
   assert.match(liveSource, /function nativeLiveDocumentHidden\(\)/);
   assert.match(liveSource, /if\(!nativeLiveTypewriterEnabled\(\)\)\{\s*renderNativeLiveItemImmediately\(live\);/);
   assert.match(liveSource, /function renderNativeLiveItem\(live\)\{[\s\S]*?_messageBody\.textContent=live\.text/);
   assert.match(liveSource, /function renderNativeLiveItemMarkdown\(live\)\{[\s\S]*?renderAssistantMarkdown\(body,live\.text\);/);
-  assert.match(liveSource, /function settleNativeLiveItem\(live\)\{\s*renderNativeLiveItemMarkdown\(live\);/);
+  assert.match(liveSource, /function settleNativeLiveItem\(live\)\{[\s\S]*?renderNativeLiveItemMarkdown\(live\);/);
   assert.match(inlineScript, /function handleNativeVisibilityChange\(\)[\s\S]*?nativeSnapshotResumeCatchup=true;[\s\S]*?flushNativeLiveItemsToTarget\(\);/);
   assert.match(inlineScript, /if\(nearBottom&&syncMessages\.length\)scheduleNativeLiveScroll\(\)/);
 });
@@ -1595,6 +1597,7 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
       function nativeCancelPendingMatches() { return false; }
+      function stripNativeUiProtocolLines(value) { return String(value || ''); }
       let latestAssistantElement = null;
       let latestFinalAssistantElement = null;
       let collectingTurnProcess = false;
@@ -1705,6 +1708,9 @@ test('late runtime delta adopts an already rendered snapshot bubble', () => {
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
       function nativeCancelPendingMatches() { return false; }
+      function stripNativeUiProtocolLines(value) {
+        return String(value || '').split('\\n').filter((line) => !line.startsWith('::git-')).join('\\n').trim();
+      }
       let latestAssistantElement = null;
       let latestFinalAssistantElement = null;
       let collectingTurnProcess = false;
@@ -1741,7 +1747,9 @@ test('late runtime delta adopts an already rendered snapshot bubble', () => {
   assert.equal(addCalls.length, 1, 'snapshot renders the first and only bubble');
   assert.equal(api.state().nativeLiveItems.size, 0, 'settled snapshots leave only their DOM bubble');
 
-  api.updateDelta({ itemId: 'item-late', turnId: 'turn-active', delta: content, updatedAt: message.at });
+  api.updateDelta({ itemId: 'item-late', turnId: 'turn-active', delta: '::git-status{"state":"clean"}', updatedAt: message.at });
+  assert.equal(addCalls.length, 1, 'a protocol-only delta must not create another bubble');
+  api.updateDelta({ itemId: 'item-late', turnId: 'turn-active', delta: `\n${content}`, updatedAt: message.at });
   assert.equal(addCalls.length, 1, 'late runtime replay must reuse the snapshot DOM bubble');
   assert.equal(api.state().nativeLiveItems.size, 1);
   const [live] = api.state().nativeLiveItems.values();
@@ -1753,33 +1761,27 @@ test('late runtime delta adopts an already rendered snapshot bubble', () => {
   assert.equal(live.targetText, content, 'an incomplete replay probe must not duplicate snapshot text on completion');
 });
 
-test('runtime stream suppresses a replayed long message without dropping normal repeated text', () => {
-  const deltaTextSource = sourceBetween('function nativeRuntimeDeltaText', 'function updateNativeLiveDelta');
-  const { nativeRuntimeDeltaText, flushNativeRuntimeReplay } = new Function(
-    `${deltaTextSource}; return { nativeRuntimeDeltaText, flushNativeRuntimeReplay };`,
-  )();
+test('runtime stream reuses an authoritative snapshot until cumulative output diverges', () => {
+  const targetTextSource = sourceBetween('function nativeRuntimeTargetText', 'function removeNativeLiveElement');
+  const { nativeRuntimeTargetText } = new Function(
+    'nativeLiveDisplayText',
+    `${targetTextSource}; return { nativeRuntimeTargetText };`,
+  )((value) => String(value || ''));
   const content = '我先定位这条会话对应的服务日志和会话记录，确认重复内容来自实时消息重放，而不是模型真的生成了两次。';
-  const live = { targetText: content, runtimeReplay: null };
+  const live = { targetText: content, runtimeBaseText: content, runtimeBaseAuthoritative: true };
 
-  assert.equal(nativeRuntimeDeltaText(live, content.slice(0, 18)), '');
-  assert.equal(nativeRuntimeDeltaText(live, content.slice(18)), '');
-  assert.equal(live.runtimeReplay, null, 'a complete replay should be consumed');
+  assert.equal(nativeRuntimeTargetText(live, content.slice(0, 18)), content);
+  assert.equal(nativeRuntimeTargetText(live, content), content);
+  assert.equal(live.runtimeBaseAuthoritative, true, 'an exact replay keeps the snapshot authoritative');
 
   const suffix = '接下来继续检查前端合并逻辑。';
-  assert.equal(nativeRuntimeDeltaText(live, content + suffix), suffix);
+  assert.equal(nativeRuntimeTargetText(live, content + suffix), content + suffix);
+  assert.equal(live.runtimeBaseAuthoritative, false, 'new cumulative output becomes authoritative');
 
-  const mismatch = { targetText: content, runtimeReplay: null };
+  const mismatch = { targetText: content, runtimeBaseText: content, runtimeBaseAuthoritative: true };
   const prefix = content.slice(0, 10);
-  assert.equal(nativeRuntimeDeltaText(mismatch, prefix), '');
-  assert.equal(nativeRuntimeDeltaText(mismatch, '这是新的正文'), prefix + '这是新的正文');
-
-  const partial = { targetText: content, runtimeReplay: null };
-  assert.equal(nativeRuntimeDeltaText(partial, prefix), '');
-  flushNativeRuntimeReplay(partial);
-  assert.equal(partial.targetText, content + prefix, 'an incomplete probe must restore buffered text');
-
-  const short = { targetText: '是', runtimeReplay: null };
-  assert.equal(nativeRuntimeDeltaText(short, '是'), '是');
+  assert.equal(nativeRuntimeTargetText(mismatch, prefix), content);
+  assert.equal(nativeRuntimeTargetText(mismatch, `${prefix}这是新的正文`), `${prefix}这是新的正文`);
 });
 
 test('streaming output has no blinking text caret', () => {
@@ -1813,9 +1815,10 @@ test('running composer queues follow-ups and keeps steer as an explicit queue ac
   assert.match(steerSource, /applyServerPromptQueue\(threadId,data\.queue\)/);
   assert.match(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:false,dismiss:!isAppOwnedQueuedPrompt\(item\)\}\)/);
   assert.doesNotMatch(steerSource, /removeQueuedPromptLocal\(threadId,item,\{persist:true\}\)/);
-  assert.ok(steerSource.indexOf('await flushPromptQueueToServer(threadId)') < steerSource.indexOf("fetch('/api/native-sessions/"));
+  assert.doesNotMatch(steerSource, /await flushPromptQueueToServer\(threadId\)/);
+  assert.ok(steerSource.indexOf('showNativeSteerOptimistically(item)') < steerSource.indexOf("fetch('/api/native-sessions/"));
   assert.ok(steerSource.indexOf("fetch('/api/native-sessions/") < steerSource.indexOf('applyServerPromptQueue(threadId,data.queue)'));
-  assert.ok(steerSource.indexOf('applyServerPromptQueue(threadId,data.queue)') < steerSource.indexOf('showNativeSteerOptimistically(item)'));
+  assert.match(steerSource, /if\(optimisticElement&&nativeOptimisticSteering\.get\(item\.id\)===optimisticElement\)/);
   assert.doesNotMatch(steerSource, /const previousItems=|const stillMissing=/);
   assert.match(dispatchSource, /queueGuidingItems\.has\(item\.id\)\|\|steerSubmitting/);
   assert.match(inlineScript, /Array\.isArray\(data\.items\)&&!promptQueueServerSyncPending\.has\(id\)/);
