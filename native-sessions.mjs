@@ -1427,7 +1427,11 @@ function applyNativeRecord(cache, record, maxMessages, store) {
       || payload.internal_chat_message_metadata_passthrough?.turnId
       || '',
   );
-  if (responseTurnId) updateNativeTurnId(cache, responseTurnId);
+  const responseStartsTurn = payload.type === 'message'
+    && payload.role === 'user';
+  if (responseTurnId && (!cache.currentTurnId || responseStartsTurn)) {
+    updateNativeTurnId(cache, responseTurnId);
+  }
 
   switch (payload.type) {
     case 'message':
@@ -1601,9 +1605,10 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
     case 'task_complete': {
       const errorMessage = nativeEventErrorMessage(payload.error);
       if (errorMessage) {
-        cache.status = 'error';
+        const pauseLike = /usage limit|quota exceeded|insufficient quota|too many requests|rate limit|high demand|(^|\D)429(\D|$)/i.test(errorMessage);
+        cache.status = pauseLike ? 'interrupted' : 'error';
         restoreRolledBackRetryAssistant(cache, maxMessages);
-        appendNativeMessage(cache, 'process', errorMessage, record, maxMessages, 'task_error', {
+        appendNativeMessage(cache, 'process', errorMessage, record, maxMessages, pauseLike ? 'turn_aborted' : 'task_error', {
           ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
         });
         break;
@@ -1647,18 +1652,21 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
       );
       break;
     case 'task_error':
-    case 'error':
-      cache.status = 'error';
+    case 'error': {
+      const errorMessage = payload.message || nativeEventErrorMessage(payload.error, '任务中断');
+      const pauseLike = /usage limit|quota exceeded|insufficient quota|too many requests|rate limit|high demand|(^|\D)429(\D|$)/i.test(String(errorMessage || ''));
+      cache.status = pauseLike ? 'interrupted' : 'error';
       restoreRolledBackRetryAssistant(cache, maxMessages);
       appendNativeMessage(
         cache,
         'process',
-        payload.message || nativeEventErrorMessage(payload.error, '任务中断'),
+        errorMessage,
         record,
         maxMessages,
-        payload.type,
+        pauseLike ? 'turn_aborted' : payload.type,
       );
       break;
+    }
     case 'thread_rolled_back':
       cache.pendingThreadRollbackTurnId = cache.currentTurnId || cache.latestTurnId || '';
       break;
@@ -1953,9 +1961,9 @@ function applyMessageRecord(cache, record, payload, maxMessages) {
   if (!text && !images.length) return;
   const turnId = String(
     cache.activeTaskTurnId
+    || cache.currentTurnId
     || payload.internal_chat_message_metadata_passthrough?.turn_id
     || payload.internal_chat_message_metadata_passthrough?.turnId
-    || cache.currentTurnId
     || '',
   );
   if (payload.role === 'user') {

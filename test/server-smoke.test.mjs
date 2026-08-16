@@ -58,6 +58,8 @@ test('app-server terminal errors broadcast full detail before closing the turn',
     'setNativeTurnState',
     'recordNativeTurnCompletion',
     'broadcastNativeRuntime',
+    'isTransientProviderLimitError',
+    'pausePromptQueueForProviderLimit',
     'console',
     `${serverSource.slice(start, end)}; return handleAppServerError;`,
   )(
@@ -66,6 +68,8 @@ test('app-server terminal errors broadcast full detail before closing the turn',
     (...args) => calls.push({ type: 'state', args }),
     (...args) => calls.push({ type: 'complete', args }),
     (event) => calls.push({ type: 'runtime', event }),
+    (message) => String(message || '').includes('429'),
+    (...args) => calls.push({ type: 'pause', args }),
     { warn() {} },
   );
 
@@ -79,7 +83,32 @@ test('app-server terminal errors broadcast full detail before closing the turn',
   assert.equal(calls[0].type, 'runtime');
   assert.equal(calls[0].event.message, detail);
   assert.equal(calls[1].type, 'complete');
-  assert.deepEqual(calls[1].args, ['thread-a', { id: 'turn-a', status: 'failed' }]);
+  assert.deepEqual(calls[1].args, [
+    'thread-a',
+    { id: 'turn-a', status: 'failed' },
+    { skipQueueDispatch: false },
+  ]);
+
+  const rateLimitDetail = 'exceeded retry limit, last status: 429 Too Many Requests';
+  handleAppServerError({
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+    willRetry: false,
+    error: { message: rateLimitDetail },
+  });
+
+  assert.deepEqual(calls[2], {
+    type: 'pause',
+    args: ['thread-a', rateLimitDetail],
+  });
+  assert.equal(calls[3].type, 'runtime');
+  assert.equal(calls[3].event.message, rateLimitDetail);
+  assert.equal(calls[3].event.pauseQueue, true);
+  assert.deepEqual(calls[4].args, [
+    'thread-a',
+    { id: 'turn-a', status: 'interrupted' },
+    { skipQueueDispatch: true },
+  ]);
 });
 
 test('Homepage stats expose current and concurrent running task names', async () => {
@@ -205,7 +234,7 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
     'releaseAppServerThreadAfterTurn',
     'scheduleServerPromptQueueDispatch',
     'setTimeout',
-    `${serverSource.slice(completionStart, completionEnd)}; return { recordNativeTurnCompletion };`,
+    `const isPromptQueuePaused = () => false; const isTransientProviderLimitError = () => false; const pausePromptQueueForProviderLimit = () => null; ${serverSource.slice(completionStart, completionEnd)}; return { recordNativeTurnCompletion };`,
   )(
     activeNativeTurns,
     (value) => String(value || '').trim(),
@@ -249,7 +278,7 @@ test('a matching persisted terminal releases a running turn and schedules the We
     'scheduleServerPromptQueueDispatch',
     'broadcastNativeRuntime',
     'releaseAppServerThreadAfterTurn',
-    `${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
+    `const isPromptQueuePaused = () => false; const isTransientProviderLimitError = () => false; const pausePromptQueueForProviderLimit = () => null; ${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
   )(
     [],
     () => {},
@@ -293,7 +322,7 @@ test('a terminal record for another turn cannot release a running queue lock', a
     'activeNativeTurns',
     'scheduleServerPromptQueueDispatch',
     'broadcastNativeRuntime',
-    `${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
+    `const isPromptQueuePaused = () => false; const isTransientProviderLimitError = () => false; const pausePromptQueueForProviderLimit = () => null; ${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
   )(
     [],
     () => {},
@@ -380,6 +409,7 @@ test('terminal completion clears an already persisted terminal without another w
     'broadcastNativeRuntime',
     'nativeTurnStatus',
     'setNativeTurnState',
+    'isPromptQueuePaused',
     'scheduleServerPromptQueueDispatch',
     'releaseAppServerThreadAfterTurn',
     `${serverSource.slice(terminalStart, terminalEnd)}; ${serverSource.slice(completionStart, completionEnd)}; return { recordNativeTurnCompletion };`,
@@ -396,6 +426,7 @@ test('terminal completion clears an already persisted terminal without another w
     (event) => events.push(event),
     (value) => String(value || '').toLowerCase() === 'failed' ? 'error' : 'done',
     (threadId, state) => activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state }),
+    () => false,
     (...args) => dispatches.push(args),
     () => Promise.resolve(false),
   );
@@ -404,6 +435,66 @@ test('terminal completion clears an already persisted terminal without another w
   assert.equal(activeNativeTurns.has('thread-a'), false, 'a prior watcher refresh must not leave a permanent override');
   assert.deepEqual(events, [{ type: 'turn-cleared', threadId: 'thread-a', turnId: 'turn-current' }]);
   assert.deepEqual(dispatches, [['thread-a', 160]]);
+
+  activeNativeTurns.set('thread-a', { turnId: 'turn-current', status: 'running' });
+  assert.equal(api.recordNativeTurnCompletion(
+    'thread-a',
+    { id: 'turn-current', status: 'interrupted' },
+    { skipQueueDispatch: true },
+  ), true);
+  assert.equal(dispatches.length, 1, 'a provider-limit pause must not dispatch the next queued prompt');
+});
+
+test('provider-limit queue pauses survive prompt queue persistence', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const loadStart = serverSource.indexOf('function loadPromptQueuesRaw');
+  const loadEnd = serverSource.indexOf('\nfunction loadPromptQueues()', loadStart);
+  const saveStart = serverSource.indexOf('function savePromptQueuesWithDismissed');
+  const saveEnd = serverSource.indexOf('\nfunction markPromptQueueDismissed', saveStart);
+  assert.ok(loadStart >= 0 && loadEnd > loadStart);
+  assert.ok(saveStart >= 0 && saveEnd > saveStart);
+
+  let stored = JSON.stringify({
+    queues: {
+      'thread-limit': {
+        updatedAt: '2026-08-16T12:00:00.000Z',
+        revision: 0,
+        items: [],
+        pause: {
+          reason: 'rate_limit',
+          message: 'exceeded retry limit, last status: 429 Too Many Requests',
+          pausedAt: '2026-08-16T12:00:00.000Z',
+        },
+      },
+    },
+    dismissed: {},
+  });
+  const api = new Function(
+    'PROMPT_QUEUE_FILE',
+    'existsSync',
+    'readFileSync',
+    'normalizeServerQueuedPrompt',
+    'cleanNativeThreadId',
+    'atomicWriteFile',
+    `${serverSource.slice(loadStart, loadEnd)}; ${serverSource.slice(saveStart, saveEnd)}; return { loadPromptQueuesRaw, savePromptQueuesWithDismissed };`,
+  )(
+    '/runtime/prompt-queues.json',
+    () => true,
+    () => stored,
+    (item) => item,
+    (value) => String(value || '').trim(),
+    (_file, content) => { stored = content; },
+  );
+
+  const loaded = api.loadPromptQueuesRaw();
+  assert.deepEqual(loaded['thread-limit']?.pause, {
+    reason: 'rate_limit',
+    message: 'exceeded retry limit, last status: 429 Too Many Requests',
+    pausedAt: '2026-08-16T12:00:00.000Z',
+  });
+  api.savePromptQueuesWithDismissed(loaded, {});
+  const reloaded = api.loadPromptQueuesRaw();
+  assert.deepEqual(reloaded['thread-limit']?.pause, loaded['thread-limit'].pause);
 });
 
 test('server-owned Web queues retry only while native state is settling', async () => {
@@ -430,7 +521,7 @@ test('server-owned Web queues retry only while native state is settling', async 
     'nativeAppErrorStatus',
     'nativeSessions',
     'console',
-    `${serverSource.slice(retryStart, retryEnd)}; return { isServerPromptQueueDispatchSettlingError, retryServerPromptQueueDispatchAfterSettling };`,
+    `const isPromptQueuePaused = () => false; ${serverSource.slice(retryStart, retryEnd)}; return { isServerPromptQueueDispatchSettlingError, retryServerPromptQueueDispatchAfterSettling };`,
   )(
     new Map(),
     retries,
@@ -3686,7 +3777,8 @@ updated_at = 1784422800000
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
     assert.match(page, /row\.button\.setAttribute\('aria-expanded',String\(kind===activeKind\)\)/);
     assert.match(page, /运行中修改将用于下一条消息/);
-    assert.match(page, /const conversation=data\.conversation;\s*nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit\(Math\.max\([\s\S]*?Number\(conversation\.nextHistoryPageLimit\)\|\|0,[\s\S]*?\)\);\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);\s*await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*if\(deferNativeSyncForHistoryPage\(\)\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
+    assert.match(page, /const conversation=data\.conversation;\s*nativeHistoryNextPageLimit=normalizeNativeHistoryPageLimit\(Math\.max\([\s\S]*?Number\(conversation\.nextHistoryPageLimit\)\|\|0,[\s\S]*?\)\);\s*currentNativeRunStatus=String\(conversation\.status\|\|''\);[\s\S]*?await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\)/);
+    assert.match(page, /await applyNativeConversationMetadata\(conversation\.metadata\|\|\{\},\{preserveProviderModel:nativeComposerOverrideApplies\(id\)\}\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationSource!=='codex'\|\|currentConversationId!==id\)return;\s*if\(deferNativeSyncForHistoryPage\(\)\)return;\s*syncComposerContextWindow\(conversation\.contextWindow\|\|null\)/);
     assert.match(page, /e\.isComposing\|\|e\.keyCode===229/);
     assert.match(page, /if\(!e\.repeat\)send\(\)/);
     assert.match(page, /function formatMessageTime/);

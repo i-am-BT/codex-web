@@ -325,8 +325,8 @@ test('native connection retries and terminal upstream errors render inside the c
   const { nativeConnectionStatusText } = new Function(
     `${textSource}; return { nativeConnectionStatusText };`,
   )();
-  const errorTitleSource = sourceBetween('function terminalErrorMessageTitle', 'let longUserMessageSerial');
-  const { terminalErrorMessageTitle, isUsageLimitTerminalError, terminalErrorDisplayText, terminalErrorHintText } = new Function(`${errorTitleSource}; return { terminalErrorMessageTitle, isUsageLimitTerminalError, terminalErrorDisplayText, terminalErrorHintText };`)();
+  const errorTitleSource = sourceBetween('function unwrapTerminalErrorPayload', 'let longUserMessageSerial');
+  const { terminalErrorMessageTitle, isUsageLimitTerminalError, terminalErrorDisplayText, terminalErrorHintText, normalizeTerminalErrorText } = new Function(`${errorTitleSource}; return { terminalErrorMessageTitle, isUsageLimitTerminalError, terminalErrorDisplayText, terminalErrorHintText, normalizeTerminalErrorText };`)();
   const messageElementSource = sourceBetween('function createConversationMessageElement', 'function addMsg');
   const runtimeHandlerSource = sourceBetween('function connectSessionEvents', 'function nativeMessageElementBySequence');
 
@@ -352,7 +352,13 @@ test('native connection retries and terminal upstream errors render inside the c
   assert.equal(terminalErrorMessageTitle('401 Unauthorized'), '认证失败');
   assert.equal(terminalErrorMessageTitle('request timed out'), '请求超时');
   assert.equal(terminalErrorMessageTitle('provider unavailable'), '任务失败');
-  assert.match(messageElementSource, /const terminalError=role==='process'&&\['task_error','error'\]\.includes\(kind\)/);
+  const nestedApiError = "{\"error\":{\"message\":\"{\\\"code\\\":\\\"invalid-argument\\\",\\\"error\\\":\\\"Duplicate tool names: view_image\\\"}\",\"type\":\"api_error\"}}";
+  assert.equal(terminalErrorMessageTitle(nestedApiError), '参数错误');
+  assert.equal(terminalErrorDisplayText(nestedApiError), 'invalid-argument: Duplicate tool names: view_image');
+  assert.equal(normalizeTerminalErrorText(nestedApiError), 'invalid-argument: Duplicate tool names: view_image');
+  assert.doesNotMatch(terminalErrorDisplayText(nestedApiError), /\\"/);
+  assert.match(messageElementSource, /const transientLimitError=role==='process'&&kind==='turn_aborted'&&isTransientProviderLimitErrorText\(text\)/);
+  assert.match(messageElementSource, /const terminalError=role==='process'&&\(\['task_error','error'\]\.includes\(kind\)\|\|transientLimitError\)/);
   assert.match(messageElementSource, /terminalError\?' terminalError':''/);
   assert.match(messageElementSource, /usageLimitError\?' usageLimitError':''/);
   assert.match(messageElementSource, /terminalErrorContent'\+\(usageLimitError\?' compact':''\)/);
@@ -587,8 +593,9 @@ test('terminal states remove only the ephemeral progress pill', () => {
   `)();
   api.clear();
   assert.deepEqual(api.state(), { removed: 1, liveTurnPlan: [], liveEditedFilesResult: null });
-  assert.match(inlineScript, /\['task_error','turn_aborted','error'\]\.includes\(kind\)\)\{\s*freezeTurnProcessElapsed\([^}]*clearLiveTurnProgress\(\)/);
-  assert.match(inlineScript, /\['task_error','turn_aborted','error'\]\.includes\(kind\)\)\{[\s\S]*?settleTurnTool\(latestToolElement\);[\s\S]*?collapseCurrentActivityCluster\(\)/);
+  assert.match(inlineScript, /if\(role==='process'&&\['task_error','turn_aborted','error'\]\.includes\(kind\)\)\{\s*freezeTurnProcessElapsed\([^}]*clearLiveTurnProgress\(\)/);
+  assert.match(inlineScript, /if\(role==='process'&&\['task_error','turn_aborted','error'\]\.includes\(kind\)\)\{[\s\S]*?settleTurnTool\(latestToolElement\);[\s\S]*?collapseCurrentActivityCluster\(\)/);
+  assert.match(inlineScript, /if\(!options\.hydrating&&currentConversationSource==='codex'&&currentConversationId[\s\S]*?transientLimitError\)\)\{/);
   // A stop request must leave the live state intact until Codex App reports its
   // terminal event; clearing it optimistically used to make a still-running task
   // look complete and allowed its queued follow-up to dispatch too early.
@@ -1806,7 +1813,7 @@ test('running composer queues follow-ups and keeps steer as an explicit queue ac
   assert.match(sendSource, /if\(existingId&&webRunActive\)\{\s*enqueuePrompt\(text,attachments\);\s*return;\s*\}/);
   assert.doesNotMatch(sendSource, /sendNativeSteer\(existingId/);
   assert.match(submitSource, /const action=webRunActive&&native\?'queue':resumeInterrupted\?'resume':'send'/);
-  assert.match(submitSource, /const label=action==='queue'\?'加入队列':action==='resume'\?'继续队列':'发送'/);
+  assert.match(submitSource, /const label=action==='queue'\?'加入队列':action==='resume'\?'开始':'发送'/);
   assert.match(inlineScript, /webRunActive&&native\?'排队消息':'向 Codex 提问'/);
   assert.doesNotMatch(inlineScript, /async function sendNativeSteer/);
   assert.doesNotMatch(sendSource, /promptQueueMode|steerQueuedPrompt\(existingId/);
@@ -1827,15 +1834,16 @@ test('running composer queues follow-ups and keeps steer as an explicit queue ac
 
 test('interrupted Codex App queues resume in place without sending a synthetic turn', () => {
   const resumeSource = sourceBetween('function hasInterruptedAppQueue', 'function syncComposerSubmitControl');
-  const makeResumeCheck = (source, id, active, draft, items) => new Function(
+  const makeResumeCheck = (source, id, active, draft, items, paused=false) => new Function(
     'currentConversationSource',
     'currentConversationId',
     'webRunActive',
     'appQueueEditDraft',
     'promptQueueFor',
     'isAppOwnedQueuedPrompt',
+    'conversationHasResumableLimitPause',
     `${resumeSource}; return canResumeInterruptedNativeTask;`,
-  )(source, id, active, draft, () => items, (item) => item?.source === 'codex-app');
+  )(source, id, active, draft, () => items, (item) => item?.source === 'codex-app', () => paused);
   const interruptedQueue = [{ source: 'codex-app', pauseState: 'interrupted' }];
   assert.equal(makeResumeCheck('codex', 'thread-a', false, null, interruptedQueue)(), true);
   assert.equal(makeResumeCheck('codex', 'thread-a', true, null, interruptedQueue)(), false);
@@ -1843,6 +1851,7 @@ test('interrupted Codex App queues resume in place without sending a synthetic t
   assert.equal(makeResumeCheck('codex', 'thread-a', false, null, [{ source: 'codex-app', pauseState: '' }])(), false);
   assert.equal(makeResumeCheck('codex', 'thread-a', false, null, [{ source: 'web', pauseState: 'interrupted' }])(), false);
   assert.equal(makeResumeCheck('web', 'thread-a', false, null, interruptedQueue)(), false);
+  assert.equal(makeResumeCheck('codex', 'thread-a', false, null, [], true)(), true);
 
   const submitSource = sourceBetween('function syncComposerSubmitControl', 'function syncComposerInputState');
   const resumeActionSource = sourceBetween('async function resumeInterruptedAppQueue', 'function syncComposerSubmitControl');
@@ -1855,16 +1864,19 @@ test('interrupted Codex App queues resume in place without sending a synthetic t
   const sendStart = inlineScript.indexOf('async function send(){');
   const sendSource = inlineScript.slice(sendStart);
   assert.match(submitSource, /const resumeInterrupted=canResumeInterruptedNativeTask\(\)&&!hasPayload/);
-  assert.match(submitSource, /action==='resume'\?'继续队列':'发送'/);
+  assert.match(submitSource, /action==='resume'\?'开始':'发送'/);
   assert.match(submitSource, /const icon=action==='resume'\?'play':'arrow-up'/);
   assert.match(submitSource, /sendBtn\.disabled=blocked\|\|\(!hasPayload&&!resumeInterrupted\)/);
   assert.match(resumeActionSource, /\/api\/prompt-queues\/'\+encodeURIComponent\(threadId\)\+'\/resume-interrupted/);
   assert.match(resumeActionSource, /applyServerPromptQueue\(threadId,data\)/);
-  assert.match(resumeActionSource, /队列已继续，等待启动/);
+  assert.match(resumeActionSource, /message:'继续'/);
+  assert.match(resumeActionSource, /startLimitPauseContinuation/);
+  assert.match(resumeActionSource, /正在继续|已开始，等待启动|正在发送队列消息/);
+  assert.match(inlineScript, /async function startLimitPauseContinuation\(threadId,payload\)/);
   assert.match(loadSource, /currentNativeRunStatus=currentConversationSource==='codex'\?String\(conversation\.status\|\|''\):''/);
-  assert.match(statusSource, /conversation\.status==='interrupted'\?'已暂停'/);
+  assert.match(statusSource, /已暂停，可点击开始继续/);
   assert.match(runtimeSource, /currentNativeRunStatus=String\(runtime\.status\|\|''\)/);
-  assert.match(runtimeSource, /runtime\.status==='interrupted'\?'Codex App · 已暂停'/);
+  assert.match(runtimeSource, /已暂停，可点击开始继续/);
   assert.match(sendSource, /const resumeInterrupted=canResumeInterruptedNativeTask\(\)&&!text&&!attachments\.length/);
   assert.match(sendSource, /if\(resumeInterrupted\)\{await resumeInterruptedAppQueue\(\);return\}/);
   assert.doesNotMatch(sendSource, /resumeInterrupted\?'继续'/);
@@ -1886,12 +1898,14 @@ test('queued dispatch waits for the matching terminal turn', () => {
     'dispatchNextQueuedPrompt',
     'setTimeout',
     'nativeTerminalPersisted',
+    'isPromptQueuePausedLocal',
     `${queueGateSource}; return { markPromptQueueTurnRunning, settlePromptQueueTurn, promptQueueTurnLocked, schedulePromptQueueDispatch };`,
   )(
     () => [{ id: 'next-item' }],
     () => false,
     () => { dispatches += 1; },
     (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    () => false,
     () => false,
   );
 
@@ -2560,7 +2574,11 @@ test('boot restores the last conversation chrome before content paints', () => {
   assert.match(inlineScript, /if\(target\)await loadConversation\(target\.id,target\.source\|\|'codex'\);await modelsReady/);
   assert.match(inlineScript, /chat\.classList\.add\('conversationRestoring'\)/);
   assert.match(inlineScript, /chat\.replaceChildren\(\)/);
-  assert.match(inlineScript, /chat\.classList\.remove\('conversationRestoring'\)/);
+  assert.match(inlineScript, /function clearConversationRestoring/);
+  assert.match(inlineScript, /if\(!res\.ok\)\{clearConversationStatusLoading\(\);clearConversationRestoring\(\)/);
+  assert.match(inlineScript, /restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);[\s\S]*?clearConversationRestoring\(\)/s);
+  assert.match(inlineScript, /clearConversationRestoring\(\)/);
+  assert.match(inlineScript, /classList\.remove\('conversationRestoring'\)/);
   assert.match(uiStyles, /\.chat\.conversationRestoring/);
   assert.match(serverSource, /dataset\.bootRestore='1'/);
   assert.match(serverSource, /正在同步会话内容…/);

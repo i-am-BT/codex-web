@@ -2186,6 +2186,115 @@ test('native session store merges consecutive same-turn assistant segments into 
   }
 });
 
+test('native session store keeps response fragments in the explicit task turn', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-turn-fragments-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f4f84-ea9f-73c2-b997-deba7b4aa802';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '16');
+  const sessionFile = path.join(sessionDir, `rollout-2026-08-16T01-00-00-${id}.jsonl`);
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-08-16T01:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace', source: 'vscode' },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.100Z',
+        type: 'turn_context',
+        payload: { turn_id: 'root-turn' },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.200Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'root-turn' },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.300Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: '同一会话只应有一个处理区块' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'root-turn' },
+        },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.400Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: '先检查会话归组。' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'fragment-a' },
+        },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.500Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          call_id: 'call-fragment-a',
+          name: 'exec_command',
+          arguments: '{"cmd":"pwd"}',
+          internal_chat_message_metadata_passthrough: { turn_id: 'fragment-a' },
+        },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.600Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-fragment-a',
+          output: '/workspace',
+          internal_chat_message_metadata_passthrough: { turn_id: 'fragment-b' },
+        },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.700Z',
+        type: 'response_item',
+        payload: {
+          type: 'reasoning',
+          summary: [{ type: 'summary_text', text: '继续保持同一处理区块。' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'fragment-b' },
+        },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.800Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          phase: 'final_answer',
+          content: [{ type: 'output_text', text: '归组完成。' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'fragment-c' },
+        },
+      },
+      {
+        timestamp: '2026-08-16T01:00:00.900Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'root-turn', duration_ms: 900 },
+      },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    const conversation = store.get(id);
+    assert.ok(conversation);
+    const taggedMessages = conversation.messages.filter((message) => message.turnId);
+    assert.ok(taggedMessages.length >= 6);
+    assert.deepEqual([...new Set(taggedMessages.map((message) => message.turnId))], ['root-turn']);
+    assert.equal(conversation.messages.filter((message) => message.kind === 'task_complete').length, 1);
+    assert.equal(conversation.messages.find((message) => message.kind === 'task_complete')?.turnId, 'root-turn');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('hides structured handoff summaries without hiding ordinary task headings', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-handoff-hide-'));
   const codexHome = path.join(temporary, '.codex');
