@@ -12902,6 +12902,8 @@ function enhanceComposerOverlayInset(){
   window.visualViewport?.addEventListener('scroll', scheduleViewport, {passive:true});
   const composer=dropZone?.parentElement||document.querySelector('.composer');
   composer?.addEventListener('transitionend',(event)=>{if(event.propertyName==='bottom')schedule()});
+  window.addEventListener('pageshow',scheduleViewport,{passive:true});
+  document.addEventListener('fullscreenchange',scheduleViewport,{passive:true});
   if(typeof ResizeObserver==='function'){
     const ro=new ResizeObserver(schedule);
     if(composer)ro.observe(composer);
@@ -14002,6 +14004,14 @@ function enhanceComposer(){
     if(!suppressClick&&guard.pointerId!==null&&typeof event.pointerId==='number'&&event.pointerId!==guard.pointerId)return;
     window.__composerExpandClickGuard=null;
     window.clearTimeout(window.__composerExpandClickGuardTimer);
+    // A collapsed-capsule pointerdown expands the grid underneath the finger.
+    // The trailing click can therefore retarget a newly revealed permission or
+    // model button; consume that click before any toolbar listener sees it.
+    if(suppressClick){
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     // Keep intentional toolbar controls clickable even when the first tap also
     // expands the collapsed capsule (mic/send/attach/cancel/etc).
     if(event.target?.closest?.('.composerMicBtn,.send,.cancelButton,.attachBtn,#attachFile,.composerPermissionToggle,.composerModelToggle,.composerContextToggle,.composerGoalIndicator,.composerProjectToggle'))return;

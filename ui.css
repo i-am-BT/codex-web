@@ -11868,7 +11868,10 @@ body .composer > .box:focus-within {
   body .app,
   body .main {
     position: relative;
-    height: 100dvh;
+    /* Some standalone/fullscreen Android browsers keep 100dvh at the
+       pre-fullscreen layout height. The visual viewport is the only reliable
+       bottom edge for the absolutely positioned composer. */
+    height: var(--composer-visual-viewport-bottom, 100dvh);
   }
 
   body .main {

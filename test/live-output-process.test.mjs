@@ -2402,6 +2402,8 @@ test('dynamic queue clearance keeps the latest message above the composer', () =
   assert.match(observerSource, /const schedule=\(\)=>scheduleComposerOverlayInset\(\{scroll:true\}\)/);
   assert.match(observerSource, /const scheduleViewport=\(\)=>scheduleComposerViewportSync\(\)/);
   assert.match(observerSource, /composer\?\.addEventListener\('transitionend',\(event\)=>\{if\(event\.propertyName==='bottom'\)schedule\(\)\}\)/);
+  assert.match(observerSource, /window\.addEventListener\('pageshow',scheduleViewport,\{passive:true\}\)/);
+  assert.match(observerSource, /document\.addEventListener\('fullscreenchange',scheduleViewport,\{passive:true\}\)/);
   assert.match(insetSource, /const pinned=distance<=Math\.max\(72,prev\+48\)/);
   assert.match(insetSource, /const shouldFollowLatest=options\.followLatest===true\|\|pinned/);
   assert.match(insetSource, /options\.scroll&&chat&&shouldFollowLatest/);
@@ -2412,6 +2414,7 @@ test('dynamic queue clearance keeps the latest message above the composer', () =
   assert.match(uiStyles, /body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /\.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.composer:has\(> \.box\.composerCollapsed\)\s*\{[^}]*padding-bottom:\s*calc\(env\(safe-area-inset-bottom, 0px\) \+ 16px\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.app,\s*body \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(calc\(84px \+ env\(safe-area-inset-bottom, 0px\)\), calc\(var\(--composer-overlay-height, calc\(72px \+ env\(safe-area-inset-bottom, 0px\)\)\) \+ 12px\)\)/s);
 });
 
@@ -2672,6 +2675,8 @@ test('mobile composer expands before opening the keyboard', () => {
   assert.match(inlineScript, /const wasCollapsed=dropZone\.classList\.contains\('composerCollapsed'\);[\s\S]{0,520}if\(event\.target\.closest\('button,a,select,label,\.composerPopover'\)\)\{[\s\S]{0,120}if\(!wasCollapsed\)expandComposer\(\)/);
   assert.match(inlineScript, /if\(wasCollapsed\)\{[\s\S]{0,220}event\.preventDefault\(\);[\s\S]{0,120}expandComposer\(\);[\s\S]{0,80}\}else\{[\s\S]{0,100}expandComposer\(\{focus:true\}\)/);
   assert.match(inlineScript, /suppressClick:true/);
+  assert.match(clickSource, /if\(suppressClick\)\{[\s\S]*?event\.stopImmediatePropagation\(\);[\s\S]*?return;[\s\S]*?\}/);
+  assert.match(clickSource, /if\(event\.target\?\.closest/);
   assert.match(inlineScript, /if\(dropZone\.classList\.contains\('composerCollapsed'\)\)expandComposer\(\);[\s\S]{0,100}else expandComposer\(\{focus:true\}\)/);
   assert.match(inlineScript, /function toggleComposerSpeech\(\)\{[\s\S]{0,260}expandComposer\(\);/);
   assert.match(inlineScript, /event\.target\.closest\('button,a,select,label,\.composerPopover'\)/);
