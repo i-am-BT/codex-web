@@ -8667,7 +8667,7 @@ body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=mobile-composer-fullscreen-20260817d">
+<link rel="stylesheet" href="/ui.css?v=mobile-composer-fullscreen-20260817e">
   <link rel="stylesheet" href="/image-prompt.css?v=top-context-padding-20260801b">
 <script>
 (()=>{try{
@@ -9077,6 +9077,8 @@ let historyRefreshReleaseTimer=null;
 let historyRenameActive=false;
 let historyProjectPreview=null;
 let historyProjectPreviewAnchor=null;
+const HISTORY_PROJECT_PREVIEW_HIDE_DELAY_MS=320;
+let historyProjectPreviewHideTimer=null;
 let nativeForkMarkers=readNativeForkMarkers();
 let deferredIconRefreshDepth=0;
 function refreshIcons(root=document){if(deferredIconRefreshDepth>0||!window.lucide?.createIcons||!window.lucide?.icons)return;window.lucide.createIcons({icons:window.lucide.icons,root,attrs:{'aria-hidden':'true','stroke-width':'1.8'}})}
@@ -17481,6 +17483,16 @@ function ensureHistoryProjectPreview(){
   preview.setAttribute('role','tooltip');
   preview.setAttribute('aria-hidden','true');
   preview.hidden=true;
+  // The preview is rendered outside the sidebar, so moving from the project
+  // header to an action crosses a small coordinate gap. Keep it alive while
+  // the pointer traverses that gap and while keyboard focus enters an action.
+  preview.addEventListener('pointerenter',cancelHistoryProjectPreviewHide);
+  preview.addEventListener('pointerleave',scheduleHistoryProjectPreviewHide);
+  preview.addEventListener('focusin',cancelHistoryProjectPreviewHide);
+  preview.addEventListener('focusout',(event)=>{
+    if(preview.contains(event.relatedTarget)||historyProjectPreviewAnchor?.contains(event.relatedTarget))return;
+    scheduleHistoryProjectPreviewHide();
+  });
   document.body.appendChild(preview);
   historyProjectPreview=preview;
   return preview;
@@ -17500,6 +17512,7 @@ function appendHistoryProjectPreviewRow(container,iconName,text,className=''){
 }
 function showHistoryProjectPreview(anchor,{projectName,projectPath,itemCount,runningCount,groupKey=''}){
   if(!desktopSidebarMedia.matches||activeHistoryProjectMenu)return;
+  cancelHistoryProjectPreviewHide();
   const preview=ensureHistoryProjectPreview();
   preview.replaceChildren();
   const heading=document.createElement('div');
@@ -17559,13 +17572,27 @@ function showHistoryProjectPreview(anchor,{projectName,projectPath,itemCount,run
   preview.setAttribute('aria-hidden','false');
   preview.classList.add('visible');
   const anchorRect=anchor.getBoundingClientRect();
-  const left=Math.max(10,Math.min(anchorRect.right+10,window.innerWidth-preview.offsetWidth-10));
+  const left=Math.max(10,Math.min(anchorRect.right+4,window.innerWidth-preview.offsetWidth-10));
   const top=Math.max(10,Math.min(anchorRect.top-6,window.innerHeight-preview.offsetHeight-10));
   preview.style.left=left+'px';
   preview.style.top=top+'px';
 }
+function cancelHistoryProjectPreviewHide(){
+  if(historyProjectPreviewHideTimer){
+    clearTimeout(historyProjectPreviewHideTimer);
+    historyProjectPreviewHideTimer=null;
+  }
+}
+function scheduleHistoryProjectPreviewHide(){
+  cancelHistoryProjectPreviewHide();
+  historyProjectPreviewHideTimer=setTimeout(()=>{
+    historyProjectPreviewHideTimer=null;
+    hideHistoryProjectPreview();
+  },HISTORY_PROJECT_PREVIEW_HIDE_DELAY_MS);
+}
 function hideHistoryProjectPreview(anchor){
   if(anchor&&anchor!==historyProjectPreviewAnchor)return;
+  cancelHistoryProjectPreviewHide();
   historyProjectPreviewAnchor=null;
   if(!historyProjectPreview){flushPendingHistoryRefresh();return}
   historyProjectPreview.classList.remove('visible');
@@ -17959,9 +17986,12 @@ function renderHistory(items){
     header.appendChild(projectMenu.menu);
     const previewData={projectName,projectPath:groupData.path,itemCount:groupData.items.length,runningCount,groupKey};
     header.addEventListener('pointerenter',()=>showHistoryProjectPreview(header,previewData));
-    header.addEventListener('pointerleave',()=>hideHistoryProjectPreview(header));
+    header.addEventListener('pointerleave',scheduleHistoryProjectPreviewHide);
     header.addEventListener('focusin',()=>showHistoryProjectPreview(header,previewData));
-    header.addEventListener('focusout',(event)=>{if(!header.contains(event.relatedTarget))hideHistoryProjectPreview(header)});
+    header.addEventListener('focusout',(event)=>{
+      if(header.contains(event.relatedTarget)||historyProjectPreview?.contains(event.relatedTarget))return;
+      scheduleHistoryProjectPreviewHide();
+    });
     const rows=document.createElement('div');
     rows.className='historyProjectItems';
     rows.id=rowsId;
