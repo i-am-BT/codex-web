@@ -4922,6 +4922,7 @@ body[data-theme] .histDelete {
 
 .historyProjectPreview.visible {
   opacity: 1;
+  pointer-events: auto;
   transform: translateX(0);
 }
 
