@@ -2415,6 +2415,7 @@ test('dynamic queue clearance keeps the latest message above the composer', () =
   assert.match(uiStyles, /\.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.composer:has\(> \.box\.composerCollapsed\)\s*\{[^}]*padding-bottom:\s*calc\(env\(safe-area-inset-bottom, 0px\) \+ 16px\)/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.app,\s*body \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.main\.sideChatOpen\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(calc\(84px \+ env\(safe-area-inset-bottom, 0px\)\), calc\(var\(--composer-overlay-height, calc\(72px \+ env\(safe-area-inset-bottom, 0px\)\)\) \+ 12px\)\)/s);
 });
 
@@ -3117,7 +3118,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(mobileGoalStyles, /body \.composer > \.threadGoalBar\.runtimeOnly,[\s\S]*?display:\s*block;/s);
   const refreshFilesSource = sourceBetween('function refreshLiveEditedFilesResult', 'function createWebPreviewResultCard');
   assert.equal((refreshFilesSource.match(/renderThreadGoalBar\(\)/g) || []).length, 2);
-  assert.match(serverSource, /ui\.css\?v=mobile-composer-fullscreen-20260817a/);
+  assert.match(serverSource, /ui\.css\?v=mobile-composer-fullscreen-20260817b/);
 });
 
 test('desktop live plan stays a compact pill with an on-demand detail popup', () => {

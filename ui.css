@@ -13527,7 +13527,7 @@ body[data-chat-bg="skin"] .sideChatSend {
     grid-template-columns: none;
     grid-template-rows: none;
     min-height: 0;
-    height: 100dvh;
+    height: var(--composer-visual-viewport-bottom, 100dvh);
     overflow: hidden;
   }
 
