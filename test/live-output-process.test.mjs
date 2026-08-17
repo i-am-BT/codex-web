@@ -2414,8 +2414,9 @@ test('dynamic queue clearance keeps the latest message above the composer', () =
   assert.match(uiStyles, /body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /\.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.composer:has\(> \.box\.composerCollapsed\)\s*\{[^}]*padding-bottom:\s*calc\(env\(safe-area-inset-bottom, 0px\) \+ 16px\)/s);
-  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.app,\s*body \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-height, 100dvh\)/s);
-  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.main\.sideChatOpen\s*\{[^}]*height:\s*var\(--composer-visual-viewport-height, 100dvh\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.app\s*\{[^}]*position:\s*fixed;[^}]*inset:\s*0;[^}]*height:\s*auto/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.main\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;[^}]*height:\s*auto/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.main\.sideChatOpen\s*\{[^}]*height:\s*auto/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(calc\(84px \+ env\(safe-area-inset-bottom, 0px\)\), calc\(var\(--composer-overlay-height, calc\(72px \+ env\(safe-area-inset-bottom, 0px\)\)\) \+ 12px\)\)/s);
 });
 
@@ -2712,7 +2713,7 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   assert.match(uiStyles, /body\.keyboardOpen \.composer/);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /body\.keyboardOpen \.chat[\s\S]{0,240}?var\(--keyboard-inset/);
-  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.app,\s*body\.keyboardOpen \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-height, 100dvh\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.app,\s*body\.keyboardOpen \.main\s*\{[^}]*bottom:\s*auto;[^}]*height:\s*var\(--composer-visual-viewport-height, 100dvh\)/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main:not\(\.sideChatOpen\) > \.composer\s*\{[^}]*bottom:\s*0;[^}]*transition:\s*none/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main\.sideChatOpen > \.composer\s*\{[^}]*bottom:\s*0 !important;[^}]*transition:\s*none/s);
   assert.match(serverSource, /interactive-widget=resizes-content/);
@@ -3121,7 +3122,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(mobileGoalStyles, /body \.composer > \.threadGoalBar\.runtimeOnly,[\s\S]*?display:\s*block;/s);
   const refreshFilesSource = sourceBetween('function refreshLiveEditedFilesResult', 'function createWebPreviewResultCard');
   assert.equal((refreshFilesSource.match(/renderThreadGoalBar\(\)/g) || []).length, 2);
-  assert.match(serverSource, /ui\.css\?v=mobile-composer-fullscreen-20260817c/);
+  assert.match(serverSource, /ui\.css\?v=mobile-composer-fullscreen-20260817d/);
 });
 
 test('desktop live plan stays a compact pill with an on-demand detail popup', () => {

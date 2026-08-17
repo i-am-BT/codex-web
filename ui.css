@@ -11865,13 +11865,19 @@ body .composer > .box:focus-within {
     overflow: hidden;
   }
 
-  body .app,
+  /* Fixed viewport edges are reliable on the affected Android fullscreen
+     browser (the drawer already uses them and spans the whole screen). */
+  body .app {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: auto;
+  }
+
   body .main {
-    position: relative;
-    /* Android fullscreen may expose a non-zero visualViewport.offsetTop for
-       system chrome. A bottom coordinate is not a height and can place the
-       composer behind that chrome, so size from the visible height only. */
-    height: var(--composer-visual-viewport-height, 100dvh);
+    position: absolute;
+    inset: 0;
+    height: auto;
   }
 
   body .main {
@@ -12153,6 +12159,7 @@ body .composer > .box:focus-within {
   /* WebKit keeps 100dvh at the layout height when its keyboard covers the page. */
   body.keyboardOpen .app,
   body.keyboardOpen .main {
+    bottom: auto;
     height: var(--composer-visual-viewport-height, 100dvh);
   }
 
@@ -13527,7 +13534,7 @@ body[data-chat-bg="skin"] .sideChatSend {
     grid-template-columns: none;
     grid-template-rows: none;
     min-height: 0;
-    height: var(--composer-visual-viewport-height, 100dvh);
+    height: auto;
     overflow: hidden;
   }
 
