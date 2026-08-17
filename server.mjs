@@ -8667,7 +8667,7 @@ body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=mobile-composer-fullscreen-20260817b">
+<link rel="stylesheet" href="/ui.css?v=mobile-composer-fullscreen-20260817c">
   <link rel="stylesheet" href="/image-prompt.css?v=top-context-padding-20260801b">
 <script>
 (()=>{try{
@@ -12844,12 +12844,21 @@ function composerVisualViewportBottom(){
   const viewport=window.visualViewport;
   return Math.round((viewport?.offsetTop||0)+(viewport?.height||window.innerHeight||0));
 }
+function composerVisualViewportHeight(){
+  const viewport=window.visualViewport;
+  return Math.max(1,Math.round(viewport?.height||document.documentElement?.clientHeight||window.innerHeight||0));
+}
 function syncComposerVisualViewport(){
   if(!document.body)return 0;
   const bottom=composerVisualViewportBottom();
-  const value=bottom+'px';
-  if(document.body.style.getPropertyValue('--composer-visual-viewport-bottom')!==value){
-    document.body.style.setProperty('--composer-visual-viewport-bottom',value);
+  const height=composerVisualViewportHeight();
+  const bottomValue=bottom+'px';
+  const heightValue=height+'px';
+  if(document.body.style.getPropertyValue('--composer-visual-viewport-bottom')!==bottomValue){
+    document.body.style.setProperty('--composer-visual-viewport-bottom',bottomValue);
+  }
+  if(document.body.style.getPropertyValue('--composer-visual-viewport-height')!==heightValue){
+    document.body.style.setProperty('--composer-visual-viewport-height',heightValue);
   }
   return bottom;
 }

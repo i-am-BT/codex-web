@@ -11868,10 +11868,10 @@ body .composer > .box:focus-within {
   body .app,
   body .main {
     position: relative;
-    /* Some standalone/fullscreen Android browsers keep 100dvh at the
-       pre-fullscreen layout height. The visual viewport is the only reliable
-       bottom edge for the absolutely positioned composer. */
-    height: var(--composer-visual-viewport-bottom, 100dvh);
+    /* Android fullscreen may expose a non-zero visualViewport.offsetTop for
+       system chrome. A bottom coordinate is not a height and can place the
+       composer behind that chrome, so size from the visible height only. */
+    height: var(--composer-visual-viewport-height, 100dvh);
   }
 
   body .main {
@@ -12153,7 +12153,7 @@ body .composer > .box:focus-within {
   /* WebKit keeps 100dvh at the layout height when its keyboard covers the page. */
   body.keyboardOpen .app,
   body.keyboardOpen .main {
-    height: var(--composer-visual-viewport-bottom, 100dvh);
+    height: var(--composer-visual-viewport-height, 100dvh);
   }
 
   /* The main chat now ends at the visible viewport, so do not lift twice. */
@@ -13527,7 +13527,7 @@ body[data-chat-bg="skin"] .sideChatSend {
     grid-template-columns: none;
     grid-template-rows: none;
     min-height: 0;
-    height: var(--composer-visual-viewport-bottom, 100dvh);
+    height: var(--composer-visual-viewport-height, 100dvh);
     overflow: hidden;
   }
 

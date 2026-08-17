@@ -2414,8 +2414,8 @@ test('dynamic queue clearance keeps the latest message above the composer', () =
   assert.match(uiStyles, /body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /\.editedFilesResult\.live\.withPlan\) > \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.composer:has\(> \.box\.composerCollapsed\)\s*\{[^}]*padding-bottom:\s*calc\(env\(safe-area-inset-bottom, 0px\) \+ 16px\)/s);
-  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.app,\s*body \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
-  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.main\.sideChatOpen\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.app,\s*body \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-height, 100dvh\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.main\.sideChatOpen\s*\{[^}]*height:\s*var\(--composer-visual-viewport-height, 100dvh\)/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{[^}]*padding-bottom:\s*max\(calc\(84px \+ env\(safe-area-inset-bottom, 0px\)\), calc\(var\(--composer-overlay-height, calc\(72px \+ env\(safe-area-inset-bottom, 0px\)\)\) \+ 12px\)\)/s);
 });
 
@@ -2691,12 +2691,14 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   const visualViewportSource = sourceBetween('function composerVisualViewportBottom', 'function keepComposerAboveKeyboard');
   assert.match(inlineScript, /function keepComposerAboveKeyboard/);
   assert.match(visualViewportSource, /function composerVisualViewportBottom\(\)/);
+  assert.match(visualViewportSource, /function composerVisualViewportHeight\(\)/);
   assert.match(visualViewportSource, /function syncComposerVisualViewport\(\)/);
   assert.match(inlineScript, /function composerKeyboardInset/);
   assert.match(inlineScript, /function enhanceComposerKeyboardLift/);
   assert.match(inlineScript, /visualViewport/);
   assert.match(inlineScript, /--keyboard-inset/);
   assert.match(inlineScript, /--composer-visual-viewport-bottom/);
+  assert.match(inlineScript, /--composer-visual-viewport-height/);
   assert.match(inlineScript, /function scheduleComposerKeyboardFocusSync\(\)/);
   assert.match(inlineScript, /function scheduleComposerOverlayInset\(options=\{\}\)/);
   assert.match(inlineScript, /function scheduleComposerViewportSync\(\)/);
@@ -2710,7 +2712,7 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   assert.match(uiStyles, /body\.keyboardOpen \.composer/);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.chat\s*\{[^}]*--composer-overlay-height/s);
   assert.match(uiStyles, /body\.keyboardOpen \.chat[\s\S]{0,240}?var\(--keyboard-inset/);
-  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.app,\s*body\.keyboardOpen \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-bottom, 100dvh\)/s);
+  assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.app,\s*body\.keyboardOpen \.main\s*\{[^}]*height:\s*var\(--composer-visual-viewport-height, 100dvh\)/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main:not\(\.sideChatOpen\) > \.composer\s*\{[^}]*bottom:\s*0;[^}]*transition:\s*none/s);
   assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body\.keyboardOpen \.main\.sideChatOpen > \.composer\s*\{[^}]*bottom:\s*0 !important;[^}]*transition:\s*none/s);
   assert.match(serverSource, /interactive-widget=resizes-content/);
@@ -2730,8 +2732,9 @@ test('keyboard lift keeps composer above the soft keyboard', () => {
   );
   assert.equal(syncVisualViewport(), 526);
   assert.equal(visualStyles.get('--composer-visual-viewport-bottom'), '526px');
+  assert.equal(visualStyles.get('--composer-visual-viewport-height'), '506px');
   assert.equal(syncVisualViewport(), 526);
-  assert.equal(visualViewportWrites, 1);
+  assert.equal(visualViewportWrites, 2);
 
   const makeOverlayHarness = (chatHeight) => {
     const styles = new Map([['--composer-overlay-height', '0']]);
@@ -3118,7 +3121,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(mobileGoalStyles, /body \.composer > \.threadGoalBar\.runtimeOnly,[\s\S]*?display:\s*block;/s);
   const refreshFilesSource = sourceBetween('function refreshLiveEditedFilesResult', 'function createWebPreviewResultCard');
   assert.equal((refreshFilesSource.match(/renderThreadGoalBar\(\)/g) || []).length, 2);
-  assert.match(serverSource, /ui\.css\?v=mobile-composer-fullscreen-20260817b/);
+  assert.match(serverSource, /ui\.css\?v=mobile-composer-fullscreen-20260817c/);
 });
 
 test('desktop live plan stays a compact pill with an on-demand detail popup', () => {
