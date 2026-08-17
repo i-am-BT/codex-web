@@ -1950,6 +1950,7 @@ app.get('/api/prompt-queues/:threadId', requireAuth, (req, res) => {
   const threadId = cleanNativeThreadId(req.params.threadId);
   if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
   res.setHeader('Cache-Control', 'no-store');
+  ensurePromptQueuePauseFromNative(threadId);
   const queue = getPromptQueueState(threadId);
   res.json({ ok: true, threadId, ...queue, dismissedItemIds: getPromptQueueDismissedItemIds(threadId) });
 });
@@ -1958,11 +1959,109 @@ app.post('/api/prompt-queues/:threadId/resume-interrupted', requireAuth, async (
   try {
     const threadId = cleanNativeThreadId(req.params.threadId);
     if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
-    const result = await resumeInterruptedAppQueuedFollowUps(threadId);
-    res.json({ ok: true, threadId, resumed: result.resumed, ...result.queue });
+    ensurePromptQueuePauseFromNative(threadId);
+    let resumedApp = 0;
+    let queue = getPromptQueueState(threadId);
+    let appResumeError = null;
+    try {
+      const result = await resumeInterruptedAppQueuedFollowUps(threadId);
+      resumedApp = Number(result?.resumed || 0);
+      queue = result?.queue || getPromptQueueState(threadId);
+    } catch (err) {
+      // Rate-limit pauses and empty App queues should still be resumable.
+      if (Number(err?.statusCode) !== 409) throw err;
+      appResumeError = err;
+    }
+    const pausedSnapshot = promptQueuePauseState(threadId);
+    const wasPaused = Boolean(pausedSnapshot);
+    let continuedTurn = null;
+    let pauseCleared = false;
+    try {
+      const hasDispatchable = serverPromptQueueHasDispatchableItem(threadId);
+      const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      const wantsContinueTurn = wasPaused
+        || body.continue === true
+        || String(body.message || '').trim() !== '';
+      const hasQueueItems = getPromptQueueItems(threadId).length > 0;
+      // A provider-limit pause always resumes the interrupted turn first.
+      // Queued follow-ups stay queued until that continuation finishes.
+      const shouldContinuePausedTurn = wasPaused && !resumedApp && wantsContinueTurn;
+      const canContinueWithoutQueue = !resumedApp
+        && !wasPaused
+        && !hasDispatchable
+        && !hasQueueItems
+        && wantsContinueTurn;
+      if (shouldContinuePausedTurn || canContinueWithoutQueue) {
+        const conversation = nativeSessions.get(threadId);
+        if (nativeTurnReservations.has(threadId) || nativeActiveTurnFor(threadId, conversation)?.status === 'running') {
+          const error = new Error('该 Codex App 会话已有任务正在运行');
+          error.statusCode = 409;
+          throw error;
+        }
+        if (!conversation) {
+          const error = new Error(appResumeError?.message || '会话不存在或尚未同步');
+          error.statusCode = 404;
+          throw error;
+        }
+        const metadata = conversation.metadata || {};
+        const settingsOptions = Object.hasOwn(metadata, 'serviceTier')
+          ? { fallbackServiceTier: metadata.serviceTier }
+          : {};
+        const continueMessage = String(body.message || '继续').trim() || '继续';
+        const turn = parseNativeTurnPayload({
+          message: continueMessage,
+          attachments: Array.isArray(body.attachments) ? body.attachments : [],
+          provider: body.provider || metadata.modelProvider || DEFAULT_PROVIDER,
+          model: body.model || metadata.model || DEFAULT_MODEL,
+          reasoningEffort: Object.hasOwn(body, 'reasoningEffort') ? body.reasoningEffort : metadata.reasoningEffort,
+          serviceTier: Object.hasOwn(body, 'serviceTier') ? body.serviceTier : metadata.serviceTier,
+          cwd: body.cwd || metadata.cwd || DEFAULT_CWD,
+          permissionMode: body.permissionMode,
+          sandbox: body.sandbox || metadata.sandboxPolicy,
+          approval: body.approval || metadata.approvalPolicy,
+        }, settingsOptions);
+        nativeTurnReservations.add(threadId);
+        try {
+          const started = await continueNativeTurn(threadId, turn);
+          continuedTurn = { turnId: started.turnId };
+          nativeSessions.scheduleRefresh();
+        } finally {
+          nativeTurnReservations.delete(threadId);
+        }
+      } else if (!resumedApp && !wasPaused && !hasDispatchable) {
+        throw appResumeError || promptQueueConflict('没有可继续的暂停任务', queue);
+      }
+      if (wasPaused) {
+        pauseCleared = true;
+        queue = setPromptQueuePause(threadId, null);
+      }
+      if (!wasPaused && hasDispatchable) {
+        scheduleServerPromptQueueDispatch(threadId, 80);
+      }
+      queue = getPromptQueueState(threadId);
+    } catch (error) {
+      if (pauseCleared && pausedSnapshot && !isPromptQueuePaused(threadId)) {
+        try {
+          setPromptQueuePause(threadId, pausedSnapshot);
+        } catch (restoreError) {
+          console.warn(`prompt queue pause restore failed: ${restoreError?.message || restoreError}`);
+        }
+      }
+      throw error;
+    }
+    res.status(continuedTurn ? 202 : 200).json({
+      ok: true,
+      threadId,
+      resumed: resumedApp || (wasPaused ? 1 : 0) || (continuedTurn ? 1 : 0),
+      resumedApp,
+      resumedPause: wasPaused,
+      continued: Boolean(continuedTurn),
+      ...(continuedTurn || {}),
+      ...queue,
+    });
   } catch (err) {
     res.status(Number(err?.statusCode) || nativeAppErrorStatus(err)).json({
-      error: err.message || '继续 Codex App 队列失败',
+      error: err.message || '继续会话失败',
       ...(err.current ? err.current : {}),
     });
   }
@@ -3165,9 +3264,11 @@ function handleNativeSessionChange(change) {
 function scheduleTerminalPromptQueueDispatches(change) {
   for (const candidate of Array.isArray(change?.changedIds) ? change.changedIds : []) {
     const threadId = cleanNativeThreadId(candidate);
-    if (!threadId || !serverPromptQueueHasDispatchableItem(threadId)) continue;
+    if (!threadId) continue;
     let conversation = null;
     try { conversation = nativeSessions.get(threadId); } catch {}
+    if (ensurePromptQueuePauseFromNative(threadId, conversation)) continue;
+    if (isPromptQueuePaused(threadId) || !serverPromptQueueHasDispatchableItem(threadId)) continue;
     const active = activeNativeTurns.get(threadId);
     if (active?.status === 'running' || (!active && conversation?.status === 'running')) continue;
     scheduleServerPromptQueueDispatch(threadId, 160);
@@ -3907,25 +4008,157 @@ function isAmbiguousAppServerRequestError(error) {
   return /请求超时|未连接|已关闭|已退出|epipe|econn(reset|aborted)|broken pipe|socket hang up/i.test(message);
 }
 
+
+function isTransientProviderLimitError(message) {
+  const value = String(message || '').toLowerCase();
+  return (
+    value.includes('usage limit')
+    || value.includes('quota exceeded')
+    || value.includes('insufficient quota')
+    || value.includes('too many requests')
+    || value.includes('rate limit')
+    || value.includes('high demand')
+    || value.includes('exceeded retry limit')
+    || value.includes('temporarily rate-limited')
+    || /(^|\D)429(\D|$)/.test(value)
+  );
+}
+
+function nativeProviderLimitPause(threadId, conversation = null) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return null;
+  let current = conversation;
+  if (!current) {
+    try { current = nativeSessions.get(id); } catch {}
+  }
+  const status = String(current?.status || '');
+  if (!['error', 'interrupted'].includes(status)) return null;
+  const latestTurnId = String(current?.latestTurnId || '');
+  const terminal = [...(current?.messages || [])].reverse().find((message) => (
+    message?.role === 'process'
+      && ['task_error', 'error', 'turn_aborted'].includes(String(message?.kind || ''))
+      && (!latestTurnId || String(message?.turnId || '') === latestTurnId)
+  ));
+  if (!terminal || !isTransientProviderLimitError(terminal.content)) return null;
+  return {
+    reason: 'rate_limit',
+    message: String(terminal.content || '').trim().slice(0, 800),
+    pausedAt: String(terminal.at || current?.updatedAt || new Date().toISOString()),
+  };
+}
+
+function ensurePromptQueuePauseFromNative(threadId, conversation = null) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return null;
+  const existing = promptQueuePauseState(id);
+  if (existing) return existing;
+  const inferred = nativeProviderLimitPause(id, conversation);
+  if (!inferred) return null;
+  return pausePromptQueueForProviderLimit(id, inferred.message).pause || inferred;
+}
+
+function promptQueuePauseState(threadId) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return null;
+  const entry = loadPromptQueuesRaw()[id];
+  const pause = entry?.pause;
+  if (!pause || typeof pause !== 'object' || Array.isArray(pause)) return null;
+  const reason = String(pause.reason || '').trim();
+  if (!reason) return null;
+  return {
+    reason,
+    message: String(pause.message || '').trim().slice(0, 800),
+    pausedAt: String(pause.pausedAt || entry?.updatedAt || ''),
+  };
+}
+
+function isPromptQueuePaused(threadId) {
+  return Boolean(promptQueuePauseState(threadId));
+}
+
+function setPromptQueuePause(threadId, pause = null) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return getPromptQueueState(id);
+  const queues = loadPromptQueuesRaw();
+  const dismissed = loadPromptQueueDismissedRaw();
+  const current = queues[id] || { items: [], updatedAt: '', revision: 0 };
+  const items = filterDismissedPromptQueueItems(id, current.items || [], dismissed);
+  const nextPause = pause && typeof pause === 'object' && !Array.isArray(pause)
+    ? {
+      reason: String(pause.reason || 'rate_limit').trim() || 'rate_limit',
+      message: String(pause.message || '').trim().slice(0, 800),
+      pausedAt: String(pause.pausedAt || new Date().toISOString()),
+    }
+    : null;
+  const prev = current.pause && typeof current.pause === 'object' ? current.pause : null;
+  const same = (!nextPause && !prev)
+    || (
+      nextPause
+      && prev
+      && String(prev.reason || '') === nextPause.reason
+      && String(prev.message || '') === nextPause.message
+    );
+  if (same && items.length === (current.items || []).length) {
+    return getPromptQueueState(id);
+  }
+  const updatedAt = new Date().toISOString();
+  const revision = Number(current.revision || 0) + 1;
+  const next = {
+    updatedAt,
+    revision,
+    items,
+    ...(nextPause ? { pause: nextPause } : {}),
+  };
+  if (!items.length && !nextPause) delete queues[id];
+  else queues[id] = next;
+  savePromptQueuesWithDismissed(queues, dismissed);
+  const state = getPromptQueueState(id);
+  broadcastPromptQueueChange({
+    threadId: id,
+    items: state.items,
+    updatedAt: state.updatedAt,
+    revision: state.revision,
+    pause: state.pause,
+    source: nextPause ? 'pause' : 'resume',
+  });
+  if (!nextPause) scheduleServerPromptQueueDispatch(id, 120);
+  return state;
+}
+
+function pausePromptQueueForProviderLimit(threadId, message) {
+  return setPromptQueuePause(threadId, {
+    reason: 'rate_limit',
+    message: String(message || '上游请求过于频繁，队列已暂停').trim(),
+    pausedAt: new Date().toISOString(),
+  });
+}
+
 function handleAppServerError(params = {}) {
   const threadId = cleanNativeThreadId(params.threadId);
   const current = threadId ? activeNativeTurns.get(threadId) : null;
   const turnId = String(params.turnId || current?.turnId || '');
   const willRetry = params.willRetry === true;
   const message = String(params.error?.message || params.error || 'Codex App 请求异常').trim().slice(0, 8000);
+  const pauseLike = !willRetry && isTransientProviderLimitError(message);
   console.warn(`codex app-server ${willRetry ? 'retrying' : 'error'}: ${message}`);
   if (!threadId) return;
   if (willRetry) setNativeTurnState(threadId, { turnId, status: 'running' });
+  if (pauseLike) pausePromptQueueForProviderLimit(threadId, message);
   broadcastNativeRuntime({
     type: 'connection-error',
     threadId,
     turnId,
     willRetry,
     message,
+    pauseQueue: pauseLike,
     updatedAt: new Date().toISOString(),
   });
   if (!willRetry && current?.status === 'running' && current.turnId === turnId) {
-    recordNativeTurnCompletion(threadId, { id: turnId, status: 'failed' });
+    // 429/额度类错误按“暂停”处理：保留会话与队列，不自动派发下一条。
+    recordNativeTurnCompletion(threadId, {
+      id: turnId,
+      status: pauseLike ? 'interrupted' : 'failed',
+    }, { skipQueueDispatch: pauseLike });
   }
 }
 
@@ -4223,7 +4456,7 @@ function recordNativeTurnStarted(threadId, turn = {}) {
   return true;
 }
 
-function recordNativeTurnCompletion(threadId, turn = {}) {
+function recordNativeTurnCompletion(threadId, turn = {}, options = {}) {
   const cleanId = cleanNativeThreadId(threadId);
   const turnId = String(turn?.id || '').trim();
   if (!cleanId || !turnId) return false;
@@ -4234,7 +4467,9 @@ function recordNativeTurnCompletion(threadId, turn = {}) {
   // The JSONL watcher may have observed task_complete before this notification.
   void releaseAppServerThreadAfterTurn(cleanId, turnId, { reason: 'turn-completed' });
   clearPersistedTerminalNativeTurn(cleanId);
-  scheduleServerPromptQueueDispatch(cleanId, 160);
+  if (options.skipQueueDispatch !== true && !isPromptQueuePaused(cleanId)) {
+    scheduleServerPromptQueueDispatch(cleanId, 160);
+  }
   return true;
 }
 
@@ -7826,7 +8061,7 @@ function syncAppQueuedFollowUpsIntoWeb({ force = false } = {}) {
     if (fingerprintPromptQueueItems(existing) === fingerprintPromptQueueItems(merged)) continue;
     const updatedAt = new Date().toISOString();
     const revision = Number(webQueues[threadId]?.revision || 0) + 1;
-    webQueues[threadId] = { updatedAt, revision, items: merged };
+    webQueues[threadId] = promptQueueEntrySnapshot(threadId, merged, { updatedAt, revision, pause: webQueues[threadId]?.pause });
     changedThreads.push(threadId);
     broadcastPromptQueueChange({ threadId, items: merged, updatedAt, revision, source: 'codex-app' });
   }
@@ -7858,6 +8093,41 @@ function stopAppQueueSync() {
   appQueueWatchTimer = null;
 }
 
+
+function promptQueueEntrySnapshot(threadId, items, { updatedAt = '', revision = 0, pause = undefined } = {}) {
+  const id = cleanNativeThreadId(threadId);
+  const current = id ? (loadPromptQueuesRaw()[id] || {}) : {};
+  const nextItems = Array.isArray(items) ? items : [];
+  const nextRevision = Number.isFinite(Number(revision)) ? Number(revision) : Number(current.revision || 0);
+  const nextUpdatedAt = String(updatedAt || current.updatedAt || new Date().toISOString());
+  let nextPause = pause;
+  if (nextPause === undefined) {
+    const existing = current.pause;
+    nextPause = existing && typeof existing === 'object' && !Array.isArray(existing) && String(existing.reason || '').trim()
+      ? {
+        reason: String(existing.reason || '').trim(),
+        message: String(existing.message || '').trim().slice(0, 800),
+        pausedAt: String(existing.pausedAt || current.updatedAt || nextUpdatedAt),
+      }
+      : null;
+  } else if (nextPause && typeof nextPause === 'object' && !Array.isArray(nextPause)) {
+    nextPause = {
+      reason: String(nextPause.reason || 'rate_limit').trim() || 'rate_limit',
+      message: String(nextPause.message || '').trim().slice(0, 800),
+      pausedAt: String(nextPause.pausedAt || nextUpdatedAt),
+    };
+  } else {
+    nextPause = null;
+  }
+  const entry = {
+    updatedAt: nextUpdatedAt,
+    revision: nextRevision,
+    items: nextItems,
+  };
+  if (nextPause) entry.pause = nextPause;
+  return entry;
+}
+
 function loadPromptQueuesRaw() {
   try {
     if (!existsSync(PROMPT_QUEUE_FILE)) return {};
@@ -7872,11 +8142,20 @@ function loadPromptQueuesRaw() {
       const itemsRaw = Array.isArray(entry) ? entry : Array.isArray(entry?.items) ? entry.items : [];
       const items = itemsRaw.slice(0, 50).map(normalizeServerQueuedPrompt).filter(Boolean);
       const revision = Number(entry?.revision || 0);
-      if (!items.length && revision <= 0) continue;
+      const pause = entry?.pause && typeof entry.pause === 'object' && !Array.isArray(entry.pause)
+        && String(entry.pause.reason || '').trim()
+        ? {
+          reason: String(entry.pause.reason || '').trim(),
+          message: String(entry.pause.message || '').trim().slice(0, 800),
+          pausedAt: String(entry.pause.pausedAt || entry?.updatedAt || ''),
+        }
+        : null;
+      if (!items.length && revision <= 0 && !pause) continue;
       queues[threadId] = {
         updatedAt: String(entry?.updatedAt || new Date().toISOString()),
         revision,
         items,
+        ...(pause ? { pause } : {}),
       };
     }
     return queues;
@@ -7910,11 +8189,11 @@ function loadPromptQueues() {
       delete merged[threadId];
       continue;
     }
-    merged[threadId] = {
+    merged[threadId] = promptQueueEntrySnapshot(threadId, items, {
       updatedAt: merged[threadId]?.updatedAt || new Date().toISOString(),
       revision: Number(merged[threadId]?.revision || 0),
-      items,
-    };
+      pause: loadPromptQueuesRaw()[threadId]?.pause,
+    });
   }
   return merged;
 }
@@ -7936,13 +8215,15 @@ function getPromptQueueUpdatedAt(threadId) {
 
 function getPromptQueueState(threadId) {
   const id = cleanNativeThreadId(threadId);
-  if (!id) return { items: [], updatedAt: '', revision: 0 };
+  if (!id) return { items: [], updatedAt: '', revision: 0, pause: null };
   const raw = loadPromptQueuesRaw()[id];
   const entry = loadPromptQueues()[id];
+  const pause = promptQueuePauseState(id);
   return {
     items: entry?.items || [],
     updatedAt: raw?.updatedAt || entry?.updatedAt || '',
     revision: Number(raw?.revision || entry?.revision || 0),
+    pause,
   };
 }
 
@@ -8004,11 +8285,20 @@ function savePromptQueuesWithDismissed(queues, dismissed) {
   const cleanQueues = {};
   for (const [threadId, entry] of Object.entries(queues || {})) {
     const id = cleanNativeThreadId(threadId);
-    if (!id || (!entry?.items?.length && Number(entry?.revision || 0) <= 0)) continue;
+    const pause = entry?.pause && typeof entry.pause === 'object' && !Array.isArray(entry.pause)
+      && String(entry.pause.reason || '').trim()
+      ? {
+        reason: String(entry.pause.reason || '').trim(),
+        message: String(entry.pause.message || '').trim().slice(0, 800),
+        pausedAt: String(entry.pause.pausedAt || entry.updatedAt || ''),
+      }
+      : null;
+    if (!id || (!entry?.items?.length && Number(entry?.revision || 0) <= 0 && !pause)) continue;
     cleanQueues[id] = {
       updatedAt: String(entry.updatedAt || new Date().toISOString()),
       revision: Number(entry.revision || 0),
-      items: entry.items.slice(0, 50),
+      items: Array.isArray(entry.items) ? entry.items.slice(0, 50) : [],
+      ...(pause ? { pause } : {}),
     };
   }
   const cleanDismissed = {};
@@ -8188,7 +8478,7 @@ async function reorderPromptQueueItems(threadId, itemIds, expectedRevision) {
     const cleanItems = filterDismissedPromptQueueItems(id, orderedItems, dismissed).slice(0, 50);
     const updatedAt = new Date().toISOString();
     const revision = current.revision + 1;
-    queues[id] = { updatedAt, revision, items: cleanItems };
+    queues[id] = promptQueueEntrySnapshot(id, cleanItems, { updatedAt, revision });
     savePromptQueuesWithDismissed(queues, dismissed);
     // Re-import app state after the real App write. The merge preserves the
     // just-written visual order while replacing App-owned content authoritatively.
@@ -8237,7 +8527,7 @@ function setPromptQueueItems(threadId, items, expectedRevision) {
   }
   const updatedAt = new Date().toISOString();
   const revision = current.revision + 1;
-  queues[id] = { updatedAt, revision, items: cleanItems };
+  queues[id] = promptQueueEntrySnapshot(id, cleanItems, { updatedAt, revision });
   savePromptQueuesWithDismissed(queues, dismissed);
   broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision });
   scheduleServerPromptQueueDispatch(id);
@@ -8265,7 +8555,7 @@ function markServerPromptQueueItemUncertain(threadId, item, error) {
   const dismissed = loadPromptQueueDismissedRaw();
   const updatedAt = new Date().toISOString();
   const revision = current.revision + 1;
-  queues[id] = { updatedAt, revision, items };
+  queues[id] = promptQueueEntrySnapshot(id, items, { updatedAt, revision });
   savePromptQueuesWithDismissed(queues, dismissed);
   broadcastPromptQueueChange({ threadId: id, items, updatedAt, revision, source: 'uncertain-dispatch' });
   resetServerPromptQueueDispatchRetries(id);
@@ -8313,7 +8603,7 @@ function appendWebPromptQueueItem(threadId, item, { scheduleDispatch = true } = 
   }
   const updatedAt = new Date().toISOString();
   const revision = current.revision + 1;
-  queues[id] = { updatedAt, revision, items: cleanItems };
+  queues[id] = promptQueueEntrySnapshot(id, cleanItems, { updatedAt, revision });
   savePromptQueuesWithDismissed(queues, dismissed);
   broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision, source: 'background-append' });
   if (scheduleDispatch) scheduleServerPromptQueueDispatch(id);
@@ -8340,7 +8630,7 @@ function dismissPromptQueueItem(threadId, item) {
   const cleanItems = filterDismissedPromptQueueItems(id, remaining, dismissed).slice(0, 50);
   const updatedAt = new Date().toISOString();
   const revision = Number(queues[id]?.revision || 0) + 1;
-  queues[id] = { updatedAt, revision, items: cleanItems };
+  queues[id] = promptQueueEntrySnapshot(id, cleanItems, { updatedAt, revision });
   savePromptQueuesWithDismissed(queues, dismissed);
   broadcastPromptQueueChange({ threadId: id, items: cleanItems, updatedAt, revision });
   scheduleServerPromptQueueDispatch(id);
@@ -8425,7 +8715,7 @@ const SERVER_PROMPT_QUEUE_SETTLING_RETRY_MAX_DELAY_MS = 2000;
 
 function serverPromptQueueHasDispatchableItem(threadId) {
   const id = cleanNativeThreadId(threadId);
-  if (!id) return false;
+  if (!id || isPromptQueuePaused(id)) return false;
   const item = getPromptQueueItems(id)[0];
   return Boolean(item && !isAppSourcedQueueItem(item) && item.autoDispatch !== false && item.dispatchState !== 'uncertain');
 }
@@ -8482,9 +8772,10 @@ function retryServerPromptQueueDispatchAfterSettling(threadId, { quiet = false }
 
 function scheduleIdleServerPromptQueueDispatches() {
   for (const threadId of Object.keys(loadPromptQueues())) {
-    if (!serverPromptQueueHasDispatchableItem(threadId)) continue;
     let conversation = null;
     try { conversation = nativeSessions.get(threadId); } catch {}
+    if (ensurePromptQueuePauseFromNative(threadId, conversation)) continue;
+    if (!serverPromptQueueHasDispatchableItem(threadId)) continue;
     if (!conversation) {
       retryServerPromptQueueDispatchAfterSettling(threadId);
       continue;
@@ -8531,6 +8822,7 @@ async function dispatchNextServerQueuedPrompt(threadId) {
     retryServerPromptQueueDispatchAfterSettling(id);
     return false;
   }
+  if (ensurePromptQueuePauseFromNative(id, conversation)) return false;
   if (active?.status === 'running') return false;
   if (conversation.status === 'running') {
     retryServerPromptQueueDispatchAfterSettling(id, { quiet: true });
@@ -8966,6 +9258,84 @@ let threadRunMobileScrollLeft = 0;
 let promptQueues = readPromptQueues();
 let queueDispatchingThreads = new Set();
 let queueGuidingItems = new Set();
+
+const promptQueuePauseByThread=new Map();
+function normalizePromptQueuePause(pause){
+  if(!pause||typeof pause!=='object'||Array.isArray(pause))return null;
+  const reason=String(pause.reason||'').trim();
+  if(!reason)return null;
+  return{
+    reason,
+    message:String(pause.message||'').trim().slice(0,800),
+    pausedAt:String(pause.pausedAt||''),
+  };
+}
+function setPromptQueuePauseLocal(threadId,pause){
+  const id=String(threadId||'').trim();
+  if(!id)return null;
+  const next=normalizePromptQueuePause(pause);
+  if(next)promptQueuePauseByThread.set(id,next);
+  else promptQueuePauseByThread.delete(id);
+  return next;
+}
+function promptQueuePauseFor(threadId=currentConversationId){
+  return promptQueuePauseByThread.get(String(threadId||'').trim())||null;
+}
+function isPromptQueuePausedLocal(threadId=currentConversationId){
+  return Boolean(promptQueuePauseFor(threadId));
+}
+function isTransientProviderLimitErrorText(text){
+  const value=String(text||'').toLowerCase();
+  return value.includes('usage limit')
+    ||value.includes('quota exceeded')
+    ||value.includes('insufficient quota')
+    ||value.includes('too many requests')
+    ||value.includes('rate limit')
+    ||value.includes('high demand')
+    ||value.includes('exceeded retry limit')
+    ||value.includes('temporarily rate-limited')
+    ||/(^|\D)429(\D|$)/.test(value);
+}
+const dismissedLimitPauseThreads=new Set();
+function clearDismissedLimitPause(threadId){
+  const id=String(threadId||'').trim();
+  if(id)dismissedLimitPauseThreads.delete(id);
+}
+function dismissLimitPause(threadId){
+  const id=String(threadId||'').trim();
+  if(id)dismissedLimitPauseThreads.add(id);
+}
+function latestNativeLimitErrorText(root=chat){
+  const nodes=[
+    ...(root?.querySelectorAll?.('.msg.process.terminalError, .msg.process[data-message-kind="task_error"], .msg.process[data-message-kind="error"], .msg.process[data-message-kind="turn_aborted"], .msg.process.nativeConnectionStatus')||[]),
+  ];
+  for(let index=nodes.length-1;index>=0;index-=1){
+    const text=String(nodes[index]?.dataset?.messageText||nodes[index]?.textContent||'').trim();
+    if(isTransientProviderLimitErrorText(text))return text;
+  }
+  return '';
+}
+function rememberLimitPauseFromText(threadId,text,{force=false}={}){
+  const id=String(threadId||currentConversationId||'').trim();
+  const message=String(text||'').trim();
+  if(!id||!message||!isTransientProviderLimitErrorText(message))return null;
+  clearDismissedLimitPause(id);
+  if(!force&&isPromptQueuePausedLocal(id))return promptQueuePauseFor(id);
+  return setPromptQueuePauseLocal(id,{
+    reason:'rate_limit',
+    message,
+    pausedAt:new Date().toISOString(),
+  });
+}
+function conversationHasResumableLimitPause(threadId=currentConversationId){
+  const id=String(threadId||'').trim();
+  if(!id)return false;
+  if(dismissedLimitPauseThreads.has(id))return isPromptQueuePausedLocal(id);
+  if(isPromptQueuePausedLocal(id))return true;
+  // Keep empty composer on "开始" only while the latest native run is still the paused limit turn.
+  return String(currentNativeRunStatus||'')==='interrupted' && Boolean(latestNativeLimitErrorText());
+}
+
 let queueFailures = new Map();
 let queueDismissedKeys=new Map(); // threadId -> Set(dismiss keys)
 let promptQueueMenu = null;
@@ -9837,6 +10207,7 @@ async function pullPromptQueueFromServer(threadId,{render=true,preferServer=true
     if(!res.ok)return null;
     const data=await res.json();
     if(Number.isInteger(data.revision))promptQueueServerRevisions.set(id,data.revision);
+    if(Object.prototype.hasOwnProperty.call(data,'pause'))setPromptQueuePauseLocal(id,data.pause);
     const items=Array.isArray(data.items)?data.items.slice(0,50).map(normalizeQueuedPrompt).filter(Boolean):[];
     const dismissedItemIds=Array.isArray(data.dismissedItemIds)?data.dismissedItemIds:[];
     // A resumed page can observe the queue before its background beacon reaches
@@ -9894,6 +10265,7 @@ function applyRemotePromptQueueEvent(event){
   if(promptQueueServerSyncInflight.has(threadId)||promptQueueServerSyncTimers.has(threadId)||promptQueueOrderSyncing.has(threadId)||promptQueueOrderIntents.has(threadId))return;
   const items=Array.isArray(event?.items)?event.items:[];
   if(Number.isInteger(event?.revision))promptQueueServerRevisions.set(threadId,event.revision);
+  if(Object.prototype.hasOwnProperty.call(event||{},'pause'))setPromptQueuePauseLocal(threadId,event.pause);
   promptQueueRemoteSyncing=true;
   try{applyPromptQueueLocal(threadId,items,{persist:true,render:true});}
   finally{promptQueueRemoteSyncing=false;}
@@ -9912,6 +10284,7 @@ function queuedPromptPayload(item){return{
 function applyServerPromptQueue(threadId,queue){
   if(!queue||!Array.isArray(queue.items))return false;
   if(Number.isInteger(queue.revision))promptQueueServerRevisions.set(threadId,queue.revision);
+  if(Object.prototype.hasOwnProperty.call(queue,'pause'))setPromptQueuePauseLocal(threadId,queue.pause);
   applyPromptQueueLocal(threadId,queue.items,{persist:true,render:true});
   return true;
 }
@@ -11806,6 +12179,10 @@ function renderThreadGoalBar(options={}){
   updateComposerOverlayInset({scroll:options.scroll!==false});
 }
 function renderPromptQueue(){
+  const pause=currentConversationSource==='codex'?promptQueuePauseFor(currentConversationId):null;
+  if(pause&&statusEl&&!webRunActive){
+    if(!String(statusEl.textContent||'').includes('已暂停'))statusEl.textContent='Codex App · 已暂停，可点击开始继续';
+  }
   if(!promptQueuePanel||!promptQueueList)return;
   if(promptQueueDragState?.active)return;
   if(promptQueueDragState)cancelPromptQueuePointerDrag();
@@ -12369,8 +12746,8 @@ function reconcilePromptQueueTurnLock(threadId,conversation){
 function promptQueueTurnLocked(threadId){return Boolean(promptQueueTurnLock(threadId))}
 function schedulePromptQueueDispatch(threadId,delay=120){
   const item=promptQueueFor(threadId)[0];
-  if(!threadId||promptQueueTurnLocked(threadId)||!item||isAppOwnedQueuedPrompt(item)||item.autoDispatch===false||item.dispatchState==='uncertain')return;
-  setTimeout(()=>{if(!promptQueueTurnLocked(threadId))dispatchNextQueuedPrompt(threadId)},delay);
+  if(!threadId||isPromptQueuePausedLocal(threadId)||promptQueueTurnLocked(threadId)||!item||isAppOwnedQueuedPrompt(item)||item.autoDispatch===false||item.dispatchState==='uncertain')return;
+  setTimeout(()=>{if(!isPromptQueuePausedLocal(threadId)&&!promptQueueTurnLocked(threadId))dispatchNextQueuedPrompt(threadId)},delay);
 }
 function showNativePromptOptimistically(item){
   resumeNativeLiveFollowBottom();
@@ -12500,6 +12877,7 @@ async function steerQueuedPrompt(threadId,itemId,preloadedItem=null){
   }
 }
 async function dispatchNextQueuedPrompt(threadId,{force=false}={}){
+  if(isPromptQueuePausedLocal(threadId)&&!force)return false;
   const item=promptQueueFor(threadId)[0];
   if(!item||isAppOwnedQueuedPrompt(item)||queueDispatchingThreads.has(threadId)||queueGuidingItems.has(item.id)||steerSubmitting)return false;
   if((item.autoDispatch===false||item.dispatchState==='uncertain')&&!force)return false;
@@ -18378,28 +18756,136 @@ function canResumeInterruptedNativeTask(){
     && Boolean(currentConversationId)
     && !webRunActive
     && !appQueueEditDraft
-    && hasInterruptedAppQueue(currentConversationId);
+    && (hasInterruptedAppQueue(currentConversationId) || conversationHasResumableLimitPause(currentConversationId));
 }
 async function resumeInterruptedAppQueue(){
   const threadId=currentConversationId;
   if(!canResumeInterruptedNativeTask())return false;
-  statusEl.textContent='Codex App · 正在继续队列…';
+  const previousPause=promptQueuePauseFor(threadId);
+  const limitText=latestNativeLimitErrorText()||previousPause?.message||'';
+  if(limitText)rememberLimitPauseFromText(threadId,limitText,{force:true});
+  statusEl.textContent='Codex App · 正在开始…';
   sendBtn.disabled=true;
+  const previousNativeRunStatus=currentNativeRunStatus;
+  const restorePause=()=>{
+    clearDismissedLimitPause(threadId);
+    if(previousPause)setPromptQueuePauseLocal(threadId,previousPause);
+    else if(limitText)rememberLimitPauseFromText(threadId,limitText,{force:true});
+  };
   try{
-    const res=await fetch('/api/prompt-queues/'+encodeURIComponent(threadId)+'/resume-interrupted',{method:'POST'});
+    const continuePayload={
+      message:'继续',
+      provider:provider.value,
+      model:model.value,
+      reasoningEffort:reasoningEffort.value,
+      serviceTier:composerServiceTier,
+      cwd:cwd.value,
+      ...composerPermissionPayload(),
+    };
+    const res=await fetch('/api/prompt-queues/'+encodeURIComponent(threadId)+'/resume-interrupted',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(continuePayload),
+    });
     const data=await res.json().catch(()=>({}));
-    if(!res.ok)throw new Error(data.error||'继续 Codex App 队列失败');
+    if(!res.ok){
+      // Local-only limit pause with no server pause/app queue: start a continuation turn here.
+      if([404,409].includes(res.status)){
+        setPromptQueuePauseLocal(threadId,null);
+        dismissLimitPause(threadId);
+        try{
+          const started=await startLimitPauseContinuation(threadId,continuePayload);
+          if(started)return true;
+        }catch(startError){
+          restorePause();
+          throw startError;
+        }
+      }
+      throw new Error(data.error||'开始失败');
+    }
     applyServerPromptQueue(threadId,data);
-    statusEl.textContent='Codex App · 队列已继续，等待启动';
+    setPromptQueuePauseLocal(threadId,data.pause||null);
+    dismissLimitPause(threadId);
+    if(data.turnId||data.continued){
+      showNativePromptOptimistically({message:continuePayload.message,attachments:[]});
+      clearNativeCancelPending();
+      currentNativeRunStatus='running';
+      webRunActive=true;
+      activeNativeTurnId=data.turnId||'';
+      markPromptQueueTurnRunning(threadId,activeNativeTurnId);
+      statusEl.textContent='Codex App · 正在继续';
+      showNativeRunningTimestamp(Date.now());
+      setTimeout(()=>{if(currentConversationSource==='codex'&&currentConversationId===threadId)void syncCurrentNativeConversation()},160);
+      refreshHistory();
+      return true;
+    }
+    const queuedStarted=await dispatchNextQueuedPrompt(threadId,{force:true});
+    if(queuedStarted){
+      statusEl.textContent='Codex App · 正在发送队列消息';
+      return true;
+    }
+    if(hasInterruptedAppQueue(threadId) || promptQueueFor(threadId).length){
+      // Queue still owns the next step (App or web). Do not inject a synthetic turn.
+      statusEl.textContent='Codex App · 已开始，等待启动';
+      setTimeout(()=>{if(currentConversationSource==='codex'&&currentConversationId===threadId)void syncCurrentNativeConversation()},120);
+      refreshHistory();
+      return true;
+    }
+    // Empty queue after a pure limit pause: start a real continuation turn.
+    try{
+      const started=await startLimitPauseContinuation(threadId,continuePayload);
+      if(started)return true;
+    }catch(startError){
+      restorePause();
+      throw startError;
+    }
+    statusEl.textContent='Codex App · 已解除暂停';
     setTimeout(()=>{if(currentConversationSource==='codex'&&currentConversationId===threadId)void syncCurrentNativeConversation()},120);
     refreshHistory();
     return true;
   }catch(error){
-    statusEl.textContent=error.message||'继续 Codex App 队列失败';
-    await pullPromptQueueFromServer(threadId,{render:true,preferServer:true});
+    currentNativeRunStatus=previousNativeRunStatus;
+    restorePause();
+    statusEl.textContent=error.message||'开始失败';
+    await pullPromptQueueFromServer(threadId,{render:true,preferServer:true}).catch(()=>{});
     return false;
   }finally{
     applyConversationMode();
+  }
+}
+async function startLimitPauseContinuation(threadId,payload){
+  if(!threadId||currentConversationSource!=='codex'||currentConversationId!==threadId)return false;
+  if(webRunActive||promptQueueTurnLocked(threadId))return false;
+  const message=String(payload?.message||'继续').trim()||'继续';
+  showNativePromptOptimistically({message,attachments:[]});
+  clearNativeCancelPending();
+  const previousNativeRunStatus=currentNativeRunStatus;
+  currentNativeRunStatus='running';
+  webRunActive=true;
+  activeNativeTurnId='';
+  applyConversationMode();
+  showNativeRunningTimestamp(Date.now());
+  try{
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(threadId)+'/turns',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload||{message}),
+    });
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(data.error||res.statusText||'继续失败');
+    activeNativeTurnId=data.turnId||'';
+    markPromptQueueTurnRunning(threadId,activeNativeTurnId);
+    statusEl.textContent='Codex App · 正在继续';
+    setTimeout(()=>{if(currentConversationSource==='codex'&&currentConversationId===threadId)void syncCurrentNativeConversation()},160);
+    refreshHistory();
+    return true;
+  }catch(error){
+    webRunActive=false;
+    activeNativeTurnId='';
+    currentNativeRunStatus=previousNativeRunStatus;
+    removeNativeRunningElement();
+    clearNativeOptimisticElements();
+    throw error;
   }
 }
 function syncComposerSubmitControl(){
@@ -18411,7 +18897,7 @@ function syncComposerSubmitControl(){
   const hasPayload=Boolean(input.value.trim()||pendingAttachments.length);
   const resumeInterrupted=canResumeInterruptedNativeTask()&&!hasPayload;
   const action=webRunActive&&native?'queue':resumeInterrupted?'resume':'send';
-  const label=action==='queue'?'加入队列':action==='resume'?'继续队列':'发送';
+  const label=action==='queue'?'加入队列':action==='resume'?'开始':'发送';
   const icon=action==='resume'?'play':'arrow-up';
   sendBtn.disabled=blocked||(!hasPayload&&!resumeInterrupted);
   if(sendBtn.dataset.composerAction!==action){
@@ -18862,7 +19348,7 @@ async function loadConversation(id,source='web',options={}){
     const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery+nativeHistoryPagingQuery;
     const res=await fetch(requestUrl);
     if(seq!==conversationLoadSeq)return false;
-    if(!res.ok){clearConversationStatusLoading();setTopStatusText('加载失败',{running:false});return false}
+    if(!res.ok){clearConversationStatusLoading();clearConversationRestoring();setTopStatusText('加载失败',{running:false});return false}
     const data=await res.json();
     if(seq!==conversationLoadSeq)return false;
     conversation=data.conversation;
@@ -18891,6 +19377,12 @@ async function loadConversation(id,source='web',options={}){
   activeNativeTurnId=String(queueTurnId||(!promptQueueLock.terminal&&conversation.activeTurnId)||'');
   webRunActive=currentConversationSource==='codex'&&!promptQueueLock.terminal&&(conversation.status==='running'||Boolean(queueTurnId));
   currentNativeRunStatus=currentConversationSource==='codex'?String(conversation.status||''):'';
+  if(currentConversationSource==='codex'){
+    const latestProcess=[...(conversation.messages||[])].reverse().find((message)=>message?.role==='process');
+    if(latestProcess&&['task_error','error','turn_aborted'].includes(String(latestProcess.kind||''))){
+      rememberLimitPauseFromText(currentConversationId,latestProcess.content);
+    }
+  }
   if(!webRunActive||!nativeCancelPendingMatches(currentConversationId,activeNativeTurnId))clearNativeCancelPending();
   syncComposerContextWindow(conversation.contextWindow||null);
   if(currentConversationSource==='codex'){
@@ -18929,6 +19421,7 @@ async function loadConversation(id,source='web',options={}){
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(!messages.length&&!webRunActive&&!nativeForkMarkers[currentConversationId])chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
   updateConversationStatus(conversation);
+  applyConversationMode();
   setThreadGoal(currentConversationSource==='codex' ? (conversation.goal || null) : null);
   if(currentConversationSource==='codex'&&!options.skipPromptQueueSync)await pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
   else renderPromptQueue();
@@ -18941,7 +19434,9 @@ async function loadConversation(id,source='web',options={}){
     if(preserveHistoryFollowBottom)resumeNativeLiveFollowBottom();
     else setNativeLiveReadingHistory(true);
     nativeHistoryLoadReady=true;
-    if(!chat.classList.contains('conversationRestoring'))refreshIcons(chat);
+    // History-page reloads keep the same conversation; always lift the restore veil after paint
+    // so nested fill/page loads cannot leave the chat permanently blank.
+    clearConversationRestoring();
   }else{
     scrollChatToLatest({force:true});
     alignChatToBottomStable(12,seq);
@@ -18949,8 +19444,7 @@ async function loadConversation(id,source='web',options={}){
     const readySource=currentConversationSource;
     const finishRestorePaint=()=>{
       if(currentConversationId!==readyId||currentConversationSource!==readySource)return;
-      chat.classList.remove('conversationRestoring');
-      refreshIcons(chat);
+      clearConversationRestoring();
     };
     // Hold the restore veil through the first history fill so usage-limit cards do not
     // pop/reshape while older pages are pulled in.
@@ -18995,6 +19489,17 @@ function setModeLabelState(native){
 }
 let conversationStatusLoadTimer=null;
 let conversationStatusLoadSeq=0;
+
+function clearConversationRestoring({refresh=true}={}){
+  const root=typeof chat!=='undefined'&&chat?chat:document.getElementById('chat');
+  if(!root)return;
+  root.classList.remove('conversationRestoring');
+  root.querySelectorAll?.('.empty.conversationRestoring')?.forEach?.((node)=>node.classList.remove('conversationRestoring'));
+  if(refresh){
+    try{refreshIcons(root)}catch{}
+  }
+}
+
 function clearConversationStatusLoading(){
   if(conversationStatusLoadTimer){
     clearTimeout(conversationStatusLoadTimer);
@@ -19034,7 +19539,10 @@ function updateConversationStatus(conversation){
   if(conversation.source==='codex'){
     if(running)showNativeRunningTimestamp(conversation.updatedAt||conversation.createdAt);
     else{
-      const stateLabel=conversation.status==='interrupted'?'已暂停':conversation.status==='error'?'任务失败':'已同步';
+      const limitPaused=isPromptQueuePausedLocal(conversation.id)||conversationHasResumableLimitPause(conversation.id);
+      const stateLabel=conversation.status==='interrupted'||limitPaused
+        ?(limitPaused?'已暂停，可点击开始继续':'已暂停')
+        :conversation.status==='error'?'任务失败':'已同步';
       setTopStatusText('Codex App · '+stateLabel+(stamp?' · '+stamp:''),{running:false});
     }
     setNativeNoticeText('Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':''),{visible:true});
@@ -19249,8 +19757,10 @@ function connectSessionEvents(){
         else ensureTurnProcessElapsedRunning(runtime.updatedAt,Date.now(),connectionTurnId);
         statusEl.textContent=cancelPending?'Codex App · 正在停止…':'Codex App · 上游连接中断，正在重连';
       }else{
+        const pauseLike=runtime.pauseQueue===true||isTransientProviderLimitErrorText(runtime.message);
+        if(pauseLike)setPromptQueuePauseLocal(currentConversationId,{reason:'rate_limit',message:runtime.message||'上游请求过于频繁，队列已暂停',pausedAt:runtime.updatedAt||new Date().toISOString()});
         upsertNativeConnectionStatus(runtime);
-        statusEl.textContent=cancelPending?'Codex App · 正在停止…':'Codex App · 上游请求异常，等待任务状态';
+        statusEl.textContent=cancelPending?'Codex App · 正在停止…':(pauseLike?'Codex App · 已暂停，可点击开始继续':'Codex App · 上游请求异常，等待任务状态');
       }
       applyConversationMode();
     }else if(runtime.type==='turn'){
@@ -19271,10 +19781,11 @@ function connectSessionEvents(){
         activeNativeTurnId='';
         removeNativeRunningElement();
         finishAllNativeLiveItems();
-        statusEl.textContent=runtime.status==='error'?'Codex App 任务失败':runtime.status==='interrupted'?'Codex App · 已暂停':'Codex App 任务完成';
+        const pauseLike=isPromptQueuePausedLocal(currentConversationId)||isTransientProviderLimitErrorText(nativeConnectionStatusElement?.dataset?.messageText||'');
+        statusEl.textContent=runtime.status==='error'?'Codex App 任务失败':runtime.status==='interrupted'?(pauseLike?'Codex App · 已暂停，可点击开始继续':'Codex App · 已暂停'):'Codex App 任务完成';
         const completedId=currentConversationId;
         scheduleNativeCompletionSync(completedId,runtimeTurnId,220);
-        schedulePromptQueueDispatch(completedId,320);
+        if(!(runtime.status==='interrupted' && isPromptQueuePausedLocal(completedId)))schedulePromptQueueDispatch(completedId,320);
       }else{
         clearNativeCompletionSync();
         if(!collectingTurnProcess||!turnProcessElapsedMatches(runtimeTurnId))beginTurnProcessCollection(runtime.updatedAt,true,runtimeTurnId);
@@ -19384,6 +19895,12 @@ async function syncCurrentNativeConversationOnce(){
     Number(conversation.nextHistoryPageLimit)||0,
   ));
   currentNativeRunStatus=String(conversation.status||'');
+  {
+    const latestProcess=[...(conversation.messages||[])].reverse().find((message)=>message?.role==='process');
+    if(latestProcess&&['task_error','error','turn_aborted'].includes(String(latestProcess.kind||''))){
+      rememberLimitPauseFromText(id,latestProcess.content);
+    }
+  }
   await applyNativeConversationMetadata(conversation.metadata||{},{preserveProviderModel:nativeComposerOverrideApplies(id)});
   if(seq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==id)return;
   if(deferNativeSyncForHistoryPage())return;
@@ -23080,16 +23597,74 @@ function shouldCollapseUserMessage(text){
   const lines=value.split(String.fromCharCode(10)).map((line)=>line.trim()).filter(Boolean);
   return value.length>=280&&lines.length>=10;
 }
+function unwrapTerminalErrorPayload(value, depth=0){
+  if(value==null)return'';
+  if(depth>6)return String(value||'').trim();
+  if(typeof value==='string'){
+    let text=value.trim();
+    if(!text)return'';
+    // Collapse common double-encoded JSON fragments shown as \" in the UI.
+    if((text.startsWith('{')&&text.endsWith('}'))||(text.startsWith('[')&&text.endsWith(']'))){
+      try{return unwrapTerminalErrorPayload(JSON.parse(text), depth+1)}catch(e){}
+    }
+    return text;
+  }
+  if(Array.isArray(value)){
+    for(const item of value){
+      const nested=unwrapTerminalErrorPayload(item, depth+1);
+      if(nested)return nested;
+    }
+    return'';
+  }
+  if(typeof value==='object'){
+    const preferred=['error','message','msg','detail','details','description','reason','title'];
+    for(const key of preferred){
+      if(!Object.prototype.hasOwnProperty.call(value,key))continue;
+      const nested=unwrapTerminalErrorPayload(value[key], depth+1);
+      if(!nested)continue;
+      if(key==='error'&&value.code&&!String(nested).includes(String(value.code))){
+        return String(value.code)+': '+nested;
+      }
+      return nested;
+    }
+    for(const nested of Object.values(value)){
+      const text=unwrapTerminalErrorPayload(nested, depth+1);
+      if(text)return text;
+    }
+  }
+  return String(value||'').trim();
+}
+function normalizeTerminalErrorText(text){
+  const raw=String(text||'').trim();
+  if(!raw)return'';
+  let cleaned=unwrapTerminalErrorPayload(raw);
+  cleaned=String(cleaned||'').trim();
+  // Final pass for stubborn double-encoded blobs that still look like JSON text.
+  if(cleaned.includes('Duplicate tool names')){
+    const match=cleaned.match(/Duplicate tool names:\\s*[^"\\}]+/i);
+    if(match){
+      const codeMatch=cleaned.match(/invalid-argument/i);
+      return (codeMatch?'invalid-argument: ':'')+match[0].replace(/\\s+/g,' ').trim();
+    }
+  }
+  if(/^[{[]/.test(cleaned)){
+    const match=cleaned.match(/"error"\\s*:\\s*"([^"]+)"/i)||cleaned.match(/"message"\\s*:\\s*"([^"]+)"/i);
+    if(match&&match[1])cleaned=match[1];
+  }
+  return cleaned||raw;
+}
 function terminalErrorMessageTitle(text){
-  const value=String(text||'').toLowerCase();
+  const normalized=normalizeTerminalErrorText(text);
+  const value=String(normalized||text||'').toLowerCase();
   if(value.includes('usage limit')||value.includes('quota exceeded')||value.includes('insufficient quota'))return'额度已达上限';
   if(value.includes('too many requests')||value.includes('rate limit')||/(^|\\D)429(\\D|$)/.test(value))return'请求过于频繁';
   if(value.includes('unauthorized')||value.includes('invalid api key')||/(^|\\D)401(\\D|$)/.test(value))return'认证失败';
   if(value.includes('timed out')||value.includes('timeout'))return'请求超时';
+  if(value.includes('duplicate tool names')||value.includes('invalid-argument')||value.includes('invalid argument'))return'参数错误';
   return'任务失败';
 }
 function isUsageLimitTerminalError(text){
-  const value=String(text||'').toLowerCase();
+  const value=String(normalizeTerminalErrorText(text)||text||'').toLowerCase();
   return value.includes('usage limit')||value.includes('quota exceeded')||value.includes('insufficient quota');
 }
 function terminalErrorDisplayText(text){
@@ -23097,7 +23672,10 @@ function terminalErrorDisplayText(text){
   if(!raw)return'';
   // Usage-limit cards keep title + badge only; hide the middle explanation block.
   if(isUsageLimitTerminalError(raw))return'';
-  return raw;
+  const cleaned=normalizeTerminalErrorText(raw);
+  // Avoid re-showing the same short title text as the body.
+  if(cleaned&&cleaned===terminalErrorMessageTitle(raw))return'';
+  return cleaned||raw;
 }
 function terminalErrorHintText(text){
   // Keep usage-limit cards compact: no secondary middle copy.
@@ -23138,7 +23716,8 @@ function bindLongUserMessage(el,body,scrollContainer=chat){
 }
 function createConversationMessageElement(role,text,options={}){
   const kind=String(options.kind||'');
-  const terminalError=role==='process'&&['task_error','error'].includes(kind);
+  const transientLimitError=role==='process'&&kind==='turn_aborted'&&isTransientProviderLimitErrorText(text);
+  const terminalError=role==='process'&&(['task_error','error'].includes(kind)||transientLimitError);
   const usageLimitError=terminalError&&isUsageLimitTerminalError(text);
   const browserCommentUser=role==='user'&&kind==='steering_browser_comment';
   const steeringUser=role==='user'&&kind==='steering_user';
@@ -23214,7 +23793,7 @@ function createConversationMessageElement(role,text,options={}){
     copy.dataset.tooltip='复制';
     copy.setAttribute('aria-label','复制此消息');
     setIconLabel(copy,'copy','复制此消息',false);
-    copy.addEventListener('click',(event)=>{event.stopPropagation();copyText(el.dataset.messageText||'',copy)});
+    copy.addEventListener('click',(event)=>{event.stopPropagation();copyText(terminalError?normalizeTerminalErrorText(el.dataset.messageText||''):(el.dataset.messageText||''),copy)});
     actions.appendChild(copy);
     const actionThreadId=String(options.actionThreadId||'');
     if(role==='user'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId){
@@ -23358,11 +23937,24 @@ function addMsg(role,text,options={}){
   }
   if(shouldClearTurnReasoningStatus(role,kind))clearTurnReasoningStatus(browserCommentUser);
   if(shouldClearPendingActivityReasoning(role,kind,steeringUser))pendingActivityReasoning=[];
+  const transientLimitError=role==='process'&&kind==='turn_aborted'&&isTransientProviderLimitErrorText(text);
   if(role==='process'&&['task_error','turn_aborted','error'].includes(kind)){
     freezeTurnProcessElapsed(options.at,options.turnId);
     clearLiveTurnProgress();
     settleTurnTool(latestToolElement);
     collapseCurrentActivityCluster();
+    // Only live terminal errors should re-arm resume. History hydration must not
+    // keep locking the composer on an old 429 after the user already clicked 开始.
+    if(!options.hydrating&&currentConversationSource==='codex'&&currentConversationId
+      && (['task_error','error'].includes(kind)||transientLimitError)){
+      const paused=rememberLimitPauseFromText(currentConversationId,text);
+      if(paused){
+        webRunActive=false;
+        activeNativeTurnId='';
+        currentNativeRunStatus='interrupted';
+        statusEl.textContent='Codex App · 已暂停，可点击开始继续';
+      }
+    }
   }
   if(role==='tool'&&['function_call_output','custom_tool_call_output','tool_search_output'].includes(options.kind)){
     const batch=isAgentActivityOutput(text)?takePendingAgentActivityBatch():latestToolElement;
