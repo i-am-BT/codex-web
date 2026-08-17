@@ -278,7 +278,7 @@ test('a matching persisted terminal releases a running turn and schedules the We
     'scheduleServerPromptQueueDispatch',
     'broadcastNativeRuntime',
     'releaseAppServerThreadAfterTurn',
-    `const isPromptQueuePaused = () => false; const isTransientProviderLimitError = () => false; const pausePromptQueueForProviderLimit = () => null; ${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
+    `const ensurePromptQueuePauseFromNative = () => null; const isPromptQueuePaused = () => false; ${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
   )(
     [],
     () => {},
@@ -322,7 +322,7 @@ test('a terminal record for another turn cannot release a running queue lock', a
     'activeNativeTurns',
     'scheduleServerPromptQueueDispatch',
     'broadcastNativeRuntime',
-    `const isPromptQueuePaused = () => false; const isTransientProviderLimitError = () => false; const pausePromptQueueForProviderLimit = () => null; ${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
+    `const ensurePromptQueuePauseFromNative = () => null; const isPromptQueuePaused = () => false; ${serverSource.slice(changeStart, changeEnd)}; return { handleNativeSessionChange };`,
   )(
     [],
     () => {},
@@ -497,6 +497,22 @@ test('provider-limit queue pauses survive prompt queue persistence', async () =>
   assert.deepEqual(reloaded['thread-limit']?.pause, loaded['thread-limit'].pause);
 });
 
+test('resuming a provider-limit pause continues the current task before queued follow-ups', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const routeStart = serverSource.indexOf("app.post('/api/prompt-queues/:threadId/resume-interrupted'");
+  const routeEnd = serverSource.indexOf("\napp.post('/api/prompt-queues/:threadId/append-beacon'", routeStart);
+  assert.ok(routeStart >= 0 && routeEnd > routeStart);
+  const routeSource = serverSource.slice(routeStart, routeEnd);
+
+  assert.match(routeSource, /const shouldContinuePausedTurn = wasPaused && !resumedApp && wantsContinueTurn/);
+  assert.match(routeSource, /if \(shouldContinuePausedTurn \|\| canContinueWithoutQueue\)/);
+  assert.ok(
+    routeSource.indexOf('continueNativeTurn(threadId, turn)') < routeSource.indexOf('setPromptQueuePause(threadId, null)'),
+    'the interrupted task must restart successfully before its pause is cleared',
+  );
+  assert.match(routeSource, /if \(!wasPaused && hasDispatchable\) \{\s*scheduleServerPromptQueueDispatch/);
+});
+
 test('server-owned Web queues retry only while native state is settling', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const retryStart = serverSource.indexOf('const SERVER_PROMPT_QUEUE_SETTLING_RETRY_LIMIT');
@@ -570,6 +586,7 @@ test('server-owned Web queues retry only while native state is settling', async 
   const consumed = [];
   const released = [];
   let refreshed = 0;
+  let providerPaused = false;
   let conversation = { status: 'running', metadata: {} };
   let continueTurn = async () => ({ turnId: 'unexpected' });
   const dispatchApi = new Function(
@@ -578,6 +595,7 @@ test('server-owned Web queues retry only while native state is settling', async 
     'nativeTurnReservations',
     'nativeSessions',
     'activeNativeTurns',
+    'ensurePromptQueuePauseFromNative',
     'getPromptQueueItems',
     'isAppSourcedQueueItem',
     'resetServerPromptQueueDispatchRetries',
@@ -597,6 +615,7 @@ test('server-owned Web queues retry only while native state is settling', async 
     reservations,
     { get: () => conversation, scheduleRefresh: () => { refreshed += 1; } },
     activeTurns,
+    () => providerPaused,
     () => [queueItem],
     () => false,
     (threadId) => resetCalls.push(threadId),
@@ -623,6 +642,12 @@ test('server-owned Web queues retry only while native state is settling', async 
   assert.equal(await dispatchApi.dispatchNextServerQueuedPrompt('thread-a'), false);
   assert.deepEqual(retryCalls, ['thread-a'], 'an in-flight caller owns the result and must not be retried');
   reservations.delete('thread-a');
+
+  providerPaused = true;
+  conversation = { status: 'error', metadata: {} };
+  assert.equal(await dispatchApi.dispatchNextServerQueuedPrompt('thread-a'), false);
+  assert.equal(consumed.length, 0, 'a provider-limit pause must keep the next queue item pending');
+  providerPaused = false;
 
   conversation = { status: 'done', metadata: {} };
   continueTurn = async () => { throw { statusCode: 409 }; };

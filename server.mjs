@@ -1950,6 +1950,7 @@ app.get('/api/prompt-queues/:threadId', requireAuth, (req, res) => {
   const threadId = cleanNativeThreadId(req.params.threadId);
   if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
   res.setHeader('Cache-Control', 'no-store');
+  ensurePromptQueuePauseFromNative(threadId);
   const queue = getPromptQueueState(threadId);
   res.json({ ok: true, threadId, ...queue, dismissedItemIds: getPromptQueueDismissedItemIds(threadId) });
 });
@@ -1958,6 +1959,7 @@ app.post('/api/prompt-queues/:threadId/resume-interrupted', requireAuth, async (
   try {
     const threadId = cleanNativeThreadId(req.params.threadId);
     if (!threadId) return res.status(400).json({ error: '会话 ID 无效' });
+    ensurePromptQueuePauseFromNative(threadId);
     let resumedApp = 0;
     let queue = getPromptQueueState(threadId);
     let appResumeError = null;
@@ -1975,23 +1977,21 @@ app.post('/api/prompt-queues/:threadId/resume-interrupted', requireAuth, async (
     let continuedTurn = null;
     let pauseCleared = false;
     try {
-      if (wasPaused) {
-        pauseCleared = true;
-        queue = setPromptQueuePause(threadId, null);
-      }
       const hasDispatchable = serverPromptQueueHasDispatchableItem(threadId);
-      if (hasDispatchable) scheduleServerPromptQueueDispatch(threadId, 80);
       const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
       const wantsContinueTurn = wasPaused
         || body.continue === true
         || String(body.message || '').trim() !== '';
       const hasQueueItems = getPromptQueueItems(threadId).length > 0;
-      // Only synthesize a continuation turn for pure limit pauses with an empty queue.
-      // App interrupted queues still resume in place; web queues are dispatched above.
-      const canContinueWithoutQueue = !resumedApp && !hasDispatchable && !hasQueueItems && wantsContinueTurn;
-      if (canContinueWithoutQueue) {
-        // Pure 429/limit pause: clear pause then start a real continuation turn.
-        // Without this, resume only unlocks state and leaves the session idle.
+      // A provider-limit pause always resumes the interrupted turn first.
+      // Queued follow-ups stay queued until that continuation finishes.
+      const shouldContinuePausedTurn = wasPaused && !resumedApp && wantsContinueTurn;
+      const canContinueWithoutQueue = !resumedApp
+        && !wasPaused
+        && !hasDispatchable
+        && !hasQueueItems
+        && wantsContinueTurn;
+      if (shouldContinuePausedTurn || canContinueWithoutQueue) {
         const conversation = nativeSessions.get(threadId);
         if (nativeTurnReservations.has(threadId) || nativeActiveTurnFor(threadId, conversation)?.status === 'running') {
           const error = new Error('该 Codex App 会话已有任务正在运行');
@@ -2030,6 +2030,13 @@ app.post('/api/prompt-queues/:threadId/resume-interrupted', requireAuth, async (
         }
       } else if (!resumedApp && !wasPaused && !hasDispatchable) {
         throw appResumeError || promptQueueConflict('没有可继续的暂停任务', queue);
+      }
+      if (wasPaused) {
+        pauseCleared = true;
+        queue = setPromptQueuePause(threadId, null);
+      }
+      if (!wasPaused && hasDispatchable) {
+        scheduleServerPromptQueueDispatch(threadId, 80);
       }
       queue = getPromptQueueState(threadId);
     } catch (error) {
@@ -3257,22 +3264,13 @@ function handleNativeSessionChange(change) {
 function scheduleTerminalPromptQueueDispatches(change) {
   for (const candidate of Array.isArray(change?.changedIds) ? change.changedIds : []) {
     const threadId = cleanNativeThreadId(candidate);
-    if (!threadId || isPromptQueuePaused(threadId) || !serverPromptQueueHasDispatchableItem(threadId)) continue;
+    if (!threadId) continue;
     let conversation = null;
     try { conversation = nativeSessions.get(threadId); } catch {}
+    if (ensurePromptQueuePauseFromNative(threadId, conversation)) continue;
+    if (isPromptQueuePaused(threadId) || !serverPromptQueueHasDispatchableItem(threadId)) continue;
     const active = activeNativeTurns.get(threadId);
     if (active?.status === 'running' || (!active && conversation?.status === 'running')) continue;
-    // task_error with 429/limit is represented as interrupted + pause; do not auto-continue.
-    if (conversation?.status === 'error' && isTransientProviderLimitError(conversation?.messages?.slice?.(-1)?.[0]?.content || '')) continue;
-    const latestProcess = [...(conversation?.messages || [])].reverse().find((message) => message?.role === 'process');
-    if (
-      latestProcess
-      && ['task_error', 'error', 'turn_aborted'].includes(String(latestProcess.kind || ''))
-      && isTransientProviderLimitError(latestProcess.content)
-    ) {
-      pausePromptQueueForProviderLimit(threadId, latestProcess.content);
-      continue;
-    }
     scheduleServerPromptQueueDispatch(threadId, 160);
   }
 }
@@ -4024,6 +4022,39 @@ function isTransientProviderLimitError(message) {
     || value.includes('temporarily rate-limited')
     || /(^|\D)429(\D|$)/.test(value)
   );
+}
+
+function nativeProviderLimitPause(threadId, conversation = null) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return null;
+  let current = conversation;
+  if (!current) {
+    try { current = nativeSessions.get(id); } catch {}
+  }
+  const status = String(current?.status || '');
+  if (!['error', 'interrupted'].includes(status)) return null;
+  const latestTurnId = String(current?.latestTurnId || '');
+  const terminal = [...(current?.messages || [])].reverse().find((message) => (
+    message?.role === 'process'
+      && ['task_error', 'error', 'turn_aborted'].includes(String(message?.kind || ''))
+      && (!latestTurnId || String(message?.turnId || '') === latestTurnId)
+  ));
+  if (!terminal || !isTransientProviderLimitError(terminal.content)) return null;
+  return {
+    reason: 'rate_limit',
+    message: String(terminal.content || '').trim().slice(0, 800),
+    pausedAt: String(terminal.at || current?.updatedAt || new Date().toISOString()),
+  };
+}
+
+function ensurePromptQueuePauseFromNative(threadId, conversation = null) {
+  const id = cleanNativeThreadId(threadId);
+  if (!id) return null;
+  const existing = promptQueuePauseState(id);
+  if (existing) return existing;
+  const inferred = nativeProviderLimitPause(id, conversation);
+  if (!inferred) return null;
+  return pausePromptQueueForProviderLimit(id, inferred.message).pause || inferred;
 }
 
 function promptQueuePauseState(threadId) {
@@ -8741,9 +8772,10 @@ function retryServerPromptQueueDispatchAfterSettling(threadId, { quiet = false }
 
 function scheduleIdleServerPromptQueueDispatches() {
   for (const threadId of Object.keys(loadPromptQueues())) {
-    if (!serverPromptQueueHasDispatchableItem(threadId)) continue;
     let conversation = null;
     try { conversation = nativeSessions.get(threadId); } catch {}
+    if (ensurePromptQueuePauseFromNative(threadId, conversation)) continue;
+    if (!serverPromptQueueHasDispatchableItem(threadId)) continue;
     if (!conversation) {
       retryServerPromptQueueDispatchAfterSettling(threadId);
       continue;
@@ -8790,6 +8822,7 @@ async function dispatchNextServerQueuedPrompt(threadId) {
     retryServerPromptQueueDispatchAfterSettling(id);
     return false;
   }
+  if (ensurePromptQueuePauseFromNative(id, conversation)) return false;
   if (active?.status === 'running') return false;
   if (conversation.status === 'running') {
     retryServerPromptQueueDispatchAfterSettling(id, { quiet: true });
