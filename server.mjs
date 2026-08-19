@@ -9385,6 +9385,14 @@ let imagePreview = null;
 let imagePreviewImage = null;
 let imagePreviewClose = null;
 let imagePreviewReturnFocus = null;
+let codePreview = null;
+let codePreviewDialog = null;
+let codePreviewFrame = null;
+let codePreviewReload = null;
+let codePreviewFullscreen = null;
+let codePreviewClose = null;
+let codePreviewSource = '';
+let codePreviewReturnFocus = null;
 let appearance = {theme:${initialThemeModeLiteral},chatBackground:'default',customBackgrounds:[],fxEnabled:false};
 const systemThemeMedia=window.matchMedia('(prefers-color-scheme: dark)');
 const desktopSidebarMedia=window.matchMedia('(min-width: 821px)');
@@ -15475,7 +15483,8 @@ function syncModalOpenState(){
   const grok2ApiConsoleOpen=grok2ApiConsoleOverlay&&!grok2ApiConsoleOverlay.classList.contains('hidden');
   const archiveConfirmOpen=archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden');
   const previewOpen=imagePreview&&!imagePreview.classList.contains('hidden');
-  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||subQuotaSettingsOpen||grok2ApiConsoleOpen||archiveConfirmOpen||previewOpen));
+  const codePreviewOpen=codePreview&&!codePreview.classList.contains('hidden');
+  document.body.classList.toggle('modalOpen',Boolean(settingsOpen||subQuotaSettingsOpen||grok2ApiConsoleOpen||archiveConfirmOpen||previewOpen||codePreviewOpen));
 }
 function ensureImagePreview(){
   if(imagePreview)return;
@@ -15519,6 +15528,116 @@ function closeImagePreview(){
   syncModalOpenState();
   if(imagePreviewReturnFocus?.isConnected)imagePreviewReturnFocus.focus();
   imagePreviewReturnFocus=null;
+}
+function createCodePreviewFrame(){
+  const frame=document.createElement('iframe');
+  frame.className='codePreviewFrame';
+  frame.title='运行中的 HTML 预览';
+  frame.tabIndex=0;
+  frame.setAttribute('sandbox','allow-scripts');
+  frame.setAttribute('referrerpolicy','no-referrer');
+  return frame;
+}
+function replaceCodePreviewFrame(source=''){
+  const next=createCodePreviewFrame();
+  if(source){
+    next.addEventListener('load',()=>{
+      if(codePreview&&!codePreview.classList.contains('hidden')&&codePreviewFrame===next)next.focus();
+    },{once:true});
+    next.srcdoc=buildCodePreviewDocument(source);
+  }
+  if(codePreviewFrame?.isConnected)codePreviewFrame.replaceWith(next);
+  else codePreviewDialog?.appendChild(next);
+  codePreviewFrame=next;
+}
+function syncCodePreviewFullscreenButton(){
+  if(!codePreviewFullscreen)return;
+  const active=document.fullscreenElement===codePreviewDialog;
+  const label=active?'退出全屏':'全屏预览';
+  setIconLabel(codePreviewFullscreen,active?'minimize-2':'maximize-2',label,false);
+  codePreviewFullscreen.title=label;
+  codePreviewFullscreen.setAttribute('aria-label',label);
+}
+async function toggleCodePreviewFullscreen(){
+  if(!codePreviewDialog?.requestFullscreen)return;
+  try{
+    if(document.fullscreenElement===codePreviewDialog)await document.exitFullscreen();
+    else{
+      if(document.fullscreenElement)await document.exitFullscreen();
+      await codePreviewDialog.requestFullscreen();
+    }
+  }catch(e){}
+}
+function ensureCodePreview(){
+  if(codePreview)return;
+  codePreview=document.createElement('div');
+  codePreview.className='codePreview hidden';
+  codePreview.setAttribute('role','presentation');
+  codePreviewDialog=document.createElement('div');
+  codePreviewDialog.className='codePreviewDialog';
+  codePreviewDialog.setAttribute('role','dialog');
+  codePreviewDialog.setAttribute('aria-modal','true');
+  codePreviewDialog.setAttribute('aria-labelledby','codePreviewTitle');
+  const toolbar=document.createElement('header');
+  toolbar.className='codePreviewToolbar';
+  const title=document.createElement('div');
+  title.id='codePreviewTitle';
+  title.className='codePreviewTitle';
+  title.textContent='运行预览';
+  const actions=document.createElement('div');
+  actions.className='codePreviewActions';
+  codePreviewReload=document.createElement('button');
+  codePreviewReload.type='button';
+  codePreviewReload.className='codePreviewAction';
+  codePreviewReload.title='重新运行';
+  codePreviewReload.setAttribute('aria-label','重新运行');
+  setIconLabel(codePreviewReload,'refresh-cw','重新运行',false);
+  codePreviewFullscreen=document.createElement('button');
+  codePreviewFullscreen.type='button';
+  codePreviewFullscreen.className='codePreviewAction';
+  codePreviewFullscreen.hidden=!codePreviewDialog.requestFullscreen;
+  codePreviewClose=document.createElement('button');
+  codePreviewClose.type='button';
+  codePreviewClose.className='codePreviewAction';
+  codePreviewClose.title='关闭预览';
+  codePreviewClose.setAttribute('aria-label','关闭预览');
+  setIconLabel(codePreviewClose,'x','关闭预览',false);
+  syncCodePreviewFullscreenButton();
+  actions.append(codePreviewReload,codePreviewFullscreen,codePreviewClose);
+  toolbar.append(title,actions);
+  codePreviewFrame=createCodePreviewFrame();
+  codePreviewDialog.append(toolbar,codePreviewFrame);
+  codePreview.appendChild(codePreviewDialog);
+  document.body.appendChild(codePreview);
+  codePreviewReload.addEventListener('click',()=>replaceCodePreviewFrame(codePreviewSource));
+  codePreviewFullscreen.addEventListener('click',toggleCodePreviewFullscreen);
+  codePreviewClose.addEventListener('click',closeCodePreview);
+  codePreview.addEventListener('click',(event)=>{if(event.target===codePreview)closeCodePreview()});
+  codePreviewDialog.addEventListener('keydown',(event)=>trapDialogFocus(codePreviewDialog,event));
+  document.addEventListener('fullscreenchange',syncCodePreviewFullscreenButton);
+  refreshIcons(codePreview);
+}
+function openCodePreview(source,trigger){
+  const value=String(source||'');
+  if(!value||value.length>CODE_PREVIEW_MAX_CHARS)return;
+  ensureCodePreview();
+  closeComposerPopovers();
+  if(imagePreview&&!imagePreview.classList.contains('hidden'))closeImagePreview();
+  codePreviewSource=value;
+  codePreviewReturnFocus=trigger||document.activeElement;
+  codePreview.classList.remove('hidden');
+  replaceCodePreviewFrame(value);
+  syncModalOpenState();
+}
+function closeCodePreview(){
+  if(!codePreview||codePreview.classList.contains('hidden'))return;
+  codePreview.classList.add('hidden');
+  codePreviewSource='';
+  replaceCodePreviewFrame();
+  if(document.fullscreenElement===codePreviewDialog)document.exitFullscreen().catch(()=>{});
+  syncModalOpenState();
+  if(codePreviewReturnFocus?.isConnected)codePreviewReturnFocus.focus();
+  codePreviewReturnFocus=null;
 }
 function trapDialogFocus(dialog,event){
   if(event.key!=='Tab'||!dialog)return;
@@ -16497,7 +16616,7 @@ document.getElementById('scrim')?.addEventListener('click', closeMenu);
 document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();finishSideChatResize();app.classList.remove('menuOpen');renderSidebarWidth();renderSideChatWidth();syncMenuButton()});
 document.addEventListener('pointerdown',(event)=>{if(!promptQueueMenu||promptQueueMenu.classList.contains('hidden'))return;if(promptQueueMenu.contains(event.target)||event.target.closest?.('.promptQueueIconButton[aria-label="队列操作"]'))return;closePromptQueueMenu()});
-document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(historyUnreadPopover&&!historyUnreadPopover.hidden){closeHistoryUnreadPopover({restoreFocus:true});return}if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(grok2ApiConsoleOverlay&&!grok2ApiConsoleOverlay.classList.contains('hidden')){closeGrok2ApiConsole();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
+document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(historyUnreadPopover&&!historyUnreadPopover.hidden){closeHistoryUnreadPopover({restoreFocus:true});return}if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(codePreview&&!codePreview.classList.contains('hidden')){closeCodePreview();return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(grok2ApiConsoleOverlay&&!grok2ApiConsoleOverlay.classList.contains('hidden')){closeGrok2ApiConsole();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
 providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
 document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
 provider?.addEventListener('change',()=>{void requestComposerProviderChange(provider.value)});
@@ -20043,6 +20162,30 @@ function handleNativeVisibilityChange(){
 }
 const MARKDOWN_ALLOWED_TAGS=['p','br','strong','em','del','code','pre','blockquote','ul','ol','li','h1','h2','h3','h4','h5','h6','hr','a','img','figure','table','thead','tbody','tr','th','td'];
 const MARKDOWN_ALLOWED_ATTRS=['href','title','align','colspan','rowspan','start','src','alt','loading','decoding','class'];
+const CODE_PREVIEW_MAX_CHARS=524288;
+function markdownCodeLanguage(code){
+  for(const className of code?.classList||[]){
+    if(String(className).toLowerCase().startsWith('language-'))return String(className).slice(9).toLowerCase();
+  }
+  return '';
+}
+function isRunnableMarkdownCode(code){
+  const source=String(code?.textContent||'').trim();
+  if(!source||source.length>CODE_PREVIEW_MAX_CHARS)return false;
+  const language=markdownCodeLanguage(code);
+  if(language)return language==='html'||language==='htm';
+  const lower=source.toLowerCase();
+  return lower.startsWith('<!doctype html')||lower.startsWith('<html');
+}
+function buildCodePreviewDocument(value){
+  const source=String(value||'');
+  const policy='<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;unsafe-inline&#39;; style-src &#39;unsafe-inline&#39;; img-src data: blob:; media-src data: blob:; font-src data:; connect-src &#39;none&#39;; object-src &#39;none&#39;; frame-src &#39;none&#39;; child-src &#39;none&#39;; worker-src &#39;none&#39;; base-uri &#39;none&#39;; form-action &#39;none&#39;; navigate-to &#39;none&#39;">';
+  const viewport='<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">';
+  const referrer='<meta name="referrer" content="no-referrer">';
+  // The guarded head is parsed before any supplied markup, including malformed
+  // documents that place scripts before their own <head> element.
+  return '<!doctype html><html><head>'+policy+viewport+referrer+'</head><body>'+source+'</body></html>';
+}
 function enhanceMarkdownCodeBlocks(body){
   for(const pre of body.querySelectorAll('pre')){
     const code=pre.querySelector(':scope > code');
@@ -20058,6 +20201,17 @@ function enhanceMarkdownCodeBlocks(body){
     copy.setAttribute('aria-label','复制代码');
     setIconLabel(copy,'copy','复制代码',false);
     copy.addEventListener('click',(event)=>{event.stopPropagation();copyText(code.textContent||'',copy)});
+    if(isRunnableMarkdownCode(code)){
+      wrapper.classList.add('runnable');
+      const run=document.createElement('button');
+      run.type='button';
+      run.className='markdownCodeRun';
+      run.title='运行代码';
+      run.setAttribute('aria-label','运行代码');
+      setIconLabel(run,'play','运行代码',false);
+      run.addEventListener('click',(event)=>{event.stopPropagation();openCodePreview(code.textContent||'',run)});
+      wrapper.appendChild(run);
+    }
     wrapper.appendChild(copy);
   }
 }

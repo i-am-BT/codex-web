@@ -5557,6 +5557,121 @@ body[data-theme] .msg.image.inputImage {
   height: 18px;
 }
 
+.codePreview {
+  position: fixed;
+  z-index: 125;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 10, 14, 0.86);
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+  backdrop-filter: blur(6px);
+}
+
+.codePreviewDialog {
+  display: grid;
+  width: min(1180px, 100%);
+  height: min(900px, calc(100dvh - 32px));
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.48);
+}
+
+.codePreviewDialog:fullscreen {
+  width: 100vw;
+  height: 100dvh;
+  border: 0;
+  border-radius: 0;
+}
+
+.codePreviewToolbar {
+  display: flex;
+  min-width: 0;
+  min-height: 52px;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px 8px 16px;
+}
+
+.codePreviewTitle {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codePreviewActions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.codePreviewAction {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  padding: 0;
+}
+
+.codePreviewAction[hidden] {
+  display: none;
+}
+
+.codePreviewAction:hover,
+.codePreviewAction:focus-visible {
+  border-color: var(--border);
+  outline: none;
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.codePreviewAction .lucide {
+  width: 17px;
+  height: 17px;
+}
+
+.codePreviewFrame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  background: #ffffff;
+}
+
+@media (max-width: 820px) {
+  .codePreview {
+    place-items: stretch;
+    padding: 0;
+  }
+
+  .codePreviewDialog {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .codePreviewToolbar {
+    min-height: calc(52px + env(safe-area-inset-top, 0px));
+    padding: calc(8px + env(safe-area-inset-top, 0px)) max(10px, env(safe-area-inset-right, 0px)) 8px max(14px, env(safe-area-inset-left, 0px));
+  }
+}
+
 .msgActions {
   min-height: 24px;
   gap: 5px;
@@ -5938,10 +6053,14 @@ body[data-theme] .markdownCodeBlock > pre {
   padding-right: 46px;
 }
 
+.markdownCodeBlock.runnable > pre {
+  padding-right: 84px;
+}
+
+.markdownCodeRun,
 .markdownCodeCopy {
   position: absolute;
   top: 8px;
-  right: 8px;
   display: inline-grid;
   width: 30px;
   height: 30px;
@@ -5956,13 +6075,26 @@ body[data-theme] .markdownCodeBlock > pre {
   transition: opacity 140ms var(--ease), border-color 140ms var(--ease), background 140ms var(--ease), color 140ms var(--ease);
 }
 
+.markdownCodeRun {
+  right: 46px;
+}
+
+.markdownCodeCopy {
+  right: 8px;
+}
+
+.markdownCodeBlock:hover > .markdownCodeRun,
 .markdownCodeBlock:hover > .markdownCodeCopy,
+.markdownCodeBlock:focus-within > .markdownCodeRun,
 .markdownCodeBlock:focus-within > .markdownCodeCopy,
+.markdownCodeRun:focus-visible,
 .markdownCodeCopy:focus-visible {
   opacity: 1;
   pointer-events: auto;
 }
 
+.markdownCodeRun:hover,
+.markdownCodeRun:focus-visible,
 .markdownCodeCopy:hover,
 .markdownCodeCopy:focus-visible {
   border-color: var(--border-strong);
@@ -5970,12 +6102,18 @@ body[data-theme] .markdownCodeBlock > pre {
   color: var(--text);
 }
 
+.markdownCodeRun .lucide,
 .markdownCodeCopy .lucide {
   width: 15px;
   height: 15px;
 }
 
+.streaming .markdownCodeRun {
+  display: none;
+}
+
 @media (hover: none), (pointer: coarse) {
+  .markdownCodeRun,
   .markdownCodeCopy {
     opacity: 1;
     pointer-events: auto;
