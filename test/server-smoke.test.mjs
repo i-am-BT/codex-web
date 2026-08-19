@@ -2508,6 +2508,12 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.match(uiStyles, /\.markdownCodeBlock\s*\{[^}]*position:\s*relative;[^}]*max-width:\s*100%/s);
     assert.match(uiStyles, /\.markdownCodeCopy\s*\{[^}]*position:\s*absolute;[^}]*opacity:\s*0;[^}]*pointer-events:\s*none/s);
     assert.match(uiStyles, /@media \(hover: none\), \(pointer: coarse\)\s*\{[^}]*\.markdownCodeCopy\s*\{[^}]*opacity:\s*1;[^}]*pointer-events:\s*auto/s);
+    assert.match(uiStyles, /\.markdownCodeBlock\.runnable > pre\s*\{[^}]*padding-right:\s*84px/s);
+    assert.match(uiStyles, /\.markdownCodeRun\s*\{[^}]*right:\s*46px/s);
+    assert.match(uiStyles, /\.streaming \.markdownCodeRun\s*\{[^}]*display:\s*none/s);
+    assert.match(uiStyles, /\.codePreview\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*125/s);
+    assert.match(uiStyles, /\.codePreviewDialog\s*\{[^}]*grid-template-rows:\s*auto minmax\(0, 1fr\);[^}]*overflow:\s*hidden/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)\s*\{[^}]*\.codePreview\s*\{[^}]*place-items:\s*stretch;[^}]*padding:\s*0/s);
     assert.match(uiStyles, /\.msg\.assistant \.continueMsg\s*\{[^}]*background:\s*transparent/s);
     assert.match(uiStyles, /--conversation-width:\s*760px/);
     assert.match(uiStyles, /body \.chat > :is\([^}]*\.msg:not\(\.user\):not\(\.inputImage\)[^}]*\.liveProcessPanel[^}]*\)\s*\{[^}]*width:\s*min\(var\(--conversation-width\), 100%\);[^}]*align-self:\s*center/s);
@@ -3443,6 +3449,12 @@ updated_at = 1784422800000
     assert.match(page, /function enhanceMarkdownCodeBlocks\(body\)/);
     assert.match(page, /if\(assistantArtifacts\)enhanceMarkdownCodeBlocks\(body\)/);
     assert.match(page, /copyText\(code\.textContent\|\|'',copy\)/);
+    assert.match(page, /function openCodePreview\(source,trigger\)/);
+    assert.match(page, /run\.addEventListener\('click',\(event\)=>\{event\.stopPropagation\(\);openCodePreview\(code\.textContent\|\|'',run\)\}\)/);
+    assert.match(page, /frame\.setAttribute\('sandbox','allow-scripts'\)/);
+    assert.doesNotMatch(page, /frame\.setAttribute\('sandbox','[^']*allow-same-origin/);
+    assert.match(page, /frame\.setAttribute\('referrerpolicy','no-referrer'\)/);
+    assert.match(page, /function closeCodePreview\(\)\{[\s\S]*?codePreviewSource='';[\s\S]*?replaceCodePreviewFrame\(\)/);
     assert.match(page, /function toolActivityPresentations/);
     assert.match(page, /function planActivityPresentation/);
     assert.doesNotMatch(page, /function createTurnPlanElement|turnPlanPanel/);
@@ -3819,6 +3831,28 @@ updated_at = 1784422800000
     assert.match(page, /async function boot\(selectRecent=false\)/);
     const inlineScript = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]).sort((a, b) => b.length - a.length)[0];
     assert.ok(inlineScript);
+    const codePreviewHelpers = inlineScript.match(/(function markdownCodeLanguage[\s\S]*?)(?=function enhanceMarkdownCodeBlocks)/)?.[1];
+    assert.ok(codePreviewHelpers);
+    const codePreviewApi = new Function(
+      `const CODE_PREVIEW_MAX_CHARS=524288; ${codePreviewHelpers}; return { isRunnableMarkdownCode, buildCodePreviewDocument };`,
+    )();
+    assert.equal(codePreviewApi.isRunnableMarkdownCode({ classList: ['language-html'], textContent: '<canvas></canvas>' }), true);
+    assert.equal(codePreviewApi.isRunnableMarkdownCode({ classList: ['language-HTM'], textContent: '<p>run</p>' }), true);
+    assert.equal(codePreviewApi.isRunnableMarkdownCode({ classList: ['language-javascript'], textContent: 'alert(1)' }), false);
+    assert.equal(codePreviewApi.isRunnableMarkdownCode({ classList: [], textContent: '<!doctype html><title>Game</title>' }), true);
+    assert.equal(codePreviewApi.isRunnableMarkdownCode({ classList: [], textContent: '<canvas></canvas>' }), false);
+    assert.equal(codePreviewApi.isRunnableMarkdownCode({ classList: ['language-html'], textContent: 'x'.repeat(524289) }), false);
+    const hostilePreview = '<script>fetch("/api/config")</script><img src="https://example.com/a.png">';
+    const guardedPreview = codePreviewApi.buildCodePreviewDocument(hostilePreview);
+    assert.ok(guardedPreview.indexOf('Content-Security-Policy') < guardedPreview.indexOf(hostilePreview));
+    assert.match(guardedPreview, /default-src &#39;none&#39;/);
+    assert.match(guardedPreview, /connect-src &#39;none&#39;/);
+    assert.match(guardedPreview, /frame-src &#39;none&#39;/);
+    assert.match(guardedPreview, /worker-src &#39;none&#39;/);
+    assert.match(guardedPreview, /form-action &#39;none&#39;/);
+    assert.match(guardedPreview, /navigate-to &#39;none&#39;/);
+    assert.match(guardedPreview, /name="referrer" content="no-referrer"/);
+    assert.ok(guardedPreview.includes(hostilePreview));
     const composerModelItemsHelper = inlineScript.match(/(function composerModelItems[\s\S]*?)(?=function selectComposerModel)/)?.[1];
     assert.ok(composerModelItemsHelper);
     const composerModelItems = new Function(`let nativeModelCatalogIds=[]; ${composerModelItemsHelper}; return composerModelItems;`)();
