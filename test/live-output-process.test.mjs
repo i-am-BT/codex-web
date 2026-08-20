@@ -2580,8 +2580,8 @@ test('boot restores the last conversation chrome before content paints', () => {
   assert.match(inlineScript, /chat\.classList\.add\('conversationRestoring'\)/);
   assert.match(inlineScript, /chat\.replaceChildren\(\)/);
   assert.match(inlineScript, /function clearConversationRestoring/);
-  assert.match(inlineScript, /if\(!res\.ok\)\{clearConversationStatusLoading\(\);clearConversationRestoring\(\)/);
-  assert.match(inlineScript, /restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);[\s\S]*?clearConversationRestoring\(\)/s);
+  assert.match(inlineScript, /if\(!res\.ok\)\{clearConversationStatusLoading\(\);if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\)/);
+  assert.match(inlineScript, /restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);[\s\S]*?if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\)/s);
   assert.match(inlineScript, /clearConversationRestoring\(\)/);
   assert.match(inlineScript, /classList\.remove\('conversationRestoring'\)/);
   assert.match(uiStyles, /\.chat\.conversationRestoring/);
@@ -3140,7 +3140,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(mobileGoalStyles, /body \.composer > \.threadGoalBar\.runtimeOnly,[\s\S]*?display:\s*block;/s);
   const refreshFilesSource = sourceBetween('function refreshLiveEditedFilesResult', 'function createWebPreviewResultCard');
   assert.equal((refreshFilesSource.match(/renderThreadGoalBar\(\)/g) || []).length, 2);
-  assert.match(serverSource, /ui\.css\?v=mobile-composer-fullscreen-20260817e/);
+  assert.match(serverSource, /ui\.css\?v=quota-project-actions-20260820a/);
 });
 
 test('desktop live plan stays a compact pill with an on-demand detail popup', () => {
@@ -3246,4 +3246,30 @@ test('conversation load defers bottom alignment until the chat is laid out and p
   height = 1200;
   drain(1);
   assert.equal(writes.length, 1, 'user scrolling away stops the alignment loop');
+});
+
+test('initial history fill keeps the restore veil until every page finishes', () => {
+  const pagingSource = sourceBetween('async function loadEarlierNativeHistoryPage', 'async function loadConversation');
+  const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  const historyRestoreStart = loadConversation.indexOf('if(options.historyScrollAnchor){');
+  const historyRestoreEnd = loadConversation.indexOf('}else{', historyRestoreStart);
+  assert.ok(historyRestoreStart >= 0 && historyRestoreEnd > historyRestoreStart);
+  const historyRestoreBranch = loadConversation.slice(historyRestoreStart, historyRestoreEnd);
+
+  assert.match(
+    pagingSource,
+    /const holdConversationRestoring=fillViewport&&chat\.classList\.contains\('conversationRestoring'\)/,
+  );
+  assert.match(
+    pagingSource,
+    /historyScrollAnchor:anchor,[\s\S]*?holdConversationRestoring,[\s\S]*?skipPromptQueueSync:true/,
+  );
+  assert.match(
+    loadConversation,
+    /if\(!res\.ok\)\{clearConversationStatusLoading\(\);if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\)/,
+  );
+  assert.match(
+    historyRestoreBranch,
+    /if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\)/,
+  );
 });

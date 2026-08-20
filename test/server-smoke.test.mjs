@@ -211,6 +211,61 @@ test('Codex App quota card omits provider status metadata', async () => {
   assert.doesNotMatch(branch, /appendSubQuotaMeta\(meta,'状态 /);
 });
 
+test('quota display labels hide account email addresses', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isSubQuotaEmailLabel');
+  const helperEnd = serverSource.indexOf('\nfunction renderSubQuota', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const helpers = new Function(
+    'subQuotaSourceDefinition',
+    `${serverSource.slice(helperStart, helperEnd)}; return { isSubQuotaEmailLabel, subQuotaDisplayName };`,
+  )((provider) => ({
+    title: provider === 'sub2api' ? 'Sub2API' : 'CPA Codex',
+  }));
+
+  assert.equal(helpers.isSubQuotaEmailLabel('person@example.com'), true);
+  assert.equal(helpers.subQuotaDisplayName({
+    provider: 'cpa-codex',
+    sourceName: 'CPA Codex',
+    name: 'person@example.com',
+    email: 'person@example.com',
+  }), 'CPA Codex');
+  assert.equal(helpers.subQuotaDisplayName({
+    provider: 'cpa-codex',
+    sourceName: 'person@example.com',
+    name: 'person@example.com',
+  }), 'CPA Codex');
+  assert.equal(helpers.subQuotaDisplayName({
+    provider: 'sub2api',
+    sourceName: 'starter-10',
+    name: 'Team A',
+  }), 'starter-10 · Team A');
+});
+
+test('unlimited quota windows hide reset countdowns', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function subQuotaWindowIsUnlimited');
+  const helperEnd = serverSource.indexOf('\nfunction appendSubQuotaWindow', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const subQuotaWindowIsUnlimited = new Function(
+    `${serverSource.slice(helperStart, helperEnd)}; return subQuotaWindowIsUnlimited;`,
+  )();
+
+  assert.equal(subQuotaWindowIsUnlimited(87.03, null, null, false, 'USD'), true);
+  assert.equal(subQuotaWindowIsUnlimited(87.03, 0, null, false, 'USD'), true);
+  assert.equal(subQuotaWindowIsUnlimited(87.03, 100, 12.97, false, 'USD'), false);
+  assert.equal(subQuotaWindowIsUnlimited(87.03, null, null, false, '%'), false);
+  assert.equal(subQuotaWindowIsUnlimited(null, null, null, true, 'USD'), false);
+
+  const windowStart = helperEnd + 1;
+  const windowEnd = serverSource.indexOf('\nfunction appendSubQuotaExpiry', windowStart);
+  assert.ok(windowEnd > windowStart);
+  assert.match(
+    serverSource.slice(windowStart, windowEnd),
+    /if\(options\.showReset===true&&!unlimited&&windowData\.resetAt\)/,
+  );
+});
+
 test('native queue turns ignore unscoped idle status and stale completions', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const notificationStart = serverSource.indexOf('function handleAppServerNotification');
@@ -3418,7 +3473,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=mobile-composer-fullscreen-20260817e"/);
+    assert.match(page, /href="\/ui\.css\?v=quota-project-actions-20260820a"/);
     assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -3600,8 +3655,10 @@ updated_at = 1784422800000
     assert.match(page, /function handleSubQuotaToggleClick\(event\)/);
     assert.match(page, /const coarse=isCoarsePointer\(\)\|\|event\.pointerType==='touch'/);
     assert.match(page, /手机端点一下显示额度，再点一下打开配置/);
-    assert.match(page, /sourceName\.textContent=quota\.provider==='cpa-codex'\s*\? providerName/s);
-    assert.doesNotMatch(page, /providerName\+\(quota\.name&&quota\.name!==providerName/);
+    assert.match(page, /function isSubQuotaEmailLabel\(value\)/);
+    assert.match(page, /function subQuotaDisplayName\(quota\)/);
+    assert.match(page, /sourceName\.textContent=subQuotaDisplayName\(quota\)/);
+    assert.doesNotMatch(page, /sourceName\.textContent=quota\.provider==='cpa-codex'/);
     assert.match(page, /finiteSubQuotaNumber\(quota\.subscription\.monthly\?\.limit\)>0/);
     assert.match(page, /重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
     assert.match(page, /if\(stale\)appendSubQuotaMeta\(meta,subQuotaStaleMetaText\(quota\)\)/);
@@ -3631,6 +3688,10 @@ updated_at = 1784422800000
     assert.match(page, /fetch\('\/api\/sub-quotas\/grok2api\/console\?tail=160'/);
     assert.match(page, /setIconLabel\(syncBtn,'refresh-cw','额度同步'\)/);
     assert.match(page, /fetch\('\/api\/sub-quotas\/grok2api\/sync'/);
+    assert.match(page, /const sourceId=String\(button\.dataset\.sourceId\|\|''\)/);
+    assert.equal((page.match(/body:JSON\.stringify\(\{sourceId\}\)/g) || []).length, 2);
+    assert.match(page, /syncBtn\.dataset\.sourceId=String\(quota\.sourceId\|\|quota\.id\|\|''\)/);
+    assert.match(page, /resetBtn\.dataset\.sourceId=String\(quota\.sourceId\|\|quota\.id\|\|''\)/);
     assert.doesNotMatch(page, /setIconLabel\(consoleBtn,'terminal-square','控制台'\)/);
     assert.match(page, /function formatCodexAppUsdAmount\(value\)/);
     assert.match(page, /formatCodexAppUsdAmount\(dollars\)/);
@@ -3638,17 +3699,42 @@ updated_at = 1784422800000
     assert.match(page, /baseUrlInput\.type='url'/);
     assert.doesNotMatch(page, /baseUrlInput\.required=true/);
     assert.match(page, /baseUrlInput\.autocomplete='url'/);
-    assert.match(page, /subQuotaSettingsSourceList\.appendChild\(createSourceFields\('cpa-codex','CPA Codex'/);
-    assert.match(page, /subQuotaSettingsSourceList\.appendChild\(createSourceFields\('sub2api','Sub2API'/);
+    assert.match(page, /subQuotaSettingsInputs=new Map\(\)/);
+    assert.match(page, /let subQuotaSettingsSyncSequence = 0/);
+    assert.match(page, /subQuotaSettingsForm\.toggleAttribute\('inert',Boolean\(busy\)\)/);
+    assert.match(page, /const syncSequence=\+\+subQuotaSettingsSyncSequence/);
+    assert.match(page, /if\(syncSequence!==subQuotaSettingsSyncSequence\)return false/);
+    assert.match(page, /function createSubQuotaManualSourceId\(provider\)/);
+    assert.match(page, /function addSubQuotaSettingsSource\(provider\)/);
+    assert.match(page, /function removeSubQuotaSettingsSource\(sourceId\)/);
+    assert.match(page, /subQuotaSettingsInputs\.set\(sourceId,inputs\)/);
+    assert.match(page, /subQuotaSettingsInputs\.get\(sourceId\)/);
+    assert.match(page, /subQuotaSettingsInputs\.delete\(sourceId\)/);
+    assert.match(page, /source\.dataset\.sourceId=sourceId/);
+    assert.match(page, /sameTypeCount=\[\.\.\.subQuotaSettingsInputs\.values\(\)\]\.filter\(\(inputs\)=>inputs\.provider===provider\)\.length/);
+    assert.match(page, /removeButton\.addEventListener\('click',\(\)=>removeSubQuotaSettingsSource\(sourceId\)\)/);
+    assert.match(page, /removeButton\?\.setAttribute\('aria-label','删除 '\+nextName\)/);
+    assert.match(page, /source\.className='subQuotaSettingsSource'\+\(builtin\?' subQuotaSettingsBuiltinSource':''\)/);
+    assert.match(page, /for\(const provider of \['cpa-codex','sub2api','grok2api','deepseek','openai-compatible'\]\)/);
+    assert.match(page, /subQuotaAddSourceButton\.addEventListener\('click',\(\)=>addSubQuotaSettingsSource\(subQuotaAddSourceType\.value\)\)/);
+    assert.match(page, /'openai-compatible':\{title:'OpenAI 兼容',detail:'检测 \/v1\/models 连通性，不提供余额'/);
+    assert.match(page, /if\(quota\.provider==='openai-compatible'\)\{/);
+    assert.match(page, /statusTitle\.textContent=stale\?'最近检测可用':'已连接'/);
+    assert.match(page, /已通过 \/v1\/models 连通性检测，兼容协议不提供余额。/);
+    assert.match(page, /source\.dataset\.provider=String\(quota\.provider\|\|''\)/);
+    assert.match(page, /source\.dataset\.sourceId=isCodexApp\?'codex-app':String\(quota\.sourceId\|\|quota\.id\|\|''\)/);
     assert.match(page, /footer\.className='subQuotaSettingsFooter'/);
-    assert.match(page, /subQuotaSettingsForm\.insertBefore\(inputs\.source,footer\)/);
 
     assert.match(page, /inputs\.baseUrlInput\.value=source\.baseUrl\|\|''/);
     assert.match(page, /source\.keyConfigured\?'Key 已配置，留空保留'/);
     assert.match(page, /正在保存额度配置…/);
+    assert.match(page, /const orderedIds=\[\.\.\.subQuotaSettingsSourceList\.querySelectorAll\('\.subQuotaSettingsSource'\)\]\.map\(\(element\)=>element\.dataset\.sourceId\)\.filter\(Boolean\)/);
+    assert.match(page, /id:inputs\.id,\s*name:inputs\.nameInput\?\.value\.trim\(\)\|\|inputs\.sourceTitle\?\.textContent\|\|subQuotaSourceDefinition\(inputs\.provider\)\.title,\s*provider:inputs\.provider,\s*baseUrl:inputs\.baseUrlInput\.value,\s*apiKey:inputs\.apiKeyInput\.value,\s*visible:subQuotaVisibilityValue\(inputs\.visibilityToggle\),/s);
+    assert.match(page, /const order=orderedIds/);
     assert.match(page, /JSON\.stringify\(\{sources,order,codexAppVisible\}\)/);
     assert.match(page, /各来源独立保存，检测失败不影响配置/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
+    assert.match(page, /void syncSubQuotaSettings\(\)\.then\(\(loaded\)=>\{/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);
     assert.match(page, /subQuotaSettingsClose\.addEventListener\('click',closeSubQuotaSettings\)/);
     assert.match(page, /event\.target===subQuotaSettingsOverlay\)closeSubQuotaSettings\(\)/);
@@ -4015,7 +4101,9 @@ updated_at = 1784422800000
     assert.ok(firstFiveHourWindow >= 0);
     assert.ok(dailySubscriptionWindow > firstFiveHourWindow);
     assert.match(inlineScript, /const label=isSub2Api\?'5小时':subQuotaRateLimitLabel\(rateLimit\.window\)/);
-    assert.match(inlineScript, /if\(isSub2ApiSubscription&&expiresAt\)appendSubQuotaExpiry\(source,expiresAt\)/);
+    assert.match(inlineScript, /const showDedicatedExpiry=isSub2ApiSubscription\|\|quota\.provider==='cpa-codex'/);
+    assert.match(inlineScript, /if\(showDedicatedExpiry&&expiresAt\)appendSubQuotaExpiry\(source,expiresAt\)/);
+    assert.match(inlineScript, /if\(!showDedicatedExpiry&&expiresAt\)appendSubQuotaMeta\(meta,'到期 '\+formatSubQuotaDate\(expiresAt\)\)/);
     assert.match(uiStyles, /\.subQuotaProgressBar\[data-level="normal"\],\s*\.subQuotaProgressBar\[data-level="available"\]\s*\{[^}]*background:\s*#22c55e/s);
     assert.match(uiStyles, /\.subQuotaProgressBar\[data-level="warning"\]\s*\{[^}]*background:\s*#f97316/s);
     assert.match(uiStyles, /\.subQuotaProgressBar\[data-level="exhausted"\]\s*\{[^}]*background:\s*var\(--danger\)/s);

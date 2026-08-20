@@ -1228,6 +1228,104 @@ body .grok2ApiConsoleIconButton:disabled {
   color: var(--success);
 }
 
+.subQuotaSettingsToolbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--primary) 5%, var(--surface-raised));
+  padding: 10px 11px;
+}
+
+.subQuotaSettingsToolbarCopy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.subQuotaSettingsToolbarTitle {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaSettingsToolbarHint {
+  overflow: hidden;
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaSettingsToolbarActions {
+  display: flex;
+  min-width: 0;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.subQuotaAddSourceType,
+.subQuotaSourceTypeSelect {
+  min-width: 132px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 9px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.subQuotaAddSourceType:focus-visible,
+.subQuotaSourceTypeSelect:focus-visible,
+.subQuotaManualSourceNameInput:focus-visible,
+.subQuotaSettingsSourceNameInput:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.subQuotaAddSourceButton {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid color-mix(in srgb, var(--primary) 45%, var(--border));
+  border-radius: 7px;
+  background: var(--primary);
+  color: var(--primary-contrast, #fff);
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.subQuotaAddSourceButton:hover:not(:disabled) {
+  border-color: var(--primary-hover);
+  background: var(--primary-hover);
+}
+
+.subQuotaAddSourceButton:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.subQuotaAddSourceButton .lucide {
+  width: 14px;
+  height: 14px;
+}
+
 .subQuotaSettingsForm {
   display: grid;
   min-width: 0;
@@ -1236,6 +1334,7 @@ body .grok2ApiConsoleIconButton:disabled {
 
 .subQuotaSettingsSourceList {
   display: grid;
+  min-height: 0;
   min-width: 0;
   gap: 10px;
 }
@@ -1383,7 +1482,10 @@ body .grok2ApiConsoleIconButton:disabled {
 
 .subQuotaVisibilityToggle:focus-visible,
 .subQuotaMoveButton:focus-visible,
-.subQuotaCodexRefresh:focus-visible {
+.subQuotaCodexRefresh:focus-visible,
+.subQuotaSourceRemoveButton:focus-visible,
+.subQuotaRemoveButton:focus-visible,
+.subQuotaAddSourceButton:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
@@ -1428,7 +1530,9 @@ body .grok2ApiConsoleIconButton:disabled {
 }
 
 .subQuotaMoveButton,
-.subQuotaCodexRefresh {
+.subQuotaCodexRefresh,
+.subQuotaSourceRemoveButton,
+.subQuotaRemoveButton {
   display: inline-flex;
   width: 26px;
   height: 26px;
@@ -1443,20 +1547,39 @@ body .grok2ApiConsoleIconButton:disabled {
 }
 
 .subQuotaMoveButton:hover:not(:disabled),
-.subQuotaCodexRefresh:hover:not(:disabled) {
+.subQuotaCodexRefresh:hover:not(:disabled),
+.subQuotaSourceRemoveButton:hover:not(:disabled),
+.subQuotaRemoveButton:hover:not(:disabled) {
   border-color: var(--border-strong);
   background: var(--surface-hover);
   color: var(--text);
 }
 
+.subQuotaSourceRemoveButton,
+.subQuotaRemoveButton {
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
+  color: var(--danger);
+}
+
+.subQuotaSourceRemoveButton:hover:not(:disabled),
+.subQuotaRemoveButton:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--danger) 58%, var(--border-strong));
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface-hover));
+  color: var(--danger);
+}
+
 .subQuotaMoveButton:disabled,
-.subQuotaCodexRefresh:disabled {
+.subQuotaCodexRefresh:disabled,
+.subQuotaSourceRemoveButton:disabled,
+.subQuotaRemoveButton:disabled {
   opacity: 0.4;
   cursor: default;
 }
 
 .subQuotaMoveButton .lucide,
-.subQuotaCodexRefresh .lucide {
+.subQuotaCodexRefresh .lucide,
+.subQuotaSourceRemoveButton .lucide,
+.subQuotaRemoveButton .lucide {
   width: 14px;
   height: 14px;
 }
@@ -1466,6 +1589,111 @@ body .grok2ApiConsoleIconButton:disabled {
   min-width: 0;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
   gap: 10px;
+}
+
+.subQuotaManualSourceFields {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr);
+  gap: 10px;
+}
+
+.subQuotaManualSourceField,
+.subQuotaSettingsSourceNameField {
+  min-width: 0;
+  margin: 0;
+}
+
+.subQuotaManualSourceNameInput,
+.subQuotaSettingsSourceNameInput {
+  width: 100%;
+  min-width: 0;
+}
+
+.subQuotaManualSourceNameInput::placeholder,
+.subQuotaSettingsSourceNameInput::placeholder {
+  color: var(--text-subtle);
+  opacity: 0.8;
+}
+
+.subQuotaOpenAiStatus,
+.subQuotaOpenAIStatus {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 9px 10px;
+}
+
+.subQuotaOpenAiStatusIcon,
+.subQuotaOpenAIStatusIcon {
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-raised);
+  color: var(--primary);
+}
+
+.subQuotaOpenAiStatusIcon .lucide,
+.subQuotaOpenAIStatusIcon .lucide {
+  width: 15px;
+  height: 15px;
+}
+
+.subQuotaOpenAiStatusCopy,
+.subQuotaOpenAIStatusCopy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.subQuotaOpenAiStatusTitle,
+.subQuotaOpenAIStatusTitle {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subQuotaOpenAiStatusMessage,
+.subQuotaOpenAIStatusMessage {
+  min-width: 0;
+  color: var(--text-subtle);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.subQuotaOpenAiStatus[data-state="loading"],
+.subQuotaOpenAIStatus[data-state="loading"] {
+  border-color: color-mix(in srgb, var(--thinking) 38%, var(--border));
+}
+
+.subQuotaOpenAiStatus[data-state="success"],
+.subQuotaOpenAIStatus[data-state="success"] {
+  border-color: color-mix(in srgb, var(--success) 38%, var(--border));
+  background: color-mix(in srgb, var(--success) 6%, var(--surface));
+}
+
+.subQuotaOpenAiStatus[data-state="error"],
+.subQuotaOpenAIStatus[data-state="error"] {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border));
+  background: color-mix(in srgb, var(--danger) 6%, var(--surface));
+}
+
+.subQuotaSource[data-provider="openai-compatible"] .subQuotaPlan,
+.subQuotaSource[data-provider="openai"] .subQuotaPlan {
+  border-color: color-mix(in srgb, var(--primary) 28%, var(--border));
 }
 
 .subQuotaCredentialHint {
@@ -3189,6 +3417,46 @@ body.modalOpen {
 
 .archiveConfirmSubmit[aria-busy="true"] .lucide {
   animation: spin 0.9s linear infinite;
+}
+
+.projectRenameField {
+  display: grid;
+  gap: 7px;
+  margin-top: 18px;
+}
+
+.projectRenameField > span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.projectRenameInput {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  outline: none;
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 13px;
+}
+
+.projectRenameInput:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.projectRenamePath {
+  overflow: hidden;
+  margin-top: 8px;
+  color: var(--text-subtle);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .settingsDialog {
@@ -5010,18 +5278,20 @@ body[data-theme] .histDelete {
 }
 
 .historyProjectPreviewAction {
-  display: grid;
+  display: inline-flex;
   min-height: 34px;
-  grid-template-columns: 16px minmax(0, 1fr);
   align-items: center;
+  justify-content: center;
   gap: 7px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
   color: var(--text);
   padding: 7px 9px;
-  text-align: left;
+  text-align: center;
   font-size: 12px;
+  cursor: pointer;
+  pointer-events: auto;
 }
 
 .historyProjectPreviewAction:hover,
@@ -12566,6 +12836,16 @@ body .composer > .box:focus-within {
     flex: 1 1 0;
   }
 
+  .projectRenameOverlay {
+    place-items: center;
+    padding: 14px;
+  }
+
+  .projectRenameDialog {
+    width: min(420px, calc(100vw - 28px));
+    padding: 18px 16px;
+  }
+
   .subQuotaSettingsOverlay {
     place-items: center;
     align-content: center;
@@ -12582,15 +12862,69 @@ body .composer > .box:focus-within {
     padding: 12px 12px 14px;
   }
 
+  .subQuotaSettingsToolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .subQuotaSettingsToolbarTitle,
+  .subQuotaSettingsToolbarHint {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  .subQuotaSettingsToolbarActions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .subQuotaAddSourceType,
+  .subQuotaSourceTypeSelect {
+    min-width: 0;
+    min-height: 40px;
+    flex: 1 1 160px;
+  }
+
+  .subQuotaAddSourceButton {
+    min-height: 40px;
+    flex: 1 1 118px;
+  }
+
+  .subQuotaMoveButton,
+  .subQuotaCodexRefresh,
+  .subQuotaSourceRemoveButton,
+  .subQuotaRemoveButton {
+    width: 40px;
+    height: 40px;
+  }
+
   .subQuotaSettingsSource {
     padding: 12px;
   }
 
   .subQuotaSettingsSourceHead {
     align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .subQuotaSettingsSourceIdentity {
+    flex: 1 1 190px;
+  }
+
+  .subQuotaSettingsSourceTitle,
+  .subQuotaSettingsSourceDetail {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .subQuotaSettingsSourceActions {
+    max-width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 5px;
   }
 
@@ -12604,6 +12938,29 @@ body .composer > .box:focus-within {
 
   .subQuotaSettingsFields {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .subQuotaManualSourceFields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .subQuotaOpenAiStatus,
+  .subQuotaOpenAIStatus {
+    grid-template-columns: 26px minmax(0, 1fr);
+    padding: 9px;
+  }
+
+  .subQuotaOpenAiStatusIcon,
+  .subQuotaOpenAIStatusIcon {
+    width: 26px;
+    height: 26px;
+  }
+
+  .subQuotaOpenAiStatusTitle,
+  .subQuotaOpenAIStatusTitle {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
   }
 
   .subQuotaCodexSummary {
@@ -12632,7 +12989,7 @@ body .composer > .box:focus-within {
 
   .subQuotaSettingsFooter {
     align-items: stretch;
-    flex-direction: column;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .subQuotaSettingsSubmit {

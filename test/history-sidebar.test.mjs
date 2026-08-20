@@ -23,6 +23,13 @@ function sourceBetween(start, end) {
 const groupingSource = sourceBetween('function conversationKey', 'function setMainView');
 const composerProjectsSource = sourceBetween('function composerProjectPaths', 'function selectComposerProjectPath');
 const completionStateSource = sourceBetween('function readHistoryCompletionState', 'function historyProjectName');
+const unreadPopoverSource = sourceBetween('function renderHistoryUnreadPopover', 'function markHistoryCompletionRead');
+const removedCodexAppUnreadSource = serverSource.match(
+  /function removedCodexAppUnreadThreadIds\(previous, current\) \{[\s\S]*?\n\}/,
+)?.[0];
+const syncCodexAppUnreadSource = serverSource.match(
+  /function syncServerHistoryCompletionReadFromCodexApp\(\) \{[\s\S]*?\n\}/,
+)?.[0];
 
 test('projectless sessions remain tasks even when they have generated working directories', () => {
   const api = new Function(`${groupingSource}; return { isStandaloneHistoryItem, partitionHistoryItems };`)();
@@ -166,6 +173,59 @@ test('a read completion stays read when its completed metadata changes', () => {
   assert.equal(api.historyCompletionUnread(doneUnread), true);
   api.trackHistoryCompletionState([doneUnreadAfterMetadataSync]);
   assert.equal(api.historyCompletionUnread(doneUnreadAfterMetadataSync), true);
+});
+
+test('opening the unread popover does not mark a completion as read', () => {
+  assert.doesNotMatch(
+    unreadPopoverSource.match(/function toggleHistoryUnreadPopover\(\)\{[\s\S]*?\n\}/)?.[0] || '',
+    /markHistoryCompletionRead/,
+  );
+  assert.match(
+    unreadPopoverSource,
+    /button\.addEventListener\('click',\(\)=>\{\s*markHistoryCompletionRead\(item\)/,
+  );
+});
+
+test('Codex App read sync requires an unread-to-read transition', () => {
+  assert.ok(removedCodexAppUnreadSource);
+  assert.ok(syncCodexAppUnreadSource);
+  let unreadThreadIds = new Set(['thread-a']);
+  const writes = [];
+  const api = new Function(
+    'readCodexAppUnreadThreadIds',
+    'nativeSessionSummaries',
+    'cleanNativeThreadId',
+    'serverHistoryCompletionVersion',
+    'selectServerHistoryCompletionReadVersion',
+    'writeHistoryCompletionReadFile',
+    `let lastCodexAppUnreadThreadIds=new Set(['thread-a']);
+     let serverHistoryCompletionRead={};
+     ${removedCodexAppUnreadSource}
+     ${syncCodexAppUnreadSource}
+     return {
+       syncServerHistoryCompletionReadFromCodexApp,
+       read: () => ({ ...serverHistoryCompletionRead }),
+     };`,
+  )(
+    () => new Set(unreadThreadIds),
+    () => [
+      { id: 'thread-a', status: 'done', updatedAt: '2026-08-18T00:10:00.000Z' },
+      { id: 'thread-b', status: 'done', updatedAt: '2026-08-18T00:20:00.000Z' },
+    ],
+    (id) => String(id || ''),
+    (item) => `${item.status}|${item.updatedAt}`,
+    (_current, incoming) => incoming,
+    () => writes.push(true),
+  );
+
+  assert.equal(api.syncServerHistoryCompletionReadFromCodexApp(), false);
+  assert.deepEqual(api.read(), {});
+  unreadThreadIds = new Set();
+  assert.equal(api.syncServerHistoryCompletionReadFromCodexApp(), true);
+  assert.deepEqual(api.read(), {
+    'codex:thread-a': 'done|2026-08-18T00:10:00.000Z',
+  });
+  assert.equal(writes.length, 1);
 });
 
 test('a stale server sync cannot revive a completion dot after it was clicked', async () => {
@@ -477,6 +537,7 @@ test('history completion read sync is single-flight and delayed during session c
 });
 
 test('project headers can start a new task in the current project path', () => {
+  const previewSource = sourceBetween('function showHistoryProjectPreview', 'function cancelHistoryProjectPreviewHide');
   assert.match(inlineScript, /function startNewTaskInProject\(projectPath/);
   assert.match(inlineScript, /newChat\(\);\s*cwd\.value=path;/);
   assert.match(inlineScript, /historyProjectEditButton/);
@@ -489,6 +550,36 @@ test('project headers can start a new task in the current project path', () => {
   assert.match(inlineScript, /setIconLabel\(newTaskButton,'plus','新建任务'\)/);
   assert.match(uiStyles, /\.historyProjectActions\s*\{/);
   assert.match(uiStyles, /\.historyProjectPreviewActions\s*\{/);
+  assert.match(uiStyles, /\.historyProjectPreviewAction\s*\{[^}]*display:\s*inline-flex[^}]*justify-content:\s*center[^}]*text-align:\s*center[^}]*pointer-events:\s*auto/s);
+  assert.match(previewSource, /renameHistoryProject\(groupKey\|\|historyProjectKey\(projectPath\),projectPath,projectName\)/);
+  assert.match(previewSource, /startNewTaskInProject\(projectPath\)/);
+  assert.match(previewSource, /newTaskButton\.disabled=!projectPath/);
+});
+
+test('project edit uses an in-page dialog supported by the Codex browser', () => {
+  const renameSource = sourceBetween('function ensureProjectRenameDialog', 'async function archiveHistoryProject');
+  assert.match(renameSource, /projectRenameDialog\.setAttribute\('role','dialog'\)/);
+  assert.match(renameSource, /projectRenameInput\.className='projectRenameInput'/);
+  assert.match(renameSource, /projectRenameDialog\.addEventListener\('submit',submitProjectRename\)/);
+  assert.match(renameSource, /projectRenameOverlay\.classList\.remove\('hidden'\)/);
+  assert.match(renameSource, /renamedHistoryProjects\.(?:delete|set)\(/);
+  assert.doesNotMatch(renameSource, /\bprompt\s*\(/);
+  assert.match(inlineScript, /const projectRenameOpen=projectRenameOverlay&&!projectRenameOverlay\.classList\.contains\('hidden'\)/);
+  assert.match(uiStyles, /\.projectRenameInput\s*\{[^}]*min-height:\s*42px/s);
+});
+
+test('project preview stays interactive while the pointer travels from the header to its actions', () => {
+  assert.match(inlineScript, /const HISTORY_PROJECT_PREVIEW_HIDE_DELAY_MS=320/);
+  assert.match(inlineScript, /function cancelHistoryProjectPreviewHide\(\){[\s\S]*clearTimeout\(historyProjectPreviewHideTimer\)/);
+  assert.match(inlineScript, /function scheduleHistoryProjectPreviewHide\(\){[\s\S]*setTimeout\(\(\)=>{[\s\S]*hideHistoryProjectPreview\(\)/);
+  const previewSource = sourceBetween('function ensureHistoryProjectPreview', 'function appendHistoryProjectPreviewRow');
+  assert.match(previewSource, /preview\.addEventListener\('pointerenter',cancelHistoryProjectPreviewHide\)/);
+  assert.match(previewSource, /preview\.addEventListener\('pointerleave',scheduleHistoryProjectPreviewHide\)/);
+  assert.match(previewSource, /preview\.addEventListener\('focusin',cancelHistoryProjectPreviewHide\)/);
+  const renderSource = sourceBetween('function renderHistory', 'function createHistoryRow');
+  assert.match(renderSource, /header\.addEventListener\('pointerleave',scheduleHistoryProjectPreviewHide\)/);
+  assert.match(renderSource, /historyProjectPreview\?\.contains\(event\.relatedTarget\)/);
+  assert.match(uiStyles, /\.historyProjectPreview\.visible\s*\{[^}]*pointer-events:\s*auto/s);
 });
 
 test('project preview stays interactive while the pointer travels from the header to its actions', () => {
