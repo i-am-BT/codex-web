@@ -95,14 +95,26 @@ export class SubQuotaService {
   }
 
   async fetchSource(source, fetchedAt) {
-    if (source.provider === 'cpa-codex') return this.fetchCpaCodexSource(source, fetchedAt);
-    if (source.provider === 'grok2api') return this.fetchGrok2ApiSource(source, fetchedAt);
-    if (source.provider === 'deepseek') return this.fetchDeepSeekSource(source, fetchedAt);
-    return this.fetchSub2ApiSource(source, fetchedAt);
+    let provider;
+    try {
+      provider = normalizeProvider(source?.provider);
+    } catch (error) {
+      return [fetchErrorQuota(
+        sourceQuotaBase(source, cleanText(source?.provider, 40).toLowerCase() || 'unknown', fetchedAt),
+        error,
+        { sourceWide: true },
+      )];
+    }
+    const normalizedSource = source?.provider === provider ? source : { ...source, provider };
+    if (provider === 'cpa-codex') return this.fetchCpaCodexSource(normalizedSource, fetchedAt);
+    if (provider === 'grok2api') return this.fetchGrok2ApiSource(normalizedSource, fetchedAt);
+    if (provider === 'deepseek') return this.fetchDeepSeekSource(normalizedSource, fetchedAt);
+    if (provider === 'openai-compatible') return this.fetchOpenAiCompatibleSource(normalizedSource, fetchedAt);
+    return this.fetchSub2ApiSource(normalizedSource, fetchedAt);
   }
 
   async fetchGrok2ApiSource(source, fetchedAt) {
-    const base = { id: source.id, name: source.name, provider: 'grok2api', fetchedAt };
+    const base = sourceQuotaBase(source, 'grok2api', fetchedAt);
     if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
 
     try {
@@ -121,7 +133,7 @@ export class SubQuotaService {
   }
 
   async fetchDeepSeekSource(source, fetchedAt) {
-    const base = { id: source.id, name: source.name, provider: 'deepseek', fetchedAt };
+    const base = sourceQuotaBase(source, 'deepseek', fetchedAt);
     if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
 
     try {
@@ -132,6 +144,41 @@ export class SubQuotaService {
         },
       });
       return [{ ...base, ...normalizeDeepSeekBalance(data) }];
+    } catch (error) {
+      return [fetchErrorQuota(base, error, { sourceWide: true })];
+    }
+  }
+
+  async fetchOpenAiCompatibleSource(source, fetchedAt) {
+    const base = sourceQuotaBase(source, 'openai-compatible', fetchedAt);
+    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+
+    try {
+      const data = await this.requestJson(`${source.baseUrl}/v1/models`, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${source.apiKey}`,
+        },
+      });
+      const models = Array.isArray(data) ? data : data?.data;
+      if (!Array.isArray(models)) throw new Error('OpenAI 兼容 /v1/models 响应无效');
+      return [{
+        ...base,
+        valid: true,
+        mode: 'openai_compatible',
+        status: 'active',
+        planName: 'OpenAI 兼容',
+        unit: '',
+        remaining: null,
+        balance: null,
+        quota: null,
+        subscription: null,
+        rateLimits: [],
+        expiresAt: '',
+        daysUntilExpiry: null,
+        today: null,
+        total: null,
+      }];
     } catch (error) {
       return [fetchErrorQuota(base, error, { sourceWide: true })];
     }
@@ -385,7 +432,7 @@ export class SubQuotaService {
   }
 
   async fetchSub2ApiSource(source, fetchedAt) {
-    const base = { id: source.id, name: source.name, provider: 'sub2api', fetchedAt };
+    const base = sourceQuotaBase(source, 'sub2api', fetchedAt);
     if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
 
     try {
@@ -454,8 +501,10 @@ export class SubQuotaService {
         },
       },
     );
+    const sourceId = quotaSourceId(source, 'sub2api');
     return normalizeSub2ApiCodexAccounts(data).map((quota, index) => ({
-      id: `${source.id}-codex-${quota.accountId || index + 1}`,
+      id: scopedQuotaId(sourceId, `codex-${quota.accountId || index + 1}`),
+      sourceId,
       name: quota.name,
       provider: 'sub2api',
       sourceName: source.name,
@@ -465,7 +514,7 @@ export class SubQuotaService {
   }
 
   async fetchCpaCodexSource(source, fetchedAt) {
-    const base = { id: source.id, name: source.name, provider: 'cpa-codex', fetchedAt };
+    const base = sourceQuotaBase(source, 'cpa-codex', fetchedAt);
     if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
 
     try {
@@ -476,9 +525,12 @@ export class SubQuotaService {
       }
 
       const quotas = [];
-      for (const file of codexFiles) {
+      const sourceId = quotaSourceId(source, 'cpa-codex');
+      for (const [index, file] of codexFiles.entries()) {
+        const accountKey = cleanText(file.id || file.name || file.auth_index, 100) || `account-${index + 1}`;
         const accountBase = {
-          id: cleanText(file.id || file.name || file.auth_index || `${source.id}-codex`, 120) || `${source.id}-codex`,
+          id: scopedQuotaId(sourceId, `codex-${accountKey}`),
+          sourceId,
           name: cleanText(file.email || file.label || file.account || file.name || 'Codex', 100) || 'Codex',
           provider: 'cpa-codex',
           fetchedAt,
@@ -584,6 +636,27 @@ export class SubQuotaService {
       clearTimeout(timeout);
     }
   }
+}
+
+function quotaSourceId(source, provider = 'quota') {
+  return cleanText(source?.id, 120) || `${provider}-source`;
+}
+
+function sourceQuotaBase(source, provider, fetchedAt) {
+  const sourceId = quotaSourceId(source, provider);
+  return {
+    id: sourceId,
+    sourceId,
+    name: cleanText(source?.name, 80) || sourceId,
+    provider,
+    fetchedAt,
+  };
+}
+
+function scopedQuotaId(sourceId, itemId) {
+  const prefix = cleanText(sourceId, 120) || 'source';
+  const suffix = cleanText(itemId, 120) || 'quota';
+  return `${prefix}-${suffix}`.slice(0, 240);
 }
 
 export function parseSubQuotaSources(value, env = process.env) {
@@ -737,6 +810,16 @@ export function normalizeSub2ApiCodexAccounts(data) {
 export function normalizeCpaCodexQuota(data, file = {}) {
   if (!isRecord(data)) throw new Error('Codex 额度响应格式无效');
   const planType = cleanText(data.plan_type || data.planType || file.account_type || file.plan_type, 40);
+  const expiresAt = cleanQuotaTimestamp(
+    data.chatgpt_subscription_active_until
+    ?? data.chatgptSubscriptionActiveUntil
+    ?? data.subscription_active_until
+    ?? data.subscriptionActiveUntil
+    ?? file.id_token?.chatgpt_subscription_active_until
+    ?? file.idToken?.chatgptSubscriptionActiveUntil
+    ?? file.chatgpt_subscription_active_until
+    ?? file.chatgptSubscriptionActiveUntil,
+  );
   const rateLimit = data.rate_limit || data.rateLimit || null;
   const codeReview = data.code_review_rate_limit || data.codeReviewRateLimit || null;
   const additional = Array.isArray(data.additional_rate_limits || data.additionalRateLimits)
@@ -773,7 +856,7 @@ export function normalizeCpaCodexQuota(data, file = {}) {
     quota: null,
     subscription: null,
     rateLimits,
-    expiresAt: '',
+    expiresAt,
     daysUntilExpiry: null,
     today: null,
     total: null,
@@ -1112,7 +1195,9 @@ export function normalizeSubQuotaBaseUrl(value, options = {}) {
       ? 'Grok2API URL'
       : provider === 'deepseek'
         ? 'DeepSeek API URL'
-        : 'API URL';
+        : provider === 'openai-compatible'
+          ? 'OpenAI 兼容 API URL'
+          : 'API URL';
   const text = String(value || '').trim();
   if (!text) throw new Error(`${label} 不能为空`);
   if (text.length > MAX_BASE_URL_LENGTH || /[\r\n\0]/.test(text)) {
@@ -1145,6 +1230,11 @@ export function normalizeSubQuotaBaseUrl(value, options = {}) {
   } else if (provider === 'deepseek') {
     pathname = pathname
       .replace(/\/v1\/usage$/i, '')
+      .replace(/\/v1$/i, '');
+  } else if (provider === 'openai-compatible') {
+    pathname = pathname
+      .replace(/\/v1\/models$/i, '')
+      .replace(/\/models$/i, '')
       .replace(/\/v1$/i, '');
   } else {
     pathname = pathname
@@ -1236,7 +1326,10 @@ function normalizeProvider(value) {
   if (text === 'cpa' || text === 'cpa-codex' || text === 'codex' || text === 'cliproxyapi') return 'cpa-codex';
   if (text === 'grok2api' || text === 'grok' || text === 'grok-api' || text === 'grok_api') return 'grok2api';
   if (text === 'deepseek' || text === 'deep-seek' || text === 'deepseek-api' || text === 'deep_seek' || text === 'ds') return 'deepseek';
-  return 'sub2api';
+  if (text === 'openai-compatible' || text === 'openai_compatible' || text === 'openai' || text === 'compatible') {
+    return 'openai-compatible';
+  }
+  throw new Error(`不支持的额度来源 provider: ${text}`);
 }
 
 function parseGrok2ApiCredentials(apiKey) {

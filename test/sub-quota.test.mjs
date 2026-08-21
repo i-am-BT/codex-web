@@ -68,6 +68,25 @@ test('normalizes editable DeepSeek API URLs', () => {
   assert.throws(() => normalizeSubQuotaBaseUrl('ftp://api.deepseek.com', { provider: 'deepseek' }), /http\/https/);
 });
 
+test('normalizes editable OpenAI-compatible API URLs and rejects unknown providers', () => {
+  assert.equal(
+    normalizeSubQuotaBaseUrl('https://openai-compatible.example.test/v1', { provider: 'openai-compatible' }),
+    'https://openai-compatible.example.test',
+  );
+  assert.equal(
+    normalizeSubQuotaBaseUrl('https://openai-compatible.example.test/v1/models', { provider: 'openai-compatible' }),
+    'https://openai-compatible.example.test',
+  );
+  assert.equal(
+    normalizeSubQuotaBaseUrl('https://openai-compatible.example.test/gateway/models', { provider: 'openai-compatible' }),
+    'https://openai-compatible.example.test/gateway',
+  );
+  assert.throws(
+    () => normalizeSubQuotaBaseUrl('https://unknown.example.test', { provider: 'unknown-provider' }),
+    /不支持的额度来源 provider/,
+  );
+});
+
 test('normalizes CPA Codex usage windows into percent rate limits', () => {
   const quota = normalizeCpaCodexQuota({
     plan_type: 'plus',
@@ -84,10 +103,16 @@ test('normalizes CPA Codex usage windows into percent rate limits', () => {
       secondary_window: null,
     },
     rate_limit_reset_credits: { available_count: 2 },
-  }, { email: 'plus@example.com' });
+  }, {
+    email: 'plus@example.com',
+    id_token: {
+      chatgpt_subscription_active_until: '2026-08-20T06:23:28+00:00',
+    },
+  });
   assert.equal(quota.planName, 'Plus');
   assert.equal(quota.unit, '%');
   assert.equal(quota.valid, true);
+  assert.equal(quota.expiresAt, '2026-08-20T06:23:28+00:00');
   assert.equal(quota.rateLimitResetCredits, 2);
   assert.equal(quota.rateLimits.length, 1);
   assert.equal(quota.rateLimits[0].window, '7d');
@@ -153,6 +178,54 @@ test('parses DeepSeek official quota sources with a default base URL', () => {
   }]);
 });
 
+test('parses multiple same-provider sources and rejects unknown providers', () => {
+  const sources = parseSubQuotaSources(JSON.stringify([
+    {
+      id: 'openai-first',
+      name: 'OpenAI First',
+      provider: 'openai-compatible',
+      baseUrl: 'https://first.example.test/v1',
+      apiKeyEnv: 'OPENAI_FIRST_KEY',
+    },
+    {
+      id: 'openai-second',
+      name: 'OpenAI Second',
+      provider: 'openai-compatible',
+      baseUrl: 'https://second.example.test/v1/models',
+      apiKeyEnv: 'OPENAI_SECOND_KEY',
+    },
+  ]), {
+    OPENAI_FIRST_KEY: 'first-secret',
+    OPENAI_SECOND_KEY: 'second-secret',
+  });
+
+  assert.deepEqual(sources.map((source) => ({
+    id: source.id,
+    provider: source.provider,
+    baseUrl: source.baseUrl,
+  })), [
+    {
+      id: 'openai-first',
+      provider: 'openai-compatible',
+      baseUrl: 'https://first.example.test',
+    },
+    {
+      id: 'openai-second',
+      provider: 'openai-compatible',
+      baseUrl: 'https://second.example.test',
+    },
+  ]);
+  assert.throws(
+    () => parseSubQuotaSources(JSON.stringify([{
+      id: 'unknown',
+      provider: 'unknown-provider',
+      baseUrl: 'https://unknown.example.test',
+      apiKeyEnv: 'UNKNOWN_KEY',
+    }]), { UNKNOWN_KEY: 'secret' }),
+    /不支持的额度来源 provider/,
+  );
+});
+
 test('normalizes DeepSeek balance responses', () => {
   const quota = normalizeDeepSeekBalance({
     is_available: true,
@@ -212,10 +285,84 @@ test('fetches DeepSeek official balance without leaking credentials', async () =
   const listed = await service.list({ refresh: true });
   assert.equal(listed.count, 1);
   assert.equal(listed.quotas[0].provider, 'deepseek');
+  assert.equal(listed.quotas[0].sourceId, 'deepseek');
   assert.equal(listed.quotas[0].balance, 88.5);
   assert.equal(listed.quotas[0].currency, 'CNY');
   assert.equal(listed.quotas[0].mode, 'deepseek');
   assert.doesNotMatch(JSON.stringify(listed), /sk-deepseek/);
+});
+
+test('checks OpenAI-compatible sources through models without inventing quota values', async () => {
+  const calls = [];
+  const service = new SubQuotaService({
+    sources: [
+      {
+        id: 'openai-first',
+        name: 'OpenAI First',
+        provider: 'openai-compatible',
+        apiKeyEnv: 'OPENAI_FIRST_KEY',
+        apiKey: 'first-secret',
+        baseUrl: 'https://first.example.test',
+      },
+      {
+        id: 'openai-second',
+        name: 'OpenAI Second',
+        provider: 'openai-compatible',
+        apiKeyEnv: 'OPENAI_SECOND_KEY',
+        apiKey: 'second-secret',
+        baseUrl: 'https://second.example.test',
+      },
+    ],
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), authorization: options.headers.Authorization });
+      return new Response(JSON.stringify({
+        object: 'list',
+        data: [{ id: 'test-model', object: 'model' }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    },
+    now: () => 1000000,
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.count, 2);
+  assert.equal(listed.availableCount, 2);
+  assert.deepEqual(listed.quotas.map((quota) => quota.sourceId), ['openai-first', 'openai-second']);
+  assert.deepEqual(listed.quotas.map((quota) => quota.id), ['openai-first', 'openai-second']);
+  assert.ok(listed.quotas.every((quota) => quota.provider === 'openai-compatible'));
+  assert.ok(listed.quotas.every((quota) => quota.mode === 'openai_compatible'));
+  assert.ok(listed.quotas.every((quota) => quota.status === 'active'));
+  assert.ok(listed.quotas.every((quota) => quota.balance === null));
+  assert.ok(listed.quotas.every((quota) => quota.remaining === null));
+  assert.ok(listed.quotas.every((quota) => quota.quota === null));
+  assert.ok(listed.quotas.every((quota) => quota.rateLimits.length === 0));
+  assert.deepEqual(calls, [
+    { url: 'https://first.example.test/v1/models', authorization: 'Bearer first-secret' },
+    { url: 'https://second.example.test/v1/models', authorization: 'Bearer second-secret' },
+  ]);
+  assert.doesNotMatch(JSON.stringify(listed), /first-secret|second-secret/);
+});
+
+test('reports unknown direct source providers without falling back to Sub2API', async () => {
+  let requested = false;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'unknown-source',
+      name: 'Unknown',
+      provider: 'unknown-provider',
+      apiKey: 'secret',
+      usageUrl: 'https://unknown.example.test/v1/usage',
+    }],
+    fetchImpl: async () => {
+      requested = true;
+      return new Response('{}', { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(requested, false);
+  assert.equal(listed.availableCount, 0);
+  assert.equal(listed.quotas[0].sourceId, 'unknown-source');
+  assert.match(listed.quotas[0].error, /不支持的额度来源 provider/);
 });
 
 test('normalizes Sub2API subscription and quota-limited responses', () => {
@@ -633,6 +780,7 @@ test('fetches all sources, isolates errors, and caches the result', async () => 
   assert.equal(first, second);
   assert.equal(requests, 1);
   assert.equal(first.availableCount, 1);
+  assert.deepEqual(first.quotas.map((quota) => quota.sourceId), ['ready', 'missing']);
   assert.equal(first.quotas[0].remaining, 12);
   assert.deepEqual(first.quotas[0].rateLimits, [{
     window: '5h',
@@ -1074,6 +1222,47 @@ test('treats invalid quota as unavailable, short-lived, and ineligible for fallb
   assert.equal(requests, 3);
 });
 
+test('keeps same-named CPA accounts isolated by stable source id', async () => {
+  const file = cpaAuthFile('shared');
+  const service = new SubQuotaService({
+    sources: [
+      {
+        id: 'cpa-one',
+        name: 'CPA One',
+        provider: 'cpa-codex',
+        baseUrl: 'https://cpa-one.test',
+        apiKey: 'key-one',
+      },
+      {
+        id: 'cpa-two',
+        name: 'CPA Two',
+        provider: 'cpa-codex',
+        baseUrl: 'https://cpa-two.test',
+        apiKey: 'key-two',
+      },
+    ],
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const expectedKey = parsed.hostname === 'cpa-one.test' ? 'key-one' : 'key-two';
+      assert.equal(options.headers['X-Management-Key'], expectedKey);
+      if (parsed.pathname.endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files: [file] }), { status: 200 });
+      }
+      return new Response(JSON.stringify(cpaUsageEnvelope(20)), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.count, 2);
+  assert.equal(listed.availableCount, 2);
+  assert.deepEqual(listed.quotas.map((quota) => quota.sourceId), ['cpa-one', 'cpa-two']);
+  assert.deepEqual(listed.quotas.map((quota) => quota.id), [
+    'cpa-one-codex-shared',
+    'cpa-two-codex-shared',
+  ]);
+  assert.deepEqual(listed.quotas.map((quota) => quota.sourceName), ['CPA One', 'CPA Two']);
+});
+
 test('falls back for a transient CPA api-call status code', async () => {
   let round = 1;
   const file = cpaAuthFile('alpha');
@@ -1094,7 +1283,7 @@ test('falls back for a transient CPA api-call status code', async () => {
   round = 2;
   const stale = await service.list({ refresh: true });
   assert.equal(stale.availableCount, 1);
-  assert.equal(stale.quotas[0].id, 'alpha');
+  assert.equal(stale.quotas[0].id, 'cpa-codex-alpha');
   assert.equal(stale.quotas[0].rateLimits[0].remaining, 80);
   assert.equal(stale.quotas[0].fetchedAt, ready.quotas[0].fetchedAt);
   assert.equal(stale.quotas[0].stale, true);
@@ -1147,12 +1336,12 @@ test('merges fresh and stale CPA accounts by stable account id', async () => {
   });
 
   const first = await service.list();
-  const firstBeta = first.quotas.find((item) => item.id === 'beta');
+  const firstBeta = first.quotas.find((item) => item.id === 'cpa-codex-beta');
   round = 2;
   now += 1000;
   const second = await service.list({ refresh: true });
-  const alpha = second.quotas.find((item) => item.id === 'alpha');
-  const beta = second.quotas.find((item) => item.id === 'beta');
+  const alpha = second.quotas.find((item) => item.id === 'cpa-codex-alpha');
+  const beta = second.quotas.find((item) => item.id === 'cpa-codex-beta');
   assert.equal(alpha.rateLimits[0].remaining, 70);
   assert.equal(alpha.stale, undefined);
   assert.equal(beta.rateLimits[0].remaining, 80);
@@ -1179,7 +1368,7 @@ test('uses all recent CPA accounts after a source-wide transient failure', async
   await service.list();
   round = 2;
   const stale = await service.list({ refresh: true });
-  assert.deepEqual(stale.quotas.map((item) => item.id), ['alpha', 'beta']);
+  assert.deepEqual(stale.quotas.map((item) => item.id), ['cpa-codex-alpha', 'cpa-codex-beta']);
   assert.ok(stale.quotas.every((item) => item.stale === true && item.warning === '请求超时'));
   assert.equal(stale.availableCount, 2);
 });
@@ -1203,11 +1392,11 @@ test('removes disappeared CPA accounts from source-wide fallback state', async (
   await service.list();
   round = 2;
   const reduced = await service.list({ refresh: true });
-  assert.deepEqual(reduced.quotas.map((item) => item.id), ['alpha']);
+  assert.deepEqual(reduced.quotas.map((item) => item.id), ['cpa-codex-alpha']);
 
   round = 3;
   const stale = await service.list({ refresh: true });
-  assert.deepEqual(stale.quotas.map((item) => item.id), ['alpha']);
+  assert.deepEqual(stale.quotas.map((item) => item.id), ['cpa-codex-alpha']);
   assert.equal(stale.quotas[0].stale, true);
 });
 
@@ -1421,6 +1610,7 @@ test('fetches Grok2API summary with admin login and can sync or reset quotas', a
   const listed = await service.list({ refresh: true });
   assert.equal(listed.count, 1);
   assert.equal(listed.quotas[0].provider, 'grok2api');
+  assert.equal(listed.quotas[0].sourceId, 'grok2api');
   assert.equal(listed.quotas[0].accountStats.pool, 'grok_build+grok_console');
   assert.equal(listed.quotas[0].accountStats.available, 6);
   assert.equal(listed.quotas[0].accountStats.abnormal, 1);
