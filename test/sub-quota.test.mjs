@@ -551,6 +551,158 @@ test('returns independent Sub2API quota results for structured API keys', async 
   assert.doesNotMatch(JSON.stringify(listed), /sub-alpha-secret|sub-beta-secret/);
 });
 
+test('retries a transient Sub2API usage failure with the same structured API key', async () => {
+  const waits = [];
+  const callsByAuthorization = new Map();
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'sub-multi',
+      name: 'Sub2API',
+      provider: 'sub2api',
+      usageUrl: 'https://sub.example.test/v1/usage',
+      apiKeys: [
+        { id: 'key-1', label: 'Key 1', apiKey: 'sub-key-1-secret' },
+        { id: 'key-2', label: 'Key 2', apiKey: 'sub-key-2-secret' },
+      ],
+    }],
+    cpaReadRetryDelaysMs: [10, 20],
+    sleep: async (delayMs) => waits.push(delayMs),
+    fetchImpl: async (_url, options) => {
+      const authorization = options.headers.Authorization;
+      const attempts = (callsByAuthorization.get(authorization) || 0) + 1;
+      callsByAuthorization.set(authorization, attempts);
+      if (authorization === 'Bearer sub-key-1-secret' && attempts === 1) {
+        throw new TypeError('fetch failed');
+      }
+      return new Response(JSON.stringify({
+        isValid: true,
+        remaining: authorization === 'Bearer sub-key-1-secret' ? 11 : 29,
+        unit: 'USD',
+      }), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.deepEqual([...callsByAuthorization.entries()], [
+    ['Bearer sub-key-1-secret', 2],
+    ['Bearer sub-key-2-secret', 1],
+  ]);
+  assert.deepEqual(waits, [10]);
+  assert.equal(listed.availableCount, 2);
+  assert.equal(listed.quotas.find((item) => item.credentialId === 'key-1').remaining, 11);
+  assert.equal(listed.quotas.find((item) => item.credentialId === 'key-2').remaining, 29);
+  assert.ok(listed.quotas.every((item) => item.stale === undefined && item.error === undefined));
+});
+
+test('keeps the last successful structured Sub2API key after bounded transient retries', async () => {
+  const waits = [];
+  const callsByRound = [];
+  let now = Date.parse('2026-08-27T00:00:00Z');
+  let round = 1;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'sub-multi',
+      name: 'Sub2API',
+      provider: 'sub2api',
+      usageUrl: 'https://sub.example.test/v1/usage',
+      apiKeys: [
+        { id: 'key-1', label: 'Key 1', apiKey: 'sub-key-1-secret' },
+        { id: 'key-2', label: 'Key 2', apiKey: 'sub-key-2-secret' },
+      ],
+    }],
+    now: () => now,
+    cpaReadRetryDelaysMs: [10, 20],
+    sleep: async (delayMs) => waits.push(delayMs),
+    fetchImpl: async (_url, options) => {
+      const authorization = options.headers.Authorization;
+      callsByRound.push({ round, authorization });
+      if (round === 2 && authorization === 'Bearer sub-key-1-secret') {
+        throw new TypeError('fetch failed');
+      }
+      return new Response(JSON.stringify({
+        isValid: true,
+        remaining: authorization === 'Bearer sub-key-1-secret' ? 11 : (round === 1 ? 29 : 37),
+        unit: 'USD',
+      }), { status: 200 });
+    },
+  });
+
+  const ready = await service.list({ refresh: true });
+  const readyKey1 = ready.quotas.find((item) => item.credentialId === 'key-1');
+  callsByRound.length = 0;
+  waits.length = 0;
+  round = 2;
+  now += 1000;
+
+  const degraded = await service.list({ refresh: true });
+  const key1 = degraded.quotas.find((item) => item.credentialId === 'key-1');
+  const key2 = degraded.quotas.find((item) => item.credentialId === 'key-2');
+  assert.equal(callsByRound.filter((call) => call.authorization === 'Bearer sub-key-1-secret').length, 3);
+  assert.equal(callsByRound.filter((call) => call.authorization === 'Bearer sub-key-2-secret').length, 1);
+  assert.deepEqual(waits, [10, 20]);
+  assert.equal(degraded.availableCount, 2);
+  assert.equal(key1.remaining, 11);
+  assert.equal(key1.fetchedAt, readyKey1.fetchedAt);
+  assert.equal(key1.stale, true);
+  assert.equal(key1.warning, 'fetch failed');
+  assert.equal(key1.error, undefined);
+  assert.equal(key2.remaining, 37);
+  assert.notEqual(key2.fetchedAt, readyKey1.fetchedAt);
+  assert.equal(key2.stale, undefined);
+  assert.equal(key2.error, undefined);
+});
+
+test('does not retry or revive a structured Sub2API key after HTTP 401', async () => {
+  const waits = [];
+  const callsByRound = [];
+  let round = 1;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'sub-multi',
+      name: 'Sub2API',
+      provider: 'sub2api',
+      usageUrl: 'https://sub.example.test/v1/usage',
+      apiKeys: [
+        { id: 'key-1', label: 'Key 1', apiKey: 'sub-key-1-secret' },
+        { id: 'key-2', label: 'Key 2', apiKey: 'sub-key-2-secret' },
+      ],
+    }],
+    cpaReadRetryDelaysMs: [10, 20],
+    sleep: async (delayMs) => waits.push(delayMs),
+    fetchImpl: async (_url, options) => {
+      const authorization = options.headers.Authorization;
+      callsByRound.push({ round, authorization });
+      if (round === 2 && authorization === 'Bearer sub-key-1-secret') {
+        return new Response('unauthorized', { status: 401 });
+      }
+      return new Response(JSON.stringify({
+        isValid: true,
+        remaining: authorization === 'Bearer sub-key-1-secret' ? 11 : (round === 1 ? 29 : 37),
+        unit: 'USD',
+      }), { status: 200 });
+    },
+  });
+
+  await service.list({ refresh: true });
+  callsByRound.length = 0;
+  waits.length = 0;
+  round = 2;
+
+  const listed = await service.list({ refresh: true });
+  const key1 = listed.quotas.find((item) => item.credentialId === 'key-1');
+  const key2 = listed.quotas.find((item) => item.credentialId === 'key-2');
+  assert.equal(callsByRound.filter((call) => call.authorization === 'Bearer sub-key-1-secret').length, 1);
+  assert.equal(callsByRound.filter((call) => call.authorization === 'Bearer sub-key-2-secret').length, 1);
+  assert.deepEqual(waits, []);
+  assert.equal(listed.availableCount, 1);
+  assert.equal(key1.error, 'HTTP 401');
+  assert.equal(key1.stale, undefined);
+  assert.equal(key1.warning, undefined);
+  assert.equal(key2.remaining, 37);
+  assert.equal(key2.stale, undefined);
+  assert.equal(key2.error, undefined);
+});
+
 test('keeps DeepSeek and OpenAI-compatible API key results isolated', async () => {
   const service = new SubQuotaService({
     sources: [
@@ -1264,6 +1416,7 @@ test('uses recent source success after a timeout and replaces it after recovery'
   let requests = 0;
   const service = new SubQuotaService({
     sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
+    readRetryDelaysMs: [],
     now: () => now,
     fetchImpl: async () => {
       requests += 1;
@@ -1302,6 +1455,7 @@ test('returns an initial timeout error and retries an error cache after five sec
   const service = new SubQuotaService({
     sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
     cacheTtlMs: 30000,
+    readRetryDelaysMs: [],
     now: () => now,
     fetchImpl: async () => {
       requests += 1;
@@ -1457,6 +1611,7 @@ test('treats invalid quota as unavailable, short-lived, and ineligible for fallb
   const service = new SubQuotaService({
     sources: [{ id: 'sub', name: 'Sub', apiKeyEnv: 'SUB_KEY', apiKey: 'key', usageUrl: 'https://sub.test/v1/usage' }],
     cacheTtlMs: 30000,
+    readRetryDelaysMs: [],
     now: () => now,
     fetchImpl: async () => {
       requests += 1;

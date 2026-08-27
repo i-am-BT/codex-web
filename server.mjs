@@ -17037,7 +17037,7 @@ function renderSubQuota(data){
       const error=document.createElement('div');
       error.className='subQuotaError';
       const displayName=subQuotaDisplayName(quota);
-      error.textContent=(displayName?displayName+'：':'')+'暂不可用：'+quota.error;
+      error.textContent=(displayName?displayName+'：':'')+'暂不可用：'+subQuotaErrorMessage(quota);
       subQuotaContent.appendChild(error);
       continue;
     }
@@ -17451,9 +17451,20 @@ function formatSubQuotaDateTimeFull(value){const date=new Date(value);return Num
 function formatSubQuotaTime(value){const date=new Date(value);return Number.isFinite(date.getTime())?date.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}):''}
 function subQuotaStaleMetaText(quota){
   const staleTime=formatSubQuotaTime(quota?.fetchedAt);
-  const warning=String(quota?.warning||quota?.error||'').trim().replace(/^刷新失败[：:]\\s*/,'').slice(0,120);
+  const rawWarning=String(quota?.warning||quota?.error||'').trim().replace(/^刷新失败[：:]\\s*/,'').slice(0,120);
+  const warning=rawWarning&&String(quota?.provider||'').toLowerCase()==='sub2api'
+    ?subQuotaErrorMessage({provider:quota.provider,error:rawWarning})
+    :rawWarning;
   const message=staleTime?'刷新失败，显示 '+staleTime+' 的上次数据':'刷新失败，显示上次数据';
   return warning?message+' · '+warning:message;
+}
+function subQuotaErrorMessage(quota){
+  const error=String(quota?.error||'额度读取失败').trim();
+  if(String(quota?.provider||'').toLowerCase()==='sub2api'){
+    if(/(?:fetch failed|network|socket|connection|timed? *out|请求超时)/i.test(error))return '网络连接失败，已自动重试';
+    if(/^HTTP (?:408|429|5[0-9][0-9])(?:$|[^0-9])/i.test(error))return '上游服务暂时异常，已自动重试';
+  }
+  return error;
 }
 function subQuotaFetchedStatusText(fetchedAt,hasStale){
   const time=formatSubQuotaTime(fetchedAt);

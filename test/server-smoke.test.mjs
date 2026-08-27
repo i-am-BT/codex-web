@@ -4861,7 +4861,7 @@ updated_at = 1784422800000
     assert.ok(subQuotaStaleHelpers);
     const subQuotaStaleApi = new Function(
       'formatSubQuotaTime',
-      subQuotaStaleHelpers + '; return { subQuotaStaleMetaText, subQuotaFetchedStatusText };',
+      subQuotaStaleHelpers + '; return { subQuotaStaleMetaText, subQuotaErrorMessage, subQuotaFetchedStatusText };',
     )((value) => value === 'stale-at' ? '10:02' : value === 'checked-at' ? '10:12' : '');
     assert.equal(
       subQuotaStaleApi.subQuotaStaleMetaText({ stale: true, fetchedAt: 'stale-at', warning: '请求超时' }),
@@ -4871,7 +4871,25 @@ updated_at = 1784422800000
       subQuotaStaleApi.subQuotaStaleMetaText({ stale: true, fetchedAt: 'stale-at', warning: '刷新失败：请求超时' }),
       '刷新失败，显示 10:02 的上次数据 · 请求超时',
     );
+    assert.equal(
+      subQuotaStaleApi.subQuotaStaleMetaText({
+        provider: 'sub2api',
+        stale: true,
+        fetchedAt: 'stale-at',
+        warning: 'fetch failed',
+      }),
+      '刷新失败，显示 10:02 的上次数据 · 网络连接失败，已自动重试',
+    );
     assert.equal(subQuotaStaleApi.subQuotaStaleMetaText({ stale: true }), '刷新失败，显示上次数据');
+    assert.equal(
+      subQuotaStaleApi.subQuotaErrorMessage({ provider: 'sub2api', error: 'fetch failed' }),
+      '网络连接失败，已自动重试',
+    );
+    assert.equal(
+      subQuotaStaleApi.subQuotaErrorMessage({ provider: 'sub2api', error: 'HTTP 502' }),
+      '上游服务暂时异常，已自动重试',
+    );
+    assert.equal(subQuotaStaleApi.subQuotaErrorMessage({ provider: 'sub2api', error: 'HTTP 401' }), 'HTTP 401');
     assert.equal(subQuotaStaleApi.subQuotaFetchedStatusText('checked-at', true), '检查于 10:12');
     assert.equal(subQuotaStaleApi.subQuotaFetchedStatusText('checked-at', false), '更新于 10:12');
     const singleFlightHelper = inlineScript.match(/(function createTrailingSingleFlight[\s\S]*?)(?=function readPromptQueues)/)?.[1];

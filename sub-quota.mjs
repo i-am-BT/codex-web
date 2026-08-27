@@ -2,7 +2,7 @@ const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_CACHE_TTL_MS = 30000;
 const ERROR_CACHE_TTL_MS = 5000;
 const LAST_GOOD_TTL_MS = 5 * 60 * 1000;
-const CPA_READ_RETRY_DELAYS_MS = [300, 900];
+const TRANSIENT_READ_RETRY_DELAYS_MS = [300, 900];
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const GROK2API_SYNC_TIMEOUT_MS = 15 * 60 * 1000;
 const GROK2API_SYNC_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -34,9 +34,9 @@ export class SubQuotaService {
     this.sleep = typeof options.sleep === 'function'
       ? options.sleep
       : (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs));
-    this.cpaReadRetryDelaysMs = normalizeRetryDelays(
-      options.cpaReadRetryDelaysMs,
-      CPA_READ_RETRY_DELAYS_MS,
+    this.readRetryDelaysMs = normalizeRetryDelays(
+      options.readRetryDelaysMs ?? options.cpaReadRetryDelaysMs,
+      TRANSIENT_READ_RETRY_DELAYS_MS,
     );
     this.configurationError = String(options.configurationError || '');
     this.cache = null;
@@ -533,12 +533,12 @@ export class SubQuotaService {
     if (!source.apiKey) return [{ ...base, error: missingSourceCredentialMessage(source) }];
 
     try {
-      const data = await this.requestJson(source.usageUrl, {
+      const data = await this.retryReadOnly(() => this.requestJson(source.usageUrl, {
         headers: {
           Accept: 'application/json',
           Authorization: `Bearer ${source.apiKey}`,
         },
-      });
+      }));
       const quota = { ...base, ...normalizeSubQuota(data) };
       if (source.baseUrl && !quota.rateLimits.some((item) => item.window === '5h')) {
         try {
@@ -707,7 +707,7 @@ export class SubQuotaService {
         'Chatgpt-Account-Id': accountId,
       },
     };
-    return this.retryCpaRead(async () => {
+    return this.retryReadOnly(async () => {
       const outer = await this.requestCpaManagementJson(source, '/v0/management/api-call', {
         method: 'POST',
         headers: {
@@ -735,7 +735,7 @@ export class SubQuotaService {
       ...requestOptions
     } = options;
     return this.withSourceCredentialFailover(source, (credential) => (
-      this.retryCpaRead(() => this.requestJson(`${source.baseUrl}${path}`, {
+      this.retryReadOnly(() => this.requestJson(`${source.baseUrl}${path}`, {
         ...requestOptions,
         headers: {
           ...(requestOptions.headers || {}),
@@ -745,14 +745,14 @@ export class SubQuotaService {
     ));
   }
 
-  async retryCpaRead(request, retryable = true) {
+  async retryReadOnly(request, retryable = true) {
     let attempt = 0;
     while (true) {
       try {
         return await request();
       } catch (error) {
-        const delayMs = this.cpaReadRetryDelaysMs[attempt];
-        if (!retryable || delayMs === undefined || !isRetryableCpaReadError(error)) throw error;
+        const delayMs = this.readRetryDelaysMs[attempt];
+        if (!retryable || delayMs === undefined || !isRetryableReadError(error)) throw error;
         attempt += 1;
         await this.sleep(delayMs);
       }
@@ -1854,7 +1854,7 @@ function isRetryableCpaReadRequest(path, options = {}) {
   return String(payload?.method || '').trim().toUpperCase() === 'GET';
 }
 
-function isRetryableCpaReadError(error) {
+function isRetryableReadError(error) {
   if (error?.name === 'AbortError') return true;
   const statusCode = Number(error?.statusCode || 0);
   if (statusCode > 0) return statusCode === 408 || statusCode === 429 || statusCode >= 500;
