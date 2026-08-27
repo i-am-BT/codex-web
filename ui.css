@@ -521,14 +521,52 @@ body[data-theme="light"] .themeToggle {
   color: var(--text-subtle);
   font-size: 10px;
   font-weight: 620;
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
   text-transform: none;
+}
+
+.historyUnreadSummary {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
 }
 
 .historyUnreadHead strong {
   color: var(--text-muted);
   font-size: 10px;
   font-weight: 680;
+}
+
+.historyUnreadSoundToggle {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-subtle);
+  padding: 0;
+  cursor: pointer;
+}
+
+.historyUnreadSoundToggle:hover,
+.historyUnreadSoundToggle:focus-visible {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+  outline: none;
+}
+
+.historyUnreadSoundToggle[aria-pressed="true"] {
+  color: var(--primary);
+}
+
+.historyUnreadSoundToggle .lucide {
+  width: 14px;
+  height: 14px;
 }
 
 .historyUnreadList {

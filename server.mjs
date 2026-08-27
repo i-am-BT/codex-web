@@ -10336,7 +10336,7 @@ body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=sync-quota-preview-20260827a">
+<link rel="stylesheet" href="/ui.css?v=task-complete-sound-20260827a">
   <link rel="stylesheet" href="/image-prompt.css?v=top-context-padding-20260801b">
 <script>
 (()=>{try{
@@ -10796,6 +10796,8 @@ const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
 const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb.historyCompletionRead.v2';
 const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v2';
+const TASK_COMPLETE_SOUND_STORAGE_KEY='codexWeb.taskCompleteSoundEnabled.v1';
+const TASK_COMPLETE_SOUND_DEDUPE_LIMIT=256;
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 const SIDE_CHAT_STORAGE_KEY='codexWeb.sideChat.v1';
 const SIDE_CHAT_WIDTH_STORAGE_KEY='codexWeb.sideChatWidth.v1';
@@ -10819,6 +10821,9 @@ let hiddenHistoryProjects=readHiddenHistoryProjects();
 let renamedHistoryProjects=readRenamedHistoryProjects();
 let historyCompletionRead=readHistoryCompletionState(HISTORY_COMPLETION_READ_STORAGE_KEY);
 let historyCompletionSeen=readHistoryCompletionState(HISTORY_COMPLETION_SEEN_STORAGE_KEY);
+let taskCompleteSoundEnabled=readTaskCompleteSoundEnabled();
+const taskCompleteSoundTurnKeys=new Set();
+let completeAudioCtx=null;
 let historyCompletionPushTimer=null;
 let historyCompletionSyncTimer=null;
 let historyCompletionSyncInFlight=null;
@@ -19668,6 +19673,60 @@ async function deleteAllArchivedTasks(){
 }
 function readRenamedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECT_NAMES_STORAGE_KEY)||'{}');if(!saved||Array.isArray(saved)||typeof saved!=='object')return new Map();return new Map(Object.entries(saved).filter(([key,value])=>key&&typeof value==='string'&&value.trim()).map(([key,value])=>[key,value.trim().replace(/\\s+/g,' ').slice(0,80)]))}catch{return new Map()}}
 function storeRenamedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECT_NAMES_STORAGE_KEY,JSON.stringify(Object.fromEntries([...renamedHistoryProjects.entries()].sort(([left],[right])=>left.localeCompare(right)))))}catch{}}
+function readTaskCompleteSoundEnabled(){
+  try{return localStorage.getItem(TASK_COMPLETE_SOUND_STORAGE_KEY)!=='0'}catch{return true}
+}
+function setTaskCompleteSoundEnabled(enabled){
+  taskCompleteSoundEnabled=Boolean(enabled);
+  try{localStorage.setItem(TASK_COMPLETE_SOUND_STORAGE_KEY,taskCompleteSoundEnabled?'1':'0')}catch{}
+}
+function taskCompleteSoundTurnKey(threadId,turnId){
+  const thread=String(threadId||'').trim();
+  const turn=String(turnId||'').trim();
+  return thread&&turn?JSON.stringify([thread,turn]):'';
+}
+function rememberTaskCompleteSoundTurn(threadId,turnId){
+  const key=taskCompleteSoundTurnKey(threadId,turnId);
+  if(!key||taskCompleteSoundTurnKeys.has(key))return false;
+  taskCompleteSoundTurnKeys.add(key);
+  while(taskCompleteSoundTurnKeys.size>TASK_COMPLETE_SOUND_DEDUPE_LIMIT){
+    taskCompleteSoundTurnKeys.delete(taskCompleteSoundTurnKeys.values().next().value);
+  }
+  return true;
+}
+async function playTaskCompleteSound(){
+  try{
+    const AudioContextClass=window.AudioContext||window.webkitAudioContext;
+    if(!AudioContextClass)return false;
+    if(!completeAudioCtx)completeAudioCtx=new AudioContextClass();
+    if(completeAudioCtx.state==='suspended'&&completeAudioCtx.resume)await completeAudioCtx.resume();
+    const now=completeAudioCtx.currentTime;
+    const master=completeAudioCtx.createGain();
+    master.gain.setValueAtTime(.85,now);
+    master.connect(completeAudioCtx.destination);
+    [[660,0,.12],[880,.13,.22]].forEach(([frequency,offset,duration])=>{
+      const oscillator=completeAudioCtx.createOscillator();
+      const gain=completeAudioCtx.createGain();
+      oscillator.type='triangle';
+      oscillator.frequency.value=frequency;
+      gain.gain.setValueAtTime(.0001,now+offset);
+      gain.gain.exponentialRampToValueAtTime(.32,now+offset+.006);
+      gain.gain.exponentialRampToValueAtTime(.0001,now+offset+duration);
+      oscillator.connect(gain);
+      gain.connect(master);
+      oscillator.start(now+offset);
+      oscillator.stop(now+offset+duration+.02);
+    });
+    return true;
+  }catch{return false}
+}
+function maybePlayTaskCompleteSound(runtime){
+  if(runtime?.type!=='turn'||String(runtime?.status||'').toLowerCase()!=='done')return false;
+  if(!rememberTaskCompleteSoundTurn(runtime.threadId,runtime.turnId))return false;
+  if(!taskCompleteSoundEnabled)return false;
+  void playTaskCompleteSound();
+  return true;
+}
 function readHistoryCompletionState(key){
   try{
     const saved=JSON.parse(localStorage.getItem(key)||'{}');
@@ -19677,6 +19736,19 @@ function readHistoryCompletionState(key){
 }
 function storeHistoryCompletionState(key,state){
   try{localStorage.setItem(key,JSON.stringify(Object.fromEntries([...state.entries()].slice(-1000))))}catch{}
+}
+function syncTaskCompleteSoundButton(button){
+  if(!button)return;
+  const label=taskCompleteSoundEnabled?'关闭任务完成提示音':'开启任务完成提示音';
+  button.title=label;
+  button.setAttribute('aria-label',label);
+  button.setAttribute('aria-pressed',taskCompleteSoundEnabled?'true':'false');
+  button.replaceChildren();
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide',taskCompleteSoundEnabled?'volume-2':'volume-x');
+  icon.setAttribute('aria-hidden','true');
+  button.appendChild(icon);
+  refreshIcons(button);
 }
 function historyCompletionKey(item){return conversationKey(item?.source==='codex'?'codex':'web',item?.id)}
 function historyCompletionVersion(item){return String(item?.status||'')+'|'+String(item?.updatedAt||item?.recencyAt||item?.createdAt||'')}
@@ -19779,12 +19851,26 @@ function renderHistoryUnreadPopover(){
   historyUnreadPopover.replaceChildren();
   const head=document.createElement('header');
   head.className='historyUnreadHead';
+  const summary=document.createElement('div');
+  summary.className='historyUnreadSummary';
   const title=document.createElement('strong');
   title.textContent='已完成';
   const count=document.createElement('span');
   count.textContent=unread.length+' 个未读';
-  head.appendChild(title);
-  head.appendChild(count);
+  summary.appendChild(title);
+  summary.appendChild(count);
+  const soundToggle=document.createElement('button');
+  soundToggle.type='button';
+  soundToggle.className='historyUnreadSoundToggle';
+  syncTaskCompleteSoundButton(soundToggle);
+  soundToggle.addEventListener('click',(event)=>{
+    event.preventDefault();
+    event.stopPropagation();
+    setTaskCompleteSoundEnabled(!taskCompleteSoundEnabled);
+    syncTaskCompleteSoundButton(soundToggle);
+  });
+  head.appendChild(summary);
+  head.appendChild(soundToggle);
   historyUnreadPopover.appendChild(head);
   const list=document.createElement('div');
   list.className='historyUnreadList';
@@ -21931,6 +22017,7 @@ function connectSessionEvents(){
     // Text deltas can arrive many times per second. Their persisted snapshot is already
     // coalesced by the sessions listener, so only refresh the sidebar for lifecycle changes.
     if(nativeRuntimeNeedsHistoryRefresh(runtime.type))scheduleHistoryRefreshFromSession();
+    if(runtime.type==='turn')maybePlayTaskCompleteSound(runtime);
     if(runtime.threadId!==currentConversationId||currentConversationSource!=='codex')return;
     if(isCompletedNativeRuntimeTurn(runtime.turnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
     if(webRunActive&&activeNativeTurnId&&runtime.turnId&&String(runtime.turnId)!==String(activeNativeTurnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;

@@ -23,6 +23,7 @@ function sourceBetween(start, end) {
 const groupingSource = sourceBetween('function conversationKey', 'function setMainView');
 const composerProjectsSource = sourceBetween('function composerProjectPaths', 'function selectComposerProjectPath');
 const completionStateSource = sourceBetween('function readHistoryCompletionState', 'function historyProjectName');
+const taskCompleteSoundSource = sourceBetween('function readTaskCompleteSoundEnabled', 'function readHistoryCompletionState');
 const unreadPopoverSource = sourceBetween('function renderHistoryUnreadPopover', 'function markHistoryCompletionRead');
 const removedCodexAppUnreadSource = serverSource.match(
   /function removedCodexAppUnreadThreadIds\(previous, current\) \{[\s\S]*?\n\}/,
@@ -515,7 +516,7 @@ test('history refreshes deferred while a project menu or preview is open', () =>
   assert.match(inlineScript, /flushPendingHistoryRefresh\(\)/);
 });
 
-test('session events coalesce native sync and avoid completion sound playback', () => {
+test('session events coalesce native sync and route live turn events through completion sound handling', () => {
   const sessionSource = sourceBetween('function scheduleChangedNativeSessionSync', 'function nativeMessageElementBySequence');
   const sessionsListenerStart = sessionSource.indexOf("sessionEvents.addEventListener('sessions'");
   const runtimeListenerStart = sessionSource.indexOf("sessionEvents.addEventListener('native-runtime'", sessionsListenerStart);
@@ -530,7 +531,69 @@ test('session events coalesce native sync and avoid completion sound playback', 
   assert.match(sessionsListenerSource, /completionReadStateChanged=parsed\.completionReadStateChanged===true/);
   assert.match(sessionsListenerSource, /if\(!changedIds\.length&&!completionReadStateChanged\)return;\s*if\(changedIds\.length\)refreshOpenSubagentTraces\(changedIds\);\s*if\(conversationChangedIds\.length\)\{\s*scheduleHistoryRefreshFromSession\(\);\s*\}\s*if\(conversationChangedIds\.length\|\|completionReadStateChanged\)\{\s*scheduleHistoryCompletionReadSync\(\);\s*\}\s*if\(changedIds\.length\)scheduleChangedNativeSessionSync\(changedIds\)/);
   assert.doesNotMatch(sessionsListenerSource, /refreshHistory\(\)|syncHistoryCompletionReadFromServer\(\)/);
-  assert.doesNotMatch(inlineScript, /playTaskCompleteSound|completeAudioCtx|AudioContext/);
+  assert.match(sessionSource, /if\(runtime\.type==='turn'\)maybePlayTaskCompleteSound\(runtime\);\s*if\(runtime\.threadId!==currentConversationId/);
+});
+
+test('completion sound is persisted, success-only, and deduplicated by thread and turn', () => {
+  const values=new Map();
+  const localStorage={
+    getItem(key){return values.has(key)?values.get(key):null},
+    setItem(key,value){values.set(key,String(value))},
+  };
+  let oscillatorStarts=0;
+  class AudioContext {
+    constructor(){this.currentTime=0;this.destination={};this.state='running'}
+    createGain(){return{gain:{setValueAtTime(){},exponentialRampToValueAtTime(){}},connect(){}}}
+    createOscillator(){return{frequency:{value:0},connect(){},start(){oscillatorStarts+=1},stop(){}}}
+  }
+  const api=new Function(
+    'localStorage',
+    'window',
+    `const TASK_COMPLETE_SOUND_STORAGE_KEY='codexWeb.taskCompleteSoundEnabled.v1';
+     const TASK_COMPLETE_SOUND_DEDUPE_LIMIT=3;
+     let taskCompleteSoundEnabled=readTaskCompleteSoundEnabled();
+     const taskCompleteSoundTurnKeys=new Set();
+     let completeAudioCtx=null;
+     ${taskCompleteSoundSource}
+     return {
+       maybePlayTaskCompleteSound,
+       readTaskCompleteSoundEnabled,
+       setTaskCompleteSoundEnabled,
+       enabled:()=>taskCompleteSoundEnabled,
+       remembered:()=>[...taskCompleteSoundTurnKeys],
+     };`,
+  )(localStorage,{AudioContext});
+
+  assert.equal(api.enabled(),true);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'running',threadId:'thread-a',turnId:'turn-1'}),false);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'error',threadId:'thread-a',turnId:'turn-1'}),false);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'interrupted',threadId:'thread-a',turnId:'turn-1'}),false);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-1'}),true);
+  assert.equal(oscillatorStarts,2);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-1'}),false);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-b',turnId:'turn-1'}),true);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-2'}),true);
+  assert.equal(oscillatorStarts,6);
+
+  api.setTaskCompleteSoundEnabled(false);
+  assert.equal(values.get('codexWeb.taskCompleteSoundEnabled.v1'),'0');
+  assert.equal(api.readTaskCompleteSoundEnabled(),false);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-muted'}),false);
+  api.setTaskCompleteSoundEnabled(true);
+  assert.equal(values.get('codexWeb.taskCompleteSoundEnabled.v1'),'1');
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-muted'}),false);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-3'}),true);
+  assert.equal(oscillatorStarts,8);
+  assert.equal(api.remembered().length,3);
+});
+
+test('unread completion popover exposes a persistent sound toggle', () => {
+  assert.match(inlineScript, /const TASK_COMPLETE_SOUND_STORAGE_KEY='codexWeb\.taskCompleteSoundEnabled\.v1'/);
+  assert.match(unreadPopoverSource, /soundToggle\.className='historyUnreadSoundToggle'/);
+  assert.match(unreadPopoverSource, /setTaskCompleteSoundEnabled\(!taskCompleteSoundEnabled\)/);
+  assert.match(completionStateSource, /button\.setAttribute\('aria-pressed',taskCompleteSoundEnabled\?'true':'false'\)/);
+  assert.match(completionStateSource, /taskCompleteSoundEnabled\?'volume-2':'volume-x'/);
+  assert.match(uiStyles, /\.historyUnreadSoundToggle\s*\{/);
 });
 
 test('history completion read sync is single-flight and delayed during session churn', () => {
