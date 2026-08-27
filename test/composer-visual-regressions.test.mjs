@@ -18,6 +18,59 @@ test('new-task composer treats project selection as optional', () => {
   assert.match(serverSource, /直接输入任务；项目路径可选。/);
 });
 
+test('mobile conversation stays viewport-bound while inner rails keep their own scroll', () => {
+  assert.match(
+    uiStyles,
+    /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{(?=[^}]*width:\s*100%)(?=[^}]*max-width:\s*100%)(?=[^}]*min-width:\s*0)(?=[^}]*overflow-x:\s*clip)(?=[^}]*overflow-y:\s*auto)(?=[^}]*overscroll-behavior-x:\s*none)[^}]*\}/s,
+  );
+  assert.match(
+    uiStyles,
+    /body \.chat > \*,[\s\S]*?body \.chat :is\([\s\S]*?\.liveProcessPanel,[\s\S]*?\.completionTimeline,[\s\S]*?\.activityClusterItems,[\s\S]*?\.activityItem[\s\S]*?\)\s*\{(?=[^}]*min-width:\s*0)(?=[^}]*max-width:\s*100%)(?=[^}]*box-sizing:\s*border-box)[^}]*\}/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.activityItem\.skillTarget \.activityItemSummary\s*\{(?=[^}]*width:\s*100%)(?=[^}]*min-width:\s*0)[^}]*grid-template-columns:\s*var\(--activity-icon-box, 16px\) auto minmax\(0, 1fr\) auto 13px/s,
+  );
+  assert.match(
+    uiStyles,
+    /body \.chat \.activitySuffix\s*\{(?=[^}]*min-width:\s*0)(?=[^}]*max-width:\s*100%)(?=[^}]*flex:\s*0 1 auto)(?=[^}]*overflow:\s*hidden)(?=[^}]*text-overflow:\s*ellipsis)[^}]*\}/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.threadRunPillsViewport\s*\{(?=[^}]*overflow-x:\s*auto)(?=[^}]*overscroll-behavior-x:\s*contain)[^}]*\}/s,
+  );
+});
+
+test('quota settings keep multi-key controls horizontally bounded', () => {
+  assert.match(serverSource, /nameLabel\.textContent='渠道名称'/);
+  assert.match(serverSource, /typeLabel\.textContent='渠道类型'/);
+  assert.doesNotMatch(serverSource, /if\(!builtin\)\{\s*const manualFields=document\.createElement\('div'\)/);
+  assert.match(serverSource, /setIconLabel\(addKeyButton,'plus','添加 Key',false\)/);
+  assert.match(serverSource, /row\.className='subQuotaCredentialRow'/);
+  assert.match(serverSource, /removeKeyButton\.setAttribute\('aria-label','移除 '\+credentialLabel\)/);
+  assert.match(serverSource, /setIconLabel\(removeKeyButton,'x','移除此 Key',false\)/);
+  assert.match(
+    uiStyles,
+    /\.subQuotaSettingsBody\s*\{(?=[^}]*min-width:\s*0)(?=[^}]*overflow-x:\s*clip)(?=[^}]*overflow-y:\s*auto)(?=[^}]*overscroll-behavior-x:\s*none)[^}]*\}/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.subQuotaSettingsStatus\s*\{(?=[^}]*min-width:\s*0)(?=[^}]*overflow-wrap:\s*anywhere)[^}]*\}/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.subQuotaCredentialHint\s*\{(?=[^}]*min-width:\s*0)(?=[^}]*overflow-wrap:\s*anywhere)[^}]*\}/s,
+  );
+  assert.match(
+    uiStyles,
+    /\.subQuotaCredentialRow input::placeholder\s*\{[^}]*font-size:\s*12px/s,
+  );
+  assert.match(
+    uiStyles,
+    /@media \(max-width: 820px\)[\s\S]*?\.subQuotaCredentialRow\s*\{[^}]*grid-template-columns:\s*46px minmax\(0, 1fr\) 40px/s,
+  );
+});
+
 test('running output can jump back to the latest item without joining the composer layout', () => {
   assert.match(serverSource, /jumpToLatest\.id='jumpToLatest'/);
   assert.match(serverSource, /jumpToLatest\.setAttribute\('aria-controls','chat'\)/);

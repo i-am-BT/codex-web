@@ -240,6 +240,16 @@ test('quota display labels hide account email addresses', async () => {
     sourceName: 'starter-10',
     name: 'Team A',
   }), 'starter-10 · Team A');
+  assert.equal(helpers.subQuotaDisplayName({
+    provider: 'sub2api',
+    sourceName: 'Sub2API',
+    name: 'Sub2API · Key 1',
+  }), 'Sub2API · Key 1');
+  assert.equal(helpers.subQuotaDisplayName({
+    provider: 'sub2api',
+    sourceName: '月付',
+    name: '月付 · Key 2',
+  }), '月付 · Key 2');
 });
 
 test('unlimited quota windows hide reset countdowns', async () => {
@@ -1246,6 +1256,483 @@ test('native tool image output falls back to embedded data after its source file
   assert.deepEqual(result.data, Buffer.from(imageData, 'base64'));
 });
 
+test('active-writer conflicts are classified without matching generic active state', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isNativeActiveWriterConflict');
+  const helperEnd = serverSource.indexOf('\nfunction isNativeThreadNotFoundError', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const api = new Function(
+    `${serverSource.slice(helperStart, helperEnd)}; return { isNativeActiveWriterConflict, nativeActiveWriterConflictError };`,
+  )();
+
+  assert.equal(api.isNativeActiveWriterConflict(
+    new Error('thread-store conflict: thread 019edad7-8eda-7622-bf2f-7c0bf4fdd063 already has an active writer'),
+  ), true);
+  assert.equal(api.isNativeActiveWriterConflict(
+    new Error('thread 019edad7-8eda-7622-bf2f-7c0bf4fdd063 already has an active writer'),
+  ), true);
+  assert.equal(api.isNativeActiveWriterConflict(new Error('thread is active and running')), false);
+  assert.equal(api.isNativeActiveWriterConflict(new Error('another writer is active')), false);
+  const friendly = api.nativeActiveWriterConflictError();
+  assert.equal(friendly.statusCode, 409);
+  assert.equal(friendly.code, 'CODEX_NATIVE_ACTIVE_WRITER');
+  assert.doesNotMatch(friendly.message, /active writer|thread-store/i);
+});
+
+test('active-writer archive fallback requires an explicit latest-turn terminal record', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isNativeActiveWriterConflict');
+  const helperEnd = serverSource.indexOf('\nfunction nativeActiveWriterConflictError', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeWriterConflict = new Error(
+    'thread-store conflict: thread 01a03858-2711-7ff3-8ba3-1dc3623863a6 already has an active writer',
+  );
+  let conversation = {
+    status: 'done',
+    latestTurnId: 'turn-latest',
+    revision: '1:2:3',
+    messages: [
+      { role: 'process', kind: 'task_complete', turnId: 'turn-latest' },
+    ],
+  };
+  const storageCalls = [];
+  const api = new Function(
+    'appServerClient',
+    'nativeSessions',
+    'nativeActiveTurnFor',
+    'nativeTurnReservations',
+    'archiveInactiveNativeThread',
+    'CODEX_HOME',
+    `${serverSource.slice(helperStart, helperEnd)}; return {
+      archiveNativeThread,
+      nativeConversationHasExplicitTerminal,
+    };`,
+  )(
+    { request: async () => { throw activeWriterConflict; } },
+    { get: () => conversation },
+    () => null,
+    new Set(),
+    (options) => {
+      storageCalls.push(options);
+      return {
+        archived: true,
+        alreadyArchived: false,
+        rolloutPath: '/tmp/.codex/archived_sessions/fixture.jsonl',
+      };
+    },
+    '/tmp/.codex',
+  );
+
+  assert.equal(api.nativeConversationHasExplicitTerminal(conversation), true);
+  assert.deepEqual(await api.archiveNativeThread(
+    '01a03858-2711-7ff3-8ba3-1dc3623863a6',
+    conversation,
+  ), {
+    mode: 'inactive-local',
+    alreadyArchived: false,
+    rolloutPath: '/tmp/.codex/archived_sessions/fixture.jsonl',
+  });
+  assert.deepEqual(storageCalls, [{
+    codexHome: '/tmp/.codex',
+    threadId: '01a03858-2711-7ff3-8ba3-1dc3623863a6',
+    expectedRolloutRevision: '1:2:3',
+  }]);
+
+  conversation = {
+    ...conversation,
+    latestTurnId: 'turn-newer',
+  };
+  assert.equal(api.nativeConversationHasExplicitTerminal(conversation), false);
+  await assert.rejects(
+    api.archiveNativeThread('01a03858-2711-7ff3-8ba3-1dc3623863a6', conversation),
+    (error) => (
+      error?.statusCode === 409
+      && /无法确认.*最新回合已经结束/.test(error.message)
+    ),
+  );
+  assert.equal(storageCalls.length, 1);
+});
+
+test('active-writer Desktop retry preserves non-availability failures', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeWriterConflict = new Error(
+    'thread 019edad7-8eda-7622-bf2f-7c0bf4fdd063 already has an active writer',
+  );
+  const desktopUnavailable = Object.assign(new Error('Desktop unavailable'), {
+    code: 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    reason: 'no-client-found',
+  });
+  const permissionDenied = new Error('Desktop permission denied');
+  let desktopCalls = 0;
+  let resumeCalls = 0;
+  let releaseCalls = 0;
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    'isCodexDesktopIpcUnavailableError',
+    'isAmbiguousDesktopTurnStartError',
+    'CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => {
+      resumeCalls += 1;
+      throw activeWriterConflict;
+    },
+    (error) => error === activeWriterConflict,
+    ({ cause } = {}) => Object.assign(new Error('friendly active-writer conflict', { cause }), {
+      code: 'CODEX_NATIVE_ACTIVE_WRITER',
+      statusCode: 409,
+    }),
+    async () => {
+      releaseCalls += 1;
+    },
+    async () => {
+      desktopCalls += 1;
+      if (desktopCalls === 1) throw desktopUnavailable;
+      throw permissionDenied;
+    },
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    (error) => (
+      error?.desktopIpcMethod !== 'thread-owner-discovery'
+      && error?.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+    ),
+    [0],
+    25,
+    40,
+  );
+
+  await assert.rejects(
+    api.continueNativeTurn('019edad7-8eda-7622-bf2f-7c0bf4fdd063', { provider: 'fake' }),
+    (error) => error === permissionDenied,
+  );
+  assert.equal(releaseCalls, 1);
+  assert.equal(resumeCalls, 1);
+  assert.equal(desktopCalls, 2);
+});
+
+test('active-writer recovery waits for a temporarily unavailable Desktop owner', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeWriterConflict = new Error(
+    'thread 019edad7-8eda-7622-bf2f-7c0bf4fdd063 already has an active writer',
+  );
+  const unavailable = (reason) => Object.assign(new Error(`Desktop unavailable: ${reason}`), {
+    code: 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    reason,
+  });
+  let desktopCalls = 0;
+  let resumeCalls = 0;
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    'isCodexDesktopIpcUnavailableError',
+    'isAmbiguousDesktopTurnStartError',
+    'CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => {
+      resumeCalls += 1;
+      throw activeWriterConflict;
+    },
+    (error) => error === activeWriterConflict,
+    ({ cause } = {}) => Object.assign(new Error('friendly active-writer conflict', { cause }), {
+      code: 'CODEX_NATIVE_ACTIVE_WRITER',
+      statusCode: 409,
+    }),
+    async () => {},
+    async () => {
+      desktopCalls += 1;
+      if (desktopCalls === 1) throw unavailable('no-client-found');
+      if (desktopCalls === 2) throw unavailable('connect-failed');
+      return { turnId: 'desktop-turn-recovered', transport: 'desktop-ipc' };
+    },
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_TIMEOUT',
+    [0, 0],
+    25,
+    40,
+  );
+
+  const result = await api.continueNativeTurn(
+    '019edad7-8eda-7622-bf2f-7c0bf4fdd063',
+    { provider: 'fake' },
+  );
+  assert.equal(result.turnId, 'desktop-turn-recovered');
+  assert.equal(resumeCalls, 1);
+  assert.equal(desktopCalls, 3);
+});
+
+test('active-writer recovery retries only an owner-discovery timeout', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeWriterConflict = new Error(
+    'thread 019edad7-8eda-7622-bf2f-7c0bf4fdd063 already has an active writer',
+  );
+  const desktopTimeout = Object.assign(new Error('Desktop IPC timeout'), {
+    code: 'CODEX_DESKTOP_IPC_TIMEOUT',
+    desktopIpcMethod: 'thread-owner-discovery',
+  });
+  let desktopCalls = 0;
+  let resumeCalls = 0;
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    'isCodexDesktopIpcUnavailableError',
+    'isAmbiguousDesktopTurnStartError',
+    'CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => {
+      resumeCalls += 1;
+      throw activeWriterConflict;
+    },
+    (error) => error === activeWriterConflict,
+    ({ cause } = {}) => Object.assign(new Error('friendly active-writer conflict', { cause }), {
+      code: 'CODEX_NATIVE_ACTIVE_WRITER',
+      statusCode: 409,
+    }),
+    async () => {},
+    async () => {
+      desktopCalls += 1;
+      if (desktopCalls < 3) throw desktopTimeout;
+      return { turnId: 'desktop-turn-after-timeout', transport: 'desktop-ipc' };
+    },
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    (error) => (
+      error?.desktopIpcMethod !== 'thread-owner-discovery'
+      && error?.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+    ),
+    [0, 0],
+    25,
+    40,
+  );
+
+  const result = await api.continueNativeTurn(
+    '019edad7-8eda-7622-bf2f-7c0bf4fdd063',
+    { provider: 'fake' },
+  );
+  assert.equal(result.turnId, 'desktop-turn-after-timeout');
+  assert.equal(resumeCalls, 1);
+  assert.equal(desktopCalls, 3);
+});
+
+test('an unconfirmed Desktop start is never replayed through fallback or owner recovery', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const desktopTimeout = Object.assign(new Error('Desktop start result was not confirmed'), {
+    code: 'CODEX_DESKTOP_IPC_TIMEOUT',
+    desktopIpcMethod: 'thread-follower-start-turn',
+  });
+  let desktopCalls = 0;
+  let resumeCalls = 0;
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    'isCodexDesktopIpcUnavailableError',
+    'isAmbiguousDesktopTurnStartError',
+    'CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => {
+      resumeCalls += 1;
+      throw new Error('fallback must not run');
+    },
+    () => false,
+    () => new Error('unexpected active writer'),
+    async () => {},
+    async () => {
+      desktopCalls += 1;
+      throw desktopTimeout;
+    },
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    (error) => (
+      error?.desktopIpcMethod === 'thread-follower-start-turn'
+      && error?.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+    ),
+    [0, 0],
+    25,
+    40,
+  );
+
+  await assert.rejects(
+    api.continueNativeTurn('019edad7-8eda-7622-bf2f-7c0bf4fdd063', { provider: 'fake' }),
+    (error) => error === desktopTimeout,
+  );
+  assert.equal(desktopCalls, 1);
+  assert.equal(resumeCalls, 0);
+});
+
+test('a permanently missing Desktop owner ends with a friendly active-writer conflict', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeWriterConflict = new Error(
+    'thread 019edad7-8eda-7622-bf2f-7c0bf4fdd063 already has an active writer',
+  );
+  const ownerTimeout = Object.assign(new Error('Desktop owner discovery timed out'), {
+    code: 'CODEX_DESKTOP_IPC_TIMEOUT',
+    desktopIpcMethod: 'thread-owner-discovery',
+  });
+  let desktopCalls = 0;
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    'isCodexDesktopIpcUnavailableError',
+    'isAmbiguousDesktopTurnStartError',
+    'CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => {
+      throw activeWriterConflict;
+    },
+    (error) => error === activeWriterConflict,
+    ({ cause } = {}) => Object.assign(new Error('该任务仍由 Codex App 持有，Web 暂时无法续接', { cause }), {
+      code: 'CODEX_NATIVE_ACTIVE_WRITER',
+      statusCode: 409,
+    }),
+    async () => {},
+    async () => {
+      desktopCalls += 1;
+      if (desktopCalls === 1) {
+        throw Object.assign(new Error('Desktop owner missing'), {
+          code: 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+          reason: 'no-client-found',
+        });
+      }
+      throw ownerTimeout;
+    },
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    (error) => (
+      error?.desktopIpcMethod === 'thread-follower-start-turn'
+      && error?.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+    ),
+    [0, 0],
+    25,
+    40,
+  );
+
+  await assert.rejects(
+    api.continueNativeTurn('019edad7-8eda-7622-bf2f-7c0bf4fdd063', { provider: 'fake' }),
+    (error) => (
+      error.code === 'CODEX_NATIVE_ACTIVE_WRITER'
+      && error.statusCode === 409
+      && /Codex App 持有/.test(error.message)
+    ),
+  );
+  assert.equal(desktopCalls, 3);
+});
+
+test('Desktop turn start recovers a delayed native echo after an ambiguous IPC disconnect', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function startDesktopNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function resumeNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const disconnect = Object.assign(new Error('Codex Desktop IPC connection closed'), {
+    code: 'ECONNRESET',
+  });
+  let desktopCalls = 0;
+  let recoveredCalls = 0;
+  const api = new Function(
+    'desktopIpcClient',
+    'buildDesktopTurnStartParams',
+    'waitForNativeTurnEcho',
+    'findNativeTurnEcho',
+    'recoverDesktopNativeTurn',
+    'setNativeTurnState',
+    'CODEX_DESKTOP_TURN_ECHO_GRACE_MS',
+    'isCodexDesktopIpcUnavailableError',
+    `${serverSource.slice(helperStart, helperEnd)}; return { startDesktopNativeTurn };`,
+  )(
+    {
+      startTurn: async () => {
+        desktopCalls += 1;
+        throw disconnect;
+      },
+    },
+    (turn) => turn,
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { latestTurnId: 'desktop-turn-from-echo', status: 'running' };
+    },
+    () => null,
+    (_threadId, conversation) => {
+      recoveredCalls += 1;
+      return { turnId: conversation.latestTurnId, recovered: true };
+    },
+    () => {},
+    100,
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+  );
+
+  const result = await api.startDesktopNativeTurn('thread-a', { message: 'hello' }, null);
+  assert.equal(result.turnId, 'desktop-turn-from-echo');
+  assert.equal(result.recovered, true);
+  assert.equal(desktopCalls, 1);
+  assert.equal(recoveredCalls, 1);
+});
+
 test('playground refresh preserves browser streaming preferences and completed Agent images', async () => {
   const playgroundPage = await readFile(
     path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', 'index.html'),
@@ -1390,6 +1877,180 @@ test('provider config reload guard preserves running app-server turns', async ()
     buildGuard([['local', { status: 'running', transport: 'app-server' }]]),
     (error) => error.statusCode === 409 && /任务正在运行/.test(error.message),
   );
+});
+
+test('quota monitor API is isolated, read-only, refreshable, and supports a 0600 token file', { timeout: 30000 }, async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-quota-monitor-test-'));
+  const runtime = path.join(temporary, 'runtime');
+  const codexHome = path.join(temporary, 'codex-home');
+  const fakeCodex = path.join(temporary, 'fake-codex.mjs');
+  const traceFile = path.join(temporary, 'codex-trace.json');
+  const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
+  const tokenFile = path.join(temporary, 'quota-monitor.token');
+  let child;
+
+  try {
+    await mkdir(runtime, { recursive: true });
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+if (process.argv[2] !== 'app-server') process.exit(2);
+const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  const lines = buffer.split('\\n');
+  buffer = lines.pop() || '';
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify(message) + '\\n');
+    if (message.method === 'initialize') {
+      send({ id: message.id, result: { userAgent: 'quota-monitor-fixture' } });
+    } else if (message.method === 'account/rateLimits/read') {
+      send({
+        id: message.id,
+        result: {
+          rateLimits: {
+            planType: 'plus',
+            credits: { hasCredits: true, unlimited: false, balance: '42.5' }
+          }
+        }
+      });
+    } else if (Object.hasOwn(message, 'id')) {
+      send({ id: message.id, error: { code: -32601, message: 'unsupported fake method' } });
+    }
+  }
+});
+`);
+    await chmod(fakeCodex, 0o755);
+    await writeFile(tokenFile, 'file-monitor-token\n', { mode: 0o600 });
+
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+    });
+    let port = await waitForServer(child, runtime);
+    let baseUrl = `http://127.0.0.1:${port}`;
+    const disabled = await fetch(`${baseUrl}/api/monitor/quotas`);
+    assert.equal(disabled.status, 503);
+    assert.match(disabled.headers.get('cache-control'), /no-store/);
+    await stopServer(child);
+    child = undefined;
+    await unlink(path.join(runtime, 'port'));
+
+    await chmod(tokenFile, 0o644);
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+      quotaMonitorTokenFile: tokenFile,
+    });
+    port = await waitForServer(child, runtime);
+    baseUrl = `http://127.0.0.1:${port}`;
+    const insecureTokenFile = await fetch(`${baseUrl}/api/monitor/quotas`, {
+      headers: { 'X-API-Token': 'file-monitor-token' },
+    });
+    assert.equal(insecureTokenFile.status, 503);
+    assert.match(insecureTokenFile.headers.get('cache-control'), /no-store/);
+    await stopServer(child);
+    child = undefined;
+    await unlink(path.join(runtime, 'port'));
+    await chmod(tokenFile, 0o600);
+
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+      quotaMonitorTokenFile: tokenFile,
+    });
+    port = await waitForServer(child, runtime);
+    baseUrl = `http://127.0.0.1:${port}`;
+    const tokenFileResponse = await fetch(`${baseUrl}/api/monitor/quotas`, {
+      headers: { 'X-API-Token': 'file-monitor-token' },
+    });
+    assert.equal(tokenFileResponse.status, 200);
+    assert.match(tokenFileResponse.headers.get('cache-control'), /no-store/);
+    const tokenFilePayload = await tokenFileResponse.json();
+    assert.equal(tokenFilePayload.configured, false);
+    assert.equal(tokenFilePayload.count, 0);
+    assert.equal(tokenFilePayload.codexApp.balance, 42.5);
+    await stopServer(child);
+    child = undefined;
+    await unlink(path.join(runtime, 'port'));
+
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+      quotaMonitorToken: 'direct-monitor-token',
+      quotaMonitorTokenFile: tokenFile,
+    });
+    port = await waitForServer(child, runtime);
+    baseUrl = `http://127.0.0.1:${port}`;
+
+    const missing = await fetch(`${baseUrl}/api/monitor/quotas`);
+    assert.equal(missing.status, 401);
+    assert.match(missing.headers.get('cache-control'), /no-store/);
+    const login = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'test-password' }),
+    });
+    assert.equal(login.status, 200);
+    const cookieOnly = await fetch(`${baseUrl}/api/monitor/quotas`, {
+      headers: { Cookie: login.headers.get('set-cookie').split(';', 1)[0] },
+    });
+    assert.equal(cookieOnly.status, 401);
+    const monitorTokenCannotAccessWebApi = await fetch(`${baseUrl}/api/config`, {
+      headers: { 'X-API-Token': 'direct-monitor-token' },
+    });
+    assert.equal(monitorTokenCannotAccessWebApi.status, 401);
+    const wrong = await fetch(`${baseUrl}/api/monitor/quotas`, {
+      headers: { 'X-API-Token': 'file-monitor-token' },
+    });
+    assert.equal(wrong.status, 401, 'the direct token must take priority over the token file');
+    assert.match(wrong.headers.get('cache-control'), /no-store/);
+
+    const headerResponse = await fetch(`${baseUrl}/api/monitor/quotas`, {
+      headers: { 'X-API-Token': 'direct-monitor-token' },
+    });
+    assert.equal(headerResponse.status, 200);
+    const bearerResponse = await fetch(`${baseUrl}/api/monitor/quotas?refresh=1`, {
+      headers: { Authorization: 'Bearer direct-monitor-token' },
+    });
+    assert.equal(bearerResponse.status, 200);
+    assert.equal((await bearerResponse.json()).codexApp.balance, 42.5);
+
+    const rejectedPost = await fetch(`${baseUrl}/api/monitor/quotas`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer direct-monitor-token' },
+    });
+    assert.equal(rejectedPost.status, 405);
+    assert.equal(rejectedPost.headers.get('allow'), 'GET');
+    assert.match(rejectedPost.headers.get('cache-control'), /no-store/);
+
+    const quotaReads = (await readAppServerTrace(appServerTraceFile))
+      .filter((message) => message.method === 'account/rateLimits/read');
+    assert.equal(quotaReads.length, 3, 'refresh=1 bypasses the direct-token server cache');
+  } finally {
+    if (child) await stopServer(child);
+    await rm(temporary, { recursive: true, force: true });
+  }
 });
 
 test('login, read-only config, CLI arguments, and session restart', { timeout: 30000 }, async () => {
@@ -2218,7 +2879,21 @@ if (args[0] === 'app-server') {
         send({ id: message.id, result: { thread: thread(threadId) } });
       }
       else if (message.method === 'thread/fork') send({ id: message.id, result: { thread: thread(forkedThreadId) } });
-      else if (message.method === 'thread/resume') send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
+      else if (message.method === 'thread/resume') {
+        const control = archiveControl();
+        const conflictThreadId = String(control.activeWriterResumeThreadId || '');
+        if (conflictThreadId && conflictThreadId === String(message.params.threadId || '')) {
+          send({
+            id: message.id,
+            error: {
+              code: -32000,
+              message: 'thread-store conflict: thread ' + conflictThreadId + ' already has an active writer',
+            },
+          });
+          continue;
+        }
+        send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
+      }
       else if (message.method === 'thread/unsubscribe') send({ id: message.id, result: {} });
       else if (message.method === 'turn/start') {
         const turnId = '019f4f84-ea9f-73c2-b997-deba7b4aa798';
@@ -2582,7 +3257,10 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.main\s*\{[^}]*--header-height:\s*64px/s);
     assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.top\s*\{[^}]*min-height:\s*64px;[^}]*height:\s*auto;[^}]*padding:\s*calc\(env\(safe-area-inset-top, 0px\) \+ 12px\) 16px 12px;[^}]*gap:\s*14px/s);
     assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.top \.title\s*\{[^}]*line-height:\s*1\.4/s);
-    assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{[^}]*margin-top:\s*10px;[^}]*padding:\s*22px 16px 20px;[^}]*scroll-padding-top:\s*32px/s);
+    assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?body \.chat\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%;[^}]*min-width:\s*0;[^}]*margin-top:\s*10px;[^}]*overflow-x:\s*clip;[^}]*overflow-y:\s*auto;[^}]*overscroll-behavior-x:\s*none;[^}]*padding:\s*22px 16px 20px;[^}]*scroll-padding-top:\s*32px/s);
+    assert.match(uiStyles, /body \.chat > \*,[\s\S]*?body \.chat :is\([\s\S]*?\.liveProcessPanel,[\s\S]*?\.completionTimeline,[\s\S]*?\.activityClusterItems,[\s\S]*?\.activityItem[\s\S]*?\)\s*\{[^}]*min-width:\s*0;[^}]*max-width:\s*100%;[^}]*box-sizing:\s*border-box/s);
+    assert.match(uiStyles, /body \.chat :is\(\.msgBody, \.markdownBody\)\s*\{[^}]*overflow-wrap:\s*anywhere;[^}]*word-break:\s*break-word/s);
+    assert.match(uiStyles, /\.activityItem\.skillTarget \.activityItemSummary\s*\{[^}]*width:\s*100%;[^}]*min-width:\s*0;[^}]*grid-template-columns:\s*var\(--activity-icon-box, 16px\) auto minmax\(0, 1fr\) auto 13px/s);
     assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.subQuotaCodexSummary\s*\{[^}]*align-items:\s*stretch;[^}]*flex-direction:\s*column;[^}]*padding-top:\s*10px/s);
     assert.match(uiStyles, /@media \(max-width: 820px\)[\s\S]*?\.subQuotaCodexBalances\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*none;[^}]*flex:\s*none/s);
     assert.match(uiStyles, /\.liveProcessPanel\s*\{[^}]*margin:\s*0 0 18px/s);
@@ -3473,7 +4151,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=quota-project-actions-20260820a"/);
+    assert.match(page, /href="\/ui\.css\?v=sync-quota-preview-20260827a"/);
     assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -3586,7 +4264,7 @@ updated_at = 1784422800000
     assert.match(page, /const requestedLimit=fillViewport\?adaptiveLimit:Math\.max\(adaptiveLimit,hintedLimit\)/);
     assert.match(page, /historyPaging:true/);
     assert.match(page, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\)/);
-    assert.match(page, /loadEarlierNativeHistoryPage\(\{fillViewport:true\}\)/);
+    assert.match(page, /loadEarlierNativeHistoryPage\(\{fillViewport:true,restoreRevision\}\)/);
     assert.match(page, /fillInitialSideChatHistoryPage\(\)/);
     assert.match(page, /function scheduleDeferredNativeHistorySync\(threadId\)/);
     assert.match(page, /nativeHistoryDeferredSyncTimer=null;\s*nativeHistorySyncDeferred=false;\s*if\(currentConversationSource!=='codex'/);
@@ -3715,6 +4393,9 @@ updated_at = 1784422800000
     assert.match(page, /removeButton\.addEventListener\('click',\(\)=>removeSubQuotaSettingsSource\(sourceId\)\)/);
     assert.match(page, /removeButton\?\.setAttribute\('aria-label','删除 '\+nextName\)/);
     assert.match(page, /source\.className='subQuotaSettingsSource'\+\(builtin\?' subQuotaSettingsBuiltinSource':''\)/);
+    assert.match(page, /const manualFields=document\.createElement\('div'\);\s*manualFields\.className='subQuotaManualSourceFields'/);
+    assert.doesNotMatch(page, /if\(!builtin\)\{\s*const manualFields=document\.createElement\('div'\)/);
+    assert.match(page, /typeSelect\.title='渠道类型由当前额度来源固定'/);
     assert.match(page, /for\(const provider of \['cpa-codex','sub2api','grok2api','deepseek','openai-compatible'\]\)/);
     assert.match(page, /subQuotaAddSourceButton\.addEventListener\('click',\(\)=>addSubQuotaSettingsSource\(subQuotaAddSourceType\.value\)\)/);
     assert.match(page, /'openai-compatible':\{title:'OpenAI 兼容',detail:'检测 \/v1\/models 连通性，不提供余额'/);
@@ -3726,13 +4407,16 @@ updated_at = 1784422800000
     assert.match(page, /footer\.className='subQuotaSettingsFooter'/);
 
     assert.match(page, /inputs\.baseUrlInput\.value=source\.baseUrl\|\|''/);
-    assert.match(page, /source\.keyConfigured\?'Key 已配置，留空保留'/);
+    assert.match(page, /inputs\.syncCredentials\?\.\(source\.credentials\)/);
+    assert.match(page, /credentialId\?credentialLabel\+' 已配置，留空保留'/);
+    assert.match(page, /addKeyButton\.addEventListener\('click'/);
+    assert.match(page, /removeKeyButton\.addEventListener\('click'/);
     assert.match(page, /正在保存额度配置…/);
     assert.match(page, /const orderedIds=\[\.\.\.subQuotaSettingsSourceList\.querySelectorAll\('\.subQuotaSettingsSource'\)\]\.map\(\(element\)=>element\.dataset\.sourceId\)\.filter\(Boolean\)/);
-    assert.match(page, /id:inputs\.id,\s*name:inputs\.nameInput\?\.value\.trim\(\)\|\|inputs\.sourceTitle\?\.textContent\|\|subQuotaSourceDefinition\(inputs\.provider\)\.title,\s*provider:inputs\.provider,\s*baseUrl:inputs\.baseUrlInput\.value,\s*apiKey:inputs\.apiKeyInput\.value,\s*visible:subQuotaVisibilityValue\(inputs\.visibilityToggle\),/s);
+    assert.match(page, /id:inputs\.id,\s*name:inputs\.nameInput\?\.value\.trim\(\)\|\|inputs\.sourceTitle\?\.textContent\|\|subQuotaSourceDefinition\(inputs\.provider\)\.title,\s*provider:inputs\.provider,\s*baseUrl:inputs\.baseUrlInput\.value,\s*apiKeys:inputs\.readCredentials\?\.\(\)\|\|\[\],\s*visible:subQuotaVisibilityValue\(inputs\.visibilityToggle\),/s);
     assert.match(page, /const order=orderedIds/);
     assert.match(page, /JSON\.stringify\(\{sources,order,codexAppVisible\}\)/);
-    assert.match(page, /各来源独立保存，检测失败不影响配置/);
+    assert.match(page, /各来源独立保存并支持多 Key，检测失败不影响配置/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /void syncSubQuotaSettings\(\)\.then\(\(loaded\)=>\{/);
     assert.match(page, /function closeSubQuotaSettings\(\)/);
@@ -6153,7 +6837,7 @@ updated_at = 1784422800000
 
     desktopIpc.startTurnMode = 'echo-only';
     desktopIpc.onStartTurn = async (message) => {
-      const text = message.params.turnStartParams.input.find((item) => item.type === 'text')?.text || '';
+      const text = message.params.turnStart.request.input.find((item) => item.type === 'text')?.text || '';
       assert.equal(text, 'recover from native echo');
       const records = [
         {
@@ -6481,21 +7165,26 @@ updated_at = 1784422800000
     assert.equal(echoedInterrupted.status, 200);
 
     const desktopStart = desktopIpc.messages.find((message) => message.method === 'thread-follower-start-turn');
+    assert.equal(desktopStart.version, 2);
+    assert.equal(desktopStart.targetClientId, 'desktop-owner');
     assert.equal(desktopStart.params.conversationId, nativeSessionId);
-    assert.deepEqual(desktopStart.params.turnStartParams.input, [{
+    assert.equal(desktopStart.params.turnStart.request.threadId, nativeSessionId);
+    assert.deepEqual(desktopStart.params.turnStart.request.input, [{
       type: 'text',
       text: 'sync through desktop owner',
       text_elements: [],
     }]);
-    assert.equal(desktopStart.params.turnStartParams.effort, 'ultra');
-    assert.equal(desktopStart.params.turnStartParams.model, 'test-model');
-    assert.equal(desktopStart.params.turnStartParams.serviceTier, 'priority');
-    assert.equal(desktopStart.params.turnStartParams.sandboxPolicy.type, 'readOnly');
+    assert.equal(desktopStart.params.turnStart.request.effort, 'ultra');
+    assert.equal(desktopStart.params.turnStart.request.model, 'test-model');
+    assert.equal(desktopStart.params.turnStart.request.serviceTier, 'priority');
+    assert.equal(desktopStart.params.turnStart.request.sandboxPolicy.type, 'readOnly');
+    assert.deepEqual(desktopStart.params.turnStart.context.attachments, []);
+    assert.deepEqual(desktopStart.params.turnStart.context.commentAttachments, []);
     const standardDesktopStart = desktopIpc.messages.find((message) => (
       message.method === 'thread-follower-start-turn'
-      && message.params.turnStartParams.input.some((item) => item.text === 'recover from native echo')
+      && message.params.turnStart.request.input.some((item) => item.text === 'recover from native echo')
     ));
-    assert.equal(standardDesktopStart.params.turnStartParams.serviceTier, null);
+    assert.equal(standardDesktopStart.params.turnStart.request.serviceTier, null);
     const desktopSteer = desktopIpc.messages.find((message) => message.method === 'thread-follower-steer-turn');
     assert.equal(desktopSteer.params.conversationId, nativeSessionId);
     assert.deepEqual(desktopSteer.params.input, [{
@@ -6515,6 +7204,146 @@ updated_at = 1784422800000
     assert.deepEqual(desktopSteer.params.attachments, []);
     assert.ok(desktopIpc.messages.some((message) => message.method === 'thread-follower-interrupt-turn'));
     desktopIpc.ownerAvailable = false;
+
+    const activeWriterDesktopStartsBeforeRecovery = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-follower-start-turn',
+    ).length;
+    const activeWriterOwnerDiscoveriesBeforeRecovery = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-owner-discovery',
+    ).length;
+    const acceptedDesktopStartsBeforeRecovery = desktopIpc.acceptedStartTurnCount;
+    const activeWriterTraceBeforeRecovery = await readAppServerTrace(appServerTraceFile);
+    await writeFile(appServerControlFile, JSON.stringify({
+      activeWriterResumeThreadId: nativeSessionId,
+    }));
+    const recoveredActiveWriterRequest = fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'recover active writer through desktop owner',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const ownerDiscoveries = desktopIpc.messages.filter((message) => (
+        message.method === 'thread-owner-discovery'
+        && message.params?.conversationId === nativeSessionId
+      )).length;
+      if (ownerDiscoveries >= activeWriterOwnerDiscoveriesBeforeRecovery + 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(
+      desktopIpc.messages.filter((message) => (
+        message.method === 'thread-owner-discovery'
+        && message.params?.conversationId === nativeSessionId
+      )).length >= activeWriterOwnerDiscoveriesBeforeRecovery + 2,
+      'the Desktop owner should receive multiple discovery retries before recovery',
+    );
+    desktopIpc.ownerAvailable = true;
+    const recoveredActiveWriter = await recoveredActiveWriterRequest;
+    const recoveredActiveWriterPayload = await recoveredActiveWriter.json();
+    assert.equal(recoveredActiveWriter.status, 202, recoveredActiveWriterPayload.error);
+    assert.equal(recoveredActiveWriterPayload.turnId, 'desktop-turn-1');
+    assert.ok(
+      desktopIpc.messages.filter((message) => (
+        message.method === 'thread-owner-discovery'
+        && message.params?.conversationId === nativeSessionId
+      )).length >= activeWriterOwnerDiscoveriesBeforeRecovery + 3,
+      'the Desktop owner should be retried across a recovery window longer than 180ms',
+    );
+    assert.equal(
+      desktopIpc.acceptedStartTurnCount,
+      acceptedDesktopStartsBeforeRecovery + 1,
+      'the recovered Desktop owner must accept the turn exactly once',
+    );
+    const activeWriterTraceAfterRecovery = await readAppServerTrace(appServerTraceFile);
+    assert.equal(
+      activeWriterTraceAfterRecovery.filter((message) => (
+        message.method === 'turn/start'
+        && message.params?.threadId === nativeSessionId
+      )).length,
+      activeWriterTraceBeforeRecovery.filter((message) => (
+        message.method === 'turn/start'
+        && message.params?.threadId === nativeSessionId
+      )).length,
+      'the Web app-server must not start a duplicate turn after thread/resume conflicts',
+    );
+    const activeWriterDesktopStarts = desktopIpc.messages
+      .filter((message) => message.method === 'thread-follower-start-turn')
+      .slice(activeWriterDesktopStartsBeforeRecovery);
+    assert.equal(activeWriterDesktopStarts.length, 2);
+    assert.equal(activeWriterDesktopStarts[0].targetClientId, 'desktop-owner');
+    assert.equal(activeWriterDesktopStarts[1].targetClientId, 'desktop-owner');
+    const interruptedRecoveredActiveWriter = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`,
+      {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ turnId: recoveredActiveWriterPayload.turnId }),
+      },
+    );
+    assert.equal(interruptedRecoveredActiveWriter.status, 200);
+
+    desktopIpc.ownerAvailable = false;
+    const activeWriterTraceBeforeFailure = await readAppServerTrace(appServerTraceFile);
+    const blockedActiveWriter = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'friendly active writer failure',
+        provider: 'fake',
+        model: 'test-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    const blockedActiveWriterPayload = await blockedActiveWriter.json();
+    assert.equal(blockedActiveWriter.status, 409);
+    assert.match(blockedActiveWriterPayload.error, /Codex App 持有/);
+    assert.match(blockedActiveWriterPayload.error, /稍后重试|App 中继续/);
+    assert.doesNotMatch(blockedActiveWriterPayload.error, /active writer|thread-store/i);
+    const activeWriterTraceAfterFailure = await readAppServerTrace(appServerTraceFile);
+    assert.equal(
+      activeWriterTraceAfterFailure.filter((message) => (
+        message.method === 'turn/start'
+        && message.params?.threadId === nativeSessionId
+      )).length,
+      activeWriterTraceBeforeFailure.filter((message) => (
+        message.method === 'turn/start'
+        && message.params?.threadId === nativeSessionId
+      )).length,
+    );
+
+    const desktopStartsBeforeActiveWriterProviderSwitch = desktopIpc.messages.filter(
+      (message) => message.method === 'thread-follower-start-turn',
+    ).length;
+    const blockedProviderSwitch = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'do not switch provider through an active writer',
+        provider: 'custom',
+        model: 'custom-model',
+        cwd: temporary,
+        sandbox: 'read-only',
+        approval: 'on-request',
+      }),
+    });
+    const blockedProviderSwitchPayload = await blockedProviderSwitch.json();
+    assert.equal(blockedProviderSwitch.status, 409);
+    assert.match(blockedProviderSwitchPayload.error, /无法在 Web 中切换渠道/);
+    assert.doesNotMatch(blockedProviderSwitchPayload.error, /active writer|thread-store/i);
+    assert.equal(
+      desktopIpc.messages.filter((message) => message.method === 'thread-follower-start-turn').length,
+      desktopStartsBeforeActiveWriterProviderSwitch,
+      'a provider switch must not silently retry through the old Desktop provider',
+    );
+    await writeFile(appServerControlFile, '{}');
 
     await writeFile(appServerControlFile, JSON.stringify({ turnStartDelayMs: 120 }));
     const concurrentTurnPayload = {
@@ -7999,11 +8828,12 @@ updated_at = 1784422800000
         .length,
       createdDeleteCountBeforeBulkRace,
     );
-    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 7);
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 10);
     assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 10);
     const switchedProviderResume = protocolMessages.find((message) => (
       message.method === 'thread/resume'
       && message.params.modelProvider === 'custom'
+      && message.params.serviceTier === 'priority'
     ));
     assert.ok(switchedProviderResume);
     assert.equal(switchedProviderResume.params.model, 'custom-model');
@@ -8368,6 +9198,8 @@ function startServer({
   dockerBin = '',
   sub2ApiBaseUrl,
   sub2ApiKey,
+  quotaMonitorToken = '',
+  quotaMonitorTokenFile = '',
 }) {
   const env = {
     ...process.env,
@@ -8393,6 +9225,8 @@ function startServer({
     CODEX_WEB_LOCAL_IMAGE_ROOTS: localImageRoots,
     PLAYGROUND_PROXY_HEARTBEAT_MS: '20',
     HOMEPAGE_API_TOKEN: '',
+    CODEX_WEB_QUOTA_MONITOR_TOKEN: quotaMonitorToken,
+    CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE: quotaMonitorTokenFile,
     IMAGE_PROMPT_AUTO_SYNC: 'false',
     PLAYGROUND_UPDATE_ENABLED: 'false',
     DEFAULT_CWD: temporary,
@@ -8410,8 +9244,8 @@ function startServer({
   if (dockerBin) env.DOCKER_BIN = dockerBin;
   env.CPA_QUOTA_BASE_URL = '';
   env.CPA_QUOTA_API_KEY = '';
-  delete env.SUB2API_BASE_URL;
-  delete env.SUB2API_API_KEY;
+  env.SUB2API_BASE_URL = '';
+  env.SUB2API_API_KEY = '';
   env.SUB2API_ADMIN_API_KEY = '';
   env.GROK2API_BASE_URL = '';
   env.GROK2API_ADMIN_PASSWORD = '';
@@ -8492,6 +9326,7 @@ async function createDesktopIpcFixture(temporary) {
     messages: [],
     ownerAvailable: true,
     startTurnMode: 'respond',
+    acceptedStartTurnCount: 0,
     onStartTurn: null,
     steerMode: 'respond',
     onSteer: null,
@@ -8561,6 +9396,9 @@ async function createDesktopIpcFixture(temporary) {
           error: 'no-client-found',
         });
         return;
+      }
+      if (message.method === 'thread-follower-start-turn') {
+        fixture.acceptedStartTurnCount += 1;
       }
       if (message.method === 'thread-follower-interrupt-turn' && fixture.interruptMode === 'timeout') {
         return;

@@ -582,20 +582,6 @@ test('project preview stays interactive while the pointer travels from the heade
   assert.match(uiStyles, /\.historyProjectPreview\.visible\s*\{[^}]*pointer-events:\s*auto/s);
 });
 
-test('project preview stays interactive while the pointer travels from the header to its actions', () => {
-  assert.match(inlineScript, /const HISTORY_PROJECT_PREVIEW_HIDE_DELAY_MS=320/);
-  assert.match(inlineScript, /function cancelHistoryProjectPreviewHide\(\)\{[\s\S]*clearTimeout\(historyProjectPreviewHideTimer\)/);
-  assert.match(inlineScript, /function scheduleHistoryProjectPreviewHide\(\)\{[\s\S]*setTimeout\(\(\)=>\{[\s\S]*hideHistoryProjectPreview\(\)/);
-  const previewSource = sourceBetween('function ensureHistoryProjectPreview', 'function appendHistoryProjectPreviewRow');
-  assert.match(previewSource, /preview\.addEventListener\('pointerenter',cancelHistoryProjectPreviewHide\)/);
-  assert.match(previewSource, /preview\.addEventListener\('pointerleave',scheduleHistoryProjectPreviewHide\)/);
-  assert.match(previewSource, /preview\.addEventListener\('focusin',cancelHistoryProjectPreviewHide\)/);
-  const renderSource = sourceBetween('function renderHistory', 'function createHistoryRow');
-  assert.match(renderSource, /header\.addEventListener\('pointerleave',scheduleHistoryProjectPreviewHide\)/);
-  assert.match(renderSource, /historyProjectPreview\?\.contains\(event\.relatedTarget\)/);
-  assert.match(uiStyles, /\.historyProjectPreview\.visible\s*\{[^}]*pointer-events:\s*auto/s);
-});
-
 test('starting a new task clears inherited project selection', () => {
   assert.match(inlineScript, /function resetNewTaskComposerCwd\(\)\{\s*cwd\.value='';\s*currentNativeWorkspaceKind='';\s*}/);
   assert.match(inlineScript, /defaultComposerCwd=String\(data\.defaults\.cwd\|\|''\);if\(!currentConversationId\)cwd\.value='';/);

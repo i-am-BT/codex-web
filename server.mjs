@@ -28,6 +28,7 @@ import {
   ImagePromptLibrary,
 } from './image-prompt-library.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
+import { archiveInactiveNativeThread } from './native-thread-archive.mjs';
 import {
   AutomationStore,
   buildAutomationRrule,
@@ -74,7 +75,9 @@ const SUB_QUOTA_DEFAULT_ORDER = ['cpa-codex', 'sub2api', 'grok2api', 'deepseek']
 const SUB_QUOTA_SUPPORTED_PROVIDERS = [...SUB_QUOTA_DEFAULT_ORDER, 'openai-compatible'];
 const SUB_QUOTA_BUILTIN_IDS = new Set(['cpa-codex', 'sub2api', 'grok2api', 'deepseek']);
 const SUB_QUOTA_MAX_SOURCES = 12;
+const SUB_QUOTA_MAX_API_KEYS = 8;
 const SUB_QUOTA_SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
+const SUB_QUOTA_CREDENTIAL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 const SUB_QUOTA_SOURCES_FILE = path.join(RUNTIME_DIR, 'sub-quota-sources.json');
 const CODEX_APP_QUOTA_PROVIDER = 'codex-app';
 const CODEX_APP_USD_PER_CREDIT = 0.04;
@@ -143,6 +146,24 @@ const CODEX_DESKTOP_IPC_ENABLED = parseBoolean(
 );
 const CODEX_DESKTOP_IPC_SOCKET = String(process.env.CODEX_DESKTOP_IPC_SOCKET || '').trim();
 const CODEX_DESKTOP_IPC_TIMEOUT_MS = Number(process.env.CODEX_DESKTOP_IPC_TIMEOUT_MS || 20000);
+const CODEX_DESKTOP_OWNER_DISCOVERY_TIMEOUT_MS = Math.min(
+  Number.isFinite(CODEX_DESKTOP_IPC_TIMEOUT_MS) && CODEX_DESKTOP_IPC_TIMEOUT_MS > 0
+    ? CODEX_DESKTOP_IPC_TIMEOUT_MS
+    : 1500,
+  1500,
+);
+const CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS = Object.freeze([150, 300, 600, 1000, 1400, 1500]);
+const CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS = Math.min(
+  CODEX_DESKTOP_OWNER_DISCOVERY_TIMEOUT_MS,
+  750,
+);
+const CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS = Math.min(
+  Number.isFinite(CODEX_DESKTOP_IPC_TIMEOUT_MS) && CODEX_DESKTOP_IPC_TIMEOUT_MS > 0
+    ? CODEX_DESKTOP_IPC_TIMEOUT_MS
+    : 2000,
+  2000,
+);
+const CODEX_DESKTOP_TURN_ECHO_GRACE_MS = 1800;
 const CODEX_DESKTOP_IPC_INTERRUPT_TIMEOUT_MS = Math.min(
   Number.isFinite(CODEX_DESKTOP_IPC_TIMEOUT_MS) && CODEX_DESKTOP_IPC_TIMEOUT_MS > 0
     ? CODEX_DESKTOP_IPC_TIMEOUT_MS
@@ -159,6 +180,8 @@ const APP_QUEUE_PERSIST_TIMEOUT_MS = Math.max(500, Math.min(CODEX_DESKTOP_IPC_TI
 const APP_QUEUE_BROADCAST_GRACE_MS = Math.min(APP_QUEUE_PERSIST_TIMEOUT_MS, 450);
 const APP_INTERRUPTED_QUEUE_PAUSE_REASON = 'Interrupted before the steer was accepted.';
 const HOMEPAGE_API_TOKEN = process.env.HOMEPAGE_API_TOKEN || '';
+const CODEX_WEB_QUOTA_MONITOR_TOKEN = normalizeQuotaMonitorToken(process.env.CODEX_WEB_QUOTA_MONITOR_TOKEN);
+const CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE = String(process.env.CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE || '').trim();
 const homepageModelCacheSeconds = Number(process.env.HOMEPAGE_MODEL_CACHE_SECONDS || 60);
 const HOMEPAGE_MODEL_CACHE_MS = (Number.isFinite(homepageModelCacheSeconds) ? Math.max(0, homepageModelCacheSeconds) : 60) * 1000;
 const IMAGE_PROMPT_AUTO_SYNC = parseBoolean(process.env.IMAGE_PROMPT_AUTO_SYNC, true);
@@ -281,6 +304,7 @@ const desktopIpcClient = new CodexDesktopIpcClient({
   socketPath: CODEX_DESKTOP_IPC_SOCKET || undefined,
   clientType: 'codex-web',
   requestTimeoutMs: CODEX_DESKTOP_IPC_TIMEOUT_MS,
+  ownerDiscoveryTimeoutMs: CODEX_DESKTOP_OWNER_DISCOVERY_TIMEOUT_MS,
 });
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
@@ -388,6 +412,30 @@ app.get('/api/homepage/stats', requireHomepageToken, async (req, res) => {
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
+  }
+});
+
+app.all('/api/monitor/quotas', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', 'GET');
+    return res.status(405).json({ error: '额度监控接口只支持 GET' });
+  }
+  return requireQuotaMonitorToken(req, res, next);
+}, async (req, res) => {
+  try {
+    const refresh = req.query.refresh === '1';
+    const [data, codexApp] = await Promise.all([
+      subQuotaService.list({ refresh }),
+      readCodexAppCredits({ refresh }),
+    ]);
+    res.json({
+      ...data,
+      codexApp: { ...codexApp, visible: codexAppQuotaVisible },
+      visibility: subQuotaVisibilityState(),
+    });
+  } catch (err) {
+    res.status(502).json({ error: `读取额度失败: ${err.message}` });
   }
 });
 
@@ -986,6 +1034,7 @@ app.get('/api/sub-quota-config', requireAuth, (_req, res) => {
     codexApp,
     sources,
     maxSources: SUB_QUOTA_MAX_SOURCES,
+    maxApiKeys: SUB_QUOTA_MAX_API_KEYS,
     providerOptions: SUB_QUOTA_SUPPORTED_PROVIDERS.map((provider) => ({
       provider,
       label: subQuotaProviderLabel(provider),
@@ -1020,17 +1069,25 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
       if (requested.remove && !requested.builtin) continue;
       const existing = existingById.get(requested.id);
       const suppliedApiKey = String(requested.apiKey || '').trim();
+      const hasSubmittedApiKeys = requested.apiKeys !== undefined;
       const submittedBaseUrl = requested.baseUrl === undefined ? undefined : String(requested.baseUrl || '').trim();
       const provider = normalizeSubQuotaProvider(requested.provider || existing?.provider);
       if (!provider) throw new Error('额度来源类型无效');
       const visible = normalizeSubQuotaVisibility(requested.visible, existing?.visible !== false);
       const name = normalizeSubQuotaSourceName(requested.name, existing?.name || subQuotaProviderLabel(provider));
-      if (submittedBaseUrl === '' && !suppliedApiKey && existing && existing.provider === provider) {
+      if (submittedBaseUrl === '' && !hasSubmittedApiKeys && !suppliedApiKey && existing && existing.provider === provider) {
         nextConfigs.push({ ...existing, name, visible });
         continue;
       }
+      const existingForProvider = existing?.provider === provider ? existing : {};
+      const submittedApiKeys = hasSubmittedApiKeys
+        ? normalizeSubmittedSubQuotaApiKeys(requested.apiKeys, existingForProvider)
+        : null;
       const rawBaseUrl = requested.baseUrl === undefined ? existing?.baseUrl : submittedBaseUrl;
       if (!rawBaseUrl) {
+        if (suppliedApiKey || submittedApiKeys?.length) {
+          throw new Error(`${name} 已填写 API Key，请先填写上游 URL 或删除全部 Key`);
+        }
         nextConfigs.push(emptySubQuotaConfig(provider, {
           id: requested.id,
           name,
@@ -1040,18 +1097,21 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
         }));
         continue;
       }
-      const apiKey = suppliedApiKey || (existing?.provider === provider ? existing.apiKey : '');
-      if (apiKey) validateSubQuotaApiKey(apiKey);
-      nextConfigs.push({
+      const apiKeys = hasSubmittedApiKeys
+        ? submittedApiKeys
+        : suppliedApiKey
+          ? normalizeStoredSubQuotaApiKeys([{ value: suppliedApiKey }])
+          : subQuotaApiKeys(existingForProvider);
+      nextConfigs.push(withSubQuotaApiKeys({
         id: requested.id,
         name,
         provider,
         order: existing?.order ?? nextConfigs.length,
         baseUrl: normalizeSubQuotaBaseUrl(rawBaseUrl, { provider }),
-        apiKey,
+        apiKeys,
         visible,
         builtin: SUB_QUOTA_BUILTIN_IDS.has(requested.id),
-      });
+      }));
     }
     if (nextConfigs.length > SUB_QUOTA_MAX_SOURCES) throw new Error(`额度来源最多配置 ${SUB_QUOTA_MAX_SOURCES} 个`);
     const requestedOrder = normalizeSubQuotaOrderRequest(req.body?.order, nextConfigs);
@@ -1087,6 +1147,7 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
       visibleCount: sources.filter((source) => source.visible).length + (codexApp.visible ? 1 : 0),
       codexApp,
       sources,
+      maxApiKeys: SUB_QUOTA_MAX_API_KEYS,
     });
   } catch (err) {
     const status = Number(err?.statusCode) || 400;
@@ -1887,11 +1948,11 @@ app.delete('/api/native-sessions/:id', requireAuth, async (req, res) => {
   const threadCwd = conversation?.metadata?.cwd || DEFAULT_CWD;
 
   try {
-    await appServerClient.request('thread/archive', { threadId });
+    const archive = await archiveNativeThread(threadId, conversation);
     try { nativeSessions.unmarkSideChatThread?.(threadId); } catch {}
     await notifyDesktopThreadArchived(threadId, threadCwd);
     nativeSessions.scheduleRefresh();
-    res.json({ ok: true, id: threadId });
+    res.json({ ok: true, id: threadId, archiveMode: archive.mode });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `归档 Codex App 会话失败: ${err.message}` });
   }
@@ -1923,7 +1984,7 @@ app.post('/api/native-projects/archive', requireAuth, async (req, res) => {
   const failed = [];
   for (const session of targets) {
     try {
-      await appServerClient.request('thread/archive', { threadId: session.id });
+      await archiveNativeThread(session.id, nativeSessions.get(session.id));
       await notifyDesktopThreadArchived(session.id, session.cwd);
       archived.push(session.id);
     } catch (err) {
@@ -2603,6 +2664,40 @@ function requireHomepageToken(req, res, next) {
   const token = String(req.get('X-API-Token') || '');
   if (!safeEqual(token, HOMEPAGE_API_TOKEN)) return res.status(401).json({ error: '无效的 API Token' });
   next();
+}
+
+function requireQuotaMonitorToken(req, res, next) {
+  const expected = quotaMonitorToken();
+  if (!expected) return res.status(503).json({ error: '额度监控 API 未配置' });
+  const token = quotaMonitorRequestToken(req);
+  if (!safeEqual(token, expected)) return res.status(401).json({ error: '无效的额度监控 API Token' });
+  next();
+}
+
+function quotaMonitorRequestToken(req) {
+  const headerToken = String(req.get('X-API-Token') || '').trim();
+  if (headerToken) return headerToken;
+  const authorization = String(req.get('Authorization') || '');
+  const match = authorization.match(/^\s*Bearer\s+([^\s]+)\s*$/i);
+  return match ? match[1] : '';
+}
+
+function normalizeQuotaMonitorToken(value) {
+  const token = String(value || '').trim();
+  return token && token.length <= 4096 && !/[\r\n\0]/.test(token) ? token : '';
+}
+
+function quotaMonitorToken() {
+  if (CODEX_WEB_QUOTA_MONITOR_TOKEN) return CODEX_WEB_QUOTA_MONITOR_TOKEN;
+  if (!CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE) return '';
+  try {
+    const file = resolveLocalPath(CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE, ROOT);
+    const stats = statSync(file);
+    if (!stats.isFile() || (stats.mode & 0o777) !== 0o600) return '';
+    return normalizeQuotaMonitorToken(readFileSync(file, 'utf8'));
+  } catch {
+    return '';
+  }
 }
 
 function homepageTaskName(task) {
@@ -3339,7 +3434,7 @@ function clearPersistedTerminalNativeTurns(change) {
   }
 }
 
-function clearPersistedTerminalNativeTurn(threadId) {
+function clearPersistedTerminalNativeTurn(threadId, options = {}) {
   const cleanId = cleanNativeThreadId(threadId);
   const active = cleanId ? activeNativeTurns.get(cleanId) : null;
   if (!active?.turnId) return false;
@@ -4514,7 +4609,7 @@ function recordNativeTurnCompletion(threadId, turn = {}, options = {}) {
   setNativeTurnState(cleanId, { turnId, status });
   // The JSONL watcher may have observed task_complete before this notification.
   void releaseAppServerThreadAfterTurn(cleanId, turnId, { reason: 'turn-completed' });
-  clearPersistedTerminalNativeTurn(cleanId);
+  clearPersistedTerminalNativeTurn(cleanId, { skipQueueDispatch: options.skipQueueDispatch === true });
   if (options.skipQueueDispatch !== true && !isPromptQueuePaused(cleanId)) {
     scheduleServerPromptQueueDispatch(cleanId, 160);
   }
@@ -4928,15 +5023,100 @@ async function continueNativeTurn(threadId, turn) {
   const baseline = nativeSessions.get(threadId);
   const currentProvider = String(baseline?.metadata?.modelProvider || '');
   if (turn.provider !== currentProvider) {
-    return resumeNativeTurn(threadId, turn);
+    try {
+      return await resumeNativeTurn(threadId, turn);
+    } catch (error) {
+      if (isNativeActiveWriterConflict(error)) {
+        throw nativeActiveWriterConflictError({ providerChanged: true, cause: error });
+      }
+      throw error;
+    }
   }
   // A previous Web fallback may have finished without its terminal notification
   // reaching this process. Release that idle Web subscription before asking the
   // Desktop owner to continue the thread.
   await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'before-desktop' });
-  const requestedAt = Date.now();
+  const desktopRequestedAt = Date.now();
+  const knownOwnerClientId = String(desktopThreadStates.get(threadId)?.ownerClientId || '');
+  try {
+    return await startDesktopNativeTurn(threadId, turn, baseline, {
+      requestedAt: desktopRequestedAt,
+      ...(knownOwnerClientId ? { targetClientId: knownOwnerClientId } : {}),
+    });
+  } catch (error) {
+    if (
+      knownOwnerClientId
+      && isCodexDesktopIpcUnavailableError(error)
+      && error?.reason === 'no-client-found'
+      && desktopThreadStates.get(threadId)?.ownerClientId === knownOwnerClientId
+    ) {
+      desktopThreadStates.delete(threadId);
+    }
+    if (isAmbiguousDesktopTurnStartError(error)) throw error;
+    if (!isRetryableDesktopOwnerRecoveryError(error)) throw error;
+  }
+
+  try {
+    return await resumeNativeTurn(threadId, turn);
+  } catch (error) {
+    if (!isNativeActiveWriterConflict(error)) throw error;
+  }
+
+  let lastUnavailableError = null;
+  for (const delayMs of CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    try {
+      return await startDesktopNativeTurn(threadId, turn, baseline, {
+        requestedAt: desktopRequestedAt,
+        ownerDiscoveryTimeoutMs: CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS,
+        timeoutMs: CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS,
+      });
+    } catch (error) {
+      if (isNativeActiveWriterConflict(error)) {
+        throw nativeActiveWriterConflictError({ cause: error });
+      }
+      if (isAmbiguousDesktopTurnStartError(error)) throw error;
+      if (!isRetryableDesktopOwnerRecoveryError(error)) throw error;
+      lastUnavailableError = error;
+    }
+  }
+  throw nativeActiveWriterConflictError({ cause: lastUnavailableError });
+}
+
+function isRetryableDesktopOwnerRecoveryError(error) {
+  if (
+    error?.desktopIpcMethod === 'thread-owner-discovery'
+    && (
+      error?.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+      || ['ECONNRESET', 'EPIPE', 'ENOTCONN', 'ECONNABORTED'].includes(String(error?.code || ''))
+      || /connection (?:closed|reset)|socket hang up|broken pipe|连接已关闭/i
+        .test(String(error?.message || ''))
+    )
+  ) {
+    return true;
+  }
+  if (!isCodexDesktopIpcUnavailableError(error)) return false;
+  return ['socket-not-found', 'connect-failed', 'not-connected', 'no-client-found']
+    .includes(String(error?.reason || ''));
+}
+
+async function startDesktopNativeTurn(threadId, turn, baseline, options = {}) {
+  const requestedAt = Number(options.requestedAt) || Date.now();
+  const existingEcho = findNativeTurnEcho(threadId, turn, baseline, requestedAt);
+  if (existingEcho) return recoverDesktopNativeTurn(threadId, existingEcho, turn);
   const echoController = new AbortController();
-  const desktopAttempt = desktopIpcClient.startTurn(threadId, buildDesktopTurnStartParams(turn)).then(
+  const desktopOptions = {
+    ...(options.targetClientId ? { targetClientId: String(options.targetClientId) } : {}),
+    ...(Number(options.ownerDiscoveryTimeoutMs) > 0
+      ? { ownerDiscoveryTimeoutMs: Number(options.ownerDiscoveryTimeoutMs) }
+      : {}),
+    ...(Number(options.timeoutMs) > 0 ? { timeoutMs: Number(options.timeoutMs) } : {}),
+  };
+  const desktopAttempt = desktopIpcClient.startTurn(
+    threadId,
+    buildDesktopTurnStartParams(turn),
+    desktopOptions,
+  ).then(
     (result) => ({ type: 'ipc-result', result }),
     (error) => ({ type: 'ipc-error', error }),
   );
@@ -4944,13 +5124,14 @@ async function continueNativeTurn(threadId, turn) {
     (conversation) => ({ type: 'native-echo', conversation }),
   );
   const outcome = await Promise.race([desktopAttempt, echoAttempt]);
-  echoController.abort();
 
   if (outcome.type === 'native-echo' && outcome.conversation) {
+    echoController.abort();
     return recoverDesktopNativeTurn(threadId, outcome.conversation, turn);
   }
 
   if (outcome.type === 'ipc-result') {
+    echoController.abort();
     const result = outcome.result;
     const turnId = String(result?.turn?.id || '');
     if (!turnId) throw new Error('Codex Desktop IPC 未返回有效 turn id');
@@ -4966,13 +5147,40 @@ async function continueNativeTurn(threadId, turn) {
   }
 
   const error = outcome.error;
-  if (!isCodexDesktopIpcUnavailableError(error)) {
-    const conversation = findNativeTurnEcho(threadId, turn, baseline, requestedAt);
-    if (conversation) return recoverDesktopNativeTurn(threadId, conversation, turn);
-    throw error;
+  const conversation = findNativeTurnEcho(threadId, turn, baseline, requestedAt);
+  if (conversation) {
+    echoController.abort();
+    return recoverDesktopNativeTurn(threadId, conversation, turn);
   }
+  if (isAmbiguousDesktopTurnStartError(error)) {
+    const recovered = await Promise.race([
+      echoAttempt,
+      new Promise((resolve) => setTimeout(resolve, CODEX_DESKTOP_TURN_ECHO_GRACE_MS, {
+        type: 'native-echo',
+        conversation: null,
+      })),
+    ]);
+    if (recovered?.conversation) {
+      echoController.abort();
+      return recoverDesktopNativeTurn(threadId, recovered.conversation, turn);
+    }
+  }
+  echoController.abort();
+  throw error;
+}
 
-  return resumeNativeTurn(threadId, turn);
+function isAmbiguousDesktopTurnStartError(error) {
+  if (
+    error?.desktopIpcMethod
+    && error.desktopIpcMethod !== 'thread-follower-start-turn'
+  ) {
+    return false;
+  }
+  if (error?.code === 'CODEX_DESKTOP_IPC_TIMEOUT') return true;
+  if (isCodexDesktopIpcUnavailableError(error)) return false;
+  if (['ECONNRESET', 'EPIPE', 'ENOTCONN', 'ECONNABORTED'].includes(String(error?.code || ''))) return true;
+  return /connection (?:closed|reset)|socket hang up|broken pipe|连接已关闭/i
+    .test(String(error?.message || ''));
 }
 
 async function resumeNativeTurn(threadId, turn) {
@@ -5538,6 +5746,109 @@ function nativeAppErrorStatus(error) {
   return 502;
 }
 
+function isNativeActiveWriterConflict(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return /\bthread\s+[0-9a-f-]{16,}\s+already has an active writer\b/.test(message);
+}
+
+const NATIVE_ARCHIVE_TERMINAL_KINDS = new Set([
+  'task_complete',
+  'task_error',
+  'turn_aborted',
+  'error',
+]);
+
+async function archiveNativeThread(threadId, initialConversation = null) {
+  try {
+    await appServerClient.request('thread/archive', { threadId });
+    return { mode: 'app-server' };
+  } catch (error) {
+    if (!isNativeActiveWriterConflict(error)) throw error;
+
+    const conversation = nativeSessions.get(threadId) || initialConversation;
+    const active = nativeActiveTurnFor(threadId, conversation);
+    if (
+      nativeTurnReservations.has(threadId)
+      || active?.status === 'running'
+      || conversation?.status === 'running'
+    ) {
+      throw nativeInactiveArchiveConflictError(
+        '该任务仍在运行，未执行本地归档；请先停止任务后重试',
+        error,
+      );
+    }
+    if (!nativeConversationHasExplicitTerminal(conversation)) {
+      throw nativeInactiveArchiveConflictError(
+        '无法确认该任务的最新回合已经结束，未执行本地归档',
+        error,
+      );
+    }
+
+    const result = archiveInactiveNativeThread({
+      codexHome: CODEX_HOME,
+      threadId,
+      expectedRolloutRevision: conversation.revision,
+    });
+    if (!result.archived) {
+      throw nativeInactiveArchiveConflictError(
+        nativeInactiveArchiveFailureMessage(result.reason),
+        error,
+      );
+    }
+    return {
+      mode: 'inactive-local',
+      alreadyArchived: result.alreadyArchived === true,
+      rolloutPath: result.rolloutPath,
+    };
+  }
+}
+
+function nativeConversationHasExplicitTerminal(conversation) {
+  const latestTurnId = String(conversation?.latestTurnId || '');
+  if (!latestTurnId || !Array.isArray(conversation?.messages)) return false;
+  return [...conversation.messages].reverse().some((message) => (
+    message?.role === 'process'
+    && NATIVE_ARCHIVE_TERMINAL_KINDS.has(String(message.kind || ''))
+    && String(message.turnId || '') === latestTurnId
+  ));
+}
+
+function nativeInactiveArchiveFailureMessage(reason) {
+  switch (String(reason || '')) {
+    case 'not-found':
+      return 'Codex App 会话不存在，未执行本地归档';
+    case 'rollout-changed':
+    case 'thread-state-changed':
+      return '会话内容或归档状态刚刚发生变化，请刷新后重试';
+    case 'rollout-missing':
+      return '会话记录文件不存在，未执行本地归档';
+    case 'unsafe-rollout-path':
+    case 'rollout-thread-mismatch':
+      return '会话记录路径未通过安全检查，未执行本地归档';
+    case 'archive-destination-exists':
+      return '归档目录已存在同名会话记录，未覆盖文件';
+    default:
+      return '该会话暂时无法安全地执行本地归档';
+  }
+}
+
+function nativeInactiveArchiveConflictError(message, cause) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = 'CODEX_NATIVE_INACTIVE_ARCHIVE_UNSAFE';
+  error.statusCode = 409;
+  return error;
+}
+
+function nativeActiveWriterConflictError({ providerChanged = false, cause } = {}) {
+  const message = providerChanged
+    ? '该任务仍由 Codex App 持有，暂时无法在 Web 中切换渠道；请稍后重试或在 App 中继续'
+    : '该任务仍由 Codex App 持有，Web 暂时无法续接；请稍后重试或在 App 中继续';
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = 'CODEX_NATIVE_ACTIVE_WRITER';
+  error.statusCode = 409;
+  return error;
+}
+
 function isNativeThreadNotFoundError(error) {
   const message = String(error?.message || '').toLowerCase();
   return /thread\s+not\s+found|thread.*不存在/.test(message);
@@ -5653,21 +5964,34 @@ function createSubQuotaService(configs = subQuotaConfigs) {
     SUB_QUOTA_CACHE_SECONDS: process.env.SUB_QUOTA_CACHE_SECONDS,
   };
   const sources = configured.map((config, index) => {
+    const envIndex = index + 1;
     const envSuffix = String(config.id || `source-${index + 1}`)
       .toUpperCase()
       .replace(/[^A-Z0-9_]/g, '_')
-      .slice(0, 64);
-    const apiKeyEnv = `CODEX_WEB_SUB_QUOTA_${envSuffix}_KEY`;
-    env[apiKeyEnv] = String(config.apiKey || '');
+      .slice(0, 48);
+    const envPrefix = `CODEX_WEB_SUB_QUOTA_SOURCE_${envIndex}_${envSuffix}`;
+    const credentials = subQuotaApiKeys(config);
+    const apiKeys = credentials.map((credential, credentialIndex) => {
+      const apiKeyEnv = `${envPrefix}_KEY_${credentialIndex + 1}`;
+      env[apiKeyEnv] = credential.value;
+      return {
+        id: credential.id,
+        label: credential.label,
+        env: apiKeyEnv,
+      };
+    });
+    const apiKeyEnv = apiKeys[0]?.env || `${envPrefix}_KEY`;
+    if (!apiKeys.length) env[apiKeyEnv] = '';
     const source = {
       id: config.id,
       name: config.name || subQuotaProviderLabel(config.provider),
       provider: config.provider,
       baseUrl: config.baseUrl,
       apiKeyEnv,
+      apiKeys,
     };
     if (config.provider === 'sub2api' && SUB2API_ADMIN_API_KEY) {
-      const adminApiKeyEnv = `CODEX_WEB_SUB_QUOTA_${envSuffix}_ADMIN_KEY`;
+      const adminApiKeyEnv = `${envPrefix}_ADMIN_KEY`;
       env[adminApiKeyEnv] = SUB2API_ADMIN_API_KEY;
       source.adminApiKeyEnv = adminApiKeyEnv;
     }
@@ -5913,6 +6237,107 @@ function normalizeSubQuotaSourceName(value, fallback = '') {
     .slice(0, 80);
 }
 
+function normalizeSubQuotaCredentialLabel(value, fallback = '') {
+  return String(value || fallback || '')
+    .replace(/[\r\n\0]+/g, ' ')
+    .trim()
+    .slice(0, 40);
+}
+
+function createSubQuotaCredentialId() {
+  return `key-${randomBytes(6).toString('hex')}`;
+}
+
+function normalizeSubQuotaCredentialId(value, fallback = '') {
+  const id = String(value || fallback || '').trim();
+  if (!id) return '';
+  if (!SUB_QUOTA_CREDENTIAL_ID_PATTERN.test(id)) throw new Error('API Key 标识无效');
+  return id;
+}
+
+function normalizeStoredSubQuotaApiKeys(value, legacyApiKey = '') {
+  const rawItems = Array.isArray(value)
+    ? value
+    : (String(legacyApiKey || '').trim() ? [{ id: 'key-1', value: legacyApiKey }] : []);
+  if (rawItems.length > SUB_QUOTA_MAX_API_KEYS) {
+    throw new Error(`每个额度来源最多配置 ${SUB_QUOTA_MAX_API_KEYS} 个 Key`);
+  }
+  const ids = new Set();
+  const values = new Set();
+  const credentials = [];
+  for (const [index, rawItem] of rawItems.entries()) {
+    const item = typeof rawItem === 'string' ? { value: rawItem } : rawItem;
+    if (!item || typeof item !== 'object') throw new Error(`API Key ${index + 1} 配置无效`);
+    const apiKey = String(item.value ?? item.apiKey ?? item.key ?? '').trim();
+    if (!apiKey) continue;
+    validateSubQuotaApiKey(apiKey);
+    if (values.has(apiKey)) throw new Error('API Key 不能重复');
+    let id = normalizeSubQuotaCredentialId(item.id, `key-${index + 1}`);
+    if (ids.has(id)) {
+      id = createSubQuotaCredentialId();
+      while (ids.has(id)) id = createSubQuotaCredentialId();
+    }
+    ids.add(id);
+    values.add(apiKey);
+    credentials.push({
+      id,
+      label: normalizeSubQuotaCredentialLabel(item.label, `Key ${credentials.length + 1}`),
+      value: apiKey,
+    });
+  }
+  return credentials;
+}
+
+function subQuotaApiKeys(config = {}) {
+  return normalizeStoredSubQuotaApiKeys(config.apiKeys, config.apiKey);
+}
+
+function firstSubQuotaApiKey(config = {}) {
+  return subQuotaApiKeys(config)[0]?.value || '';
+}
+
+function normalizeSubmittedSubQuotaApiKeys(value, existingConfig = {}) {
+  if (!Array.isArray(value)) throw new Error('API Key 列表无效');
+  if (value.length > SUB_QUOTA_MAX_API_KEYS) {
+    throw new Error(`每个额度来源最多配置 ${SUB_QUOTA_MAX_API_KEYS} 个 Key`);
+  }
+  const existing = subQuotaApiKeys(existingConfig);
+  const existingById = new Map(existing.map((credential) => [credential.id, credential]));
+  const ids = new Set();
+  const values = new Set();
+  const credentials = [];
+  for (const [index, rawItem] of value.entries()) {
+    const item = typeof rawItem === 'string' ? { value: rawItem } : rawItem;
+    if (!item || typeof item !== 'object') throw new Error(`API Key ${index + 1} 配置无效`);
+    const requestedId = normalizeSubQuotaCredentialId(item.id);
+    const current = requestedId ? existingById.get(requestedId) : null;
+    const suppliedApiKey = String(item.value ?? item.apiKey ?? item.key ?? '').trim();
+    const apiKey = suppliedApiKey || current?.value || '';
+    if (!apiKey) continue;
+    validateSubQuotaApiKey(apiKey);
+    if (values.has(apiKey)) throw new Error('API Key 不能重复');
+    let id = current?.id || requestedId || createSubQuotaCredentialId();
+    while (ids.has(id)) id = createSubQuotaCredentialId();
+    ids.add(id);
+    values.add(apiKey);
+    credentials.push({
+      id,
+      label: normalizeSubQuotaCredentialLabel(item.label, current?.label || `Key ${credentials.length + 1}`),
+      value: apiKey,
+    });
+  }
+  return credentials;
+}
+
+function withSubQuotaApiKeys(config = {}) {
+  const apiKeys = subQuotaApiKeys(config);
+  return {
+    ...config,
+    apiKeys,
+    apiKey: apiKeys[0]?.value || '',
+  };
+}
+
 function subQuotaConfigArray(configs = subQuotaConfigs) {
   if (Array.isArray(configs)) return configs.filter((config) => config && typeof config === 'object');
   if (!configs || typeof configs !== 'object') return [];
@@ -5934,7 +6359,7 @@ function sortSubQuotaConfigs(configs = subQuotaConfigs) {
 function emptySubQuotaConfig(provider, options = {}) {
   const resolvedProvider = normalizeSubQuotaProvider(provider) || 'cpa-codex';
   const id = String(options.id || (SUB_QUOTA_BUILTIN_IDS.has(resolvedProvider) ? resolvedProvider : '')).trim();
-  return {
+  return withSubQuotaApiKeys({
     id,
     name: normalizeSubQuotaSourceName(options.name, subQuotaProviderLabel(resolvedProvider)),
     provider: resolvedProvider,
@@ -5944,14 +6369,15 @@ function emptySubQuotaConfig(provider, options = {}) {
     baseUrl: options.baseUrl === undefined
       ? (resolvedProvider === 'deepseek' ? DEEPSEEK_DEFAULT_BASE_URL : '')
       : String(options.baseUrl || ''),
+    apiKeys: options.apiKeys,
     apiKey: String(options.apiKey || ''),
     visible: options.visible !== false,
     builtin: options.builtin === undefined ? SUB_QUOTA_BUILTIN_IDS.has(id) : options.builtin === true,
-  };
+  });
 }
 
 function withBuiltinSubQuotaConfigs(configs = []) {
-  const sources = subQuotaConfigArray(configs).map((config) => ({ ...config }));
+  const sources = subQuotaConfigArray(configs).map((config) => withSubQuotaApiKeys(config));
   const ids = new Set(sources.map((config) => config.id));
   for (const provider of SUB_QUOTA_DEFAULT_ORDER) {
     if (ids.has(provider)) continue;
@@ -5980,18 +6406,17 @@ function normalizeStoredSubQuotaSources(value) {
     const baseUrl = rawBaseUrl
       ? normalizeSubQuotaBaseUrl(rawBaseUrl, { provider })
       : (provider === 'deepseek' ? DEEPSEEK_DEFAULT_BASE_URL : '');
-    const apiKey = String(source?.apiKey || '').trim();
-    if (apiKey) validateSubQuotaApiKey(apiKey);
-    return {
+    const apiKeys = normalizeStoredSubQuotaApiKeys(source?.apiKeys, source?.apiKey);
+    return withSubQuotaApiKeys({
       id,
       name: normalizeSubQuotaSourceName(source?.name, subQuotaProviderLabel(provider)),
       provider,
       order: Number.isFinite(Number(source?.order)) ? Number(source.order) : index,
       baseUrl,
-      apiKey,
+      apiKeys,
       visible: normalizeSubQuotaVisibility(source?.visible, true),
       builtin: SUB_QUOTA_BUILTIN_IDS.has(id),
-    };
+    });
   });
   return withBuiltinSubQuotaConfigs(sources).map((source, index) => ({ ...source, order: index }));
 }
@@ -6004,7 +6429,7 @@ function readLegacySubQuotaConfigs(env = process.env) {
   const legacyApiKey = String(env.SUB2API_API_KEY || '').trim();
   const cpaExplicit = String(env.CPA_QUOTA_BASE_URL || '').trim().replace(/\/+$/, '')
     || String(env.CPA_QUOTA_API_KEY || '').trim();
-  const cpa = {
+  const cpa = withSubQuotaApiKeys({
     id: 'cpa-codex',
     name: 'CPA Codex',
     provider: 'cpa-codex',
@@ -6013,9 +6438,9 @@ function readLegacySubQuotaConfigs(env = process.env) {
     apiKey: String(env.CPA_QUOTA_API_KEY || (legacyProvider === 'cpa-codex' ? legacyApiKey : '')).trim(),
     visible: parseBoolean(env.CPA_QUOTA_VISIBLE, true),
     builtin: true,
-  };
+  });
   const useSub2ApiLegacyValues = legacyProvider === 'sub2api' || rawProvider === 'multi';
-  const sub2api = {
+  const sub2api = withSubQuotaApiKeys({
     id: 'sub2api',
     name: 'Sub2API',
     provider: 'sub2api',
@@ -6024,12 +6449,13 @@ function readLegacySubQuotaConfigs(env = process.env) {
     apiKey: useSub2ApiLegacyValues ? legacyApiKey : '',
     visible: parseBoolean(env.SUB2API_QUOTA_VISIBLE, true),
     builtin: true,
-  };
+  });
   if (rawProvider === 'multi' && !cpaExplicit) {
     cpa.baseUrl = '';
+    cpa.apiKeys = [];
     cpa.apiKey = '';
   }
-  const grok2api = {
+  const grok2api = withSubQuotaApiKeys({
     id: 'grok2api',
     name: 'Grok2API',
     provider: 'grok2api',
@@ -6038,8 +6464,8 @@ function readLegacySubQuotaConfigs(env = process.env) {
     apiKey: String(env.GROK2API_ADMIN_PASSWORD || env.GROK2API_API_KEY || '').trim(),
     visible: parseBoolean(env.GROK2API_QUOTA_VISIBLE, true),
     builtin: true,
-  };
-  const deepseek = {
+  });
+  const deepseek = withSubQuotaApiKeys({
     id: 'deepseek',
     name: 'DeepSeek',
     provider: 'deepseek',
@@ -6048,7 +6474,7 @@ function readLegacySubQuotaConfigs(env = process.env) {
     apiKey: String(env.DEEPSEEK_API_KEY || '').trim(),
     visible: parseBoolean(env.DEEPSEEK_QUOTA_VISIBLE, true),
     builtin: true,
-  };
+  });
   return sortSubQuotaConfigs([cpa, sub2api, grok2api, deepseek]);
 }
 
@@ -6073,23 +6499,32 @@ function readStartupSubQuotaState(env = process.env) {
 
 function configuredSubQuotaConfigs(configs = subQuotaConfigs) {
   return sortSubQuotaConfigs(configs)
-    .filter((config) => Boolean(config.baseUrl && config.apiKey));
+    .map((config) => withSubQuotaApiKeys(config))
+    .filter((config) => Boolean(config.baseUrl && config.apiKeys.length));
 }
 
 function publicSubQuotaConfigs(configs = subQuotaConfigs) {
   return sortSubQuotaConfigs(configs)
-    .map((config) => ({
-      id: config.id,
-      name: config.name || subQuotaProviderLabel(config.provider),
-      provider: config.provider,
-      providerLabel: subQuotaProviderLabel(config.provider),
-      baseUrl: String(config.baseUrl || ''),
-      keyConfigured: Boolean(config.apiKey),
-      configured: Boolean(config.baseUrl && config.apiKey),
-      visible: config.visible !== false,
-      builtin: config.builtin === true,
-      removable: config.builtin !== true,
-    }));
+    .map((rawConfig) => {
+      const config = withSubQuotaApiKeys(rawConfig);
+      return {
+        id: config.id,
+        name: config.name || subQuotaProviderLabel(config.provider),
+        provider: config.provider,
+        providerLabel: subQuotaProviderLabel(config.provider),
+        baseUrl: String(config.baseUrl || ''),
+        keyConfigured: config.apiKeys.length > 0,
+        keyCount: config.apiKeys.length,
+        credentials: config.apiKeys.map((credential) => ({
+          id: credential.id,
+          label: credential.label,
+        })),
+        configured: Boolean(config.baseUrl && config.apiKeys.length),
+        visible: config.visible !== false,
+        builtin: config.builtin === true,
+        removable: config.builtin !== true,
+      };
+    });
 }
 
 function normalizeSubQuotaVisibility(value, fallback) {
@@ -6129,6 +6564,7 @@ function normalizeSubQuotaConfigRequest(body = {}) {
         provider,
         baseUrl: source?.baseUrl,
         apiKey: source?.apiKey,
+        apiKeys: Object.hasOwn(source || {}, 'apiKeys') ? source.apiKeys : undefined,
         visible: normalizeSubQuotaVisibility(source?.visible, undefined),
         remove: source?.remove === true,
         builtin: SUB_QUOTA_BUILTIN_IDS.has(id),
@@ -6146,6 +6582,7 @@ function normalizeSubQuotaConfigRequest(body = {}) {
     provider,
     baseUrl: body?.baseUrl,
     apiKey: body?.apiKey,
+    apiKeys: Object.hasOwn(body || {}, 'apiKeys') ? body.apiKeys : undefined,
     visible: normalizeSubQuotaVisibility(body?.visible, undefined),
     builtin: SUB_QUOTA_BUILTIN_IDS.has(provider),
   }];
@@ -6187,16 +6624,20 @@ function subQuotaOrderValue(configs) {
 function persistSubQuotaConfigs(configs, { codexAppVisible = codexAppQuotaVisible } = {}) {
   const sources = withBuiltinSubQuotaConfigs(configs).map((source, index) => ({ ...source, order: index }));
   if (sources.length > SUB_QUOTA_MAX_SOURCES) throw new Error(`额度来源最多配置 ${SUB_QUOTA_MAX_SOURCES} 个`);
+  const persistedSources = sources.map((source) => {
+    const { apiKey: _legacyApiKey, ...persisted } = withSubQuotaApiKeys(source);
+    return persisted;
+  });
   atomicWriteFile(SUB_QUOTA_SOURCES_FILE, `${JSON.stringify({
-    version: 1,
+    version: 2,
     updatedAt: new Date().toISOString(),
     codexAppVisible: codexAppVisible !== false,
-    sources,
+    sources: persistedSources,
   }, null, 2)}\n`);
   const configured = configuredSubQuotaConfigs(sources);
   const order = subQuotaOrderValue(sources);
   const legacySource = (provider) => sources.find((source) => (
-    source.provider === provider && source.baseUrl && source.apiKey
+    source.provider === provider && source.baseUrl && subQuotaApiKeys(source).length
   )) || sources.find((source) => source.id === provider)
     || sources.find((source) => source.provider === provider)
     || emptySubQuotaConfig(provider, { id: provider, builtin: true });
@@ -6204,16 +6645,16 @@ function persistSubQuotaConfigs(configs, { codexAppVisible = codexAppQuotaVisibl
   const sub2api = legacySource('sub2api');
   const grok2api = legacySource('grok2api');
   const deepseek = legacySource('deepseek');
-  const legacy = sub2api.baseUrl && sub2api.apiKey ? sub2api : cpa;
+  const legacy = sub2api.baseUrl && firstSubQuotaApiKey(sub2api) ? sub2api : cpa;
   updateEnvVars(ENV_FILE, {
     CPA_QUOTA_BASE_URL: cpa.baseUrl,
-    CPA_QUOTA_API_KEY: cpa.apiKey,
+    CPA_QUOTA_API_KEY: firstSubQuotaApiKey(cpa),
     SUB2API_BASE_URL: legacy.baseUrl,
-    SUB2API_API_KEY: legacy.apiKey,
+    SUB2API_API_KEY: firstSubQuotaApiKey(legacy),
     GROK2API_BASE_URL: grok2api.baseUrl,
-    GROK2API_ADMIN_PASSWORD: grok2api.apiKey,
+    GROK2API_ADMIN_PASSWORD: firstSubQuotaApiKey(grok2api),
     DEEPSEEK_BASE_URL: deepseek.baseUrl,
-    DEEPSEEK_API_KEY: deepseek.apiKey,
+    DEEPSEEK_API_KEY: firstSubQuotaApiKey(deepseek),
     CODEX_APP_QUOTA_VISIBLE: codexAppVisible,
     CPA_QUOTA_VISIBLE: cpa.visible !== false,
     SUB2API_QUOTA_VISIBLE: sub2api.visible !== false,
@@ -6225,9 +6666,9 @@ function persistSubQuotaConfigs(configs, { codexAppVisible = codexAppQuotaVisibl
   process.env.SUB_QUOTA_ORDER = order;
   process.env.SUB_QUOTA_PROVIDER = configured.length > 1 ? 'multi' : (configured[0]?.provider || '');
   process.env.GROK2API_BASE_URL = grok2api.baseUrl;
-  process.env.GROK2API_ADMIN_PASSWORD = grok2api.apiKey;
+  process.env.GROK2API_ADMIN_PASSWORD = firstSubQuotaApiKey(grok2api);
   process.env.DEEPSEEK_BASE_URL = deepseek.baseUrl;
-  process.env.DEEPSEEK_API_KEY = deepseek.apiKey;
+  process.env.DEEPSEEK_API_KEY = firstSubQuotaApiKey(deepseek);
   process.env.CODEX_APP_QUOTA_VISIBLE = String(codexAppVisible);
   process.env.CPA_QUOTA_VISIBLE = String(cpa.visible !== false);
   process.env.SUB2API_QUOTA_VISIBLE = String(sub2api.visible !== false);
@@ -6245,7 +6686,7 @@ function getSubQuotaApiKey(sourceIdOrProvider = currentSubQuotaProvider()) {
   const source = subQuotaConfigArray(subQuotaConfigs)
     .find((config) => config.id === raw)
     || subQuotaConfigArray(subQuotaConfigs).find((config) => config.provider === provider);
-  return String(source?.apiKey || '');
+  return firstSubQuotaApiKey(source);
 }
 
 async function proxyPlaygroundRequest(req, res) {
@@ -9165,7 +9606,7 @@ body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=quota-project-actions-20260820a">
+<link rel="stylesheet" href="/ui.css?v=sync-quota-preview-20260827a">
   <link rel="stylesheet" href="/image-prompt.css?v=top-context-padding-20260801b">
 <script>
 (()=>{try{
@@ -9241,7 +9682,7 @@ let subQuotaToggle = null, subQuotaPopover = null, subQuotaStatus = null, subQuo
 let subQuotaSettingsForm = null, subQuotaSettingsInputs = new Map(), subQuotaSettingsStatus = null;
 let subQuotaSettingsOverlay = null, subQuotaSettingsDialog = null, subQuotaSettingsClose = null, subQuotaSettingsReturnFocus = null;
 let subQuotaSettingsSourceList = null, subQuotaSettingsCodexApp = null, subQuotaSettingsCreateSource = null;
-let subQuotaAddSourceType = null, subQuotaAddSourceButton = null, subQuotaSettingsMaxSources = 12;
+let subQuotaAddSourceType = null, subQuotaAddSourceButton = null, subQuotaSettingsMaxSources = 12, subQuotaSettingsMaxApiKeys = 8;
 let subQuotaSettingsSyncSequence = 0;
 let grok2ApiConsoleOverlay = null, grok2ApiConsoleDialog = null, grok2ApiConsoleOutput = null, grok2ApiConsoleStatus = null, grok2ApiConsoleRefresh = null, grok2ApiConsoleClose = null, grok2ApiConsoleReturnFocus = null;
 let archiveConfirmOverlay = null, archiveConfirmDialog = null, archiveConfirmName = null, archiveConfirmCancel = null, archiveConfirmSubmit = null, archiveConfirmStatus = null;
@@ -9272,6 +9713,7 @@ let automationEditingId = '';
 let subQuotaRequestSeq = 0;
 let grok2ApiConsoleRequestSeq = 0;
 let conversationLoadSeq = 0;
+let conversationRestoreRevision = 0;
 let nativeCursor = 0;
 let nativeGeneration = 0;
 const NATIVE_HISTORY_PAGE_SIZE = 60;
@@ -15226,7 +15668,7 @@ function ensureSubQuotaSettingsDialog(){
   descriptionIcon.setAttribute('data-lucide','shield-check');
   descriptionIcon.setAttribute('aria-hidden','true');
   const descriptionText=document.createElement('span');
-  descriptionText.textContent='各来源独立保存，检测失败不影响配置。';
+  descriptionText.textContent='各来源独立保存并支持多 Key，检测失败不影响配置。';
   subQuotaDescription.append(descriptionIcon,descriptionText);
   subQuotaSettingsForm=document.createElement('form');
   subQuotaSettingsForm.id='subQuotaSettingsForm';
@@ -15365,44 +15807,42 @@ function ensureSubQuotaSettingsDialog(){
     moveButtons.appendChild(moveDown);
     sourceActions.append(visibilityToggle,moveButtons);
     sourceHead.append(sourceIdentity.identity,sourceActions);
-    let nameInput=null;
-    if(!builtin){
-      const manualFields=document.createElement('div');
-      manualFields.className='subQuotaManualSourceFields';
-      const nameField=document.createElement('label');
-      nameField.className='field subQuotaManualSourceField';
-      const nameLabel=document.createElement('span');
-      nameLabel.textContent='渠道名称';
-      nameInput=document.createElement('input');
-      nameInput.id=inputPrefix+'-name';
-      nameInput.className='subQuotaManualSourceNameInput';
-      nameInput.type='text';
-      nameInput.maxLength=80;
-      nameInput.autocomplete='off';
-      nameInput.value=displayName;
-      nameInput.placeholder=definition.title;
-      nameInput.addEventListener('input',()=>{
-        const nextName=nameInput.value.trim()||definition.title;
-        sourceIdentity.sourceTitle.textContent=nextName;
-        visibilityToggle.setAttribute('aria-label','在额度面板显示 '+nextName);
-        removeButton?.setAttribute('aria-label','删除 '+nextName);
-      });
-      nameField.append(nameLabel,nameInput);
-      const typeField=document.createElement('label');
-      typeField.className='field subQuotaManualSourceField';
-      const typeLabel=document.createElement('span');
-      typeLabel.textContent='渠道类型';
-      const typeSelect=document.createElement('select');
-      typeSelect.className='subQuotaSourceTypeSelect';
-      typeSelect.disabled=true;
-      const typeOption=document.createElement('option');
-      typeOption.value=provider;
-      typeOption.textContent=definition.title;
-      typeSelect.appendChild(typeOption);
-      typeField.append(typeLabel,typeSelect);
-      manualFields.append(nameField,typeField);
-      source.appendChild(manualFields);
-    }
+    const manualFields=document.createElement('div');
+    manualFields.className='subQuotaManualSourceFields';
+    const nameField=document.createElement('label');
+    nameField.className='field subQuotaManualSourceField';
+    const nameLabel=document.createElement('span');
+    nameLabel.textContent='渠道名称';
+    const nameInput=document.createElement('input');
+    nameInput.id=inputPrefix+'-name';
+    nameInput.className='subQuotaManualSourceNameInput';
+    nameInput.type='text';
+    nameInput.maxLength=80;
+    nameInput.autocomplete='off';
+    nameInput.value=displayName;
+    nameInput.placeholder=definition.title;
+    nameInput.addEventListener('input',()=>{
+      const nextName=nameInput.value.trim()||definition.title;
+      sourceIdentity.sourceTitle.textContent=nextName;
+      visibilityToggle.setAttribute('aria-label','在额度面板显示 '+nextName);
+      removeButton?.setAttribute('aria-label','删除 '+nextName);
+    });
+    nameField.append(nameLabel,nameInput);
+    const typeField=document.createElement('label');
+    typeField.className='field subQuotaManualSourceField';
+    const typeLabel=document.createElement('span');
+    typeLabel.textContent='渠道类型';
+    const typeSelect=document.createElement('select');
+    typeSelect.className='subQuotaSourceTypeSelect';
+    typeSelect.disabled=true;
+    typeSelect.title='渠道类型由当前额度来源固定';
+    const typeOption=document.createElement('option');
+    typeOption.value=provider;
+    typeOption.textContent=definition.title;
+    typeSelect.appendChild(typeOption);
+    typeField.append(typeLabel,typeSelect);
+    manualFields.append(nameField,typeField);
+    source.appendChild(manualFields);
     const fields=document.createElement('div');
     fields.className='subQuotaSettingsFields';
     const urlField=document.createElement('label');
@@ -15421,23 +15861,97 @@ function ensureSubQuotaSettingsDialog(){
     baseUrlInput.value=String(sourceConfig.baseUrl||'');
     urlField.appendChild(urlLabel);
     urlField.appendChild(baseUrlInput);
-    const keyField=document.createElement('label');
-    keyField.className='field';
+    const keyField=document.createElement('div');
+    keyField.className='field subQuotaCredentialField';
+    const keyHeader=document.createElement('div');
+    keyHeader.className='subQuotaCredentialHeader';
     const keyLabel=document.createElement('span');
     keyLabel.textContent=definition.keyLabel;
-    const apiKeyInput=document.createElement('input');
-    apiKeyInput.id=inputPrefix+'-api-key';
-    apiKeyInput.name=sourceId+'ApiKey';
-    apiKeyInput.type='password';
-    apiKeyInput.maxLength=4096;
-    apiKeyInput.autocomplete='new-password';
-    apiKeyInput.placeholder=sourceConfig.keyConfigured?'Key 已配置，留空保留':definition.keyPlaceholder;
-    keyField.appendChild(keyLabel);
-    keyField.appendChild(apiKeyInput);
+    const keyHeaderActions=document.createElement('div');
+    keyHeaderActions.className='subQuotaCredentialHeaderActions';
+    const keyCount=document.createElement('span');
+    keyCount.className='subQuotaCredentialCount';
+    const addKeyButton=document.createElement('button');
+    addKeyButton.type='button';
+    addKeyButton.className='subQuotaCredentialAdd';
+    setIconLabel(addKeyButton,'plus','添加 Key',false);
+    keyHeaderActions.append(keyCount,addKeyButton);
+    keyHeader.append(keyLabel,keyHeaderActions);
+    const credentialList=document.createElement('div');
+    credentialList.className='subQuotaCredentialList';
     const credentialHint=document.createElement('small');
     credentialHint.className='subQuotaCredentialHint';
-    credentialHint.textContent=sourceConfig.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，可先保存 URL';
-    keyField.appendChild(credentialHint);
+    let credentialRowSequence=0;
+    const credentialRows=()=>[...credentialList.querySelectorAll('.subQuotaCredentialRow')];
+    const syncCredentialControls=()=>{
+      const rows=credentialRows();
+      const active=rows.filter((row)=>row.dataset.credentialId||row.querySelector('input')?.value.trim()).length;
+      keyCount.textContent=active?active+' 个':'未配置';
+      addKeyButton.disabled=rows.length>=subQuotaSettingsMaxApiKeys;
+      addKeyButton.title=addKeyButton.disabled
+        ? '每个渠道最多配置 '+subQuotaSettingsMaxApiKeys+' 个 Key'
+        : '添加一个 Key';
+      credentialHint.textContent=active
+        ? '已配置 '+active+' 个 Key；已保存项留空会保留，删除一行会移除该 Key'
+        : '可添加多个 Key，保存后会分别检测';
+    };
+    const addCredentialRow=(credential={})=>{
+      if(credentialRows().length>=subQuotaSettingsMaxApiKeys)return null;
+      credentialRowSequence+=1;
+      const credentialId=String(credential.id||'');
+      const credentialLabel=String(credential.label||('Key '+credentialRowSequence));
+      const row=document.createElement('div');
+      row.className='subQuotaCredentialRow';
+      row.dataset.credentialId=credentialId;
+      row.dataset.credentialLabel=credentialLabel;
+      const rowLabel=document.createElement('span');
+      rowLabel.className='subQuotaCredentialRowLabel';
+      rowLabel.textContent=credentialLabel;
+      const apiKeyInput=document.createElement('input');
+      apiKeyInput.id=inputPrefix+'-api-key-'+credentialRowSequence;
+      apiKeyInput.name=sourceId+'ApiKey'+credentialRowSequence;
+      apiKeyInput.type='password';
+      apiKeyInput.maxLength=4096;
+      apiKeyInput.autocomplete='new-password';
+      apiKeyInput.spellcheck=false;
+      apiKeyInput.placeholder=credentialId?credentialLabel+' 已配置，留空保留':definition.keyPlaceholder;
+      apiKeyInput.addEventListener('input',syncCredentialControls);
+      const removeKeyButton=document.createElement('button');
+      removeKeyButton.type='button';
+      removeKeyButton.className='subQuotaCredentialRemove';
+      removeKeyButton.title='移除此 Key';
+      removeKeyButton.setAttribute('aria-label','移除 '+credentialLabel);
+      setIconLabel(removeKeyButton,'x','移除此 Key',false);
+      removeKeyButton.addEventListener('click',()=>{
+        row.remove();
+        if(!credentialRows().length)addCredentialRow();
+        syncCredentialControls();
+      });
+      row.append(rowLabel,apiKeyInput,removeKeyButton);
+      credentialList.appendChild(row);
+      refreshIcons(row);
+      syncCredentialControls();
+      return row;
+    };
+    const syncCredentials=(credentials=[])=>{
+      credentialList.replaceChildren();
+      credentialRowSequence=0;
+      const items=Array.isArray(credentials)?credentials:[];
+      for(const credential of items)addCredentialRow(credential);
+      if(!credentialRows().length)addCredentialRow();
+      syncCredentialControls();
+    };
+    const readCredentials=()=>credentialRows().map((row)=>({
+      id:row.dataset.credentialId||'',
+      label:row.dataset.credentialLabel||'',
+      value:row.querySelector('input')?.value||'',
+    }));
+    addKeyButton.addEventListener('click',()=>{
+      const row=addCredentialRow();
+      row?.querySelector('input')?.focus();
+    });
+    keyField.append(keyHeader,credentialList,credentialHint);
+    syncCredentials(sourceConfig.credentials);
     fields.append(urlField,keyField);
     source.prepend(sourceHead);
     source.appendChild(fields);
@@ -15448,7 +15962,10 @@ function ensureSubQuotaSettingsDialog(){
       nameInput,
       sourceTitle:sourceIdentity.sourceTitle,
       baseUrlInput,
-      apiKeyInput,
+      credentialList,
+      syncCredentials,
+      readCredentials,
+      syncCredentialControls,
       credentialHint,
       source,
       stateBadge:sourceIdentity.stateBadge,
@@ -15759,6 +16276,7 @@ async function syncSubQuotaSettings(){
     if(!response.ok)throw new Error(data.error||'读取设置失败');
     const sources=Array.isArray(data.sources)?data.sources:[{id:data.provider,provider:data.provider,providerLabel:data.providerLabel,baseUrl:data.baseUrl,keyConfigured:data.keyConfigured,configured:data.configured,builtin:true}];
     subQuotaSettingsMaxSources=Math.max(4,Number(data.maxSources)||12);
+    subQuotaSettingsMaxApiKeys=Math.max(1,Number(data.maxApiKeys)||8);
     setSubQuotaVisibilityToggle(subQuotaSettingsCodexApp?.visibilityToggle,data.codexApp?.visible!==false);
     const incomingIds=new Set(sources.map((source)=>String(source.id||source.provider||'')));
     for(const [sourceId,inputs] of [...subQuotaSettingsInputs]){
@@ -15784,9 +16302,7 @@ async function syncSubQuotaSettings(){
       inputs.builtin=source.builtin===true;
       if(inputs.nameInput)inputs.nameInput.value=source.name||subQuotaSourceDefinition(source.provider).title;
       inputs.baseUrlInput.value=source.baseUrl||'';
-      inputs.apiKeyInput.value='';
-      inputs.apiKeyInput.placeholder=source.keyConfigured?'Key 已配置，留空保留':subQuotaSourceDefinition(source.provider).keyPlaceholder;
-      inputs.credentialHint.textContent=source.keyConfigured?'Key 已配置，留空不会替换':'Key 未配置，可先保存 URL';
+      inputs.syncCredentials?.(source.credentials);
       syncSubQuotaSourceState(inputs,source);
       subQuotaSettingsSourceList.appendChild(inputs.source);
     }
@@ -15817,7 +16333,7 @@ async function submitSubQuotaSettings(event){
       name:inputs.nameInput?.value.trim()||inputs.sourceTitle?.textContent||subQuotaSourceDefinition(inputs.provider).title,
       provider:inputs.provider,
       baseUrl:inputs.baseUrlInput.value,
-      apiKey:inputs.apiKeyInput.value,
+      apiKeys:inputs.readCredentials?.()||[],
       visible:subQuotaVisibilityValue(inputs.visibilityToggle),
     }));
     const order=orderedIds;
@@ -15825,7 +16341,6 @@ async function submitSubQuotaSettings(event){
     const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources,order,codexAppVisible})});
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'保存失败');
-    for(const inputs of subQuotaSettingsInputs.values())inputs.apiKeyInput.value='';
     await syncSubQuotaSettings();
     subQuotaSettingsStatus.classList.add('success');
     subQuotaSettingsStatus.textContent='设置已保存 · '+(data.configuredCount||0)+' 个上游已配置 · '+(data.visibleCount||0)+' 项显示';
@@ -16479,10 +16994,13 @@ function subQuotaDisplayName(quota){
   const itemName=(!rawItemName||isSubQuotaEmailLabel(rawItemName)||(email&&rawItemName.toLowerCase()===email))
     ?''
     :rawItemName;
-  const configuredName=sourceName||itemName||providerName;
-  return sourceName&&itemName&&itemName!==configuredName
-    ?configuredName+' · '+itemName
-    :configuredName;
+  if(!sourceName)return itemName||providerName;
+  if(!itemName)return sourceName;
+  const sourceKey=sourceName.toLowerCase();
+  const itemKey=itemName.toLowerCase();
+  return itemKey===sourceKey||itemKey.startsWith(sourceKey+' · ')
+    ?itemName
+    :sourceName+' · '+itemName;
 }
 function renderSubQuota(data){
   subQuotaContent.replaceChildren();
@@ -19921,6 +20439,10 @@ async function loadEarlierNativeHistoryPage(options={}){
     ||(!fillViewport&&chat.scrollTop>NATIVE_HISTORY_SCROLL_THRESHOLD)
   )return false;
   const id=currentConversationId;
+  const inheritedRestoreRevision=Number(options.restoreRevision);
+  const restoreRevision=Number.isInteger(inheritedRestoreRevision)&&inheritedRestoreRevision>0
+    ? inheritedRestoreRevision
+    : ++conversationRestoreRevision;
   const preserveFollowBottom=fillViewport&&!nativeLiveReadingHistory&&nativeLiveFollowBottom;
   if(!preserveFollowBottom)setNativeLiveReadingHistory(true);
   const anchor=captureHistoryScrollAnchor(chat);
@@ -19961,6 +20483,7 @@ async function loadEarlierNativeHistoryPage(options={}){
         historyPaging:true,
         preserveHistoryFollowBottom:preserveFollowBottom,
         holdConversationRestoring,
+        restoreRevision,
         skipPromptQueueSync:true,
       });
       if(!loaded)break;
@@ -20013,6 +20536,12 @@ async function loadConversation(id,source='web',options={}){
   if(conversationChanged&&appQueueEditDraft){appQueueEditDraft=null;input.value='';input.style.height='auto';clearPendingAttachments()}
   if(source!=='codex'||currentConversationSource!=='codex'||currentConversationId!==id)clearNativeComposerOverride();
   showChatView();
+  const inheritedRestoreRevision=Number(options.restoreRevision);
+  const restoreRevision=Number.isInteger(inheritedRestoreRevision)&&inheritedRestoreRevision>0
+    ? inheritedRestoreRevision
+    : ++conversationRestoreRevision;
+  const restorePaint=conversationChanged||chat.classList.contains('conversationRestoring');
+  if(restorePaint)beginConversationRestoring();
   clearNativeCompletionSync();
   clearSubagentTraceStates();
   clearNativeLiveItems();
@@ -20058,7 +20587,7 @@ async function loadConversation(id,source='web',options={}){
     const requestUrl=endpoint+encodeURIComponent(id)+nativeHistoryQuery+nativeHistoryPagingQuery;
     const res=await fetch(requestUrl);
     if(seq!==conversationLoadSeq)return false;
-    if(!res.ok){clearConversationStatusLoading();if(!options.holdConversationRestoring)clearConversationRestoring();setTopStatusText('加载失败',{running:false});return false}
+    if(!res.ok){clearConversationStatusLoading();if(!options.holdConversationRestoring)clearConversationRestoring({restoreRevision,id,source:nextConversationSource});setTopStatusText('加载失败',{running:false});return false}
     const data=await res.json();
     if(seq!==conversationLoadSeq)return false;
     conversation=data.conversation;
@@ -20112,8 +20641,6 @@ async function loadConversation(id,source='web',options={}){
   if(webRunActive)beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);
   else resetTurnProcessCollection();
   const deferHistoryIcons=Boolean(options.historyScrollAnchor)||messages.length>=NATIVE_HISTORY_PAGE_SIZE;
-  const restorePaint=conversationChanged||chat.classList.contains('conversationRestoring');
-  if(restorePaint)chat.classList.add('conversationRestoring');
   if(deferHistoryIcons)beginDeferredIconRefresh();
   try{
     // Clear only when the next snapshot is ready to render, so refresh/boot does not
@@ -20123,6 +20650,7 @@ async function loadConversation(id,source='web',options={}){
       if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
       addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
     });
+    if(restorePaint)beginConversationRestoring();
   }finally{
     if(deferHistoryIcons)endDeferredIconRefresh(chat);
     // conversationRestoring is cleared after the first stable paint/history fill.
@@ -20141,20 +20669,24 @@ async function loadConversation(id,source='web',options={}){
   bindNativeLiveScrollTracking();
   if(options.historyScrollAnchor){
     await restoreHistoryScrollAnchor(chat,options.historyScrollAnchor);
+    if(seq!==conversationLoadSeq||currentConversationId!==conversation.id||currentConversationSource!==(conversation.source==='codex'?'codex':'web'))return false;
     if(preserveHistoryFollowBottom)resumeNativeLiveFollowBottom();
     else setNativeLiveReadingHistory(true);
     nativeHistoryLoadReady=true;
-    // History-page reloads keep the same conversation; lift the restore veil after paint unless
-    // the initial fill owns it, so nested page loads cannot leave the chat permanently blank.
-    if(!options.holdConversationRestoring)clearConversationRestoring();
+    // History-page reloads keep the same conversation; always lift the restore veil after paint
+    // so nested fill/page loads cannot leave the chat permanently blank.
+    if(!options.holdConversationRestoring)clearConversationRestoring({
+      restoreRevision,
+      id:conversation.id,
+      source:conversation.source,
+    });
   }else{
     scrollChatToLatest({force:true});
     alignChatToBottomStable(12,seq);
     const readyId=currentConversationId;
     const readySource=currentConversationSource;
     const finishRestorePaint=()=>{
-      if(currentConversationId!==readyId||currentConversationSource!==readySource)return;
-      clearConversationRestoring();
+      clearConversationRestoring({restoreRevision,id:readyId,source:readySource});
     };
     // Hold the restore veil through the first history fill so usage-limit cards do not
     // pop/reshape while older pages are pulled in.
@@ -20162,7 +20694,7 @@ async function loadConversation(id,source='web',options={}){
       nativeHistoryLoadReady=true;
       const needsFill=!nativeHistoryViewportFilled(chat)&&nativeHistoryHasEarlierMessages;
       if(needsFill){
-        void loadEarlierNativeHistoryPage({fillViewport:true}).finally(finishRestorePaint);
+        void loadEarlierNativeHistoryPage({fillViewport:true,restoreRevision}).finally(finishRestorePaint);
       }else{
         finishRestorePaint();
       }
@@ -20200,14 +20732,43 @@ function setModeLabelState(native){
 let conversationStatusLoadTimer=null;
 let conversationStatusLoadSeq=0;
 
-function clearConversationRestoring({refresh=true}={}){
+function conversationRestoreOwnerMatches(revision,id,source){
+  return revision===conversationRestoreRevision
+    &&String(currentConversationId)===String(id||'')
+    &&currentConversationSource===(source==='codex'?'codex':'web');
+}
+
+function beginConversationRestoring(){
   const root=typeof chat!=='undefined'&&chat?chat:document.getElementById('chat');
   if(!root)return;
+  root.classList.add('conversationRestoring');
+  let placeholder=root.querySelector('.conversationRestorePlaceholder');
+  if(!placeholder){
+    placeholder=root.querySelector('.empty.conversationRestoring');
+    if(placeholder)placeholder.classList.add('conversationRestorePlaceholder');
+  }
+  if(placeholder)return;
+  placeholder=document.createElement('div');
+  placeholder.className='empty conversationRestorePlaceholder';
+  const heading=document.createElement('b');
+  heading.textContent='正在切换会话';
+  const detail=document.createElement('span');
+  detail.textContent='正在同步会话内容…';
+  placeholder.append(heading,detail);
+  root.appendChild(placeholder);
+}
+
+function clearConversationRestoring({refresh=true,restoreRevision=0,id='',source='web'}={}){
+  if(restoreRevision&&!conversationRestoreOwnerMatches(restoreRevision,id,source))return false;
+  const root=typeof chat!=='undefined'&&chat?chat:document.getElementById('chat');
+  if(!root)return false;
   root.classList.remove('conversationRestoring');
+  root.querySelectorAll?.('.conversationRestorePlaceholder')?.forEach?.((node)=>node.remove());
   root.querySelectorAll?.('.empty.conversationRestoring')?.forEach?.((node)=>node.classList.remove('conversationRestoring'));
   if(refresh){
     try{refreshIcons(root)}catch{}
   }
+  return true;
 }
 
 function clearConversationStatusLoading(){
@@ -24611,16 +25172,34 @@ function createConversationMessageElement(role,text,options={}){
       icon.className='terminalErrorIcon';
       icon.setAttribute('aria-hidden','true');
       setIconLabel(icon,usageLimitError?'gauge':'circle-alert','',false);
-      const content=document.createElement('div');
-      content.className='terminalErrorContent'+(usageLimitError?' compact':'');
+      const bodyText=String(body.textContent||'').trim();
+      const hint=terminalErrorHintText(text);
+      const collapsibleError=!usageLimitError&&Boolean(bodyText||hint);
+      const content=document.createElement(collapsibleError?'details':'div');
+      content.className='terminalErrorContent'+(usageLimitError?' compact':'')+(collapsibleError?' terminalErrorDisclosure':'');
       const title=document.createElement('strong');
       title.className='terminalErrorTitle';
       title.textContent=terminalErrorMessageTitle(text);
-      content.appendChild(title);
-      const bodyText=String(body.textContent||'').trim();
+      if(collapsibleError){
+        content.open=false;
+        const summary=document.createElement('summary');
+        summary.className='terminalErrorSummary';
+        const preview=document.createElement('span');
+        preview.className='terminalErrorPreview';
+        preview.textContent=bodyText||hint;
+        preview.setAttribute('aria-hidden','true');
+        const chevron=document.createElement('i');
+        chevron.className='terminalErrorChevron';
+        chevron.setAttribute('data-lucide','chevron-right');
+        chevron.setAttribute('aria-hidden','true');
+        const accessibleLabel=document.createElement('span');
+        accessibleLabel.className='srOnly';
+        accessibleLabel.textContent='错误详情';
+        summary.append(title,preview,chevron,accessibleLabel);
+        content.appendChild(summary);
+      }else content.appendChild(title);
       if(bodyText)content.appendChild(body);
       else body.remove();
-      const hint=terminalErrorHintText(text);
       if(hint){
         const tip=document.createElement('small');
         tip.className='terminalErrorHint';

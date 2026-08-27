@@ -38,6 +38,27 @@ function cpaUsageEnvelope(usedPercent) {
   };
 }
 
+function cpaAccountsCheckEnvelope(accountId, entitlement = {}) {
+  return {
+    status_code: 200,
+    body: {
+      accounts: {
+        [accountId]: {
+          account: { id: accountId },
+          entitlement: {
+            plan_type: 'plus',
+            has_active_subscription: true,
+            expires_at: '2026-09-20T12:23:28Z',
+            renews_at: '2026-09-20T06:23:28Z',
+            billing_period: 'monthly',
+            ...entitlement,
+          },
+        },
+      },
+    },
+  };
+}
+
 test('normalizes editable Sub2API URLs and rejects unsafe values', () => {
   assert.equal(normalizeSubQuotaBaseUrl(' https://sub.example.test/ '), 'https://sub.example.test');
   assert.equal(normalizeSubQuotaBaseUrl('https://sub.example.test/v1'), 'https://sub.example.test');
@@ -87,7 +108,7 @@ test('normalizes editable OpenAI-compatible API URLs and rejects unknown provide
   );
 });
 
-test('normalizes CPA Codex usage windows into percent rate limits', () => {
+test('normalizes CPA Codex usage windows with the current subscription entitlement', () => {
   const quota = normalizeCpaCodexQuota({
     plan_type: 'plus',
     email: 'plus@example.com',
@@ -108,11 +129,19 @@ test('normalizes CPA Codex usage windows into percent rate limits', () => {
     id_token: {
       chatgpt_subscription_active_until: '2026-08-20T06:23:28+00:00',
     },
+  }, {
+    accountId: 'account-plus',
+    accountCheck: cpaAccountsCheckEnvelope('account-plus').body,
+    now: Date.parse('2026-08-22T00:00:00Z'),
   });
   assert.equal(quota.planName, 'Plus');
   assert.equal(quota.unit, '%');
   assert.equal(quota.valid, true);
-  assert.equal(quota.expiresAt, '2026-08-20T06:23:28+00:00');
+  assert.equal(quota.expiresAt, '2026-09-20T12:23:28Z');
+  assert.equal(quota.hasActiveSubscription, true);
+  assert.equal(quota.renewsAt, '2026-09-20T06:23:28Z');
+  assert.equal(quota.billingPeriod, 'monthly');
+  assert.equal(quota.accountId, 'account-plus');
   assert.equal(quota.rateLimitResetCredits, 2);
   assert.equal(quota.rateLimits.length, 1);
   assert.equal(quota.rateLimits[0].window, '7d');
@@ -120,6 +149,52 @@ test('normalizes CPA Codex usage windows into percent rate limits', () => {
   assert.equal(quota.rateLimits[0].remaining, 82);
   assert.equal(quota.rateLimits[0].limit, 100);
   assert.equal(quota.rateLimits[0].resetAt, '2026-07-27T08:39:33.000Z');
+});
+
+test('does not revive a stale auth-file expiry when live Plus entitlement is unavailable', () => {
+  const file = {
+    email: 'plus@example.com',
+    id_token: {
+      chatgpt_subscription_active_until: '2026-08-20T06:23:28Z',
+    },
+  };
+  const usage = {
+    plan_type: 'plus',
+    rate_limit: {
+      allowed: true,
+      primary_window: { used_percent: 20, limit_window_seconds: 18000 },
+    },
+  };
+  const now = Date.parse('2026-08-22T00:00:00Z');
+
+  assert.equal(normalizeCpaCodexQuota(usage, file, { now }).expiresAt, '');
+  assert.equal(normalizeCpaCodexQuota(usage, file, {
+    now,
+    accountId: 'account-plus',
+    accountCheck: cpaAccountsCheckEnvelope('account-plus', { expires_at: null }).body,
+  }).expiresAt, '');
+
+  assert.equal(normalizeCpaCodexQuota(usage, {
+    ...file,
+    id_token: {
+      chatgpt_subscription_active_until: '2026-09-01T06:23:28Z',
+    },
+  }, {
+    now,
+    accountId: 'account-plus',
+    accountCheck: {
+      accounts: {
+        default: {
+          account: { id: 'another-account' },
+          entitlement: {
+            plan_type: 'plus',
+            has_active_subscription: true,
+            expires_at: '2026-10-01T00:00:00Z',
+          },
+        },
+      },
+    },
+  }).expiresAt, '');
 });
 test('parses server-side Sub quota sources without embedding credentials', () => {
   const sources = parseSubQuotaSources(JSON.stringify([{
@@ -157,6 +232,87 @@ test('parses server-side Sub quota sources without embedding credentials', () =>
   assert.equal(adminEnriched[0].adminApiKeyEnv, 'SUB_ADMIN_API_KEY');
   assert.equal(adminEnriched[0].adminApiKey, 'admin-secret');
   assert.throws(() => parseSubQuotaSources('[{"baseUrl":"file:///tmp/key"}]'), /apiKeyEnv/);
+});
+
+test('parses structured API key credentials from environment variables', () => {
+  const [source] = parseSubQuotaSources(JSON.stringify([{
+    id: 'multi-sub',
+    name: 'Multi Sub',
+    baseUrl: 'https://sub.example.test',
+    apiKeys: [
+      { id: 'primary', label: '主 Key', apiKeyEnv: 'SUB_PRIMARY_KEY' },
+      { id: 'backup', label: '备用 Key', apiKeyEnv: 'SUB_BACKUP_KEY' },
+    ],
+  }]), {
+    SUB_PRIMARY_KEY: 'primary-secret',
+    SUB_BACKUP_KEY: 'backup-secret',
+  });
+
+  assert.equal(source.apiKey, undefined);
+  assert.equal(source.apiKeyEnv, undefined);
+  assert.deepEqual(source.apiKeys, [
+    {
+      id: 'primary',
+      label: '主 Key',
+      apiKeyEnv: 'SUB_PRIMARY_KEY',
+      apiKey: 'primary-secret',
+    },
+    {
+      id: 'backup',
+      label: '备用 Key',
+      apiKeyEnv: 'SUB_BACKUP_KEY',
+      apiKey: 'backup-secret',
+    },
+  ]);
+  assert.throws(
+    () => parseSubQuotaSources(JSON.stringify([{
+      id: 'duplicate',
+      baseUrl: 'https://sub.example.test',
+      apiKeys: [
+        { id: 'same', apiKeyEnv: 'SUB_PRIMARY_KEY' },
+        { id: 'same', apiKeyEnv: 'SUB_BACKUP_KEY' },
+      ],
+    }]), {
+      SUB_PRIMARY_KEY: 'primary-secret',
+      SUB_BACKUP_KEY: 'backup-secret',
+    }),
+    /API Key id 重复/,
+  );
+
+  const [serverSource] = parseSubQuotaSources(JSON.stringify([{
+    id: 'server-contract',
+    baseUrl: 'https://sub.example.test',
+    apiKeys: [
+      { id: 'one', label: 'One', env: 'SUB_PRIMARY_KEY' },
+      { id: 'two', label: 'Two', env: 'SUB_BACKUP_KEY' },
+    ],
+  }]), {
+    SUB_PRIMARY_KEY: 'primary-secret',
+    SUB_BACKUP_KEY: 'backup-secret',
+  });
+  assert.deepEqual(serverSource.apiKeys.map(({ id, label, apiKeyEnv }) => ({ id, label, apiKeyEnv })), [
+    { id: 'one', label: 'One', apiKeyEnv: 'SUB_PRIMARY_KEY' },
+    { id: 'two', label: 'Two', apiKeyEnv: 'SUB_BACKUP_KEY' },
+  ]);
+
+  const [aliasSource] = parseSubQuotaSources(JSON.stringify([{
+    id: 'legacy-alias',
+    baseUrl: 'https://sub.example.test',
+    apiKeyEnvs: [{ id: 'one', label: 'One', env: 'SUB_PRIMARY_KEY' }],
+  }]), { SUB_PRIMARY_KEY: 'primary-secret' });
+  assert.equal(aliasSource.apiKeys[0].apiKey, 'primary-secret');
+
+  assert.throws(
+    () => parseSubQuotaSources(JSON.stringify([{
+      id: 'too-many',
+      baseUrl: 'https://sub.example.test',
+      apiKeys: Array.from({ length: 9 }, (_, index) => ({
+        id: `key-${index + 1}`,
+        env: `SUB_KEY_${index + 1}`,
+      })),
+    }]), {}),
+    /最多配置 8 个 API Key/,
+  );
 });
 
 test('parses DeepSeek official quota sources with a default base URL', () => {
@@ -340,6 +496,114 @@ test('checks OpenAI-compatible sources through models without inventing quota va
     { url: 'https://second.example.test/v1/models', authorization: 'Bearer second-secret' },
   ]);
   assert.doesNotMatch(JSON.stringify(listed), /first-secret|second-secret/);
+});
+
+test('returns independent Sub2API quota results for structured API keys', async () => {
+  const authorizations = [];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'sub-multi',
+      name: 'Sub2API',
+      provider: 'sub2api',
+      usageUrl: 'https://sub.example.test/v1/usage',
+      apiKeys: [
+        { id: 'alpha', label: 'Alpha', apiKey: 'sub-alpha-secret' },
+        { id: 'beta', label: 'Beta', apiKey: 'sub-beta-secret' },
+      ],
+    }],
+    fetchImpl: async (_url, options) => {
+      const authorization = options.headers.Authorization;
+      authorizations.push(authorization);
+      return new Response(JSON.stringify({
+        isValid: true,
+        remaining: authorization === 'Bearer sub-alpha-secret' ? 11 : 29,
+        unit: 'USD',
+      }), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.count, 2);
+  assert.equal(listed.availableCount, 2);
+  assert.deepEqual(listed.quotas.map((quota) => ({
+    id: quota.id,
+    sourceId: quota.sourceId,
+    credentialId: quota.credentialId,
+    credentialLabel: quota.credentialLabel,
+    remaining: quota.remaining,
+  })), [
+    {
+      id: 'sub-multi-credential-alpha',
+      sourceId: 'sub-multi',
+      credentialId: 'alpha',
+      credentialLabel: 'Alpha',
+      remaining: 11,
+    },
+    {
+      id: 'sub-multi-credential-beta',
+      sourceId: 'sub-multi',
+      credentialId: 'beta',
+      credentialLabel: 'Beta',
+      remaining: 29,
+    },
+  ]);
+  assert.deepEqual(authorizations, ['Bearer sub-alpha-secret', 'Bearer sub-beta-secret']);
+  assert.doesNotMatch(JSON.stringify(listed), /sub-alpha-secret|sub-beta-secret/);
+});
+
+test('keeps DeepSeek and OpenAI-compatible API key results isolated', async () => {
+  const service = new SubQuotaService({
+    sources: [
+      {
+        id: 'deepseek-multi',
+        name: 'DeepSeek',
+        provider: 'deepseek',
+        baseUrl: 'https://api.deepseek.test',
+        apiKeys: [
+          { id: 'one', label: '账号一', apiKey: 'deep-one-secret' },
+          { id: 'two', label: '账号二', apiKey: 'deep-two-secret' },
+        ],
+      },
+      {
+        id: 'openai-multi',
+        name: 'OpenAI Compatible',
+        provider: 'openai-compatible',
+        baseUrl: 'https://openai.example.test',
+        apiKeys: [
+          { id: 'good', label: '可用', apiKey: 'openai-good-secret' },
+          { id: 'bad', label: '失效', apiKey: 'openai-bad-secret' },
+        ],
+      },
+    ],
+    fetchImpl: async (url, options) => {
+      const authorization = options.headers.Authorization;
+      if (String(url).endsWith('/user/balance')) {
+        return new Response(JSON.stringify({
+          is_available: true,
+          balance_infos: [{
+            currency: 'CNY',
+            total_balance: authorization === 'Bearer deep-one-secret' ? '10' : '20',
+          }],
+        }), { status: 200 });
+      }
+      if (authorization === 'Bearer openai-bad-secret') {
+        return new Response('{}', { status: 401 });
+      }
+      return new Response(JSON.stringify({ data: [{ id: 'model' }] }), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.count, 4);
+  assert.equal(listed.availableCount, 3);
+  assert.equal(listed.quotas.find((quota) => quota.id === 'deepseek-multi-credential-one').balance, 10);
+  assert.equal(listed.quotas.find((quota) => quota.id === 'deepseek-multi-credential-two').balance, 20);
+  assert.equal(listed.quotas.find((quota) => quota.id === 'openai-multi-credential-good').status, 'active');
+  assert.equal(listed.quotas.find((quota) => quota.id === 'openai-multi-credential-bad').error, 'HTTP 401');
+  assert.doesNotMatch(
+    JSON.stringify(listed),
+    /deep-one-secret|deep-two-secret|openai-good-secret|openai-bad-secret/,
+  );
 });
 
 test('reports unknown direct source providers without falling back to Sub2API', async () => {
@@ -1222,6 +1486,105 @@ test('treats invalid quota as unavailable, short-lived, and ineligible for fallb
   assert.equal(requests, 3);
 });
 
+test('fetches renewed CPA expiry from the live account entitlement', async () => {
+  const file = {
+    ...cpaAuthFile('renewed'),
+    id_token: {
+      chatgpt_subscription_active_until: '2026-08-20T06:23:28Z',
+    },
+  };
+  const apiCalls = [];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      baseUrl: 'https://cpa.test',
+      apiKey: 'cpa-management-secret',
+    }],
+    now: () => Date.parse('2026-08-22T00:00:00Z'),
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files: [file] }), { status: 200 });
+      }
+      const payload = JSON.parse(options.body);
+      apiCalls.push(payload);
+      assert.equal(payload.auth_index, 'auth-renewed');
+      assert.equal(payload.method, 'GET');
+      assert.equal(payload.header.Authorization, 'Bearer $TOKEN$');
+      assert.equal(payload.header['Chatgpt-Account-Id'], 'account-renewed');
+      if (payload.url === 'https://chatgpt.com/backend-api/wham/usage') {
+        return new Response(JSON.stringify(cpaUsageEnvelope(18)), { status: 200 });
+      }
+      assert.equal(
+        payload.url,
+        'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27',
+      );
+      const accountCheck = cpaAccountsCheckEnvelope('account-renewed');
+      accountCheck.body.accounts['another-account'] = {
+        account: { id: 'another-account' },
+        entitlement: {
+          plan_type: 'plus',
+          has_active_subscription: true,
+          expires_at: '2026-10-20T00:00:00Z',
+        },
+      };
+      return new Response(JSON.stringify(accountCheck), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.availableCount, 1);
+  assert.equal(listed.quotas[0].expiresAt, '2026-09-20T12:23:28Z');
+  assert.equal(listed.quotas[0].hasActiveSubscription, true);
+  assert.equal(listed.quotas[0].rateLimits[0].remaining, 82);
+  assert.deepEqual(apiCalls.map((payload) => payload.url), [
+    'https://chatgpt.com/backend-api/wham/usage',
+    'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27',
+  ]);
+  assert.doesNotMatch(JSON.stringify(listed), /cpa-management-secret/);
+});
+
+test('keeps CPA usage when the live entitlement check fails and hides stale expiry', async () => {
+  const file = {
+    ...cpaAuthFile('renewed'),
+    id_token: {
+      chatgpt_subscription_active_until: '2026-08-20T06:23:28Z',
+    },
+  };
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      baseUrl: 'https://cpa.test',
+      apiKey: 'key',
+    }],
+    now: () => Date.parse('2026-08-22T00:00:00Z'),
+    cpaReadRetryDelaysMs: [0, 0],
+    sleep: async () => {},
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files: [file] }), { status: 200 });
+      }
+      const payload = JSON.parse(options.body);
+      if (payload.url === 'https://chatgpt.com/backend-api/wham/usage') {
+        return new Response(JSON.stringify(cpaUsageEnvelope(20)), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        status_code: 503,
+        body: { error: 'subscription temporarily unavailable' },
+      }), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.availableCount, 1);
+  assert.equal(listed.quotas[0].error, undefined);
+  assert.equal(listed.quotas[0].expiresAt, '');
+  assert.equal(listed.quotas[0].rateLimits[0].remaining, 80);
+});
+
 test('keeps same-named CPA accounts isolated by stable source id', async () => {
   const file = cpaAuthFile('shared');
   const service = new SubQuotaService({
@@ -1263,11 +1626,161 @@ test('keeps same-named CPA accounts isolated by stable source id', async () => {
   assert.deepEqual(listed.quotas.map((quota) => quota.sourceName), ['CPA One', 'CPA Two']);
 });
 
+test('uses ordered CPA management credential failover only for authentication errors', async () => {
+  const keys = [];
+  const file = cpaAuthFile('alpha');
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      baseUrl: 'https://cpa.test',
+      apiKeys: [
+        { id: 'primary', label: 'Primary', apiKey: 'cpa-primary-secret' },
+        { id: 'secondary', label: 'Secondary', apiKey: 'cpa-secondary-secret' },
+      ],
+    }],
+    fetchImpl: async (url, options = {}) => {
+      const key = options.headers['X-Management-Key'];
+      keys.push(key);
+      if (String(url).endsWith('/auth-files') && key === 'cpa-primary-secret') {
+        return new Response('{}', { status: 401 });
+      }
+      if (String(url).endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files: [file] }), { status: 200 });
+      }
+      return new Response(JSON.stringify(cpaUsageEnvelope(20)), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.availableCount, 1);
+  assert.deepEqual(keys, [
+    'cpa-primary-secret',
+    'cpa-secondary-secret',
+    'cpa-secondary-secret',
+    'cpa-secondary-secret',
+  ]);
+  assert.doesNotMatch(JSON.stringify(listed), /cpa-primary-secret|cpa-secondary-secret/);
+});
+
+test('does not switch CPA management credentials after a network failure', async () => {
+  const keys = [];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      baseUrl: 'https://cpa.test',
+      apiKeys: [
+        { id: 'primary', label: 'Primary', apiKey: 'cpa-primary-secret' },
+        { id: 'secondary', label: 'Secondary', apiKey: 'cpa-secondary-secret' },
+      ],
+    }],
+    cpaReadRetryDelaysMs: [0, 0],
+    sleep: async () => {},
+    fetchImpl: async (_url, options = {}) => {
+      keys.push(options.headers['X-Management-Key']);
+      throw new TypeError('fetch failed for cpa-primary-secret');
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.deepEqual(keys, ['cpa-primary-secret', 'cpa-primary-secret', 'cpa-primary-secret']);
+  assert.equal(listed.availableCount, 0);
+  assert.match(listed.quotas[0].error, /fetch failed for \[REDACTED\]/);
+  assert.doesNotMatch(JSON.stringify(listed), /cpa-primary-secret|cpa-secondary-secret/);
+});
+
+test('retries an intermittent CPA api-call HTTP 502 before rendering an error', async () => {
+  const file = cpaAuthFile('alpha');
+  const waits = [];
+  const usageKeys = [];
+  let usageAttempts = 0;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      baseUrl: 'https://cpa.test',
+      apiKey: 'cpa-management-secret',
+    }],
+    cpaReadRetryDelaysMs: [10, 20],
+    sleep: async (delayMs) => waits.push(delayMs),
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files: [file] }), { status: 200 });
+      }
+      const payload = JSON.parse(options.body);
+      if (payload.url === 'https://chatgpt.com/backend-api/wham/usage') {
+        usageAttempts += 1;
+        usageKeys.push(options.headers['X-Management-Key']);
+        if (usageAttempts === 1) return new Response('bad gateway', { status: 502 });
+        return new Response(JSON.stringify(cpaUsageEnvelope(20)), { status: 200 });
+      }
+      return new Response(JSON.stringify(cpaAccountsCheckEnvelope('account-alpha')), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(usageAttempts, 2);
+  assert.deepEqual(waits, [10]);
+  assert.deepEqual(usageKeys, ['cpa-management-secret', 'cpa-management-secret']);
+  assert.equal(listed.availableCount, 1);
+  assert.equal(listed.quotas[0].rateLimits[0].remaining, 80);
+  assert.equal(listed.quotas[0].error, undefined);
+  assert.equal(listed.quotas[0].stale, undefined);
+});
+
+test('uses last-known-good CPA quota after bounded HTTP 502 retries are exhausted', async () => {
+  const file = cpaAuthFile('alpha');
+  let round = 1;
+  let failedUsageAttempts = 0;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'cpa',
+      name: 'CPA',
+      provider: 'cpa-codex',
+      baseUrl: 'https://cpa.test',
+      apiKey: 'key',
+    }],
+    cpaReadRetryDelaysMs: [0, 0],
+    sleep: async () => {},
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).endsWith('/auth-files')) {
+        return new Response(JSON.stringify({ files: [file] }), { status: 200 });
+      }
+      const payload = JSON.parse(options.body);
+      if (payload.url === 'https://chatgpt.com/backend-api/wham/usage') {
+        if (round === 2) {
+          failedUsageAttempts += 1;
+          return new Response('bad gateway', { status: 502 });
+        }
+        return new Response(JSON.stringify(cpaUsageEnvelope(20)), { status: 200 });
+      }
+      return new Response(JSON.stringify(cpaAccountsCheckEnvelope('account-alpha')), { status: 200 });
+    },
+  });
+
+  const ready = await service.list();
+  round = 2;
+  const stale = await service.list({ refresh: true });
+  assert.equal(failedUsageAttempts, 3);
+  assert.equal(stale.availableCount, 1);
+  assert.equal(stale.quotas[0].rateLimits[0].remaining, 80);
+  assert.equal(stale.quotas[0].fetchedAt, ready.quotas[0].fetchedAt);
+  assert.equal(stale.quotas[0].stale, true);
+  assert.equal(stale.quotas[0].warning, 'HTTP 502');
+  assert.equal(stale.quotas[0].error, undefined);
+});
+
 test('falls back for a transient CPA api-call status code', async () => {
   let round = 1;
   const file = cpaAuthFile('alpha');
   const service = new SubQuotaService({
     sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
+    cpaReadRetryDelaysMs: [0, 0],
+    sleep: async () => {},
     fetchImpl: async (url) => {
       if (String(url).endsWith('/auth-files')) {
         return new Response(JSON.stringify({ files: [file] }), { status: 200 });
@@ -1292,6 +1805,7 @@ test('falls back for a transient CPA api-call status code', async () => {
 
 test('does not revive CPA quota for an unauthorized status containing network wording', async () => {
   let round = 1;
+  let unauthorizedAttempts = 0;
   const file = cpaAuthFile('alpha');
   const service = new SubQuotaService({
     sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
@@ -1300,6 +1814,7 @@ test('does not revive CPA quota for an unauthorized status containing network wo
         return new Response(JSON.stringify({ files: [file] }), { status: 200 });
       }
       if (round === 2) {
+        unauthorizedAttempts += 1;
         return new Response(JSON.stringify({
           status_code: 401,
           body: { error: 'upstream connection timed out' },
@@ -1312,6 +1827,7 @@ test('does not revive CPA quota for an unauthorized status containing network wo
   await service.list();
   round = 2;
   const unauthorized = await service.list({ refresh: true });
+  assert.equal(unauthorizedAttempts, 1);
   assert.equal(unauthorized.availableCount, 0);
   assert.equal(unauthorized.quotas[0].error, 'HTTP 401: upstream connection timed out');
   assert.equal(unauthorized.quotas[0].stale, undefined);
@@ -1324,6 +1840,8 @@ test('merges fresh and stale CPA accounts by stable account id', async () => {
   const service = new SubQuotaService({
     sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
     now: () => now,
+    cpaReadRetryDelaysMs: [0, 0],
+    sleep: async () => {},
     fetchImpl: async (url, init) => {
       if (String(url).endsWith('/auth-files')) {
         return new Response(JSON.stringify({ files }), { status: 200 });
@@ -1355,6 +1873,8 @@ test('uses all recent CPA accounts after a source-wide transient failure', async
   const files = [cpaAuthFile('alpha'), cpaAuthFile('beta')];
   const service = new SubQuotaService({
     sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
+    cpaReadRetryDelaysMs: [0, 0],
+    sleep: async () => {},
     fetchImpl: async (url, init) => {
       if (String(url).endsWith('/auth-files')) {
         if (round === 2) throw new DOMException('aborted', 'AbortError');
@@ -1379,6 +1899,8 @@ test('removes disappeared CPA accounts from source-wide fallback state', async (
   const beta = cpaAuthFile('beta');
   const service = new SubQuotaService({
     sources: [{ id: 'cpa', name: 'CPA', provider: 'cpa-codex', baseUrl: 'https://cpa.test', apiKey: 'key' }],
+    cpaReadRetryDelaysMs: [0, 0],
+    sleep: async () => {},
     fetchImpl: async (url, init) => {
       if (String(url).endsWith('/auth-files')) {
         if (round === 3) throw new DOMException('aborted', 'AbortError');
@@ -1632,6 +2154,136 @@ test('fetches Grok2API summary with admin login and can sync or reset quotas', a
   assert.equal(reset.ok, true);
   assert.equal(reset.reset, 4);
   assert.ok(calls.some((item) => item.url.endsWith('/api/admin/v1/accounts/reset-quota')));
+});
+
+test('uses ordered Grok2API credential failover for authentication errors', async () => {
+  const passwords = [];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'grok',
+      name: 'Grok2API',
+      provider: 'grok2api',
+      baseUrl: 'https://grok.example.test',
+      apiKeys: [
+        { id: 'primary', label: 'Primary', apiKey: 'admin:bad-secret' },
+        { id: 'secondary', label: 'Secondary', apiKey: 'admin:good-secret' },
+      ],
+    }],
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).endsWith('/auth/login')) {
+        const password = JSON.parse(options.body).password;
+        passwords.push(password);
+        if (password === 'bad-secret') return new Response('{}', { status: 401 });
+        return new Response(JSON.stringify({
+          data: {
+            tokens: {
+              accessToken: 'good-token',
+              accessTokenExpiresAt: new Date(Date.now() + 60000).toISOString(),
+            },
+          },
+        }), { status: 200 });
+      }
+      assert.equal(options.headers.Authorization, 'Bearer good-token');
+      return new Response(JSON.stringify({
+        data: {
+          total: 1,
+          available: 1,
+          providers: { grok_build: { total: 1, available: 1 } },
+        },
+      }), { status: 200 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.availableCount, 1);
+  assert.deepEqual(passwords, ['bad-secret', 'good-secret']);
+  assert.doesNotMatch(JSON.stringify(listed), /bad-secret|good-secret|good-token/);
+});
+
+test('isolates Grok2API cached tokens by credential id', async () => {
+  const loginPasswords = [];
+  const summaryTokens = [];
+  const fetchImpl = async (url, options = {}) => {
+    if (String(url).endsWith('/auth/login')) {
+      const password = JSON.parse(options.body).password;
+      loginPasswords.push(password);
+      return new Response(JSON.stringify({
+        data: {
+          tokens: {
+            accessToken: `token-${password}`,
+            accessTokenExpiresAt: new Date(Date.now() + 60000).toISOString(),
+          },
+        },
+      }), { status: 200 });
+    }
+    summaryTokens.push(options.headers.Authorization);
+    return new Response(JSON.stringify({
+      data: {
+        total: 1,
+        available: 1,
+        providers: { grok_build: { total: 1, available: 1 } },
+      },
+    }), { status: 200 });
+  };
+  const first = {
+    id: 'grok',
+    name: 'Grok',
+    provider: 'grok2api',
+    baseUrl: 'https://grok.example.test',
+    apiKeys: [{ id: 'first', label: 'First', apiKey: 'admin:first-secret' }],
+  };
+  const second = {
+    ...first,
+    apiKeys: [{ id: 'second', label: 'Second', apiKey: 'admin:second-secret' }],
+  };
+  const service = new SubQuotaService({ sources: [first], fetchImpl });
+
+  await service.fetchGrok2ApiSummary(first);
+  await service.fetchGrok2ApiSummary(second);
+
+  assert.deepEqual(loginPasswords, ['first-secret', 'second-secret']);
+  assert.deepEqual(summaryTokens, ['Bearer token-first-secret', 'Bearer token-second-secret']);
+});
+
+test('does not switch Grok2API credentials or replay reset after a server failure', async () => {
+  const loginPasswords = [];
+  let resetRequests = 0;
+  const source = {
+    id: 'grok',
+    name: 'Grok2API',
+    provider: 'grok2api',
+    baseUrl: 'https://grok.example.test',
+    apiKeys: [
+      { id: 'primary', label: 'Primary', apiKey: 'admin:primary-secret' },
+      { id: 'secondary', label: 'Secondary', apiKey: 'admin:secondary-secret' },
+    ],
+  };
+  const service = new SubQuotaService({
+    sources: [source],
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).endsWith('/auth/login')) {
+        const password = JSON.parse(options.body).password;
+        loginPasswords.push(password);
+        return new Response(JSON.stringify({
+          data: {
+            tokens: {
+              accessToken: `token-${password}`,
+              accessTokenExpiresAt: new Date(Date.now() + 60000).toISOString(),
+            },
+          },
+        }), { status: 200 });
+      }
+      if (String(url).endsWith('/accounts/reset-quota')) {
+        resetRequests += 1;
+        return new Response('{}', { status: 503 });
+      }
+      throw new Error(`unexpected url ${url}`);
+    },
+  });
+
+  await assert.rejects(() => service.resetGrok2ApiQuota(source), /HTTP 503/);
+  assert.deepEqual(loginPasswords, ['primary-secret']);
+  assert.equal(resetRequests, 1);
 });
 
 test('normalizes Grok2API admin URLs', () => {

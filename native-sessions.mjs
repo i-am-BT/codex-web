@@ -14,7 +14,12 @@ import {
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const SESSION_ID_PATTERN = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+const SESSION_UUID_SOURCE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const SESSION_ID_PATTERN = new RegExp(`(${SESSION_UUID_SOURCE})\\.jsonl$`, 'i');
+const SESSION_FILE_PATTERN = new RegExp(
+  `(${SESSION_UUID_SOURCE})(?:_${SESSION_UUID_SOURCE})?\\.jsonl$`,
+  'i',
+);
 const READ_CHUNK_BYTES = 256 * 1024;
 const FIRST_RECORD_LIMIT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAX_READ_BYTES = 0;
@@ -41,6 +46,10 @@ export class NativeSessionStore extends EventEmitter {
     this.sessionsDir = path.join(this.codexHome, 'sessions');
     this.indexFile = path.join(this.codexHome, 'session_index.jsonl');
     this.globalStateFile = path.join(this.codexHome, '.codex-global-state.json');
+    this.projectlessWorkspaceRoot = path.resolve(
+      options.projectlessWorkspaceRoot
+        || path.join(path.dirname(this.codexHome), 'Documents', 'Codex'),
+    );
     this.sideChatStateFile = path.resolve(
       options.sideChatStateFile || path.join(this.codexHome, 'codex-web-side-chat.json'),
     );
@@ -70,6 +79,7 @@ export class NativeSessionStore extends EventEmitter {
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
     this.projectThreadIds = new Set();
+    this.threadWorkspaceCwds = new Map();
     this.sideChatThreadIds = new Set();
     this.sideChatSourceThreads = new Map();
     this.pinnedThreadIds = [];
@@ -151,8 +161,9 @@ export class NativeSessionStore extends EventEmitter {
       this.sessionsDir,
       this.titles,
       this.appThreads,
-      (id) => this.workspaceKindForThread(id),
+      (id, cwd) => this.workspaceKindForThread(id, cwd),
       this.sessionMetadataCache,
+      (id) => this.workspaceCwdForThread(id),
     );
     const nextSubagentEntries = scanSessionFiles(this.sessionsDir, this.titles, this.subagentThreads);
     const conversationChangedIds = [
@@ -226,11 +237,13 @@ export class NativeSessionStore extends EventEmitter {
 
     if (state) {
       const assignments = state['thread-project-assignments'];
-      this.projectThreadIds = new Set((assignments && typeof assignments === 'object' && !Array.isArray(assignments)
-        ? Object.keys(assignments)
-        : [])
+      const normalizedAssignments = assignments && typeof assignments === 'object' && !Array.isArray(assignments)
+        ? assignments
+        : {};
+      this.projectThreadIds = new Set(Object.keys(normalizedAssignments)
         .map((id) => String(id || '').trim().toLowerCase())
         .filter((id) => SESSION_ID_PATTERN.test(`${id}.jsonl`)));
+      this.threadWorkspaceCwds = assignedThreadWorkspaceCwds(state, normalizedAssignments);
     }
     const globalProjectlessIds = [...globalIds, ...local.legacyProjectlessIds]
       .map((id) => String(id || '').trim().toLowerCase())
@@ -410,11 +423,19 @@ export class NativeSessionStore extends EventEmitter {
     return [...this.pinnedThreadIds];
   }
 
-  workspaceKindForThread(id) {
+  workspaceKindForThread(id, cwd = '') {
     const threadId = String(id || '').trim().toLowerCase();
     if (!this.workspaceStateAvailable || !SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return '';
+    if (this.projectThreadIds.has(threadId)) return 'project';
     if (this.projectlessThreadIds.has(threadId)) return 'projectless';
+    if (isGeneratedProjectlessWorkspace(cwd, this.projectlessWorkspaceRoot)) return 'projectless';
     return 'project';
+  }
+
+  workspaceCwdForThread(id) {
+    const threadId = String(id || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return '';
+    return this.threadWorkspaceCwds.get(threadId) || '';
   }
 
   markProjectlessThread(id, options = {}) {
@@ -528,10 +549,16 @@ export class NativeSessionStore extends EventEmitter {
         if (Number(row.has_model) === 1) rawThreadSettings.model = row.model;
         if (Number(row.has_reasoning_effort) === 1) rawThreadSettings.reasoningEffort = row.reasoning_effort;
         const threadSettings = normalizeThreadSettings(rawThreadSettings);
+        const rowCwd = String(row.cwd || '').trim();
+        const assignedWorkspaceCwd = this.workspaceCwdForThread(id);
+        const cwd = assignedWorkspaceCwd || rowCwd;
         next.set(id, {
           rolloutPath: path.resolve(rolloutPath),
-          cwd: String(row.cwd || '').trim(),
-          workspaceKind: this.workspaceStateAvailable ? this.workspaceKindForThread(id) : '',
+          cwd,
+          assignedWorkspaceCwd,
+          workspaceKind: this.workspaceStateAvailable
+            ? this.workspaceKindForThread(id, cwd)
+            : '',
           title: cleanTitle(row.title),
           createdAtMs: timestampMs(row.created_at_ms),
           updatedAtMs: timestampMs(row.updated_at_ms),
@@ -1019,6 +1046,7 @@ function scanSessionFiles(
   appThreads = null,
   workspaceKindForThread = null,
   sessionMetadataCache = null,
+  workspaceCwdForThread = null,
 ) {
   const entries = new Map();
   if (!existsSync(root)) return entries;
@@ -1040,7 +1068,7 @@ function scanSessionFiles(
         continue;
       }
       if (!child.isFile()) continue;
-      const id = child.name.match(SESSION_ID_PATTERN)?.[1]?.toLowerCase();
+      const id = child.name.match(SESSION_FILE_PATTERN)?.[1]?.toLowerCase();
       if (!id) continue;
       const appThread = appThreads?.get(id);
       if (appThreads && !appThread) continue;
@@ -1054,12 +1082,15 @@ function scanSessionFiles(
         const sessionMetadata = sessionMetadataCache
           ? cachedSessionMetadata(sessionMetadataCache, id, filePath, stat.ino)
           : appThread?.cwd ? null : sessionMetadataFromFirstRecord(readFirstRecord(filePath));
+        const assignedWorkspaceCwd = workspaceCwdForThread?.(id) || appThread?.assignedWorkspaceCwd || '';
+        const cwd = assignedWorkspaceCwd || appThread?.cwd || sessionMetadata?.cwd || '';
         const entry = {
           id,
           title,
-          cwd: appThread?.cwd || sessionMetadata?.cwd || '',
+          cwd,
+          assignedWorkspaceCwd,
           originator: sessionMetadata?.originator || '',
-          workspaceKind: appThread?.workspaceKind || workspaceKindForThread?.(id) || '',
+          workspaceKind: appThread?.workspaceKind || workspaceKindForThread?.(id, cwd) || '',
           filePath,
           size: stat.size,
           ino: stat.ino,
@@ -1081,6 +1112,54 @@ function scanSessionFiles(
   }
 
   return entries;
+}
+
+function isGeneratedProjectlessWorkspace(cwd, root) {
+  const workspace = String(cwd || '').trim();
+  const base = String(root || '').trim();
+  if (!workspace || !base) return false;
+  const relative = path.relative(path.resolve(base), path.resolve(workspace));
+  if (!relative || path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) {
+    return false;
+  }
+  const segments = relative.split(path.sep).filter(Boolean);
+  return segments.length >= 2 && /^\d{4}-\d{2}-\d{2}$/.test(segments[0]);
+}
+
+function assignedThreadWorkspaceCwds(state, assignments) {
+  const resolved = new Map();
+  const localProjects = state?.['local-projects'];
+  const projects = localProjects && typeof localProjects === 'object' && !Array.isArray(localProjects)
+    ? localProjects
+    : {};
+  const persistedAtoms = state?.['electron-persisted-atom-state'];
+  const atoms = persistedAtoms && typeof persistedAtoms === 'object' && !Array.isArray(persistedAtoms)
+    ? persistedAtoms
+    : {};
+
+  for (const [rawId, rawAssignment] of Object.entries(assignments || {})) {
+    const threadId = String(rawId || '').trim().toLowerCase();
+    if (!SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) continue;
+    const assignment = rawAssignment && typeof rawAssignment === 'object' && !Array.isArray(rawAssignment)
+      ? rawAssignment
+      : {};
+    const projectId = String(assignment.projectId || '').trim();
+    const workspaceState = atoms[`thread-workspace-state-v1:${threadId}`];
+    const appliedProjectId = String(workspaceState?.project?.projectId || '').trim();
+    const appliedCwd = projectId && appliedProjectId === projectId
+      ? String(workspaceState?.applied?.cwd || '').trim()
+      : '';
+    const assignmentCwd = String(assignment.cwd || '').trim();
+    const projectRoots = projectId && projects[projectId] && typeof projects[projectId] === 'object'
+      ? projects[projectId].rootPaths
+      : [];
+    const projectCwd = Array.isArray(projectRoots)
+      ? String(projectRoots.find((value) => String(value || '').trim()) || '').trim()
+      : '';
+    const cwd = appliedCwd || assignmentCwd || projectCwd;
+    if (cwd) resolved.set(threadId, cwd);
+  }
+  return resolved;
 }
 
 function sameLocalPath(left, right) {
@@ -1113,7 +1192,7 @@ function changedSessionIds(previous, next) {
 }
 
 function entrySignature(entry) {
-  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.originator || ''}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}:${entry.settingsUpdatedAtMs || 0}:${JSON.stringify(entry.threadSettings || {})}`;
+  return `${entry.filePath}:${entry.ino}:${entry.size}:${entry.mtimeMs}:${entry.recencyMs}:${entry.title}:${entry.cwd}:${entry.assignedWorkspaceCwd || ''}:${entry.originator || ''}:${entry.workspaceKind || ''}:${entry.parentThreadId || ''}:${entry.agentPath || ''}:${entry.settingsUpdatedAtMs || 0}:${JSON.stringify(entry.threadSettings || {})}`;
 }
 
 function sessionSummary(entry, status) {
@@ -3397,7 +3476,11 @@ function buildConversation(entry, cache, options, runningWindowMs) {
     cursor: Math.max(0, cache.nextSequence - 1),
     reset,
     revision: `${entry.ino}:${entry.size}:${entry.mtimeMs}`,
-    metadata: { ...cache.metadata, workspaceKind: entry.workspaceKind || '' },
+    metadata: {
+      ...cache.metadata,
+      cwd: entry.assignedWorkspaceCwd || cache.metadata.cwd || entry.cwd || '',
+      workspaceKind: entry.workspaceKind || '',
+    },
     goal: cache.goal ? { ...cache.goal } : null,
     contextWindow: Number.isFinite(cache.contextUsedTokens) && cache.contextWindowTokens > 0
       ? {

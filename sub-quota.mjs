@@ -2,14 +2,17 @@ const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_CACHE_TTL_MS = 30000;
 const ERROR_CACHE_TTL_MS = 5000;
 const LAST_GOOD_TTL_MS = 5 * 60 * 1000;
+const CPA_READ_RETRY_DELAYS_MS = [300, 900];
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const GROK2API_SYNC_TIMEOUT_MS = 15 * 60 * 1000;
 const GROK2API_SYNC_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$/;
 const ENV_KEY_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
+const MAX_SOURCE_API_KEYS = 8;
 const RATE_LIMIT_WINDOWS = new Set(['5h', '1d', '7d', '30d']);
 const MAX_BASE_URL_LENGTH = 2048;
 const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const CODEX_ACCOUNTS_CHECK_URL = 'https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27';
 const CODEX_USAGE_HEADERS = {
   Authorization: 'Bearer $TOKEN$',
   'Content-Type': 'application/json',
@@ -28,10 +31,18 @@ export class SubQuotaService {
     this.timeoutMs = positiveNumber(options.timeoutMs, DEFAULT_TIMEOUT_MS);
     this.cacheTtlMs = positiveNumber(options.cacheTtlMs, DEFAULT_CACHE_TTL_MS);
     this.now = options.now || Date.now;
+    this.sleep = typeof options.sleep === 'function'
+      ? options.sleep
+      : (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs));
+    this.cpaReadRetryDelaysMs = normalizeRetryDelays(
+      options.cpaReadRetryDelaysMs,
+      CPA_READ_RETRY_DELAYS_MS,
+    );
     this.configurationError = String(options.configurationError || '');
     this.cache = null;
     this.pending = null;
     this.lastSuccessfulBySource = new Map();
+    this.activeCredentialBySource = new Map();
   }
 
   static fromEnvironment(env = process.env, options = {}) {
@@ -115,13 +126,15 @@ export class SubQuotaService {
 
   async fetchGrok2ApiSource(source, fetchedAt) {
     const base = sourceQuotaBase(source, 'grok2api', fetchedAt);
-    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+    if (!hasConfiguredSourceCredential(source)) {
+      return [{ ...base, error: missingSourceCredentialMessage(source) }];
+    }
 
     try {
       const summary = await this.fetchGrok2ApiSummary(source);
       return [{ ...base, ...normalizeGrok2ApiSummary(summary) }];
     } catch (error) {
-      return [fetchErrorQuota(base, error, { sourceWide: true })];
+      return [fetchErrorQuota(base, sanitizeCredentialError(error, sourceApiKeyCredentials(source)), { sourceWide: true })];
     }
   }
 
@@ -133,8 +146,18 @@ export class SubQuotaService {
   }
 
   async fetchDeepSeekSource(source, fetchedAt) {
+    const credentials = sourceApiKeyCredentials(source);
+    if (!credentials.length) {
+      return [{ ...sourceQuotaBase(source, 'deepseek', fetchedAt), error: missingSourceCredentialMessage(source) }];
+    }
+    return (await Promise.all(credentials.map((credential) => (
+      this.fetchDeepSeekCredential(bindSourceCredential(source, credential), fetchedAt)
+    )))).flat();
+  }
+
+  async fetchDeepSeekCredential(source, fetchedAt) {
     const base = sourceQuotaBase(source, 'deepseek', fetchedAt);
-    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+    if (!source.apiKey) return [{ ...base, error: missingSourceCredentialMessage(source) }];
 
     try {
       const data = await this.requestJson(`${source.baseUrl}/user/balance`, {
@@ -145,13 +168,25 @@ export class SubQuotaService {
       });
       return [{ ...base, ...normalizeDeepSeekBalance(data) }];
     } catch (error) {
-      return [fetchErrorQuota(base, error, { sourceWide: true })];
+      return [fetchErrorQuota(base, sanitizeCredentialError(error, [{ apiKey: source.apiKey }]), {
+        sourceWide: !source.credentialScoped,
+      })];
     }
   }
 
   async fetchOpenAiCompatibleSource(source, fetchedAt) {
+    const credentials = sourceApiKeyCredentials(source);
+    if (!credentials.length) {
+      return [{ ...sourceQuotaBase(source, 'openai-compatible', fetchedAt), error: missingSourceCredentialMessage(source) }];
+    }
+    return (await Promise.all(credentials.map((credential) => (
+      this.fetchOpenAiCompatibleCredential(bindSourceCredential(source, credential), fetchedAt)
+    )))).flat();
+  }
+
+  async fetchOpenAiCompatibleCredential(source, fetchedAt) {
     const base = sourceQuotaBase(source, 'openai-compatible', fetchedAt);
-    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+    if (!source.apiKey) return [{ ...base, error: missingSourceCredentialMessage(source) }];
 
     try {
       const data = await this.requestJson(`${source.baseUrl}/v1/models`, {
@@ -180,13 +215,15 @@ export class SubQuotaService {
         total: null,
       }];
     } catch (error) {
-      return [fetchErrorQuota(base, error, { sourceWide: true })];
+      return [fetchErrorQuota(base, sanitizeCredentialError(error, [{ apiKey: source.apiKey }]), {
+        sourceWide: !source.credentialScoped,
+      })];
     }
   }
 
   async resetGrok2ApiQuota(source, options = {}) {
     if (!source || source.provider !== 'grok2api') throw new Error('未配置 Grok2API 额度来源');
-    if (!source.apiKey) throw new Error(`缺少环境变量 ${source.apiKeyEnv || 'GROK2API_ADMIN_PASSWORD'}`);
+    if (!hasConfiguredSourceCredential(source)) throw new Error(missingSourceCredentialMessage(source, 'GROK2API_ADMIN_PASSWORD'));
     const ids = Array.isArray(options.ids)
       ? options.ids.map((id) => cleanText(id, 64)).filter(Boolean)
       : [];
@@ -217,7 +254,7 @@ export class SubQuotaService {
 
   async syncGrok2ApiQuota(source) {
     if (!source || source.provider !== 'grok2api') throw new Error('未配置 Grok2API 额度来源');
-    if (!source.apiKey) throw new Error(`缺少环境变量 ${source.apiKeyEnv || 'GROK2API_ADMIN_PASSWORD'}`);
+    if (!hasConfiguredSourceCredential(source)) throw new Error(missingSourceCredentialMessage(source, 'GROK2API_ADMIN_PASSWORD'));
     const targets = [
       {
         provider: 'grok_build',
@@ -266,9 +303,15 @@ export class SubQuotaService {
   }
 
   async requestGrok2ApiJson(source, path, options = {}) {
-    const { username, password } = parseGrok2ApiCredentials(source.apiKey);
+    return this.withSourceCredentialFailover(source, (credential) => (
+      this.requestGrok2ApiJsonWithCredential(source, credential, path, options)
+    ));
+  }
+
+  async requestGrok2ApiJsonWithCredential(source, credential, path, options = {}) {
+    const { username, password } = parseGrok2ApiCredentials(credential.apiKey);
     if (!password) throw new Error('Grok2API 管理员密码不能为空');
-    const token = await this.loginGrok2Api(source, username, password);
+    const token = await this.loginGrok2Api(source, credential, username, password);
     const headers = {
       Accept: 'application/json',
       Authorization: `Bearer ${token}`,
@@ -283,8 +326,8 @@ export class SubQuotaService {
     try {
       return await this.requestJson(`${source.baseUrl}${path}`, request);
     } catch (error) {
-      if (Number(error?.statusCode || 0) !== 401) throw error;
-      const retryToken = await this.loginGrok2Api(source, username, password, { force: true });
+      if (!isAuthenticationError(error)) throw error;
+      const retryToken = await this.loginGrok2Api(source, credential, username, password, { force: true });
       return this.requestJson(`${source.baseUrl}${path}`, {
         ...request,
         headers: {
@@ -296,7 +339,13 @@ export class SubQuotaService {
   }
 
   async requestGrok2ApiEventStream(source, path) {
-    const { username, password } = parseGrok2ApiCredentials(source.apiKey);
+    return this.withSourceCredentialFailover(source, (credential) => (
+      this.requestGrok2ApiEventStreamWithCredential(source, credential, path)
+    ));
+  }
+
+  async requestGrok2ApiEventStreamWithCredential(source, credential, path) {
+    const { username, password } = parseGrok2ApiCredentials(credential.apiKey);
     if (!password) throw new Error('Grok2API 管理员密码不能为空');
     const requestWithToken = async (token) => {
       const controller = new AbortController();
@@ -328,19 +377,19 @@ export class SubQuotaService {
         clearTimeout(timeout);
       }
     };
+    const token = await this.loginGrok2Api(source, credential, username, password);
     try {
-      const token = await this.loginGrok2Api(source, username, password);
       return await requestWithToken(token);
     } catch (error) {
-      if (Number(error?.statusCode || 0) !== 401) throw error;
-      const retryToken = await this.loginGrok2Api(source, username, password, { force: true });
+      if (!isAuthenticationError(error)) throw error;
+      const retryToken = await this.loginGrok2Api(source, credential, username, password, { force: true });
       return requestWithToken(retryToken);
     }
   }
 
-  async loginGrok2Api(source, username, password, { force = false } = {}) {
+  async loginGrok2Api(source, credential, username, password, { force = false } = {}) {
     if (!this.grok2ApiTokens) this.grok2ApiTokens = new Map();
-    const cacheKey = `${source.baseUrl}::${username}`;
+    const cacheKey = `${credentialPoolKey(source)}::${credential.id}::${username}`;
     const cached = this.grok2ApiTokens.get(cacheKey);
     const now = this.now();
     if (!force && cached?.token && cached.expiresAt > now + 5000) return cached.token;
@@ -374,6 +423,33 @@ export class SubQuotaService {
       expiresAt: Number.isFinite(expiresAt) ? expiresAt : now + 10 * 60 * 1000,
     });
     return token;
+  }
+
+  async withSourceCredentialFailover(source, request) {
+    const credentials = orderedSourceCredentials(
+      source,
+      this.activeCredentialBySource.get(credentialPoolKey(source)),
+    );
+    const failures = [];
+    for (const credential of credentials) {
+      if (!credential.apiKey) {
+        failures.push({
+          credential,
+          error: missingCredentialError(credential, source),
+        });
+        continue;
+      }
+      try {
+        const result = await request(credential);
+        this.activeCredentialBySource.set(credentialPoolKey(source), credential.id);
+        return result;
+      } catch (error) {
+        const sanitizedError = sanitizeCredentialError(error, credentials);
+        failures.push({ credential, error: sanitizedError });
+        if (!isAuthenticationError(sanitizedError)) throw sanitizedError;
+      }
+    }
+    throw combinedCredentialError(failures, source);
   }
 
   async fetchSourceWithFallback(source, fetchedAt) {
@@ -432,8 +508,29 @@ export class SubQuotaService {
   }
 
   async fetchSub2ApiSource(source, fetchedAt) {
+    const credentials = sourceApiKeyCredentials(source);
+    const quotas = credentials.length
+      ? (await Promise.all(credentials.map((credential) => (
+        this.fetchSub2ApiCredential(bindSourceCredential(source, credential), fetchedAt)
+      )))).flat()
+      : [{ ...sourceQuotaBase(source, 'sub2api', fetchedAt), error: missingSourceCredentialMessage(source) }];
+    if (!source.adminApiKey) return quotas;
+    try {
+      const accounts = await this.fetchSub2ApiCodexAccounts(source, fetchedAt);
+      return [...quotas, ...accounts];
+    } catch (error) {
+      const base = sourceQuotaBase(source, 'sub2api', fetchedAt);
+      return [...quotas, fetchErrorQuota({
+        ...base,
+        id: `${source.id}-codex-accounts`,
+        name: `${source.name} Codex`,
+      }, error, { partial: true })];
+    }
+  }
+
+  async fetchSub2ApiCredential(source, fetchedAt) {
     const base = sourceQuotaBase(source, 'sub2api', fetchedAt);
-    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+    if (!source.apiKey) return [{ ...base, error: missingSourceCredentialMessage(source) }];
 
     try {
       const data = await this.requestJson(source.usageUrl, {
@@ -455,19 +552,11 @@ export class SubQuotaService {
           // The models probe is optional. Keep a valid /v1/usage result intact.
         }
       }
-      if (!source.adminApiKey) return [quota];
-      try {
-        const accounts = await this.fetchSub2ApiCodexAccounts(source, fetchedAt);
-        return [quota, ...accounts];
-      } catch (error) {
-        return [quota, fetchErrorQuota({
-          ...base,
-          id: `${source.id}-codex-accounts`,
-          name: `${source.name} Codex`,
-        }, error, { partial: true })];
-      }
+      return [quota];
     } catch (error) {
-      return [fetchErrorQuota(base, error, { sourceWide: true })];
+      return [fetchErrorQuota(base, sanitizeCredentialError(error, [{ apiKey: source.apiKey }]), {
+        sourceWide: !source.credentialScoped && !source.adminApiKey,
+      })];
     }
   }
 
@@ -515,7 +604,9 @@ export class SubQuotaService {
 
   async fetchCpaCodexSource(source, fetchedAt) {
     const base = sourceQuotaBase(source, 'cpa-codex', fetchedAt);
-    if (!source.apiKey) return [{ ...base, error: `缺少环境变量 ${source.apiKeyEnv}` }];
+    if (!hasConfiguredSourceCredential(source)) {
+      return [{ ...base, error: missingSourceCredentialMessage(source) }];
+    }
 
     try {
       const authFiles = await this.listCpaAuthFiles(source);
@@ -539,9 +630,22 @@ export class SubQuotaService {
         try {
           const accountId = await this.resolveCpaAccountId(source, file);
           const usage = await this.fetchCpaCodexUsage(source, file, accountId);
-          quotas.push({ ...accountBase, ...normalizeCpaCodexQuota(usage, file) });
+          let accountCheck = null;
+          try {
+            accountCheck = await this.fetchCpaCodexAccountCheck(source, file, accountId);
+          } catch {
+            // Subscription metadata is optional; keep live usage when this probe fails.
+          }
+          quotas.push({
+            ...accountBase,
+            ...normalizeCpaCodexQuota(usage, file, {
+              accountCheck,
+              accountId,
+              now: this.now(),
+            }),
+          });
         } catch (error) {
-          quotas.push(fetchErrorQuota(accountBase, error));
+          quotas.push(fetchErrorQuota(accountBase, sanitizeCredentialError(error, sourceApiKeyCredentials(source))));
         }
       }
       return quotas;
@@ -551,9 +655,7 @@ export class SubQuotaService {
   }
 
   async listCpaAuthFiles(source) {
-    const data = await this.requestJson(`${source.baseUrl}/v0/management/auth-files`, {
-      headers: managementHeaders(source.apiKey),
-    });
+    const data = await this.requestCpaManagementJson(source, '/v0/management/auth-files');
     const files = data?.files ?? data?.auth_files ?? data;
     if (!Array.isArray(files)) throw new Error('CPA auth-files 响应无效');
     return files;
@@ -564,9 +666,9 @@ export class SubQuotaService {
     if (direct) return direct;
     const name = cleanText(file.name || file.id, 240);
     if (!name) throw new Error('Codex 凭证缺少文件名');
-    const auth = await this.requestJson(
-      `${source.baseUrl}/v0/management/auth-files/download?name=${encodeURIComponent(name)}`,
-      { headers: managementHeaders(source.apiKey) },
+    const auth = await this.requestCpaManagementJson(
+      source,
+      `/v0/management/auth-files/download?name=${encodeURIComponent(name)}`,
     );
     const accountId = cleanText(auth?.account_id || auth?.accountId, 80);
     if (!accountId) throw new Error('Codex 凭证缺少 ChatGPT 账号 ID');
@@ -574,35 +676,87 @@ export class SubQuotaService {
   }
 
   async fetchCpaCodexUsage(source, file, accountId) {
+    return this.fetchCpaCodexBackendJson(
+      source,
+      file,
+      accountId,
+      CODEX_USAGE_URL,
+      'Codex 额度',
+    );
+  }
+
+  async fetchCpaCodexAccountCheck(source, file, accountId) {
+    return this.fetchCpaCodexBackendJson(
+      source,
+      file,
+      accountId,
+      CODEX_ACCOUNTS_CHECK_URL,
+      'Codex 订阅',
+    );
+  }
+
+  async fetchCpaCodexBackendJson(source, file, accountId, url, responseLabel) {
     const authIndex = cleanText(file.auth_index || file.authIndex, 80);
     if (!authIndex) throw new Error('Codex 凭证缺少 auth_index');
     const payload = {
       auth_index: authIndex,
       method: 'GET',
-      url: CODEX_USAGE_URL,
+      url,
       header: {
         ...CODEX_USAGE_HEADERS,
         'Chatgpt-Account-Id': accountId,
       },
     };
-    const outer = await this.requestJson(`${source.baseUrl}/v0/management/api-call`, {
-      method: 'POST',
-      headers: {
-        ...managementHeaders(source.apiKey),
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
+    return this.retryCpaRead(async () => {
+      const outer = await this.requestCpaManagementJson(source, '/v0/management/api-call', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        cpaReadRetry: false,
+      });
+      const statusCode = Number(outer?.status_code ?? outer?.statusCode ?? 0);
+      const body = parseMaybeJson(outer?.body ?? outer?.bodyText ?? outer);
+      if (statusCode && (statusCode < 200 || statusCode >= 300)) {
+        const detail = cleanText(body?.error || body?.detail || body?.message || JSON.stringify(body || {}), 120);
+        const error = new Error(detail ? `HTTP ${statusCode}: ${detail}` : `HTTP ${statusCode}`);
+        error.statusCode = statusCode;
+        throw error;
+      }
+      if (!isRecord(body)) throw new Error(`${responseLabel}响应无效`);
+      return body;
     });
-    const statusCode = Number(outer?.status_code ?? outer?.statusCode ?? 0);
-    const body = parseMaybeJson(outer?.body ?? outer?.bodyText ?? outer);
-    if (statusCode && (statusCode < 200 || statusCode >= 300)) {
-      const detail = cleanText(body?.error || body?.detail || body?.message || JSON.stringify(body || {}), 120);
-      const error = new Error(detail ? `HTTP ${statusCode}: ${detail}` : `HTTP ${statusCode}`);
-      error.statusCode = statusCode;
-      throw error;
+  }
+
+  async requestCpaManagementJson(source, path, options = {}) {
+    const {
+      cpaReadRetry = isRetryableCpaReadRequest(path, options),
+      ...requestOptions
+    } = options;
+    return this.withSourceCredentialFailover(source, (credential) => (
+      this.retryCpaRead(() => this.requestJson(`${source.baseUrl}${path}`, {
+        ...requestOptions,
+        headers: {
+          ...(requestOptions.headers || {}),
+          ...managementHeaders(credential.apiKey),
+        },
+      }), cpaReadRetry)
+    ));
+  }
+
+  async retryCpaRead(request, retryable = true) {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await request();
+      } catch (error) {
+        const delayMs = this.cpaReadRetryDelaysMs[attempt];
+        if (!retryable || delayMs === undefined || !isRetryableCpaReadError(error)) throw error;
+        attempt += 1;
+        await this.sleep(delayMs);
+      }
     }
-    if (!isRecord(body)) throw new Error('Codex 额度响应无效');
-    return body;
   }
 
   async requestJson(url, options = {}) {
@@ -644,12 +798,21 @@ function quotaSourceId(source, provider = 'quota') {
 
 function sourceQuotaBase(source, provider, fetchedAt) {
   const sourceId = quotaSourceId(source, provider);
+  const sourceName = cleanText(source?.name, 80) || sourceId;
+  const credentialId = cleanText(source?.credentialId, 80);
+  const credentialLabel = cleanText(source?.credentialLabel, 80) || credentialId;
+  const credentialScoped = Boolean(source?.credentialScoped && credentialId);
   return {
-    id: sourceId,
+    id: credentialScoped ? scopedQuotaId(sourceId, `credential-${credentialId}`) : sourceId,
     sourceId,
-    name: cleanText(source?.name, 80) || sourceId,
+    name: credentialScoped && credentialLabel ? `${sourceName} · ${credentialLabel}`.slice(0, 160) : sourceName,
     provider,
     fetchedAt,
+    ...(credentialScoped ? {
+      sourceName,
+      credentialId,
+      credentialLabel,
+    } : {}),
   };
 }
 
@@ -676,15 +839,23 @@ export function parseSubQuotaSources(value, env = process.env) {
     const id = String(item?.id || `sub-${index + 1}`).trim();
     const name = String(item?.name || id).trim().slice(0, 80);
     const apiKeyEnv = String(item?.apiKeyEnv || '').trim();
+    const hasApiKeys = Object.hasOwn(item || {}, 'apiKeys');
+    const hasApiKeyEnvs = Object.hasOwn(item || {}, 'apiKeyEnvs');
+    const hasStructuredApiKeys = hasApiKeys || hasApiKeyEnvs;
     const adminApiKeyEnv = String(item?.adminApiKeyEnv || '').trim();
     const provider = normalizeProvider(item?.provider);
     if (!SOURCE_ID_PATTERN.test(id)) throw new Error(`额度来源 ${index + 1} 的 id 无效`);
     if (ids.has(id)) throw new Error(`额度来源 id 重复: ${id}`);
     if (!name) throw new Error(`额度来源 ${id} 缺少名称`);
-    if (!ENV_KEY_PATTERN.test(apiKeyEnv)) throw new Error(`额度来源 ${id} 的 apiKeyEnv 无效`);
+    if (!hasStructuredApiKeys && !ENV_KEY_PATTERN.test(apiKeyEnv)) {
+      throw new Error(`额度来源 ${id} 的 apiKeyEnv 无效`);
+    }
     if (adminApiKeyEnv && !ENV_KEY_PATTERN.test(adminApiKeyEnv)) {
       throw new Error(`额度来源 ${id} 的 adminApiKeyEnv 无效`);
     }
+    const apiKeys = hasStructuredApiKeys
+      ? parseSourceApiKeyCredentials(hasApiKeys ? item.apiKeys : item.apiKeyEnvs, env, id)
+      : null;
     ids.add(id);
     const baseUrl = provider === 'deepseek'
       ? normalizeSubQuotaBaseUrl(String(item?.baseUrl || '').trim() || DEEPSEEK_DEFAULT_BASE_URL, { provider: 'deepseek' })
@@ -693,8 +864,10 @@ export function parseSubQuotaSources(value, env = process.env) {
       id,
       name,
       provider,
-      apiKeyEnv,
-      apiKey: String(env[apiKeyEnv] || '').trim(),
+      ...(apiKeys ? { apiKeys } : {
+        apiKeyEnv,
+        apiKey: String(env[apiKeyEnv] || '').trim(),
+      }),
       baseUrl,
       usageUrl: provider === 'sub2api' ? `${baseUrl}/v1/usage` : '',
       ...(provider === 'sub2api' && adminApiKeyEnv ? {
@@ -703,6 +876,168 @@ export function parseSubQuotaSources(value, env = process.env) {
       } : {}),
     };
   });
+}
+
+function parseSourceApiKeyCredentials(value, env, sourceId) {
+  if (!Array.isArray(value) || !value.length) {
+    throw new Error(`额度来源 ${sourceId} 的 apiKeys 必须是非空数组`);
+  }
+  if (value.length > MAX_SOURCE_API_KEYS) {
+    throw new Error(`额度来源 ${sourceId} 最多配置 ${MAX_SOURCE_API_KEYS} 个 API Key`);
+  }
+  const ids = new Set();
+  const envNames = new Set();
+  return value.map((item, index) => {
+    const record = typeof item === 'string' ? { apiKeyEnv: item } : item;
+    if (!isRecord(record)) throw new Error(`额度来源 ${sourceId} 的第 ${index + 1} 个 API Key 配置无效`);
+    const id = String(record.id || `key-${index + 1}`).trim();
+    const label = String(record.label || record.name || `Key ${index + 1}`).trim().slice(0, 80);
+    const apiKeyEnv = String(record.apiKeyEnv || record.env || '').trim();
+    if (!SOURCE_ID_PATTERN.test(id)) throw new Error(`额度来源 ${sourceId} 的 API Key id 无效: ${id}`);
+    if (ids.has(id)) throw new Error(`额度来源 ${sourceId} 的 API Key id 重复: ${id}`);
+    if (!label) throw new Error(`额度来源 ${sourceId} 的 API Key ${id} 缺少标签`);
+    if (!ENV_KEY_PATTERN.test(apiKeyEnv)) {
+      throw new Error(`额度来源 ${sourceId} 的 API Key ${id} apiKeyEnv 无效`);
+    }
+    if (envNames.has(apiKeyEnv)) {
+      throw new Error(`额度来源 ${sourceId} 的 API Key 环境变量重复: ${apiKeyEnv}`);
+    }
+    ids.add(id);
+    envNames.add(apiKeyEnv);
+    return {
+      id,
+      label,
+      apiKeyEnv,
+      apiKey: String(env[apiKeyEnv] || '').trim(),
+    };
+  });
+}
+
+function sourceApiKeyCredentials(source) {
+  const structured = Array.isArray(source?.apiKeys);
+  const items = structured
+    ? source.apiKeys.slice(0, MAX_SOURCE_API_KEYS)
+    : [{
+      id: 'primary',
+      label: 'Key 1',
+      apiKeyEnv: source?.apiKeyEnv,
+      apiKey: source?.apiKey,
+    }];
+  const credentials = [];
+  const ids = new Set();
+  const values = new Set();
+  for (const [index, item] of items.entries()) {
+    const record = typeof item === 'string' ? { apiKey: item } : (isRecord(item) ? item : {});
+    let id = cleanText(record.id, 48).replace(/[^A-Za-z0-9_-]/g, '');
+    if (!id || !/^[A-Za-z0-9]/.test(id)) id = `key-${index + 1}`;
+    const baseId = id;
+    let suffix = 2;
+    while (ids.has(id)) {
+      id = `${baseId}-${suffix}`.slice(0, 48);
+      suffix += 1;
+    }
+    const apiKey = String(record.apiKey ?? record.value ?? record.key ?? '').trim();
+    if (apiKey && values.has(apiKey)) continue;
+    ids.add(id);
+    if (apiKey) values.add(apiKey);
+    credentials.push({
+      id,
+      label: cleanText(record.label || record.name, 80) || `Key ${index + 1}`,
+      apiKeyEnv: cleanText(record.apiKeyEnv || record.env, 128),
+      apiKey,
+      structured,
+    });
+  }
+  return credentials;
+}
+
+function bindSourceCredential(source, credential) {
+  return {
+    ...source,
+    apiKey: credential.apiKey,
+    apiKeyEnv: credential.apiKeyEnv || source?.apiKeyEnv || '',
+    credentialId: credential.id,
+    credentialLabel: credential.label,
+    credentialScoped: credential.structured,
+  };
+}
+
+function hasConfiguredSourceCredential(source) {
+  return sourceApiKeyCredentials(source).some((credential) => Boolean(credential.apiKey));
+}
+
+function missingSourceCredentialMessage(source, fallbackEnv = '') {
+  const credentialId = cleanText(source?.credentialId, 80);
+  if (credentialId) {
+    const label = cleanText(source?.credentialLabel, 80) || credentialId;
+    const envName = cleanText(source?.apiKeyEnv, 128);
+    return envName ? `缺少环境变量 ${envName}` : `${label} 未配置`;
+  }
+  const envName = cleanText(source?.apiKeyEnv || fallbackEnv, 128);
+  return envName ? `缺少环境变量 ${envName}` : '未配置可用 API Key';
+}
+
+function missingCredentialError(credential, source) {
+  const error = new Error(missingSourceCredentialMessage(bindSourceCredential(source, credential)));
+  error.code = 'MISSING_CREDENTIAL';
+  return error;
+}
+
+function credentialPoolKey(source) {
+  return [
+    cleanText(source?.provider, 40),
+    quotaSourceId(source),
+    cleanText(source?.baseUrl, MAX_BASE_URL_LENGTH),
+  ].join('::');
+}
+
+function orderedSourceCredentials(source, activeCredentialId = '') {
+  const credentials = sourceApiKeyCredentials(source);
+  if (!activeCredentialId) return credentials;
+  const activeIndex = credentials.findIndex((credential) => credential.id === activeCredentialId);
+  if (activeIndex <= 0) return credentials;
+  return [
+    credentials[activeIndex],
+    ...credentials.slice(0, activeIndex),
+    ...credentials.slice(activeIndex + 1),
+  ];
+}
+
+function isAuthenticationError(error) {
+  const statusCode = Number(error?.statusCode || 0);
+  return statusCode === 401 || statusCode === 403;
+}
+
+function combinedCredentialError(failures, source) {
+  if (failures.length === 1) return failures[0].error;
+  if (!failures.length) return new Error(missingSourceCredentialMessage(source));
+  const error = new Error(failures.map(({ credential, error: failure }) => (
+    `${cleanText(credential?.label, 80) || credential?.id || 'Key'}: ${formatFetchError(failure)}`
+  )).join('；'));
+  const statusCodes = failures
+    .map(({ error: failure }) => Number(failure?.statusCode || 0))
+    .filter(Boolean);
+  if (statusCodes.length && failures.every(({ error: failure }) => (
+    isAuthenticationError(failure) || failure?.code === 'MISSING_CREDENTIAL'
+  ))) {
+    error.statusCode = statusCodes[statusCodes.length - 1];
+  }
+  return error;
+}
+
+function sanitizeCredentialError(error, credentials) {
+  const secrets = credentials
+    .map((credential) => String(credential?.apiKey || ''))
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length);
+  let message = String(error?.message || '请求失败');
+  for (const secret of secrets) message = message.split(secret).join('[REDACTED]');
+  if (message === String(error?.message || '请求失败')) return error;
+  const sanitized = new Error(message);
+  sanitized.name = error?.name || 'Error';
+  if (error?.statusCode !== undefined) sanitized.statusCode = error.statusCode;
+  if (error?.code !== undefined) sanitized.code = error.code;
+  return sanitized;
 }
 
 export function normalizeSubQuota(data) {
@@ -807,19 +1142,48 @@ export function normalizeSub2ApiCodexAccounts(data) {
   return quotas;
 }
 
-export function normalizeCpaCodexQuota(data, file = {}) {
+export function normalizeCpaCodexQuota(data, file = {}, options = {}) {
   if (!isRecord(data)) throw new Error('Codex 额度响应格式无效');
-  const planType = cleanText(data.plan_type || data.planType || file.account_type || file.plan_type, 40);
-  const expiresAt = cleanQuotaTimestamp(
+  const entitlement = selectCpaCodexEntitlement(options.accountCheck, options.accountId);
+  const planType = cleanText(
+    entitlement?.plan_type
+    || entitlement?.planType
+    || data.plan_type
+    || data.planType
+    || file.account_type
+    || file.plan_type,
+    40,
+  );
+  const entitlementExpiresAt = cleanQuotaTimestamp(
+    entitlement?.expires_at
+    ?? entitlement?.expiresAt,
+  );
+  const usageExpiresAt = cleanQuotaTimestamp(
     data.chatgpt_subscription_active_until
     ?? data.chatgptSubscriptionActiveUntil
     ?? data.subscription_active_until
-    ?? data.subscriptionActiveUntil
-    ?? file.id_token?.chatgpt_subscription_active_until
+    ?? data.subscriptionActiveUntil,
+  );
+  const legacyExpiresAt = cleanQuotaTimestamp(
+    file.id_token?.chatgpt_subscription_active_until
     ?? file.idToken?.chatgptSubscriptionActiveUntil
     ?? file.chatgpt_subscription_active_until
     ?? file.chatgptSubscriptionActiveUntil,
   );
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const legacyExpiryIsStale = planType.toLowerCase() !== 'free'
+    && legacyExpiresAt
+    && Date.parse(legacyExpiresAt) <= now;
+  const hasLiveAccountCheck = isRecord(options.accountCheck);
+  const expiresAt = entitlementExpiresAt
+    || usageExpiresAt
+    || (hasLiveAccountCheck || legacyExpiryIsStale ? '' : legacyExpiresAt);
+  const hasActiveSubscription = normalizeOptionalBoolean(
+    entitlement?.has_active_subscription
+    ?? entitlement?.hasActiveSubscription,
+  );
+  const renewsAt = cleanQuotaTimestamp(entitlement?.renews_at ?? entitlement?.renewsAt);
+  const billingPeriod = cleanText(entitlement?.billing_period ?? entitlement?.billingPeriod, 40);
   const rateLimit = data.rate_limit || data.rateLimit || null;
   const codeReview = data.code_review_rate_limit || data.codeReviewRateLimit || null;
   const additional = Array.isArray(data.additional_rate_limits || data.additionalRateLimits)
@@ -839,10 +1203,11 @@ export function normalizeCpaCodexQuota(data, file = {}) {
   ];
   const allowed = rateLimit?.allowed;
   const limitReached = rateLimit?.limit_reached ?? rateLimit?.limitReached;
+  const hasPlanAccess = planType.toLowerCase() !== 'free' && hasActiveSubscription !== false;
   return {
-    valid: planType.toLowerCase() !== 'free',
+    valid: hasPlanAccess,
     mode: 'cpa_codex',
-    status: planType.toLowerCase() === 'free'
+    status: !hasPlanAccess
       ? 'no_access'
       : limitReached
         ? 'quota_exhausted'
@@ -861,13 +1226,59 @@ export function normalizeCpaCodexQuota(data, file = {}) {
     today: null,
     total: null,
     email: cleanText(data.email || file.email || file.account, 120),
-    accountId: cleanText(data.account_id || data.accountId || file.account_id, 80),
+    accountId: cleanText(data.account_id || data.accountId || options.accountId || file.account_id, 80),
+    ...(hasActiveSubscription !== null ? { hasActiveSubscription } : {}),
+    ...(renewsAt ? { renewsAt } : {}),
+    ...(billingPeriod ? { billingPeriod } : {}),
     rateLimitResetCredits: nonNegativeInteger(
       data?.rate_limit_reset_credits?.available_count
       ?? data?.rateLimitResetCredits?.availableCount
       ?? data?.rate_limit_reset_credits?.applicable_available_count,
     ),
   };
+}
+
+function selectCpaCodexEntitlement(data, accountId) {
+  if (!isRecord(data?.accounts)) return null;
+  const accounts = data.accounts;
+  const expectedAccountId = cleanText(accountId, 80);
+  if (expectedAccountId && isRecord(accounts[expectedAccountId]?.entitlement)) {
+    return accounts[expectedAccountId].entitlement;
+  }
+
+  if (expectedAccountId) {
+    for (const entry of Object.values(accounts)) {
+      if (!isRecord(entry) || cpaCodexAccountEntryId(entry) !== expectedAccountId) continue;
+      if (isRecord(entry.entitlement)) return entry.entitlement;
+    }
+  }
+
+  const defaultEntry = isRecord(accounts.default) ? accounts.default : null;
+  if (!defaultEntry || !isRecord(defaultEntry.entitlement)) return null;
+  const defaultAccountId = cpaCodexAccountEntryId(defaultEntry);
+  const concreteKeys = Object.keys(accounts).filter((key) => key !== 'default');
+  if (expectedAccountId && defaultAccountId && defaultAccountId !== expectedAccountId) return null;
+  if (expectedAccountId && !defaultAccountId && concreteKeys.length) return null;
+  return defaultEntry.entitlement;
+}
+
+function cpaCodexAccountEntryId(entry) {
+  return cleanText(
+    entry?.account?.id
+    || entry?.account?.account_id
+    || entry?.account?.accountId
+    || entry?.account_id
+    || entry?.accountId,
+    80,
+  );
+}
+
+function normalizeOptionalBoolean(value) {
+  if (value === true || value === false) return value;
+  const text = cleanText(value, 8).toLowerCase();
+  if (text === 'true') return true;
+  if (text === 'false') return false;
+  return null;
 }
 
 
@@ -1424,6 +1835,30 @@ function grok2ApiResponseError(bodyText) {
 function formatFetchError(error) {
   const message = error?.name === 'AbortError' ? '请求超时' : String(error?.message || '请求失败');
   return message.slice(0, 160);
+}
+
+function normalizeRetryDelays(value, fallback) {
+  const candidate = value === undefined ? fallback : value;
+  if (!Array.isArray(candidate)) return [...fallback];
+  return candidate
+    .map((delayMs) => Number(delayMs))
+    .filter((delayMs) => Number.isFinite(delayMs) && delayMs >= 0)
+    .slice(0, 4);
+}
+
+function isRetryableCpaReadRequest(path, options = {}) {
+  const method = String(options.method || 'GET').trim().toUpperCase();
+  if (method === 'GET') return true;
+  if (method !== 'POST' || path !== '/v0/management/api-call') return false;
+  const payload = parseMaybeJson(options.body);
+  return String(payload?.method || '').trim().toUpperCase() === 'GET';
+}
+
+function isRetryableCpaReadError(error) {
+  if (error?.name === 'AbortError') return true;
+  const statusCode = Number(error?.statusCode || 0);
+  if (statusCode > 0) return statusCode === 408 || statusCode === 429 || statusCode >= 500;
+  return isTransientFetchError(error);
 }
 
 function fetchErrorQuota(base, error, { sourceWide = false, partial = false } = {}) {

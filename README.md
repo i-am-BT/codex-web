@@ -164,6 +164,8 @@ cp .env.example .env
 | `SESSION_TTL_HOURS` | 登录有效期，默认 168 小时 |
 | `HOMEPAGE_API_TOKEN` | Homepage 统计接口访问令牌；未设置时接口禁用 |
 | `HOMEPAGE_MODEL_CACHE_SECONDS` | Homepage 模型数量缓存秒数，默认 60 |
+| `CODEX_WEB_QUOTA_MONITOR_TOKEN` | 独立的只读额度监控令牌；设置后启用 `GET /api/monitor/quotas` |
+| `CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE` | 只读额度监控令牌文件；仅在直接令牌未设置时读取，文件权限必须为 `0600` |
 | `CPA_QUOTA_BASE_URL` | CPA Management 地址；与 `CPA_QUOTA_API_KEY` 同时设置后启用 CPA Codex 额度 |
 | `CPA_QUOTA_API_KEY` | CPA Management Key，仅保存在服务端本地 `.env` |
 | `SUB2API_BASE_URL` | Sub2API 地址；旧的单 CPA 配置仍可通过 `SUB_QUOTA_PROVIDER=cpa-codex` 兼容读取 |
@@ -221,6 +223,31 @@ SUB_QUOTA_PROVIDER=multi
 ```
 
 各组 URL 与 Key 均可在额度设置弹窗中保存，环境变量仍可用于首次或手工配置。真实 Key 只应写入已忽略的本地 `.env`，不要写入 `.env.example`、README、提交记录或浏览器端代码。点击设置时 Key 输入框不会回显现有值，留空不会替换对应来源的当前 Key。只配置一路时仍会正常显示；多路均配置后会在同一个额度弹层中依次显示。
+
+#### 外部只读额度 API
+
+Hermes 等外部监控可调用 `GET /api/monitor/quotas` 读取与 Web 额度面板相同的服务商额度和 Codex App 点数。该接口使用独立令牌，不接受 Web 登录 Cookie，也不会授予其他 API 的访问权限。可直接设置令牌，或让 Codex Web 与 Hermes 共用一个只保存令牌的 `0600` 文件；两者同时设置时直接令牌优先：
+
+```bash
+# 二选一
+CODEX_WEB_QUOTA_MONITOR_TOKEN=<replace-with-a-random-read-only-token>
+
+# 或使用共享 token 文件，避免在两份 .env 中重复保存明文
+CODEX_WEB_QUOTA_MONITOR_TOKEN_FILE=/absolute/path/to/quota-monitor.token
+chmod 600 /absolute/path/to/quota-monitor.token
+```
+
+请求可使用 `X-API-Token` 或 Bearer：
+
+```bash
+curl -H "X-API-Token: $CODEX_WEB_QUOTA_MONITOR_TOKEN" \
+  http://localhost:36354/api/monitor/quotas
+
+curl -H "Authorization: Bearer $CODEX_WEB_QUOTA_MONITOR_TOKEN" \
+  "http://localhost:36354/api/monitor/quotas?refresh=1"
+```
+
+`refresh=1` 会跳过额度缓存并主动刷新。接口及所有鉴权错误响应都带 `Cache-Control: no-store`；未配置有效令牌时返回 `503`，令牌错误时返回 `401`，非 `GET` 请求返回 `405`。响应不会包含上游 API Key 或管理密码。
 
 ### 同源代理
 

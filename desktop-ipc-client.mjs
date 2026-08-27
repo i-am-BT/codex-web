@@ -8,11 +8,13 @@ const INITIAL_CLIENT_ID = 'initializing-client';
 const MAX_FRAME_BYTES = 256 * 1024 * 1024;
 const DEFAULT_CONNECT_TIMEOUT_MS = 1500;
 const DEFAULT_REQUEST_TIMEOUT_MS = 20000;
+const DEFAULT_OWNER_DISCOVERY_TIMEOUT_MS = 5000;
 const DEFAULT_HISTORY_REQUEST_TIMEOUT_MS = 305000;
 const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 4000];
 const METHOD_VERSIONS = new Map([
   ['initialize', 0],
-  ['thread-follower-start-turn', 1],
+  ['thread-owner-discovery', 1],
+  ['thread-follower-start-turn', 2],
   ['thread-follower-load-complete-history', 1],
   ['thread-follower-steer-turn', 1],
   ['thread-follower-interrupt-turn', 2],
@@ -32,7 +34,6 @@ const BROADCAST_VERSIONS = new Map([
 const SAFE_FALLBACK_ERRORS = new Set([
   'disabled',
   'no-client-found',
-  'request-version-mismatch',
   'socket-not-found',
 ]);
 
@@ -87,6 +88,10 @@ export class CodexDesktopIpcClient extends EventEmitter {
     this.clientType = options.clientType || 'codex-web';
     this.connectTimeoutMs = positiveTimeout(options.connectTimeoutMs, DEFAULT_CONNECT_TIMEOUT_MS);
     this.requestTimeoutMs = positiveTimeout(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
+    this.ownerDiscoveryTimeoutMs = positiveTimeout(
+      options.ownerDiscoveryTimeoutMs,
+      Math.min(this.requestTimeoutMs, DEFAULT_OWNER_DISCOVERY_TIMEOUT_MS),
+    );
     this.socket = null;
     this.startPromise = null;
     this.clientId = INITIAL_CLIENT_ID;
@@ -121,13 +126,18 @@ export class CodexDesktopIpcClient extends EventEmitter {
   }
 
   async request(method, params = {}, options = {}) {
-    await this.start();
+    try {
+      await this.start();
+    } catch (error) {
+      throw cloneDesktopIpcRequestError(error, method);
+    }
     const version = options.version ?? METHOD_VERSIONS.get(method);
     if (!Number.isInteger(version)) throw new Error(`Codex Desktop IPC 方法版本未知: ${method}`);
     return this.sendRequest(method, params, {
       version,
       timeoutMs: positiveTimeout(options.timeoutMs, this.requestTimeoutMs),
       targetClientId: String(options.targetClientId || ''),
+      returnEnvelope: options.returnEnvelope === true,
     });
   }
 
@@ -145,22 +155,55 @@ export class CodexDesktopIpcClient extends EventEmitter {
   }
 
   async startTurn(conversationId, turnStartParams, options = {}) {
+    const targetClientId = await this.resolveThreadOwner(conversationId, options);
     const response = await this.request('thread-follower-start-turn', {
       conversationId,
-      turnStartParams,
-    }, options);
+      turnStart: normalizeTurnStart(conversationId, turnStartParams),
+    }, {
+      ...options,
+      targetClientId,
+    });
     const result = response?.result;
     if (!result?.turn?.id) throw new Error('Codex Desktop IPC 未返回有效 turn id');
     return result;
   }
 
   async loadCompleteHistory(conversationId, options = {}) {
+    const targetClientId = await this.resolveThreadOwner(conversationId, options);
     return this.request('thread-follower-load-complete-history', { conversationId }, {
       ...options,
+      targetClientId,
       timeoutMs: positiveTimeout(
         options.timeoutMs,
         Math.max(this.requestTimeoutMs, DEFAULT_HISTORY_REQUEST_TIMEOUT_MS),
       ),
+    });
+  }
+
+  async findThreadOwner(conversationId, options = {}) {
+    const response = await this.request('thread-owner-discovery', {
+      hostId: String(options.hostId || 'local'),
+      conversationId,
+    }, {
+      timeoutMs: positiveTimeout(options.timeoutMs, this.ownerDiscoveryTimeoutMs),
+      returnEnvelope: true,
+    });
+    const ownerClientId = String(response?.handledByClientId || '');
+    if (!ownerClientId) {
+      throw new CodexDesktopIpcUnavailableError(
+        'Codex Desktop IPC 未返回 App owner client id',
+        'no-client-found',
+      );
+    }
+    return ownerClientId;
+  }
+
+  async resolveThreadOwner(conversationId, options = {}) {
+    const targetClientId = String(options.targetClientId || '');
+    if (targetClientId) return targetClientId;
+    return this.findThreadOwner(conversationId, {
+      hostId: options.hostId,
+      timeoutMs: options.ownerDiscoveryTimeoutMs,
     });
   }
 
@@ -330,7 +373,12 @@ export class CodexDesktopIpcClient extends EventEmitter {
     }
   }
 
-  sendRequest(method, params, { version, timeoutMs, targetClientId = '' }) {
+  sendRequest(method, params, {
+    version,
+    timeoutMs,
+    targetClientId = '',
+    returnEnvelope = false,
+  }) {
     const socket = this.socket;
     if (!socket?.writable) {
       return Promise.reject(new CodexDesktopIpcUnavailableError('Codex Desktop IPC 未连接', 'not-connected'));
@@ -353,16 +401,23 @@ export class CodexDesktopIpcClient extends EventEmitter {
         this.pending.delete(requestId);
         const error = new Error(`Codex Desktop IPC 请求超时: ${method}`);
         error.code = 'CODEX_DESKTOP_IPC_TIMEOUT';
+        error.desktopIpcMethod = method;
         reject(error);
       }, timeoutMs + 250);
       timer.unref?.();
-      this.pending.set(requestId, { method, resolve, reject, timer });
+      this.pending.set(requestId, {
+        method,
+        resolve,
+        reject,
+        timer,
+        returnEnvelope,
+      });
       try {
         this.writeMessage(message);
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(requestId);
-        reject(error);
+        reject(cloneDesktopIpcRequestError(error, method));
       }
     });
   }
@@ -402,20 +457,24 @@ export class CodexDesktopIpcClient extends EventEmitter {
       this.pending.delete(message.requestId);
       clearTimeout(pending.timer);
       if (message.resultType === 'success') {
-        pending.resolve(message.result);
+        pending.resolve(pending.returnEnvelope ? message : message.result);
         return;
       }
       const reason = String(message.error || 'request-failed');
       const safeFallbackReason = reason.split(':', 1)[0].trim();
       if (SAFE_FALLBACK_ERRORS.has(safeFallbackReason)) {
-        pending.reject(new CodexDesktopIpcUnavailableError(
+        const error = new CodexDesktopIpcUnavailableError(
           `Codex Desktop IPC 无可用 App owner: ${reason}`,
           safeFallbackReason,
-        ));
+        );
+        error.desktopIpcMethod = pending.method;
+        pending.reject(error);
         return;
       }
       const error = new Error(`Codex Desktop IPC 请求失败: ${reason}`);
       error.code = reason;
+      error.reason = safeFallbackReason;
+      error.desktopIpcMethod = pending.method;
       pending.reject(error);
       return;
     }
@@ -469,7 +528,7 @@ export class CodexDesktopIpcClient extends EventEmitter {
   rejectPending(error) {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(error);
+      pending.reject(cloneDesktopIpcRequestError(error, pending.method));
     }
     this.pending.clear();
   }
@@ -515,6 +574,62 @@ function waitForConnect(socket, timeoutMs) {
 function positiveTimeout(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
+function cloneDesktopIpcRequestError(error, method) {
+  const message = String(error?.message || error || `Codex Desktop IPC 请求失败: ${method}`);
+  const cloned = isCodexDesktopIpcUnavailableError(error)
+    ? new CodexDesktopIpcUnavailableError(message, error?.reason, { cause: error })
+    : new Error(message, error instanceof Error ? { cause: error } : undefined);
+  if (error?.code) cloned.code = error.code;
+  if (error?.reason) cloned.reason = error.reason;
+  cloned.desktopIpcMethod = method;
+  return cloned;
+}
+
+function normalizeTurnStart(conversationId, turnStartParams) {
+  const source = turnStartParams && typeof turnStartParams === 'object' && !Array.isArray(turnStartParams)
+    ? turnStartParams
+    : {};
+  if (source.request && typeof source.request === 'object' && !Array.isArray(source.request)) {
+    return {
+      request: {
+        ...source.request,
+        threadId: conversationId,
+      },
+      context: source.context && typeof source.context === 'object' && !Array.isArray(source.context)
+        ? { ...source.context }
+        : {},
+    };
+  }
+
+  const {
+    attachments,
+    commentAttachments,
+    localTurnMetadata,
+    useAppServerPermissionDefault,
+    usePermissionSelection,
+    inheritThreadSettings,
+    threadStartKind,
+    mcpAppModelContextAttachments,
+    ...request
+  } = source;
+  return {
+    request: {
+      ...request,
+      threadId: conversationId,
+    },
+    context: {
+      attachments: Array.isArray(attachments) ? attachments : [],
+      commentAttachments: Array.isArray(commentAttachments) ? commentAttachments : [],
+      ...(localTurnMetadata === undefined ? {} : { localTurnMetadata }),
+      ...(useAppServerPermissionDefault === undefined ? {} : { useAppServerPermissionDefault }),
+      ...(usePermissionSelection === undefined ? {} : { usePermissionSelection }),
+      ...(inheritThreadSettings === undefined ? {} : { inheritThreadSettings }),
+      ...(threadStartKind === undefined ? {} : { threadStartKind }),
+      ...(mcpAppModelContextAttachments === undefined ? {} : { mcpAppModelContextAttachments }),
+    },
+  };
 }
 
 function normalizeReconnectDelays(value) {
