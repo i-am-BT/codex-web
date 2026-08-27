@@ -153,6 +153,22 @@ const APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS = Math.min(
     : 5000,
   5000,
 );
+const APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS = Math.min(
+  Number.isFinite(APP_SERVER_REQUEST_TIMEOUT_MS) && APP_SERVER_REQUEST_TIMEOUT_MS > 0
+    ? APP_SERVER_REQUEST_TIMEOUT_MS
+    : 2500,
+  2500,
+);
+const APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS = Object.freeze([0, 250, 750]);
+const APP_SERVER_THREAD_IDLE_RELEASE_GRACE_MS = Math.max(
+  1500,
+  Math.min(Number.isFinite(NATIVE_SESSION_POLL_MS) && NATIVE_SESSION_POLL_MS > 0 ? NATIVE_SESSION_POLL_MS * 2 : 3000, 5000),
+);
+const APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS = Math.max(
+  750,
+  Math.min(Number.isFinite(NATIVE_SESSION_POLL_MS) && NATIVE_SESSION_POLL_MS > 0 ? NATIVE_SESSION_POLL_MS : 3000, 3000),
+);
+const APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS = Object.freeze([250, 1000, 3000, 8000]);
 const NATIVE_MODEL_CAPABILITIES_TIMEOUT_MS = Math.min(APP_SERVER_REQUEST_TIMEOUT_MS, 8000);
 const CODEX_DESKTOP_IPC_ENABLED = parseBoolean(
   process.env.CODEX_DESKTOP_IPC_ENABLED,
@@ -339,6 +355,9 @@ const nativeTurnStatusSyncRequests = new Map();
 // turns use a separate IPC connection and must never be unsubscribed by Web.
 const appServerLoadedThreads = new Map();
 const appServerUnsubscribeRequests = new Map();
+const appServerThreadReconcileRequests = new Map();
+const appServerThreadIdleReleaseTimers = new Map();
+const appServerThreadIdleReleaseAttempts = new Map();
 const loginAttempts = new Map();
 let activeProcess = null;
 let activeConversationId = '';
@@ -352,6 +371,8 @@ appServerClient.on('ready', () => {
   // the previous process disappeared with it.
   appServerLoadedThreads.clear();
   appServerUnsubscribeRequests.clear();
+  appServerThreadReconcileRequests.clear();
+  clearAppServerThreadIdleReleaseState();
 });
 appServerClient.on('notification', handleAppServerNotification);
 appServerClient.on('request', handleAppServerRequest);
@@ -364,6 +385,8 @@ appServerClient.on('protocolError', (error) => console.error(error.message));
 appServerClient.on('exit', (error) => {
   appServerLoadedThreads.clear();
   appServerUnsubscribeRequests.clear();
+  appServerThreadReconcileRequests.clear();
+  clearAppServerThreadIdleReleaseState();
   clearAppServerNativeTurns(error.message);
   clearAppServerPendingRequests(error.message);
   broadcastNativeRuntime({ type: 'disconnected', error: error.message });
@@ -1536,6 +1559,8 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
   let createdThreadId = '';
   let createdSideChat = false;
   let turnAccepted = false;
+  let turnOutcomeUncertain = false;
+  let createdTurnReservation = false;
   let queueReservation = null;
   try {
     const turn = parseNativeTurnPayload(req.body || {}, { allowProjectless: true });
@@ -1559,6 +1584,13 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
     const threadId = cleanNativeThreadId(started?.thread?.id);
     if (!threadId) throw new Error('Codex app-server 未返回有效 thread id');
     createdThreadId = threadId;
+    // Protect the new subscription until turn/start has settled. The idle
+    // release timer starts when thread/start returns and could otherwise
+    // mistake a slow, not-yet-materialized turn for an idle thread.
+    if (!nativeTurnReservations.has(threadId)) {
+      nativeTurnReservations.add(threadId);
+      createdTurnReservation = true;
+    }
     if (turn.projectless) {
       try { nativeSessions.markProjectlessThread?.(threadId, { cwd: turn.cwd }); }
       catch (error) { console.warn('登记无项目任务失败: ' + error.message); }
@@ -1583,6 +1615,7 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       ...(queue ? { queue } : {}),
     });
   } catch (err) {
+    turnOutcomeUncertain = err?.appServerTurnOutcomeUncertain === true;
     let recoverableThreadId = '';
     if (createdSideChat && createdThreadId) {
       try { nativeSessions.unmarkSideChatThread?.(createdThreadId); } catch {}
@@ -1598,8 +1631,21 @@ app.post('/api/native-sessions', requireAuth, async (req, res) => {
       ...(recoverableThreadId ? { recoverableThreadId } : {}),
     });
   } finally {
-    if (createdThreadId && !turnAccepted) {
+    if (createdThreadId && !turnAccepted && !turnOutcomeUncertain) {
       await releaseAppServerThreadAfterTurn(createdThreadId, '', { reason: 'create-failed' });
+    }
+    if (createdTurnReservation) {
+      nativeTurnReservations.delete(createdThreadId);
+      if (turnOutcomeUncertain) {
+        const record = appServerLoadedThreads.get(createdThreadId);
+        if (record) {
+          scheduleAppServerThreadIdleRelease(createdThreadId, {
+            record,
+            delayMs: 0,
+            reason: 'create-ambiguous',
+          });
+        }
+      }
     }
     releasePromptQueueReservation(queueReservation);
   }
@@ -3419,6 +3465,9 @@ function broadcastNativeSessionChange(change) {
 
 function handleNativeSessionChange(change) {
   clearPersistedTerminalNativeTurns(change);
+  if (typeof releaseIdleAppServerThreadSubscriptions === 'function') {
+    releaseIdleAppServerThreadSubscriptions(change);
+  }
   scheduleTerminalPromptQueueDispatches(change);
   // Session snapshots can briefly report idle before the matching turn completion
   // notification arrives. They must not release the turn lock used by queue dispatch.
@@ -4037,17 +4086,46 @@ async function respondToNativeRequest(pending, response) {
 async function requestLoadedAppServerThread(method, params = {}, options = {}) {
   const requestedThreadId = cleanNativeThreadId(params.threadId);
   if (requestedThreadId) await waitForAppServerThreadUnsubscribe(requestedThreadId);
-  const { result, child } = await appServerClient.requestWithConnection(method, params, options);
-  const threadId = cleanNativeThreadId(result?.thread?.id || params.threadId);
-  if (
-    threadId
-    && child
-    && child === appServerClient.child
-    && appServerClient.initialized
-  ) {
-    markAppServerThreadLoaded(threadId, child);
+  const attemptedConnection = appServerClient.child;
+  try {
+    const { result, child } = await appServerClient.requestWithConnection(method, params, options);
+    const threadId = cleanNativeThreadId(result?.thread?.id || params.threadId);
+    if (
+      threadId
+      && child
+      && child === appServerClient.child
+      && appServerClient.initialized
+    ) {
+      // A release can begin while the RPC is in flight. Finish that older
+      // release before recording this response as a fresh Web subscription,
+      // otherwise its unsubscribe could arrive after the new load.
+      await waitForAppServerThreadUnsubscribe(threadId);
+      markAppServerThreadLoaded(threadId, child);
+    }
+    return result;
+  } catch (error) {
+    // A timed-out resume may have reached app-server even though no result
+    // arrived. Track the known thread and reconcile it without replaying work.
+    const connection = attemptedConnection || appServerClient.child;
+    if (
+      method === 'thread/resume'
+      && requestedThreadId
+      && connection
+      && connection === appServerClient.child
+      && appServerClient.initialized
+      && isAmbiguousAppServerRequestError(error)
+    ) {
+      markAppServerThreadLoaded(requestedThreadId, connection);
+      if (typeof reconcileUnconfirmedAppServerThread === 'function') {
+        await reconcileUnconfirmedAppServerThread(requestedThreadId, '', {
+          allowProbeWhileBusy: true,
+          record: appServerLoadedThreads.get(requestedThreadId) || null,
+          reason: 'thread-load-ambiguous',
+        });
+      }
+    }
+    throw error;
   }
-  return result;
 }
 
 function markAppServerThreadLoaded(threadId, connection = appServerClient.child) {
@@ -4059,15 +4137,18 @@ function markAppServerThreadLoaded(threadId, connection = appServerClient.child)
     turnId: previous?.connection === connection ? String(previous.turnId || '') : '',
     loadedAt: Date.now(),
   });
+  appServerThreadIdleReleaseAttempts.delete(cleanId);
+  scheduleAppServerThreadIdleRelease(cleanId);
   return true;
 }
 
-function markAppServerThreadTurn(threadId, turnId) {
+function markAppServerThreadTurn(threadId, turnId, expectedRecord = null) {
   const cleanId = cleanNativeThreadId(threadId);
   const cleanTurnId = String(turnId || '').trim();
   const record = cleanId ? appServerLoadedThreads.get(cleanId) : null;
   if (
     !record
+    || (expectedRecord && record !== expectedRecord)
     || !cleanTurnId
     || record.connection !== appServerClient.child
   ) {
@@ -4080,8 +4161,176 @@ function markAppServerThreadTurn(threadId, turnId) {
 async function waitForAppServerThreadUnsubscribe(threadId) {
   const cleanId = cleanNativeThreadId(threadId);
   const pending = cleanId ? appServerUnsubscribeRequests.get(cleanId) : null;
-  if (!pending) return;
-  await pending.promise.catch(() => {});
+  if (!pending) return true;
+  const released = await pending.promise;
+  if (released === false) {
+    throw appServerThreadReleaseError(cleanId, '等待上一次释放完成');
+  }
+  return true;
+}
+
+function appServerThreadReleaseError(threadId, reason = '') {
+  const cleanId = cleanNativeThreadId(threadId);
+  const suffix = String(reason || '').trim();
+  const error = new Error(
+    `Web 暂时无法释放 Codex App 会话占用${cleanId ? `（${cleanId}）` : ''}${suffix ? `：${suffix}` : ''}，请稍后重试`,
+  );
+  error.code = 'CODEX_WEB_SUBSCRIPTION_RELEASE_FAILED';
+  error.statusCode = 409;
+  return error;
+}
+
+function clearAppServerThreadIdleReleaseTimer(threadId, expectedRecord = null) {
+  const cleanId = cleanNativeThreadId(threadId);
+  if (!cleanId) return;
+  const entry = appServerThreadIdleReleaseTimers.get(cleanId);
+  const timer = entry?.timer || entry;
+  const timerRecord = entry?.record || null;
+  if (
+    expectedRecord
+    && timerRecord
+    && timerRecord !== expectedRecord
+  ) {
+    return;
+  }
+  if (
+    expectedRecord
+    && !timerRecord
+    && appServerLoadedThreads.get(cleanId) !== expectedRecord
+  ) {
+    return;
+  }
+  if (timer) clearTimeout(timer);
+  appServerThreadIdleReleaseTimers.delete(cleanId);
+}
+
+function clearAppServerThreadIdleReleaseState() {
+  for (const entry of appServerThreadIdleReleaseTimers.values()) {
+    clearTimeout(entry?.timer || entry);
+  }
+  appServerThreadIdleReleaseTimers.clear();
+  appServerThreadIdleReleaseAttempts.clear();
+}
+
+function appServerThreadIdleReleaseRetryDelay(threadId) {
+  const cleanId = cleanNativeThreadId(threadId);
+  // The counter records retries already scheduled after a failed release.
+  // Use the just-failed attempt's slot for the first retry (250 ms).
+  const attempt = Math.max(0, Number(appServerThreadIdleReleaseAttempts.get(cleanId) || 0) - 1);
+  const index = Math.min(
+    Math.max(0, attempt),
+    APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS.length - 1,
+  );
+  return APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS[index] || APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS;
+}
+
+function scheduleAppServerThreadIdleRelease(threadId, {
+  record: expectedRecord = null,
+  delayMs = null,
+  reason = 'idle-subscription',
+} = {}) {
+  const cleanId = cleanNativeThreadId(threadId);
+  if (!cleanId) return false;
+  const record = appServerLoadedThreads.get(cleanId);
+  if (!record || (expectedRecord && record !== expectedRecord)) {
+    clearAppServerThreadIdleReleaseTimer(cleanId, expectedRecord);
+    return false;
+  }
+  if (record.connection !== appServerClient.child || !appServerClient.initialized) {
+    clearAppServerThreadIdleReleaseTimer(cleanId, record);
+    return false;
+  }
+
+  const loadedAt = Number(record.loadedAt) || Date.now();
+  const remainingGrace = Math.max(0, APP_SERVER_THREAD_IDLE_RELEASE_GRACE_MS - (Date.now() - loadedAt));
+  const requestedDelay = Number(delayMs);
+  const delay = Number.isFinite(requestedDelay) && requestedDelay >= 0
+    ? requestedDelay
+    : remainingGrace;
+  clearAppServerThreadIdleReleaseTimer(cleanId, record);
+
+  let timer;
+  timer = setTimeout(() => {
+    const entry = appServerThreadIdleReleaseTimers.get(cleanId);
+    if (!entry || entry.timer !== timer || entry.record !== record) return;
+    appServerThreadIdleReleaseTimers.delete(cleanId);
+    const current = appServerLoadedThreads.get(cleanId);
+    if (!current || current !== record) return;
+    if (current.connection !== appServerClient.child || !appServerClient.initialized) return;
+
+    const currentLoadedAt = Number(current.loadedAt) || Date.now();
+    const graceRemaining = Math.max(
+      0,
+      APP_SERVER_THREAD_IDLE_RELEASE_GRACE_MS - (Date.now() - currentLoadedAt),
+    );
+    if (graceRemaining > 0) {
+      scheduleAppServerThreadIdleRelease(cleanId, {
+        record: current,
+        delayMs: graceRemaining,
+        reason,
+      });
+      return;
+    }
+
+    // Local JSONL state can lag behind app-server. Always ask the authoritative
+    // turns list before releasing an idle subscription; never unsubscribe
+    // directly from a timer based only on a stale local snapshot.
+    Promise.resolve()
+      .then(() => {
+        if (typeof reconcileUnconfirmedAppServerThread !== 'function') {
+          return { released: false, state: 'unknown' };
+        }
+        return reconcileUnconfirmedAppServerThread(cleanId, String(current.turnId || ''), {
+          record: current,
+          reason,
+        });
+      })
+      .then((result) => {
+        const latest = appServerLoadedThreads.get(cleanId);
+        if (!latest || latest !== current) return;
+        // A failed unsubscribe owns its own retry timer. Do not add a second
+        // timer while that request is still pending or has already scheduled
+        // its bounded backoff.
+        if (appServerUnsubscribeRequests.has(cleanId) || appServerThreadIdleReleaseTimers.has(cleanId)) return;
+        if (result?.released || ['not-loaded', 'connection-replaced'].includes(result?.state)) return;
+        if (!['running', 'busy'].includes(result?.state)) {
+          appServerThreadIdleReleaseAttempts.set(
+            cleanId,
+            Number(appServerThreadIdleReleaseAttempts.get(cleanId) || 0) + 1,
+          );
+        }
+        const delay = ['running', 'busy'].includes(result?.state)
+          ? APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS
+          : (
+            typeof appServerThreadIdleReleaseRetryDelay === 'function'
+              ? appServerThreadIdleReleaseRetryDelay(cleanId)
+              : APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS
+          );
+        scheduleAppServerThreadIdleRelease(cleanId, {
+          record: latest,
+          delayMs: delay,
+          reason,
+        });
+      })
+      .catch(() => {
+        const latest = appServerLoadedThreads.get(cleanId);
+        if (!latest || latest !== current || appServerUnsubscribeRequests.has(cleanId)) return;
+        appServerThreadIdleReleaseAttempts.set(
+          cleanId,
+          Number(appServerThreadIdleReleaseAttempts.get(cleanId) || 0) + 1,
+        );
+        scheduleAppServerThreadIdleRelease(cleanId, {
+          record: latest,
+          delayMs: typeof appServerThreadIdleReleaseRetryDelay === 'function'
+            ? appServerThreadIdleReleaseRetryDelay(cleanId)
+            : APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS,
+          reason,
+        });
+      });
+  }, Math.max(0, Math.floor(delay)));
+  timer.unref?.();
+  appServerThreadIdleReleaseTimers.set(cleanId, { timer, record });
+  return true;
 }
 
 function isAppServerThreadAlreadyUnsubscribedError(error) {
@@ -4089,24 +4338,372 @@ function isAppServerThreadAlreadyUnsubscribedError(error) {
   return /not subscribed|already unsubscribed|thread\s+not\s+found|unknown thread|no such thread|线程.*(不存在|未订阅)/i.test(message);
 }
 
+function isAppServerThreadIdleProbeError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return /(?:thread|conversation).*(?:not found|unknown|not materialized|not materialised|not subscribed|already unsubscribed)|(?:not materialized|not materialised|not subscribed|already unsubscribed)|线程.*(?:不存在|未订阅|尚未加载|未 materialize)/i.test(message);
+}
+
+function appServerThreadHasPendingWebRequest(threadId) {
+  const cleanId = cleanNativeThreadId(threadId);
+  if (!cleanId) return false;
+  return [...pendingNativeRequests.values()].some((request) => (
+    request?.transport !== 'desktop-ipc'
+    && cleanNativeThreadId(request?.threadId) === cleanId
+  ));
+}
+
+function appServerThreadIsBusy(threadId, conversation = null, options = {}) {
+  const cleanId = cleanNativeThreadId(threadId);
+  if (!cleanId) return true;
+  if (!options.ignoreReservations && (
+    nativeTurnReservations.has(cleanId)
+    || serverPromptQueueDispatchingThreads.has(cleanId)
+  )) {
+    return true;
+  }
+  if (!options.ignorePending && appServerThreadHasPendingWebRequest(cleanId)) return true;
+  if (!options.ignoreActive && activeNativeTurns.get(cleanId)?.status === 'running') return true;
+  if (!options.ignoreConversationStatus && conversation?.status === 'running') return true;
+  if (
+    !options.ignoreConversationStatus
+    && typeof nativeConversationHasFreshRunningActivity === 'function'
+    && nativeConversationHasFreshRunningActivity(conversation)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function releaseIdleAppServerThreadSubscriptions(change = {}) {
+  const changedIds = Array.isArray(change?.changedIds)
+    ? change.changedIds.map(cleanNativeThreadId).filter(Boolean)
+    : [];
+  const candidates = [...new Set([
+    ...changedIds,
+    ...appServerLoadedThreads.keys(),
+  ])];
+  for (const threadId of candidates) {
+    const record = appServerLoadedThreads.get(threadId);
+    if (!record) continue;
+    const loadedAt = Number(record.loadedAt) || 0;
+    const graceElapsed = loadedAt <= 0
+      || Date.now() - loadedAt >= APP_SERVER_THREAD_IDLE_RELEASE_GRACE_MS;
+    if (graceElapsed || !appServerThreadIdleReleaseTimers.has(threadId)) {
+      scheduleAppServerThreadIdleRelease(threadId, {
+        record,
+        ...(graceElapsed ? { delayMs: 0 } : {}),
+        reason: 'idle-session-change',
+      });
+    }
+  }
+}
+
+function reconcileUnconfirmedAppServerThread(threadId, expectedTurnId = '', options = {}) {
+  const cleanId = cleanNativeThreadId(threadId);
+  if (!cleanId) return Promise.resolve({ released: false, state: 'invalid' });
+  const requestedTurnId = String(expectedTurnId || '').trim();
+  const requestedRecord = options.record || appServerLoadedThreads.get(cleanId) || null;
+  if (options.record && !requestedRecord) {
+    return Promise.resolve({ released: false, state: 'record-replaced' });
+  }
+  const existing = appServerThreadReconcileRequests.get(cleanId);
+  if (existing) {
+    const existingRecord = existing.__appServerRecord || null;
+    const currentRecord = appServerLoadedThreads.get(cleanId) || null;
+    if (
+      (!currentRecord && !requestedRecord)
+      || (existingRecord && (
+        existingRecord === requestedRecord
+        || existingRecord === currentRecord
+      ))
+    ) {
+      return existing;
+    }
+  }
+
+  const reason = String(options.reason || 'ambiguous-app-server-request').trim();
+  const retryDelays = Array.isArray(options.retryDelays)
+    ? options.retryDelays
+    : APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS;
+  let promise;
+  promise = (async () => {
+    let lastError = null;
+    const releaseIfSafe = async (record, conversation, {
+      turnId = '',
+      terminal = false,
+      status = '',
+    } = {}) => {
+      if (appServerLoadedThreads.get(cleanId) !== record) {
+        return { released: false, state: 'record-replaced' };
+      }
+      const candidateTurnId = String(turnId || requestedTurnId || record.turnId || '').trim();
+      const current = activeNativeTurns.get(cleanId);
+      const currentTurnId = String(current?.turnId || '').trim();
+      const activeTurnMatches = current?.status === 'running'
+        && Boolean(candidateTurnId)
+        && Boolean(currentTurnId)
+        && currentTurnId === candidateTurnId;
+      if (current?.status === 'running' && !activeTurnMatches) {
+        return {
+          released: false,
+          state: 'running',
+          ...(currentTurnId ? { turnId: currentTurnId } : {}),
+        };
+      }
+
+      const busy = appServerThreadIsBusy(cleanId, conversation, {
+        ignoreReservations: options.allowReservationRelease === true,
+        ignoreActive: activeTurnMatches,
+        ignoreConversationStatus: activeTurnMatches,
+      });
+      if (busy) {
+        return {
+          released: false,
+          state: 'busy',
+          ...(candidateTurnId ? { turnId: candidateTurnId } : {}),
+        };
+      }
+      if (appServerLoadedThreads.get(cleanId) !== record) {
+        return { released: false, state: 'record-replaced' };
+      }
+      if (candidateTurnId && record.turnId !== candidateTurnId) {
+        record.turnId = candidateTurnId;
+      }
+      if (activeTurnMatches && typeof setNativeTurnState === 'function') {
+        setNativeTurnState(cleanId, {
+          turnId: candidateTurnId,
+          status: terminal ? nativeTurnStatus(status || 'completed') : 'done',
+          transport: 'app-server',
+        });
+      }
+      const released = await releaseAppServerThreadAfterTurn(cleanId, candidateTurnId, {
+        expectedRecord: record,
+        allowRunning: activeTurnMatches,
+        reason,
+      });
+      return {
+        released: released !== false,
+        state: terminal ? 'terminal' : 'idle',
+        ...(candidateTurnId ? { turnId: candidateTurnId } : {}),
+      };
+    };
+
+    for (const rawDelay of retryDelays) {
+      const delay = Number(rawDelay);
+      if (Number.isFinite(delay) && delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+
+      const record = appServerLoadedThreads.get(cleanId);
+      if (!record) return { released: true, state: 'not-loaded' };
+      if (requestedRecord && record !== requestedRecord) {
+        return { released: false, state: 'record-replaced' };
+      }
+      if (record.connection !== appServerClient.child || !appServerClient.initialized) {
+        if (appServerLoadedThreads.get(cleanId) === record) appServerLoadedThreads.delete(cleanId);
+        return { released: true, state: 'connection-replaced' };
+      }
+
+      let conversation = null;
+      try { conversation = nativeSessions.get(cleanId); } catch {}
+      if (
+        !options.allowProbeWhileBusy
+        && appServerThreadIsBusy(cleanId, conversation)
+      ) {
+        return { released: false, state: 'busy' };
+      }
+
+      try {
+        const response = await appServerClient.requestWithConnection(
+          'thread/turns/list',
+          {
+            threadId: cleanId,
+            limit: 1,
+            sortDirection: 'desc',
+            itemsView: 'notLoaded',
+          },
+          { timeoutMs: APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS },
+        );
+        if (appServerLoadedThreads.get(cleanId) !== record) {
+          return { released: false, state: 'record-replaced' };
+        }
+        const responseChild = response?.child;
+        if (
+          (responseChild && responseChild !== record.connection)
+          || appServerClient.child !== record.connection
+          || !appServerClient.initialized
+        ) {
+          if (appServerLoadedThreads.get(cleanId) === record) appServerLoadedThreads.delete(cleanId);
+          return { released: true, state: 'connection-replaced' };
+        }
+
+        const result = response && Object.hasOwn(response, 'result')
+          ? response.result
+          : response;
+        if (!result || typeof result !== 'object' || Array.isArray(result) || !Array.isArray(result.data)) {
+          lastError = new Error('app-server thread/turns/list 返回缺少 data 数组');
+          continue;
+        }
+        const turn = result.data.length ? result.data[0] : null;
+        // An empty data array is an authoritative idle result. A non-empty
+        // array containing null/primitive data is malformed and must never
+        // be treated as permission to unsubscribe a live Web subscription.
+        if (result.data.length && (!turn || typeof turn !== 'object' || Array.isArray(turn))) {
+          lastError = new Error('app-server thread/turns/list 返回无效 turn');
+          continue;
+        }
+        const turnId = String(turn?.id || '').trim();
+        const rawStatus = String(turn?.status || '').trim().toLowerCase();
+        if (turn && (!turnId || !rawStatus)) {
+          lastError = new Error('app-server thread/turns/list 返回 turn 缺少 id 或 status');
+          continue;
+        }
+        const running = ['inprogress', 'running'].includes(rawStatus);
+        const terminal = ['completed', 'complete', 'done', 'interrupted', 'cancelled', 'canceled', 'aborted', 'failed', 'error']
+          .includes(rawStatus);
+
+        if (running) {
+          if (appServerLoadedThreads.get(cleanId) !== record) {
+            return { released: false, state: 'record-replaced' };
+          }
+          appServerThreadIdleReleaseAttempts.delete(cleanId);
+          const current = activeNativeTurns.get(cleanId);
+          if (turnId) {
+            markAppServerThreadTurn(cleanId, turnId, record);
+            if (
+              typeof setNativeTurnState === 'function'
+              && !(current?.transport === 'desktop-ipc' && current.status === 'running')
+            ) {
+              setNativeTurnState(cleanId, {
+                turnId,
+                status: 'running',
+                transport: 'app-server',
+              });
+            }
+          }
+          return { released: false, state: 'running', turnId };
+        }
+
+        if (!terminal && turn) {
+          lastError = new Error(`未知的 app-server turn 状态: ${rawStatus}`);
+          continue;
+        }
+
+        try { conversation = nativeSessions.get(cleanId) || conversation; } catch {}
+        let releaseTurnId = turnId || requestedTurnId || String(record.turnId || '').trim();
+        if (requestedTurnId && turnId && turnId !== requestedTurnId) {
+          const persistedTerminal = typeof nativeTurnHasPersistedTerminal === 'function'
+            && nativeTurnHasPersistedTerminal(conversation, requestedTurnId);
+          if (!persistedTerminal) {
+            const current = activeNativeTurns.get(cleanId);
+            if (current?.status === 'running') {
+              return { released: false, state: 'running', turnId: current.turnId || turnId };
+            }
+            lastError = new Error('探测到的最新回合与待确认回合不一致');
+            continue;
+          }
+          releaseTurnId = requestedTurnId;
+        }
+        return releaseIfSafe(record, conversation, {
+          turnId: releaseTurnId,
+          terminal,
+          status: rawStatus,
+        });
+      } catch (error) {
+        if (appServerLoadedThreads.get(cleanId) !== record) {
+          return { released: false, state: 'record-replaced' };
+        }
+        if (
+          record.connection !== appServerClient.child
+          || isAppServerThreadAlreadyUnsubscribedError(error)
+          || isAppServerThreadIdleProbeError(error)
+        ) {
+          try { conversation = nativeSessions.get(cleanId) || conversation; } catch {}
+          const result = await releaseIfSafe(record, conversation, {
+            turnId: requestedTurnId || String(record.turnId || '').trim(),
+            terminal: false,
+          });
+          if (result.state === 'busy' || result.state === 'running') {
+            return { ...result, error };
+          }
+          return result;
+        }
+        lastError = error;
+      }
+    }
+    return { released: false, state: 'unknown', error: lastError };
+  })().finally(() => {
+    if (appServerThreadReconcileRequests.get(cleanId) === promise) {
+      appServerThreadReconcileRequests.delete(cleanId);
+    }
+  });
+  promise.__appServerRecord = requestedRecord;
+  appServerThreadReconcileRequests.set(cleanId, promise);
+  return promise;
+}
+
 async function unsubscribeAppServerThread(
   threadId,
-  { expectedTurnId = '', allowRunning = false, force = false, reason = 'terminal' } = {},
+  {
+    expectedTurnId = '',
+    allowRunning = false,
+    force = false,
+    reason = 'terminal',
+    expectedRecord = null,
+  } = {},
 ) {
   const cleanId = cleanNativeThreadId(threadId);
   if (!cleanId) return false;
   const record = appServerLoadedThreads.get(cleanId);
-  if (!record) return false;
+  if (expectedRecord && record !== expectedRecord) return false;
+  // An already-cleared subscription is an idempotent success. This lets a
+  // handoff continue when cleanup won the race just before this call.
+  if (!record) {
+    clearAppServerThreadIdleReleaseTimer(cleanId);
+    appServerThreadIdleReleaseAttempts.delete(cleanId);
+    return true;
+  }
   const cleanExpectedTurnId = String(expectedTurnId || '').trim();
-  if (cleanExpectedTurnId && record.turnId && record.turnId !== cleanExpectedTurnId) return false;
+  if (cleanExpectedTurnId && record.turnId && record.turnId !== cleanExpectedTurnId) {
+    scheduleAppServerThreadIdleRelease(cleanId, {
+      record,
+      delayMs: APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS,
+      reason,
+    });
+    return false;
+  }
 
   const active = activeNativeTurns.get(cleanId);
   if (!force && active?.status === 'running') {
-    if (!allowRunning || !cleanExpectedTurnId || active.turnId !== cleanExpectedTurnId) return false;
+    if (!allowRunning || !cleanExpectedTurnId || active.turnId !== cleanExpectedTurnId) {
+      scheduleAppServerThreadIdleRelease(cleanId, {
+        record,
+        delayMs: APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS,
+        reason,
+      });
+      return false;
+    }
   }
 
   const pending = appServerUnsubscribeRequests.get(cleanId);
-  if (pending?.connection === record.connection) return pending.promise;
+  if (pending) {
+    if (pending.record === record || (!pending.record && pending.connection === record.connection)) {
+      return pending.promise;
+    }
+    // A newer load may replace the map record while an old unsubscribe is
+    // still in flight. Serialize the new release behind the old request, but
+    // never let the old request's finally block own the new record.
+    return pending.promise.then((released) => {
+      if (released === false) return false;
+      return unsubscribeAppServerThread(cleanId, {
+        expectedTurnId,
+        allowRunning,
+        force,
+        reason,
+        expectedRecord,
+      });
+    }).catch(() => false);
+  }
 
   let released = false;
   let promise;
@@ -4124,8 +4721,24 @@ async function unsubscribeAppServerThread(
         { threadId: cleanId },
         { timeoutMs: APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS },
       );
+      const responseChild = response?.child;
+      const responseStatus = String(response?.result?.status || '').trim();
+      const validStatus = [
+        'notLoaded',
+        'notSubscribed',
+        'unsubscribed',
+      ].includes(responseStatus);
       // If the request crossed a process replacement, the old writer is gone.
-      released = response?.child === record.connection || response?.child !== appServerClient.child;
+      // Otherwise require the protocol's explicit terminal status; an
+      // unshaped response must not make Web forget a live subscription.
+      const connectionReplaced = record.connection !== appServerClient.child
+        || !appServerClient.initialized
+        || (responseChild && responseChild !== appServerClient.child);
+      released = connectionReplaced
+        || (responseChild === record.connection && validStatus);
+      if (!released && !validStatus) {
+        console.warn(`释放 Web app-server 会话订阅返回无效状态 (${cleanId}, ${reason})`);
+      }
       return released;
     } catch (error) {
       if (
@@ -4140,13 +4753,30 @@ async function unsubscribeAppServerThread(
     } finally {
       if (released && appServerLoadedThreads.get(cleanId) === record) {
         appServerLoadedThreads.delete(cleanId);
+        clearAppServerThreadIdleReleaseTimer(cleanId, record);
+        appServerThreadIdleReleaseAttempts.delete(cleanId);
       }
       if (appServerUnsubscribeRequests.get(cleanId)?.promise === promise) {
         appServerUnsubscribeRequests.delete(cleanId);
       }
+      if (!released && appServerLoadedThreads.get(cleanId) === record) {
+        appServerThreadIdleReleaseAttempts.set(
+          cleanId,
+          Number(appServerThreadIdleReleaseAttempts.get(cleanId) || 0) + 1,
+        );
+        scheduleAppServerThreadIdleRelease(cleanId, {
+          record,
+          delayMs: appServerThreadIdleReleaseRetryDelay(cleanId),
+          reason,
+        });
+      }
     }
   });
-  appServerUnsubscribeRequests.set(cleanId, { connection: record.connection, promise });
+  appServerUnsubscribeRequests.set(cleanId, {
+    connection: record.connection,
+    record,
+    promise,
+  });
   return promise;
 }
 
@@ -4158,6 +4788,8 @@ async function unsubscribeAllAppServerThreads() {
 }
 
 function releaseAppServerThreadAfterTurn(threadId, turnId, options = {}) {
+  const cleanId = cleanNativeThreadId(threadId);
+  if (!cleanId || !appServerLoadedThreads.has(cleanId)) return Promise.resolve(true);
   return unsubscribeAppServerThread(threadId, {
     expectedTurnId: turnId,
     ...options,
@@ -5060,7 +5692,10 @@ async function continueNativeTurn(threadId, turn) {
   // A previous Web fallback may have finished without its terminal notification
   // reaching this process. Release that idle Web subscription before asking the
   // Desktop owner to continue the thread.
-  await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'before-desktop' });
+  const releasedForDesktop = await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'before-desktop' });
+  if (releasedForDesktop === false) {
+    throw nativeActiveWriterConflictError({ reason: 'web-subscription-release' });
+  }
   const desktopRequestedAt = Date.now();
   const knownOwnerClientId = String(desktopThreadStates.get(threadId)?.ownerClientId || '');
   try {
@@ -5343,13 +5978,20 @@ async function steerNativeTurn(threadId, steer, expectedTurnId) {
 
   let turnId = expectedTurnId;
   let resumedByWeb = false;
+  let resumedRecord = null;
   if (!turnId) {
     const resumed = await requestLoadedAppServerThread('thread/resume', { threadId });
     resumedByWeb = true;
+    resumedRecord = appServerLoadedThreads.get(threadId) || null;
     turnId = findInProgressTurnId(resumed?.thread);
   }
   if (!turnId) {
-    if (resumedByWeb) await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'steer-no-turn' });
+    if (resumedByWeb) {
+      await releaseAppServerThreadAfterTurn(threadId, '', {
+        expectedRecord: resumedRecord,
+        reason: 'steer-no-turn',
+      });
+    }
     throw new Error('该会话没有可引导的运行中任务');
   }
   let result;
@@ -5360,8 +6002,22 @@ async function steerNativeTurn(threadId, steer, expectedTurnId) {
       input: steer.input,
     });
   } catch (error) {
-    if (resumedByWeb && !isAmbiguousAppServerRequestError(error)) {
-      await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'steer-failed' });
+    if (resumedByWeb) {
+      if (isAmbiguousAppServerRequestError(error)) {
+        error.appServerTurnOutcomeUncertain = true;
+        if (typeof reconcileUnconfirmedAppServerThread === 'function') {
+          await reconcileUnconfirmedAppServerThread(threadId, turnId, {
+            allowProbeWhileBusy: true,
+            record: resumedRecord,
+            reason: 'steer-ambiguous',
+          });
+        }
+      } else {
+        await releaseAppServerThreadAfterTurn(threadId, '', {
+          expectedRecord: resumedRecord,
+          reason: 'steer-failed',
+        });
+      }
     }
     throw error;
   }
@@ -5395,13 +6051,20 @@ async function interruptNativeTurn(threadId, expectedTurnId) {
 
   let turnId = expectedTurnId;
   let resumedByWeb = false;
+  let resumedRecord = null;
   if (!turnId) {
     const resumed = await requestLoadedAppServerThread('thread/resume', { threadId });
     resumedByWeb = true;
+    resumedRecord = appServerLoadedThreads.get(threadId) || null;
     turnId = findInProgressTurnId(resumed?.thread);
   }
   if (!turnId) {
-    if (resumedByWeb) await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'interrupt-no-turn' });
+    if (resumedByWeb) {
+      await releaseAppServerThreadAfterTurn(threadId, '', {
+        expectedRecord: resumedRecord,
+        reason: 'interrupt-no-turn',
+      });
+    }
     throw new Error('该会话没有可取消的任务');
   }
   try {
@@ -5409,12 +6072,27 @@ async function interruptNativeTurn(threadId, expectedTurnId) {
       timeoutMs: APP_SERVER_INTERRUPT_TIMEOUT_MS,
     });
   } catch (error) {
-    if (resumedByWeb && !isAmbiguousAppServerRequestError(error)) {
-      await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'interrupt-failed' });
+    if (resumedByWeb) {
+      if (isAmbiguousAppServerRequestError(error)) {
+        error.appServerTurnOutcomeUncertain = true;
+        if (typeof reconcileUnconfirmedAppServerThread === 'function') {
+          await reconcileUnconfirmedAppServerThread(threadId, turnId, {
+            allowProbeWhileBusy: true,
+            record: resumedRecord,
+            reason: 'interrupt-ambiguous',
+          });
+        }
+      } else {
+        await releaseAppServerThreadAfterTurn(threadId, '', {
+          expectedRecord: resumedRecord,
+          reason: 'interrupt-failed',
+        });
+      }
     }
     throw error;
   }
   await releaseAppServerThreadAfterTurn(threadId, turnId, {
+    expectedRecord: resumedRecord,
     allowRunning: true,
     reason: 'turn-interrupted',
   });
@@ -5502,6 +6180,28 @@ async function startNativeTurn(threadId, turn) {
     // timeout is ambiguous because Codex may have accepted the request.
     if (!isAmbiguousAppServerRequestError(error)) {
       await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'turn-start-failed' });
+    } else {
+      // The request may have reached app-server even though its response was
+      // lost. Keep the subscription protected by the caller's reservation and
+      // reconcile it without ever bypassing that reservation.
+      error.appServerTurnOutcomeUncertain = true;
+      let reconciliation = null;
+      if (typeof reconcileUnconfirmedAppServerThread === 'function') {
+        reconciliation = await reconcileUnconfirmedAppServerThread(threadId, '', {
+          allowProbeWhileBusy: true,
+          reason: 'turn-start-ambiguous',
+        });
+      }
+      if (!reconciliation?.released && typeof scheduleAppServerThreadIdleRelease === 'function') {
+        const record = appServerLoadedThreads.get(threadId);
+        if (record) {
+          scheduleAppServerThreadIdleRelease(threadId, {
+            record,
+            delayMs: 0,
+            reason: 'turn-start-ambiguous',
+          });
+        }
+      }
     }
     throw error;
   }
@@ -15600,7 +16300,7 @@ function subQuotaSourceDefinition(provider){
     sub2api:{title:'Sub2API',detail:'订阅与 API Key',icon:'layers',urlPlaceholder:'https://sub.example.com',keyLabel:'API Key',keyPlaceholder:'Sub2API API Key'},
     grok2api:{title:'Grok2API',detail:'账号池管理',icon:'activity',urlPlaceholder:'http://127.0.0.1:8100',keyLabel:'管理员密码',keyPlaceholder:'管理员密码，或 username:password'},
     deepseek:{title:'DeepSeek 官方',detail:'官方余额',icon:'brain',urlPlaceholder:'https://api.deepseek.com',keyLabel:'API Key',keyPlaceholder:'DeepSeek API Key'},
-    'openai-compatible':{title:'OpenAI 兼容',detail:'检测 /v1/models 连通性，不提供余额',icon:'plug-zap',urlPlaceholder:'https://api.example.com/v1',keyLabel:'API Key',keyPlaceholder:'OpenAI 兼容 API Key'},
+    'openai-compatible':{title:'OpenAI 兼容',detail:'检测 /v1/models；New API 自动读取额度',icon:'plug-zap',urlPlaceholder:'https://api.example.com/v1',keyLabel:'API Key',keyPlaceholder:'OpenAI 兼容 API Key'},
   })[provider]||{title:'自定义渠道',detail:'额度来源',icon:'plug',urlPlaceholder:'https://api.example.com',keyLabel:'API Key',keyPlaceholder:'API Key'};
 }
 function createSubQuotaManualSourceId(provider){
@@ -16015,7 +16715,7 @@ function ensureSubQuotaSettingsDialog(){
   toolbarTitle.textContent='手动添加渠道';
   const toolbarHint=document.createElement('span');
   toolbarHint.className='subQuotaSettingsToolbarHint';
-  toolbarHint.textContent='同类型可添加多个实例，OpenAI 兼容仅检测连通性。';
+  toolbarHint.textContent='同类型可添加多个实例；New API 自动读取额度，普通兼容服务仅检测连通性。';
   toolbarCopy.append(toolbarTitle,toolbarHint);
   const toolbarActions=document.createElement('div');
   toolbarActions.className='subQuotaSettingsToolbarActions';
@@ -17031,6 +17731,77 @@ function subQuotaDisplayName(quota){
     ?itemName
     :sourceName+' · '+itemName;
 }
+function isSubQuotaNewApi(quota){
+  if(!quota||quota.provider!=='openai-compatible')return false;
+  const mode=String(quota.mode||'').trim().toLowerCase().replace(/-/g,'_');
+  const providerType=String(quota.providerType||quota.metadata?.providerType||quota.meta?.providerType||'')
+    .trim().toLowerCase().replace(/-/g,'_');
+  return quota.newApi===true
+    || quota.newAPI===true
+    || quota.newApiDetected===true
+    || ['new_api','openai_compatible_new_api'].includes(mode)
+    || ['new_api','newapi'].includes(providerType);
+}
+function subQuotaNewApiDetails(quota){
+  const window=quota?.quota||{};
+  const metadata=quota?.metadata||quota?.meta||{};
+  const value=(...candidates)=>{
+    for(const candidate of candidates){
+      const next=finiteSubQuotaNumber(candidate);
+      if(next!==null)return next;
+    }
+    return null;
+  };
+  const quotaPerUnit=value(
+    quota?.quotaPerUnit,
+    metadata.quotaPerUnit,
+    quota?.quota_per_unit,
+    metadata.quota_per_unit,
+  );
+  const rawPointsRemaining=value(
+    quota?.quotaPoints,
+    metadata.quotaPoints,
+    quota?.quota_points,
+  );
+  const rawPointsUsed=value(
+    quota?.usedQuotaPoints,
+    metadata.usedQuotaPoints,
+    quota?.used_quota_points,
+  );
+  const pointsToUnit=(points)=>{
+    if(points===null||quotaPerUnit===null||quotaPerUnit<=0)return null;
+    return points/quotaPerUnit;
+  };
+  let used=value(window.used,quota?.used,quota?.usedBalance,quota?.usedUsd,metadata.used,metadata.usedUsd);
+  let limit=value(window.limit,quota?.limit,quota?.quotaLimit,quota?.limitUsd,metadata.limit,metadata.limitUsd);
+  let remaining=value(
+    window.remaining,
+    quota?.remaining,
+    quota?.balance,
+    quota?.remainingBalance,
+    quota?.remainingUsd,
+    metadata.remaining,
+    metadata.remainingUsd,
+  );
+  if(remaining===null)remaining=pointsToUnit(rawPointsRemaining);
+  if(used===null)used=pointsToUnit(rawPointsUsed);
+  if(limit===null&&used!==null&&remaining!==null)limit=used+remaining;
+  if(remaining===null&&used!==null&&limit!==null)remaining=Math.max(0,limit-used);
+  const rawUnit=String(quota?.unit||window.unit||'USD').trim().toLowerCase();
+  const unit=['credit','credits','point','points'].includes(rawUnit)
+    ? 'credits'
+    : ['usd','$','dollar','dollars'].includes(rawUnit)
+      ? 'USD'
+      : rawUnit.toUpperCase()||'USD';
+  return {
+    used,
+    limit,
+    remaining,
+    unit,
+    requestCount:value(quota?.requestCount,metadata.requestCount,quota?.request_count,metadata.request_count),
+    quotaPerUnit,
+  };
+}
 function renderSubQuota(data){
   subQuotaContent.replaceChildren();
   if(data?.configurationError&&!data?.codexApp){renderSubQuotaError(data.configurationError);return}
@@ -17080,6 +17851,7 @@ function renderSubQuota(data){
     }
     const source=document.createElement('article');
     const isCodexApp=quota.provider==='codex-app';
+    const isNewApiQuota=isSubQuotaNewApi(quota);
     source.className='subQuotaSource'+(isCodexApp?' subQuotaSourceCodex':'');
     source.dataset.provider=String(quota.provider||'');
     source.dataset.sourceId=isCodexApp?'codex-app':String(quota.sourceId||quota.id||'');
@@ -17087,7 +17859,16 @@ function renderSubQuota(data){
       const plan=document.createElement('div');
       plan.className='subQuotaPlan';
       const planName=document.createElement('span');
-      planName.textContent=quota.planName||(quota.mode==='cpa_codex'?'Codex':quota.mode==='quota_limited'?'API Key 限额':'额度');
+      const fallbackPlanName=isNewApiQuota
+        ? 'New API'
+        : quota.mode==='cpa_codex'
+          ? 'Codex'
+          : quota.mode==='quota_limited'
+            ? 'API Key 限额'
+            : '额度';
+      planName.textContent=quota.planName&&!(isNewApiQuota&&quota.planName==='OpenAI 兼容')
+        ? quota.planName
+        : fallbackPlanName;
       const sourceName=document.createElement('span');
       sourceName.textContent=subQuotaDisplayName(quota);
       plan.appendChild(planName);
@@ -17184,7 +17965,8 @@ function renderSubQuota(data){
       if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
       if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
       if(meta.childElementCount){source.appendChild(meta);detailCount+=1}
-      if(quota.supportsReset!==false){
+      const hasGrok2ApiActions=quota.supportsReset!==false;
+      if(hasGrok2ApiActions){
         const actions=document.createElement('div');
         actions.className='subQuotaActions';
         const syncBtn=document.createElement('button');
@@ -17212,38 +17994,126 @@ function renderSubQuota(data){
         actions.appendChild(actionProgress);
         source.appendChild(actions);
       }
-      if(detailCount || meta.childElementCount){
+      if(detailCount || meta.childElementCount || hasGrok2ApiActions){
         subQuotaContent.appendChild(source);
         rendered+=1;
       }
       continue;
     }
     if(quota.provider==='openai-compatible'){
+      const newApiDetails=isNewApiQuota?subQuotaNewApiDetails(quota):null;
+      const quotaStatus=String(quota.status||'active').trim().toLowerCase();
+      const statusNeedsAttention=['quota_exhausted','expired','no_access','blocked'].includes(quotaStatus);
+      const hasNewApiBalance=Boolean(
+        quota.unlimited
+        || newApiDetails&&[newApiDetails.used,newApiDetails.limit,newApiDetails.remaining].some((value)=>value!==null),
+      );
       const statusCard=document.createElement('div');
       statusCard.className='subQuotaOpenAIStatus';
-      statusCard.dataset.state=stale?'loading':'success';
+      statusCard.dataset.state=stale?'loading':statusNeedsAttention?'error':'success';
+      statusCard.dataset.kind=isNewApiQuota?'new-api':'compatibility';
       const statusIcon=document.createElement('span');
       statusIcon.className='subQuotaOpenAIStatusIcon';
-      setIconLabel(statusIcon,stale?'clock-3':'circle-check','',false);
+      setIconLabel(statusIcon,stale?'clock-3':statusNeedsAttention?'circle-alert':'circle-check','',false);
       const statusCopy=document.createElement('div');
       statusCopy.className='subQuotaOpenAIStatusCopy';
       const statusTitle=document.createElement('strong');
       statusTitle.className='subQuotaOpenAIStatusTitle';
-      statusTitle.textContent=stale?'最近检测可用':'已连接';
+      statusTitle.textContent=stale
+        ? '最近检测可用'
+        : statusNeedsAttention
+          ? formatSubQuotaStatus(quotaStatus)
+          : isNewApiQuota
+            ? 'New API 已连接'
+            : '已连接';
       const statusMessage=document.createElement('span');
       statusMessage.className='subQuotaOpenAIStatusMessage';
       statusMessage.textContent=stale
-        ? '当前检测失败，显示最近一次成功结果；兼容协议不提供余额。'
-        : '已通过 /v1/models 连通性检测，兼容协议不提供余额。';
+        ? '当前检测失败，显示最近一次成功结果'+(isNewApiQuota?'；额度数据可能已过期。':'；已连接，未提供标准余额接口。')
+        : isNewApiQuota
+          ? hasNewApiBalance
+            ? '已通过 /v1/models 连通性检测，并读取 New API 额度。'
+            : '已识别 New API，但未返回可用余额。'
+          : '已通过 /v1/models 连通性检测；该兼容服务未提供标准余额接口。';
       statusCopy.append(statusTitle,statusMessage);
       statusCard.append(statusIcon,statusCopy);
       source.appendChild(statusCard);
-      if(stale){
-        const meta=document.createElement('div');
-        meta.className='subQuotaMeta';
-        appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
-        source.appendChild(meta);
+      let detailCount=0;
+      if(isNewApiQuota&&newApiDetails){
+        const balanceWindow={
+          used:newApiDetails.used,
+          limit:newApiDetails.limit,
+          remaining:newApiDetails.remaining,
+        };
+        if(quota.unlimited)balanceWindow.availability='available';
+        if(
+          quota.unlimited
+          || [balanceWindow.used,balanceWindow.limit,balanceWindow.remaining].some((value)=>value!==null)
+        ){
+          detailCount+=appendSubQuotaWindow(
+            source,
+            '余额',
+            balanceWindow,
+            newApiDetails.unit,
+            {fixedCurrency:newApiDetails.unit==='USD'},
+          )?1:0;
+        }
       }
+      const meta=document.createElement('div');
+      meta.className='subQuotaMeta';
+      if(isNewApiQuota&&newApiDetails){
+        const metadata=quota.metadata||quota.meta||{};
+        const user=quota.user||metadata.user||{};
+        const textValue=(...values)=>{
+          for(const value of values){
+            if(value===null||value===undefined||typeof value==='object')continue;
+            const text=String(value).trim();
+            if(text)return text;
+          }
+          return '';
+        };
+        const group=textValue(
+          quota.group,
+          quota.groupName,
+          metadata.group,
+          metadata.groupName,
+          user.group,
+          user.groupName,
+        );
+        const username=textValue(
+          quota.username,
+          quota.userName,
+          quota.user_name,
+          metadata.username,
+          metadata.userName,
+          metadata.user_name,
+          user.username,
+          user.userName,
+          user.name,
+          quota.displayName,
+          metadata.displayName,
+        );
+        if(group)appendSubQuotaMeta(meta,'组 '+group);
+        if(username)appendSubQuotaMeta(meta,'用户 '+username);
+        if(newApiDetails.used!==null){
+          appendSubQuotaMeta(meta,'已用 '+formatSubQuotaAmount(newApiDetails.used,newApiDetails.unit,true));
+        }
+        if(newApiDetails.limit!==null){
+          appendSubQuotaMeta(meta,'总额 '+formatSubQuotaAmount(newApiDetails.limit,newApiDetails.unit,true));
+        }
+        if(newApiDetails.requestCount!==null){
+          appendSubQuotaMeta(meta,'请求 '+newApiDetails.requestCount.toLocaleString('zh-CN')+' 次');
+        }
+        if(newApiDetails.quotaPerUnit!==null){
+          appendSubQuotaMeta(meta,'换算 '+newApiDetails.quotaPerUnit.toLocaleString('zh-CN')+' 点/USD');
+        }
+        if(quota.expiresAt){
+          appendSubQuotaMeta(meta,'到期 '+formatSubQuotaDateTimeFull(quota.expiresAt));
+        }
+      }
+      if(quota.status&&isNewApiQuota)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
+      if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
+      if(meta.childElementCount)source.appendChild(meta);
       subQuotaContent.appendChild(source);
       rendered+=1;
       continue;

@@ -939,13 +939,26 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
     ['thread-a', { connection, turnId: '', loadedAt: 0 }],
   ]);
   const appServerUnsubscribeRequests = new Map();
+  const appServerThreadIdleReleaseTimers = new Map();
+  const appServerThreadIdleReleaseAttempts = new Map();
   const requests = [];
+  const scheduled = [];
+  let holdUnsubscribe = false;
+  let resolveHeldUnsubscribe = null;
   const appServerClient = {
     child: connection,
     initialized: false,
     requestWithConnection: async (method, params, options) => {
       requests.push({ method, params, options });
-      return { result: {}, child: connection };
+      if (method === 'thread/unsubscribe' && holdUnsubscribe) {
+        return new Promise((resolve) => {
+          resolveHeldUnsubscribe = () => resolve({
+            result: { status: 'unsubscribed' },
+            child: connection,
+          });
+        });
+      }
+      return { result: { status: 'unsubscribed' }, child: connection };
     },
   };
   const api = new Function(
@@ -955,8 +968,23 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
     'activeNativeTurns',
     'appServerClient',
     'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
+    'appServerThreadIdleReleaseTimers',
+    'appServerThreadIdleReleaseAttempts',
+    'appServerThreadIdleReleaseRetryDelay',
+    'APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS',
+    'APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS',
+    'scheduled',
     'console',
-    `${serverSource.slice(helperStart, helperEnd)}; return { unsubscribeAppServerThread };`,
+    `function clearAppServerThreadIdleReleaseTimer(threadId) {
+      const timer = appServerThreadIdleReleaseTimers.get(threadId);
+      if (timer) clearTimeout(timer);
+      appServerThreadIdleReleaseTimers.delete(threadId);
+    }
+    function scheduleAppServerThreadIdleRelease(threadId, options = {}) {
+      scheduled.push({ threadId, options });
+    }
+    ${serverSource.slice(helperStart, helperEnd)};
+    return { unsubscribeAppServerThread };`,
   )(
     (value) => String(value || '').trim(),
     appServerLoadedThreads,
@@ -964,6 +992,12 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
     new Map(),
     appServerClient,
     5000,
+    appServerThreadIdleReleaseTimers,
+    appServerThreadIdleReleaseAttempts,
+    () => 250,
+    750,
+    [250, 1000, 3000, 8000],
+    scheduled,
     { warn() {} },
   );
 
@@ -976,14 +1010,1129 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
   );
 
   appServerClient.initialized = true;
-  appServerLoadedThreads.set('thread-a', { connection, turnId: '', loadedAt: 1 });
-  assert.equal(await api.unsubscribeAppServerThread('thread-a'), true);
-  assert.deepEqual(requests, [{
+  const oldRecord = { connection, turnId: 'turn-old', loadedAt: 1 };
+  appServerLoadedThreads.set('thread-a', oldRecord);
+  holdUnsubscribe = true;
+  const oldRelease = api.unsubscribeAppServerThread('thread-a');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0], {
     method: 'thread/unsubscribe',
     params: { threadId: 'thread-a' },
     options: { timeoutMs: 5000 },
-  }]);
+  });
+
+  const reloadedRecord = { connection, turnId: 'turn-new', loadedAt: 2 };
+  appServerLoadedThreads.set('thread-a', reloadedRecord);
+  assert.equal(typeof resolveHeldUnsubscribe, 'function');
+  resolveHeldUnsubscribe();
+  assert.equal(await oldRelease, true);
+  assert.equal(
+    appServerLoadedThreads.get('thread-a'),
+    reloadedRecord,
+    'an old unsubscribe completion must not delete a newer load record',
+  );
   assert.equal(appServerUnsubscribeRequests.size, 0);
+  assert.equal(scheduled.length, 0);
+
+  holdUnsubscribe = false;
+  assert.equal(await api.unsubscribeAppServerThread('thread-a'), true);
+  assert.equal(appServerLoadedThreads.has('thread-a'), false);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].method, 'thread/unsubscribe');
+  assert.equal(scheduled.length, 0);
+});
+
+test('app-server unsubscribe failures retain ownership and turn mismatches do not unsubscribe', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isAppServerThreadAlreadyUnsubscribedError');
+  const helperEnd = serverSource.indexOf('\nasync function unsubscribeAllAppServerThreads', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const threadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  const appServerLoadedThreads = new Map([
+    [threadId, { connection, turnId: 'turn-old', loadedAt: 1 }],
+  ]);
+  const appServerUnsubscribeRequests = new Map();
+  const appServerThreadIdleReleaseTimers = new Map();
+  const appServerThreadIdleReleaseAttempts = new Map();
+  const requests = [];
+  const scheduled = [];
+  let failUnsubscribe = true;
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    requestWithConnection: async (method, params, options) => {
+      requests.push({ method, params, options });
+      if (failUnsubscribe) throw new Error('transport timeout');
+      return { result: { status: 'unsubscribed' }, child: connection };
+    },
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'appServerLoadedThreads',
+    'appServerUnsubscribeRequests',
+    'activeNativeTurns',
+    'appServerClient',
+    'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
+    'appServerThreadIdleReleaseTimers',
+    'appServerThreadIdleReleaseAttempts',
+    'appServerThreadIdleReleaseRetryDelay',
+    'APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS',
+    'APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS',
+    'scheduled',
+    'console',
+    `function clearAppServerThreadIdleReleaseTimer(threadId) {
+      const timer = appServerThreadIdleReleaseTimers.get(threadId);
+      if (timer) clearTimeout(timer);
+      appServerThreadIdleReleaseTimers.delete(threadId);
+    }
+    function scheduleAppServerThreadIdleRelease(threadId, options = {}) {
+      scheduled.push({ threadId, options });
+    }
+    ${serverSource.slice(helperStart, helperEnd)};
+    return { unsubscribeAppServerThread };`,
+  )(
+    (value) => String(value || '').trim(),
+    appServerLoadedThreads,
+    appServerUnsubscribeRequests,
+    new Map(),
+    appServerClient,
+    5000,
+    appServerThreadIdleReleaseTimers,
+    appServerThreadIdleReleaseAttempts,
+    () => 250,
+    750,
+    [250, 1000, 3000, 8000],
+    scheduled,
+    { warn() {} },
+  );
+
+  assert.equal(await api.unsubscribeAppServerThread(threadId, { reason: 'test-failure' }), false);
+  assert.equal(appServerLoadedThreads.has(threadId), true);
+  assert.equal(appServerUnsubscribeRequests.size, 0);
+  assert.equal(appServerThreadIdleReleaseAttempts.get(threadId), 1);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].threadId, threadId);
+  assert.equal(scheduled[0].options.delayMs, 250);
+  assert.equal(requests.length, 1);
+
+  failUnsubscribe = false;
+  requests.length = 0;
+  scheduled.length = 0;
+  appServerThreadIdleReleaseAttempts.clear();
+  appServerLoadedThreads.set(threadId, { connection, turnId: 'turn-old', loadedAt: 1 });
+  assert.equal(
+    await api.unsubscribeAppServerThread(threadId, {
+      expectedTurnId: 'turn-new',
+      reason: 'test-mismatch',
+    }),
+    false,
+  );
+  assert.equal(appServerLoadedThreads.has(threadId), true);
+  assert.deepEqual(requests, []);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].options.delayMs, 750);
+});
+
+test('ambiguous app-server turns reconcile terminal, running, and idle states without replaying work', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isAppServerThreadAlreadyUnsubscribedError');
+  const helperEnd = serverSource.indexOf('\nasync function unsubscribeAllAppServerThreads', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const appServerLoadedThreads = new Map();
+  const appServerUnsubscribeRequests = new Map();
+  const appServerThreadReconcileRequests = new Map();
+  const appServerThreadIdleReleaseTimers = new Map();
+  const appServerThreadIdleReleaseAttempts = new Map();
+  const pendingNativeRequests = new Map();
+  const nativeTurnReservations = new Set();
+  const serverPromptQueueDispatchingThreads = new Set();
+  const activeNativeTurns = new Map();
+  const conversations = new Map();
+  const requests = [];
+  const updates = [];
+  const scheduled = [];
+  let probeResponse = { data: [{ id: 'turn-a', status: 'completed' }] };
+  let probeError = null;
+  let holdProbe = false;
+  let resolveHeldProbe = null;
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    requestWithConnection: async (method, params, options) => {
+      requests.push({ method, params, options });
+      if (method === 'thread/turns/list') {
+        if (holdProbe) {
+          return new Promise((resolve, reject) => {
+            resolveHeldProbe = () => {
+              if (probeError) {
+                reject(probeError);
+                return;
+              }
+              resolve({ result: probeResponse, child: connection });
+            };
+          });
+        }
+        if (probeError) throw probeError;
+        return { result: probeResponse, child: connection };
+      }
+      return { result: { status: 'unsubscribed' }, child: connection };
+    },
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'appServerLoadedThreads',
+    'appServerUnsubscribeRequests',
+    'appServerThreadReconcileRequests',
+    'pendingNativeRequests',
+    'nativeTurnReservations',
+    'serverPromptQueueDispatchingThreads',
+    'activeNativeTurns',
+    'nativeSessions',
+    'appServerClient',
+    'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
+    'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
+    'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
+    'nativeConversationHasFreshRunningActivity',
+    'nativeTurnHasPersistedTerminal',
+    'nativeTurnStatus',
+    'markAppServerThreadTurn',
+    'setNativeTurnState',
+    'appServerThreadIdleReleaseTimers',
+    'appServerThreadIdleReleaseAttempts',
+    'appServerThreadIdleReleaseRetryDelay',
+    'APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS',
+    'APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS',
+    'scheduled',
+    'console',
+    `function clearAppServerThreadIdleReleaseTimer(threadId) {
+      const timer = appServerThreadIdleReleaseTimers.get(threadId);
+      if (timer) clearTimeout(timer);
+      appServerThreadIdleReleaseTimers.delete(threadId);
+    }
+    function scheduleAppServerThreadIdleRelease(threadId, options = {}) {
+      scheduled.push({ threadId, options });
+    }
+    ${serverSource.slice(helperStart, helperEnd)};
+    function releaseAppServerThreadAfterTurn(threadId, turnId, options = {}) {
+      const result = unsubscribeAppServerThread(threadId, {
+        expectedTurnId: turnId,
+        ...options,
+      });
+      return result;
+    }
+    return {
+      reconcileUnconfirmedAppServerThread,
+      unsubscribeAppServerThread,
+    };`,
+  )(
+    (value) => String(value || '').trim(),
+    appServerLoadedThreads,
+    appServerUnsubscribeRequests,
+    appServerThreadReconcileRequests,
+    pendingNativeRequests,
+    nativeTurnReservations,
+    serverPromptQueueDispatchingThreads,
+    activeNativeTurns,
+    { get: (threadId) => conversations.get(threadId) || null },
+    appServerClient,
+    2500,
+    [0],
+    2500,
+    () => false,
+    (conversation, turnId) => conversation?.messages?.some((message) => (
+      message?.turnId === turnId && message?.role === 'process'
+    )),
+    (status) => ['failed', 'error'].includes(String(status || '').toLowerCase()) ? 'error' : 'done',
+    (threadId, turnId) => {
+      const record = appServerLoadedThreads.get(threadId);
+      if (record) record.turnId = turnId;
+      return Boolean(record);
+    },
+    (threadId, state) => {
+      updates.push({ threadId, state });
+      activeNativeTurns.set(threadId, {
+        ...(activeNativeTurns.get(threadId) || {}),
+        ...state,
+      });
+    },
+    appServerThreadIdleReleaseTimers,
+    appServerThreadIdleReleaseAttempts,
+    () => 250,
+    750,
+    [250, 1000, 3000, 8000],
+    scheduled,
+    { warn() {} },
+  );
+
+  const threadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  appServerLoadedThreads.set(threadId, { connection, turnId: '', loadedAt: 0 });
+  conversations.set(threadId, { status: 'done', messages: [] });
+  let result = await api.reconcileUnconfirmedAppServerThread(threadId, '', {
+    retryDelays: [0],
+    reason: 'test-terminal',
+  });
+  assert.equal(result.released, true);
+  assert.equal(result.state, 'terminal');
+  assert.equal(appServerLoadedThreads.has(threadId), false);
+  assert.deepEqual(requests.map((request) => request.method), ['thread/turns/list', 'thread/unsubscribe']);
+  assert.deepEqual(requests[0].params, {
+    threadId,
+    limit: 1,
+    sortDirection: 'desc',
+    itemsView: 'notLoaded',
+  });
+  assert.equal(requests[0].options.timeoutMs, 2500);
+
+  requests.length = 0;
+  updates.length = 0;
+  probeResponse = { data: [{ id: 'turn-running', status: 'inProgress' }] };
+  appServerLoadedThreads.set(threadId, { connection, turnId: '', loadedAt: 0 });
+  conversations.set(threadId, { status: 'running', messages: [] });
+  result = await api.reconcileUnconfirmedAppServerThread(threadId, '', {
+    retryDelays: [0],
+    reason: 'test-running',
+    allowProbeWhileBusy: true,
+  });
+  assert.equal(result.released, false);
+  assert.equal(result.state, 'running');
+  assert.equal(appServerLoadedThreads.get(threadId).turnId, 'turn-running');
+  assert.equal(activeNativeTurns.get(threadId)?.status, 'running');
+  assert.deepEqual(requests.map((request) => request.method), ['thread/turns/list']);
+  assert.equal(updates.length, 1);
+
+  requests.length = 0;
+  updates.length = 0;
+  probeResponse = { data: [] };
+  activeNativeTurns.clear();
+  conversations.set(threadId, { status: 'done', messages: [] });
+  result = await api.reconcileUnconfirmedAppServerThread(threadId, '', {
+    retryDelays: [0],
+    reason: 'test-idle',
+  });
+  assert.equal(result.released, true);
+  assert.equal(result.state, 'idle');
+  assert.equal(appServerLoadedThreads.has(threadId), false);
+  assert.deepEqual(requests.map((request) => request.method), ['thread/turns/list', 'thread/unsubscribe']);
+
+  for (const message of ['thread is not materialized', 'thread not found']) {
+    requests.length = 0;
+    probeError = new Error(message);
+    activeNativeTurns.clear();
+    appServerLoadedThreads.set(threadId, { connection, turnId: '', loadedAt: 0 });
+    conversations.set(threadId, { status: 'done', messages: [] });
+    result = await api.reconcileUnconfirmedAppServerThread(threadId, '', {
+      retryDelays: [0],
+      reason: `test-${message}`,
+    });
+    assert.equal(result.released, true);
+    assert.equal(result.state, 'idle');
+    assert.equal(appServerLoadedThreads.has(threadId), false);
+    assert.deepEqual(requests.map((request) => request.method), ['thread/turns/list', 'thread/unsubscribe']);
+  }
+
+  probeError = null;
+  requests.length = 0;
+  activeNativeTurns.clear();
+  appServerLoadedThreads.set(threadId, { connection, turnId: '', loadedAt: 0 });
+  conversations.set(threadId, { status: 'done', messages: [] });
+  holdProbe = true;
+  const firstReconcile = api.reconcileUnconfirmedAppServerThread(threadId, '', {
+    retryDelays: [0],
+    reason: 'test-concurrent',
+  });
+  assert.equal(requests.length, 1);
+  const secondReconcile = api.reconcileUnconfirmedAppServerThread(threadId, '', {
+    retryDelays: [0],
+    reason: 'test-concurrent-duplicate',
+  });
+  assert.equal(firstReconcile, secondReconcile);
+  assert.equal(requests.length, 1);
+  assert.equal(typeof resolveHeldProbe, 'function');
+  holdProbe = false;
+  resolveHeldProbe();
+  const [firstResult, secondResult] = await Promise.all([firstReconcile, secondReconcile]);
+  assert.deepEqual(firstResult, secondResult);
+  assert.equal(firstResult.released, true);
+  assert.equal(appServerLoadedThreads.has(threadId), false);
+  assert.deepEqual(requests.map((request) => request.method), ['thread/turns/list', 'thread/unsubscribe']);
+  assert.equal(scheduled.length, 0);
+});
+
+test('ambiguous app-server probe retries are bounded and never start another turn', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isAppServerThreadAlreadyUnsubscribedError');
+  const helperEnd = serverSource.indexOf('\nasync function unsubscribeAllAppServerThreads', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const threadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  const appServerLoadedThreads = new Map([[threadId, { connection, turnId: '', loadedAt: 0 }]]);
+  const appServerUnsubscribeRequests = new Map();
+  const appServerThreadReconcileRequests = new Map();
+  const appServerThreadIdleReleaseTimers = new Map();
+  const appServerThreadIdleReleaseAttempts = new Map();
+  const requests = [];
+  const scheduled = [];
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    requestWithConnection: async (method) => {
+      requests.push(method);
+      throw new Error('Codex app-server 请求超时: thread/turns/list');
+    },
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'appServerLoadedThreads',
+    'appServerUnsubscribeRequests',
+    'appServerThreadReconcileRequests',
+    'pendingNativeRequests',
+    'nativeTurnReservations',
+    'serverPromptQueueDispatchingThreads',
+    'activeNativeTurns',
+    'nativeSessions',
+    'appServerClient',
+    'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
+    'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
+    'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
+    'nativeConversationHasFreshRunningActivity',
+    'nativeTurnHasPersistedTerminal',
+    'nativeTurnStatus',
+    'markAppServerThreadTurn',
+    'setNativeTurnState',
+    'appServerThreadIdleReleaseTimers',
+    'appServerThreadIdleReleaseAttempts',
+    'appServerThreadIdleReleaseRetryDelay',
+    'APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS',
+    'APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS',
+    'scheduled',
+    'console',
+    `function clearAppServerThreadIdleReleaseTimer(threadId) {
+      const timer = appServerThreadIdleReleaseTimers.get(threadId);
+      if (timer) clearTimeout(timer);
+      appServerThreadIdleReleaseTimers.delete(threadId);
+    }
+    function scheduleAppServerThreadIdleRelease(threadId, options = {}) {
+      scheduled.push({ threadId, options });
+    }
+    ${serverSource.slice(helperStart, helperEnd)};
+    function releaseAppServerThreadAfterTurn(threadId, turnId, options = {}) {
+      return unsubscribeAppServerThread(threadId, {
+        expectedTurnId: turnId,
+        ...options,
+      });
+    }
+    return { reconcileUnconfirmedAppServerThread };`,
+  )(
+    (value) => String(value || '').trim(),
+    appServerLoadedThreads,
+    appServerUnsubscribeRequests,
+    appServerThreadReconcileRequests,
+    new Map(),
+    new Set(),
+    new Set(),
+    new Map(),
+    { get: () => ({ status: 'done', messages: [] }) },
+    appServerClient,
+    2500,
+    [0, 0, 0],
+    2500,
+    () => false,
+    () => false,
+    () => 'done',
+    () => true,
+    () => {},
+    appServerThreadIdleReleaseTimers,
+    appServerThreadIdleReleaseAttempts,
+    () => 250,
+    750,
+    [250, 1000, 3000, 8000],
+    scheduled,
+    { warn() {} },
+  );
+
+  const result = await api.reconcileUnconfirmedAppServerThread(threadId, '', {
+    retryDelays: [0, 0, 0],
+    reason: 'test-timeout',
+  });
+  assert.equal(result.released, false);
+  assert.equal(result.state, 'unknown');
+  assert.deepEqual(requests, ['thread/turns/list', 'thread/turns/list', 'thread/turns/list']);
+  assert.equal(appServerLoadedThreads.has(threadId), true);
+  assert.ok(requests.every((method) => method === 'thread/turns/list'));
+  assert.equal(appServerThreadReconcileRequests.size, 0);
+  assert.equal(scheduled.length, 0);
+});
+
+test('malformed app-server latest-turn probes never release a Web subscription', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isAppServerThreadAlreadyUnsubscribedError');
+  const helperEnd = serverSource.indexOf('\nasync function unsubscribeAllAppServerThreads', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const threadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  const appServerLoadedThreads = new Map();
+  const appServerUnsubscribeRequests = new Map();
+  const appServerThreadReconcileRequests = new Map();
+  const appServerThreadIdleReleaseTimers = new Map();
+  const appServerThreadIdleReleaseAttempts = new Map();
+  const requests = [];
+  const scheduled = [];
+  const malformedResponses = [
+    ['missing data', {}],
+    ['data is not an array', { data: {} }],
+    ['turn is null', { data: [null] }],
+    ['turn is an array', { data: [[]] }],
+    ['turn is missing id', { data: [{ status: 'completed' }] }],
+    ['turn is missing status', { data: [{ id: 'turn-malformed' }] }],
+  ];
+  let probeResponse = null;
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    requestWithConnection: async (method, params, options) => {
+      requests.push({ method, params, options });
+      if (method === 'thread/turns/list') {
+        return { result: probeResponse, child: connection };
+      }
+      return { result: { status: 'unsubscribed' }, child: connection };
+    },
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'appServerLoadedThreads',
+    'appServerUnsubscribeRequests',
+    'appServerThreadReconcileRequests',
+    'pendingNativeRequests',
+    'nativeTurnReservations',
+    'serverPromptQueueDispatchingThreads',
+    'activeNativeTurns',
+    'nativeSessions',
+    'appServerClient',
+    'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
+    'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
+    'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
+    'nativeConversationHasFreshRunningActivity',
+    'nativeTurnHasPersistedTerminal',
+    'nativeTurnStatus',
+    'markAppServerThreadTurn',
+    'setNativeTurnState',
+    'appServerThreadIdleReleaseTimers',
+    'appServerThreadIdleReleaseAttempts',
+    'appServerThreadIdleReleaseRetryDelay',
+    'APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS',
+    'APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS',
+    'scheduled',
+    'console',
+    `function clearAppServerThreadIdleReleaseTimer(threadId) {
+      const timer = appServerThreadIdleReleaseTimers.get(threadId);
+      if (timer) clearTimeout(timer);
+      appServerThreadIdleReleaseTimers.delete(threadId);
+    }
+    function scheduleAppServerThreadIdleRelease(threadId, options = {}) {
+      scheduled.push({ threadId, options });
+    }
+    ${serverSource.slice(helperStart, helperEnd)};
+    function releaseAppServerThreadAfterTurn(threadId, turnId, options = {}) {
+      return unsubscribeAppServerThread(threadId, {
+        expectedTurnId: turnId,
+        ...options,
+      });
+    }
+    return { reconcileUnconfirmedAppServerThread };`,
+  )(
+    (value) => String(value || '').trim(),
+    appServerLoadedThreads,
+    appServerUnsubscribeRequests,
+    appServerThreadReconcileRequests,
+    new Map(),
+    new Set(),
+    new Set(),
+    new Map(),
+    { get: () => ({ status: 'done', messages: [] }) },
+    appServerClient,
+    2500,
+    [0],
+    2500,
+    () => false,
+    () => false,
+    () => 'done',
+    () => true,
+    () => {},
+    appServerThreadIdleReleaseTimers,
+    appServerThreadIdleReleaseAttempts,
+    () => 250,
+    750,
+    [250, 1000, 3000, 8000],
+    scheduled,
+    { warn() {} },
+  );
+
+  for (const [label, response] of malformedResponses) {
+    const record = { connection, turnId: 'turn-expected', loadedAt: 0 };
+    appServerLoadedThreads.set(threadId, record);
+    appServerThreadReconcileRequests.clear();
+    appServerUnsubscribeRequests.clear();
+    requests.length = 0;
+    scheduled.length = 0;
+    probeResponse = response;
+
+    const result = await api.reconcileUnconfirmedAppServerThread(threadId, '', {
+      record,
+      retryDelays: [0],
+      reason: `test-${label}`,
+    });
+
+    assert.equal(result.released, false, label);
+    assert.equal(result.state, 'unknown', label);
+    assert.equal(appServerLoadedThreads.get(threadId), record, label);
+    assert.equal(appServerUnsubscribeRequests.size, 0, label);
+    assert.deepEqual(requests.map((request) => request.method), ['thread/turns/list'], label);
+    assert.equal(scheduled.length, 0, label);
+  }
+});
+
+test('an in-flight app-server probe cannot clean up a replacement record', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function isAppServerThreadAlreadyUnsubscribedError');
+  const helperEnd = serverSource.indexOf('\nasync function unsubscribeAllAppServerThreads', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const threadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  const oldRecord = { connection, turnId: 'turn-old', loadedAt: 1 };
+  const newRecord = { connection, turnId: 'turn-new', loadedAt: 2 };
+  const appServerLoadedThreads = new Map([[threadId, oldRecord]]);
+  const appServerUnsubscribeRequests = new Map();
+  const appServerThreadReconcileRequests = new Map();
+  const appServerThreadIdleReleaseTimers = new Map();
+  const appServerThreadIdleReleaseAttempts = new Map();
+  const requests = [];
+  const scheduled = [];
+  const probeResolvers = [];
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    requestWithConnection: async (method, params, options) => {
+      requests.push({ method, params, options });
+      if (method === 'thread/turns/list') {
+        return new Promise((resolve) => {
+          probeResolvers.push(() => resolve({
+            result: { data: [{ id: 'turn-completed', status: 'completed' }] },
+            child: connection,
+          }));
+        });
+      }
+      return { result: { status: 'unsubscribed' }, child: connection };
+    },
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'appServerLoadedThreads',
+    'appServerUnsubscribeRequests',
+    'appServerThreadReconcileRequests',
+    'pendingNativeRequests',
+    'nativeTurnReservations',
+    'serverPromptQueueDispatchingThreads',
+    'activeNativeTurns',
+    'nativeSessions',
+    'appServerClient',
+    'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
+    'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
+    'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
+    'nativeConversationHasFreshRunningActivity',
+    'nativeTurnHasPersistedTerminal',
+    'nativeTurnStatus',
+    'markAppServerThreadTurn',
+    'setNativeTurnState',
+    'appServerThreadIdleReleaseTimers',
+    'appServerThreadIdleReleaseAttempts',
+    'appServerThreadIdleReleaseRetryDelay',
+    'APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS',
+    'APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS',
+    'scheduled',
+    'console',
+    `function clearAppServerThreadIdleReleaseTimer(threadId) {
+      const timer = appServerThreadIdleReleaseTimers.get(threadId);
+      if (timer) clearTimeout(timer);
+      appServerThreadIdleReleaseTimers.delete(threadId);
+    }
+    function scheduleAppServerThreadIdleRelease(threadId, options = {}) {
+      scheduled.push({ threadId, options });
+    }
+    ${serverSource.slice(helperStart, helperEnd)};
+    function releaseAppServerThreadAfterTurn(threadId, turnId, options = {}) {
+      return unsubscribeAppServerThread(threadId, {
+        expectedTurnId: turnId,
+        ...options,
+      });
+    }
+    return { reconcileUnconfirmedAppServerThread };`,
+  )(
+    (value) => String(value || '').trim(),
+    appServerLoadedThreads,
+    appServerUnsubscribeRequests,
+    appServerThreadReconcileRequests,
+    new Map(),
+    new Set(),
+    new Set(),
+    new Map(),
+    { get: () => ({ status: 'done', messages: [] }) },
+    appServerClient,
+    2500,
+    [0],
+    2500,
+    () => false,
+    () => false,
+    () => 'done',
+    (threadId, turnId, expectedRecord) => {
+      const record = appServerLoadedThreads.get(threadId);
+      if (record === expectedRecord) record.turnId = turnId;
+      return record === expectedRecord;
+    },
+    () => {},
+    appServerThreadIdleReleaseTimers,
+    appServerThreadIdleReleaseAttempts,
+    () => 250,
+    750,
+    [250, 1000, 3000, 8000],
+    scheduled,
+    { warn() {} },
+  );
+
+  const oldProbe = api.reconcileUnconfirmedAppServerThread(threadId, '', {
+    record: oldRecord,
+    retryDelays: [0],
+    reason: 'test-old-probe',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.filter((request) => request.method === 'thread/turns/list').length, 1);
+  assert.equal(probeResolvers.length, 1);
+
+  appServerLoadedThreads.set(threadId, newRecord);
+  const newProbe = api.reconcileUnconfirmedAppServerThread(threadId, '', {
+    record: newRecord,
+    retryDelays: [0],
+    reason: 'test-new-probe',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.filter((request) => request.method === 'thread/turns/list').length, 2);
+  assert.notEqual(oldProbe, newProbe);
+  assert.equal(appServerThreadReconcileRequests.get(threadId), newProbe);
+
+  probeResolvers[0]();
+  const oldResult = await oldProbe;
+  assert.deepEqual(oldResult, { released: false, state: 'record-replaced' });
+  assert.equal(appServerLoadedThreads.get(threadId), newRecord);
+  assert.equal(
+    appServerThreadReconcileRequests.get(threadId),
+    newProbe,
+    'the old probe finally must not remove the replacement probe',
+  );
+  assert.deepEqual(
+    requests.map((request) => request.method),
+    ['thread/turns/list', 'thread/turns/list'],
+  );
+
+  probeResolvers[1]();
+  const newResult = await newProbe;
+  assert.equal(newResult.released, true);
+  assert.equal(appServerLoadedThreads.has(threadId), false);
+  assert.equal(appServerThreadReconcileRequests.size, 0);
+  assert.equal(appServerUnsubscribeRequests.size, 0);
+  assert.deepEqual(
+    requests.map((request) => request.method),
+    ['thread/turns/list', 'thread/turns/list', 'thread/unsubscribe'],
+  );
+});
+
+test('ambiguous thread loading only reconciles resume, never the source of a fork or start', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function requestLoadedAppServerThread');
+  const helperEnd = serverSource.indexOf('\nfunction markAppServerThreadLoaded', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const sourceThreadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  const sourceRecord = { connection, turnId: 'turn-source', loadedAt: 1 };
+  const appServerLoadedThreads = new Map([[sourceThreadId, sourceRecord]]);
+  const requests = [];
+  const marks = [];
+  const reconciles = [];
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    requestWithConnection: async (method, params, options) => {
+      requests.push({ method, params, options });
+      throw new Error('Codex app-server 请求超时');
+    },
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'appServerClient',
+    'waitForAppServerThreadUnsubscribe',
+    'markAppServerThreadLoaded',
+    'appServerLoadedThreads',
+    'reconcileUnconfirmedAppServerThread',
+    'isAmbiguousAppServerRequestError',
+    `${serverSource.slice(helperStart, helperEnd)}; return { requestLoadedAppServerThread };`,
+  )(
+    (value) => String(value || '').trim(),
+    appServerClient,
+    async () => true,
+    (threadId, child) => {
+      marks.push({ threadId, child });
+      return true;
+    },
+    appServerLoadedThreads,
+    async (threadId, turnId, options) => {
+      reconciles.push({ threadId, turnId, options });
+      return { released: false, state: 'unknown' };
+    },
+    () => true,
+  );
+
+  for (const method of ['thread/fork', 'thread/start']) {
+    await assert.rejects(
+      api.requestLoadedAppServerThread(
+        method,
+        method === 'thread/fork' ? { threadId: sourceThreadId } : {},
+      ),
+      /请求超时/,
+    );
+    assert.equal(appServerLoadedThreads.get(sourceThreadId), sourceRecord);
+  }
+  assert.equal(marks.length, 0);
+  assert.equal(reconciles.length, 0);
+
+  await assert.rejects(
+    api.requestLoadedAppServerThread('thread/resume', { threadId: sourceThreadId }),
+    /请求超时/,
+  );
+  assert.deepEqual(marks, [{ threadId: sourceThreadId, child: connection }]);
+  assert.equal(reconciles.length, 1);
+  assert.equal(reconciles[0].threadId, sourceThreadId);
+  assert.equal(reconciles[0].turnId, '');
+  assert.equal(reconciles[0].options.allowProbeWhileBusy, true);
+  assert.equal(appServerLoadedThreads.get(sourceThreadId), sourceRecord);
+  assert.deepEqual(
+    requests.map((request) => request.method),
+    ['thread/fork', 'thread/start', 'thread/resume'],
+  );
+});
+
+test('a pending new-session turn/start keeps its Web subscription reserved', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const routeStart = serverSource.indexOf("app.post('/api/native-sessions',");
+  const routeEnd = serverSource.indexOf("\napp.post('/api/native-sessions/:id/turns'", routeStart);
+  const helperStart = serverSource.indexOf('function clearAppServerThreadIdleReleaseTimer');
+  const helperEnd = serverSource.indexOf('\nasync function unsubscribeAllAppServerThreads', helperStart);
+  const turnStart = serverSource.indexOf('async function startNativeTurn');
+  const turnEnd = serverSource.indexOf('\nfunction buildDesktopTurnStartParams', turnStart);
+  assert.ok(routeStart >= 0 && routeEnd > routeStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  assert.ok(turnStart >= 0 && turnEnd > turnStart);
+  assert.match(
+    serverSource.slice(routeStart, routeEnd),
+    /nativeTurnReservations\.add\(threadId\)/,
+    'new sessions must reserve the thread before turn/start',
+  );
+
+  const threadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  const connection = {};
+  const record = { connection, turnId: '', loadedAt: 0 };
+  const appServerLoadedThreads = new Map([[threadId, record]]);
+  const appServerUnsubscribeRequests = new Map();
+  const appServerThreadReconcileRequests = new Map();
+  const appServerThreadIdleReleaseTimers = new Map();
+  const appServerThreadIdleReleaseAttempts = new Map();
+  const pendingNativeRequests = new Map();
+  const nativeTurnReservations = new Set([threadId]);
+  const serverPromptQueueDispatchingThreads = new Set();
+  const activeNativeTurns = new Map();
+  const requests = [];
+  const timers = [];
+  let resolveTurnStart;
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    request: async (method) => {
+      if (method !== 'turn/start') throw new Error(`unexpected app-server method: ${method}`);
+      return new Promise((resolve) => {
+        resolveTurnStart = resolve;
+      });
+    },
+    requestWithConnection: async (method, params, options) => {
+      requests.push({ method, params, options });
+      if (method === 'thread/turns/list') {
+        return { result: { data: [] }, child: connection };
+      }
+      return { result: { status: 'unsubscribed' }, child: connection };
+    },
+  };
+  const fakeSetTimeout = (callback, delay) => {
+    const timer = { callback, delay, cleared: false, unref() {} };
+    timers.push(timer);
+    return timer;
+  };
+  const fakeClearTimeout = (timer) => {
+    if (timer) timer.cleared = true;
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'appServerLoadedThreads',
+    'appServerUnsubscribeRequests',
+    'appServerThreadReconcileRequests',
+    'pendingNativeRequests',
+    'nativeTurnReservations',
+    'serverPromptQueueDispatchingThreads',
+    'activeNativeTurns',
+    'nativeSessions',
+    'appServerClient',
+    'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
+    'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
+    'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
+    'nativeConversationHasFreshRunningActivity',
+    'nativeTurnHasPersistedTerminal',
+    'nativeTurnStatus',
+    'markAppServerThreadTurn',
+    'setNativeTurnState',
+    'appServerThreadIdleReleaseTimers',
+    'appServerThreadIdleReleaseAttempts',
+    'appServerThreadIdleReleaseRetryDelay',
+    'APP_SERVER_THREAD_IDLE_RELEASE_BUSY_RETRY_MS',
+    'APP_SERVER_THREAD_IDLE_RELEASE_RETRY_DELAYS_MS',
+    'APP_SERVER_THREAD_IDLE_RELEASE_GRACE_MS',
+    'scheduleServerPromptQueueDispatch',
+    'compactObjectWithServiceTier',
+    'nativeSandboxPolicy',
+    'isAmbiguousAppServerRequestError',
+    'setTimeout',
+    'clearTimeout',
+    'console',
+    `${serverSource.slice(helperStart, helperEnd)}
+    function releaseAppServerThreadAfterTurn(threadId, turnId, options = {}) {
+      return unsubscribeAppServerThread(threadId, {
+        expectedTurnId: turnId,
+        ...options,
+      });
+    }
+    ${serverSource.slice(turnStart, turnEnd)};
+    return {
+      scheduleAppServerThreadIdleRelease,
+      reconcileUnconfirmedAppServerThread,
+      startNativeTurn,
+    };`,
+  )(
+    (value) => String(value || '').trim(),
+    appServerLoadedThreads,
+    appServerUnsubscribeRequests,
+    appServerThreadReconcileRequests,
+    pendingNativeRequests,
+    nativeTurnReservations,
+    serverPromptQueueDispatchingThreads,
+    activeNativeTurns,
+    { get: () => null },
+    appServerClient,
+    2500,
+    [0],
+    2500,
+    () => false,
+    () => false,
+    () => 'done',
+    (id, turnId) => {
+      const current = appServerLoadedThreads.get(id);
+      if (current) current.turnId = turnId;
+      return Boolean(current);
+    },
+    (id, state) => {
+      activeNativeTurns.set(id, { ...state });
+    },
+    appServerThreadIdleReleaseTimers,
+    appServerThreadIdleReleaseAttempts,
+    () => 250,
+    750,
+    [250, 1000, 3000, 8000],
+    0,
+    () => {},
+    (value, serviceTier) => ({ ...value, serviceTier }),
+    () => ({ type: 'readOnly' }),
+    () => false,
+    fakeSetTimeout,
+    fakeClearTimeout,
+    { warn() {} },
+  );
+
+  api.scheduleAppServerThreadIdleRelease(threadId, {
+    record,
+    delayMs: 0,
+    reason: 'test-pending-turn-start',
+  });
+  const startPromise = api.startNativeTurn(threadId, {
+    input: [{ type: 'text', text: 'slow turn/start' }],
+    cwd: '/tmp',
+    provider: 'fake',
+    model: 'test-model',
+    reasoningEffort: 'medium',
+    approval: 'never',
+    permissionMode: 'never',
+    sandbox: 'read-only',
+    serviceTier: null,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof resolveTurnStart, 'function');
+
+  const firstTimer = appServerThreadIdleReleaseTimers.get(threadId)?.timer;
+  assert.ok(firstTimer);
+  firstTimer.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    requests.map((request) => request.method),
+    [],
+    'the idle timer must stop at the reservation before probing or unsubscribing',
+  );
+  assert.equal(appServerLoadedThreads.get(threadId), record);
+
+  resolveTurnStart({ turn: { id: 'turn-slow', status: 'inProgress' } });
+  const started = await startPromise;
+  assert.equal(started.turnId, 'turn-slow');
+  assert.deepEqual(requests.map((request) => request.method), []);
+  assert.equal(appServerUnsubscribeRequests.size, 0);
+
+  // This mirrors the route finally block after turn/start has settled. Once
+  // the running marker is gone, the same timer chain may clean up normally.
+  nativeTurnReservations.delete(threadId);
+  activeNativeTurns.delete(threadId);
+  const retryTimer = appServerThreadIdleReleaseTimers.get(threadId)?.timer;
+  assert.ok(retryTimer);
+  retryTimer.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    requests.map((request) => request.method),
+    ['thread/turns/list', 'thread/unsubscribe'],
+  );
+  assert.equal(appServerLoadedThreads.has(threadId), false);
+});
+
+test('ambiguous steer and interrupt cleanup retain the record loaded by their resume', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const threadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  const connection = {};
+  const ambiguous = new Error('Codex app-server 请求超时');
+  const desktopUnavailable = Object.assign(new Error('Desktop owner unavailable'), {
+    code: 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+  });
+  const scenarios = [
+    {
+      name: 'steer',
+      startMarker: 'async function steerNativeTurn',
+      endMarker: '\nasync function waitForNativeSteerEcho',
+      rpc: 'turn/steer',
+      invoke: (api) => api.steerNativeTurn(threadId, { input: [{ type: 'text', text: 'steer' }] }, ''),
+      client: {
+        steerTurn: async () => { throw desktopUnavailable; },
+      },
+    },
+    {
+      name: 'interrupt',
+      startMarker: 'async function interruptNativeTurn',
+      endMarker: '\nasync function stopNativeTurnForArchive',
+      rpc: 'turn/interrupt',
+      invoke: (api) => api.interruptNativeTurn(threadId, ''),
+      client: {
+        interruptTurn: async () => { throw desktopUnavailable; },
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const start = serverSource.indexOf(scenario.startMarker);
+    const end = serverSource.indexOf(scenario.endMarker, start);
+    assert.ok(start >= 0 && end > start, scenario.name);
+    const oldRecord = { connection, turnId: 'turn-a', loadedAt: 1 };
+    const replacementRecord = { connection, turnId: 'turn-new', loadedAt: 2 };
+    const appServerLoadedThreads = new Map([[threadId, oldRecord]]);
+    const reconciles = [];
+    const releases = [];
+    const appServerClient = {
+      request: async (method) => {
+        assert.equal(method, scenario.rpc);
+        appServerLoadedThreads.set(threadId, replacementRecord);
+        throw ambiguous;
+      },
+    };
+    const api = new Function(
+      'nativeSessions',
+      'desktopThreadStates',
+      'DEFAULT_CWD',
+      'canonicalizeNativeCwd',
+      'randomBytes',
+      'desktopIpcClient',
+      'buildDesktopTurnInput',
+      'buildDesktopRestoreMessage',
+      'waitForNativeSteerEcho',
+      'isCodexDesktopIpcUnavailableError',
+      'isNativeThreadNotFoundError',
+      'requestLoadedAppServerThread',
+      'findInProgressTurnId',
+      'appServerClient',
+      'isAmbiguousAppServerRequestError',
+      'reconcileUnconfirmedAppServerThread',
+      'releaseAppServerThreadAfterTurn',
+      'markAppServerThreadTurn',
+      'activeNativeTurns',
+      'appServerLoadedThreads',
+      'CODEX_DESKTOP_IPC_INTERRUPT_TIMEOUT_MS',
+      'APP_SERVER_INTERRUPT_TIMEOUT_MS',
+      'console',
+      `${serverSource.slice(start, end)}; return { ${scenario.name}NativeTurn };`,
+    )(
+      { get: () => ({ metadata: { cwd: '/tmp' } }) },
+      new Map(),
+      '/tmp',
+      (value) => value,
+      () => ({ toString: () => 'a'.repeat(32) }),
+      scenario.client,
+      (value) => value,
+      (value) => value,
+      async () => null,
+      (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+      () => false,
+      async () => {
+        appServerLoadedThreads.set(threadId, oldRecord);
+        return { thread: { turns: [{ id: 'turn-a', status: 'inProgress' }] } };
+      },
+      () => 'turn-a',
+      appServerClient,
+      (error) => error === ambiguous,
+      async (...args) => { reconciles.push(args); return { released: false, state: 'running' }; },
+      async (...args) => { releases.push(args); return true; },
+      () => true,
+      new Map(),
+      appServerLoadedThreads,
+      100,
+      100,
+      { warn() {} },
+    );
+
+    await assert.rejects(
+      scenario.invoke(api),
+      (error) => error === ambiguous,
+      scenario.name,
+    );
+    assert.equal(reconciles.length, 1, scenario.name);
+    assert.equal(reconciles[0][2].record, oldRecord, scenario.name);
+    assert.equal(appServerLoadedThreads.get(threadId), replacementRecord, scenario.name);
+    assert.equal(releases.length, 0, scenario.name);
+  }
 });
 
 test('Desktop snapshots and patches synchronize live and terminal turn state', async () => {
@@ -1277,6 +2426,56 @@ test('active-writer conflicts are classified without matching generic active sta
   assert.equal(friendly.statusCode, 409);
   assert.equal(friendly.code, 'CODEX_NATIVE_ACTIVE_WRITER');
   assert.doesNotMatch(friendly.message, /active writer|thread-store/i);
+});
+
+test('Desktop handoff stops when Web subscription release is not confirmed', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  let desktopCalls = 0;
+  const conflict = Object.assign(new Error('Web subscription still active'), {
+    code: 'CODEX_NATIVE_ACTIVE_WRITER',
+    statusCode: 409,
+  });
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    'isCodexDesktopIpcUnavailableError',
+    'isAmbiguousDesktopTurnStartError',
+    'CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => { throw new Error('fallback must not run'); },
+    () => false,
+    () => conflict,
+    async () => false,
+    async () => {
+      desktopCalls += 1;
+      return { turnId: 'unexpected' };
+    },
+    () => false,
+    () => false,
+    [0],
+    25,
+    40,
+  );
+
+  await assert.rejects(
+    api.continueNativeTurn('019edad7-8eda-7622-bf2f-7c0bf4fdd063', { provider: 'fake' }),
+    (error) => error === conflict,
+  );
+  assert.equal(desktopCalls, 0);
 });
 
 test('active-writer archive fallback requires an explicit latest-turn terminal record', async () => {
@@ -2950,7 +4149,9 @@ if (args[0] === 'app-server') {
         }
         send({ id: message.id, result: { thread: thread(message.params.threadId || fixtureThreadId) } });
       }
-      else if (message.method === 'thread/unsubscribe') send({ id: message.id, result: {} });
+      else if (message.method === 'thread/unsubscribe') {
+        send({ id: message.id, result: { status: 'unsubscribed' } });
+      }
       else if (message.method === 'turn/start') {
         const turnId = '019f4f84-ea9f-73c2-b997-deba7b4aa798';
         const text = (message.params.input || []).find((item) => item.type === 'text')?.text || '';
@@ -4454,10 +5655,11 @@ updated_at = 1784422800000
     assert.match(page, /typeSelect\.title='渠道类型由当前额度来源固定'/);
     assert.match(page, /for\(const provider of \['cpa-codex','sub2api','grok2api','deepseek','openai-compatible'\]\)/);
     assert.match(page, /subQuotaAddSourceButton\.addEventListener\('click',\(\)=>addSubQuotaSettingsSource\(subQuotaAddSourceType\.value\)\)/);
-    assert.match(page, /'openai-compatible':\{title:'OpenAI 兼容',detail:'检测 \/v1\/models 连通性，不提供余额'/);
+    assert.match(page, /'openai-compatible':\{title:'OpenAI 兼容',detail:'检测 \/v1\/models；New API 自动读取额度'/);
     assert.match(page, /if\(quota\.provider==='openai-compatible'\)\{/);
-    assert.match(page, /statusTitle\.textContent=stale\?'最近检测可用':'已连接'/);
-    assert.match(page, /已通过 \/v1\/models 连通性检测，兼容协议不提供余额。/);
+    assert.match(page, /function isSubQuotaNewApi\(quota\)/);
+    assert.match(page, /const newApiDetails=isNewApiQuota\?subQuotaNewApiDetails\(quota\):null/);
+    assert.match(page, /已通过 \/v1\/models 连通性检测；该兼容服务未提供标准余额接口。/);
     assert.match(page, /source\.dataset\.provider=String\(quota\.provider\|\|''\)/);
     assert.match(page, /source\.dataset\.sourceId=isCodexApp\?'codex-app':String\(quota\.sourceId\|\|quota\.id\|\|''\)/);
     assert.match(page, /footer\.className='subQuotaSettingsFooter'/);
@@ -4913,6 +6115,190 @@ updated_at = 1784422800000
     assert.equal(previewToggle.dataset.previewOpen, undefined);
     subQuotaPreviewApi.showSubQuotaPreview();
     assert.equal(subQuotaLoads, 2);
+    const renderSubQuotaHelper = inlineScript.match(/(function renderSubQuota\(data\)[\s\S]*?)(?=function subQuotaProgressPercent)/)?.[1];
+    assert.ok(renderSubQuotaHelper);
+    const newApiQuotaHelpers = inlineScript.match(/(function isSubQuotaNewApi\(quota\)[\s\S]*?)(?=function renderSubQuota)/)?.[1];
+    assert.ok(newApiQuotaHelpers);
+    const newApiQuotaApi = new Function(
+      'finiteSubQuotaNumber',
+      newApiQuotaHelpers + '; return { isSubQuotaNewApi, subQuotaNewApiDetails };',
+    )((value) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null));
+    const makeQuotaNode = () => ({
+      children: [],
+      className: '',
+      dataset: {},
+      hidden: false,
+      style: { setProperty: () => {} },
+      append(...items) {
+        this.children.push(...items);
+      },
+      appendChild(item) {
+        this.children.push(item);
+        return item;
+      },
+      replaceChildren(...items) {
+        this.children = [...items];
+      },
+      setAttribute: () => {},
+      addEventListener: () => {},
+      get childElementCount() {
+        return this.children.length;
+      },
+    });
+    const grokQuotaContent = makeQuotaNode();
+    const grokQuotaStatus = { dataset: {}, textContent: '' };
+    const grokQuotaPrimarySource = { hidden: false, textContent: '' };
+    const renderGrokQuota = new Function(
+      'subQuotaContent',
+      'subQuotaStatus',
+      'subQuotaPrimarySource',
+      'subQuotaErrorMessage',
+      'subQuotaDisplayName',
+      'isSubQuotaNewApi',
+      'subQuotaNewApiDetails',
+      'finiteSubQuotaNumber',
+      'appendSubQuotaExpiry',
+      'appendSubQuotaWindow',
+      'appendSubQuotaMeta',
+      'formatSubQuotaStatus',
+      'subQuotaStaleMetaText',
+      'subQuotaFetchedStatusText',
+      'setIconLabel',
+      'syncGrok2ApiQuota',
+      'resetGrok2ApiQuota',
+      'refreshSubQuotaCountdowns',
+      'document',
+      renderSubQuotaHelper + '; return renderSubQuota;',
+    )(
+      grokQuotaContent,
+      grokQuotaStatus,
+      grokQuotaPrimarySource,
+      () => '',
+      () => 'Grok2API',
+      newApiQuotaApi.isSubQuotaNewApi,
+      newApiQuotaApi.subQuotaNewApiDetails,
+      (value) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null),
+      () => {},
+      () => false,
+      (parent, text) => parent.appendChild({ textContent: text }),
+      () => '',
+      () => '',
+      () => '',
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      { createElement: makeQuotaNode },
+    );
+    renderGrokQuota({
+      configured: true,
+      fetchedAt: '2026-08-27T04:00:00.000Z',
+      quotas: [{
+        id: 'grok-empty',
+        sourceId: 'grok-empty',
+        sourceName: 'Grok2API',
+        planName: 'Build + Console',
+        provider: 'grok2api',
+        accountStats: { pools: { build: { total: 0, available: 0 } } },
+        fetchedAt: '2026-08-27T04:00:00.000Z',
+      }],
+    });
+    assert.equal(grokQuotaContent.childElementCount, 1);
+    const grokQuotaActions = grokQuotaContent.children[0].children.find((item) => item.className === 'subQuotaActions');
+    assert.ok(grokQuotaActions);
+    assert.ok(grokQuotaActions.children.some((item) => item.className === 'subQuotaSync'));
+    assert.ok(grokQuotaActions.children.some((item) => item.className === 'subQuotaActionProgress'));
+    const syncGrokQuotaHelper = inlineScript.match(/(async function syncGrok2ApiQuota\(button\)[\s\S]*?)(?=async function loadSubQuota)/)?.[1];
+    assert.ok(syncGrokQuotaHelper);
+    const matchesSyncSelector = (node, selector) => {
+      const [tagName, ...classNames] = String(selector || '').trim().split('.');
+      return (!tagName || node.tagName === tagName.toUpperCase())
+        && classNames.filter(Boolean).every((className) => node.className.split(/\s+/).includes(className));
+    };
+    const makeSyncNode = (className = '', tagName = 'div') => ({
+      children: [],
+      className,
+      tagName: tagName.toUpperCase(),
+      dataset: {},
+      disabled: false,
+      hidden: false,
+      parentNode: null,
+      textContent: '',
+      appendChild(item) {
+        item.parentNode = this;
+        this.children.push(item);
+        return item;
+      },
+      replaceChildren(...items) {
+        this.children = [];
+        for (const item of items) this.appendChild(item);
+      },
+      querySelector(selector) {
+        return this.querySelectorAll(selector)[0] || null;
+      },
+      querySelectorAll(selector) {
+        const matches = [];
+        const visit = (node) => {
+          for (const child of node.children) {
+            if (matchesSyncSelector(child, selector)) matches.push(child);
+            visit(child);
+          }
+        };
+        visit(this);
+        return matches;
+      },
+      closest(selector) {
+        let node = this;
+        while (node) {
+          if (matchesSyncSelector(node, selector)) return node;
+          node = node.parentNode;
+        }
+        return null;
+      },
+    });
+    const syncedQuotaContent = makeSyncNode();
+    const syncedQuotaStatus = { dataset: {}, textContent: '' };
+    const renderSyncedGrokCard = () => {
+      syncedQuotaContent.replaceChildren();
+      const source = makeSyncNode('subQuotaSource', 'article');
+      const actions = makeSyncNode('subQuotaActions');
+      const syncButton = makeSyncNode('subQuotaSync', 'button');
+      syncButton.dataset.sourceId = 'grok-empty';
+      const actionProgress = makeSyncNode('subQuotaActionProgress', 'span');
+      actionProgress.hidden = true;
+      actions.appendChild(syncButton);
+      actions.appendChild(actionProgress);
+      source.appendChild(actions);
+      syncedQuotaContent.appendChild(source);
+      return syncButton;
+    };
+    let syncButton = renderSyncedGrokCard();
+    const syncGrokQuota = new Function(
+      'subQuotaContent',
+      'subQuotaStatus',
+      'loadSubQuota',
+      'fetch',
+      'window',
+      syncGrokQuotaHelper + '; return syncGrok2ApiQuota;',
+    )(
+      syncedQuotaContent,
+      syncedQuotaStatus,
+      async () => {
+        syncButton = renderSyncedGrokCard();
+      },
+      async () => ({
+        ok: true,
+        json: async () => ({ sync: { succeeded: 2, failed: 0, providerFailures: 0 } }),
+      }),
+      { setTimeout: () => 0 },
+    );
+    await syncGrokQuota(syncButton);
+    const syncedProgress = syncedQuotaContent.querySelector('.subQuotaActionProgress');
+    assert.ok(syncedProgress);
+    assert.equal(syncedProgress.hidden, false);
+    assert.equal(syncedProgress.dataset.state, 'success');
+    assert.equal(syncedProgress.textContent, '同步完成 · 成功 2');
+    assert.equal(syncedQuotaStatus.textContent, '同步完成 · 成功 2');
     const subQuotaStaleHelpers = inlineScript.match(/(function subQuotaStaleMetaText[\s\S]*?)(?=function renderSubQuotaError)/)?.[1];
     assert.ok(subQuotaStaleHelpers);
     const subQuotaStaleApi = new Function(

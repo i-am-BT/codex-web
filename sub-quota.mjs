@@ -20,6 +20,14 @@ const CODEX_USAGE_HEADERS = {
   'User-Agent': 'codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal',
 };
 const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com';
+// New API stores wallet values as integer quota points. The value is
+// configurable per instance and is exposed by the public /api/status route.
+const NEW_API_DEFAULT_QUOTA_PER_UNIT = 500000;
+const NEW_API_USAGE_TOKEN_PATH = '/api/usage/token/';
+const NEW_API_SELF_PATH = '/api/user/self';
+const NEW_API_STATUS_PATH = '/api/status';
+const NEW_API_OPTIONAL_TIMEOUT_MS = 2500;
+const NEW_API_USAGE_RETRY_DELAYS_MS = Object.freeze([250]);
 const TRANSIENT_FETCH_ERROR = Symbol('transientFetchError');
 const SOURCE_WIDE_FETCH_ERROR = Symbol('sourceWideFetchError');
 const PARTIAL_SOURCE_FETCH_ERROR = Symbol('partialSourceFetchError');
@@ -42,6 +50,7 @@ export class SubQuotaService {
     this.cache = null;
     this.pending = null;
     this.lastSuccessfulBySource = new Map();
+    this.lastSuccessfulNewApiByCredential = new Map();
     this.activeCredentialBySource = new Map();
   }
 
@@ -189,30 +198,79 @@ export class SubQuotaService {
     if (!source.apiKey) return [{ ...base, error: missingSourceCredentialMessage(source) }];
 
     try {
-      const data = await this.requestJson(`${source.baseUrl}/v1/models`, {
-        headers: {
-          Accept: 'application/json',
-          Authorization: `Bearer ${source.apiKey}`,
-        },
-      });
+      const headers = {
+        Accept: 'application/json',
+        Authorization: `Bearer ${source.apiKey}`,
+      };
+      const data = await this.requestJson(`${source.baseUrl}/v1/models`, { headers });
       const models = Array.isArray(data) ? data : data?.data;
       if (!Array.isArray(models)) throw new Error('OpenAI 兼容 /v1/models 响应无效');
+      let newApiQuota = null;
+      let optionalProbeError = null;
+      try {
+        // TokenAuth keys expose the New API balance here. Keep the trailing
+        // slash because some deployments redirect the slashless path, and
+        // redirects are intentionally rejected by requestJson.
+        const optionalTimeoutMs = Math.min(this.timeoutMs, NEW_API_OPTIONAL_TIMEOUT_MS);
+        const requestOptionalJson = (path) => this.requestJson(
+          newApiEndpointUrl(source.baseUrl, path),
+          { headers, timeoutMs: optionalTimeoutMs },
+        );
+        const usageData = await this.retryOptionalRead(
+          () => requestOptionalJson(NEW_API_USAGE_TOKEN_PATH),
+        );
+        // The token usage response is the recognition boundary. The status
+        // and self endpoints only enrich a response that was already proven
+        // to be New API; neither is required for detection.
+        let newApiData = normalizeNewApiQuota(usageData);
+        const [statusResult, selfResult] = await Promise.allSettled([
+          requestOptionalJson(NEW_API_STATUS_PATH),
+          requestOptionalJson(NEW_API_SELF_PATH),
+        ]);
+        const statusData = statusResult.status === 'fulfilled' ? statusResult.value : null;
+        if (statusData) {
+          try {
+            newApiData = normalizeNewApiQuota(usageData, { statusData });
+          } catch {
+            // Keep the validated point-valued response if status metadata is
+            // malformed.
+          }
+        }
+        if (selfResult.status === 'fulfilled') {
+          newApiData = mergeNewApiMetadata(newApiData, selfResult.value);
+        }
+        newApiQuota = newApiData;
+        this.lastSuccessfulNewApiByCredential.set(newApiCredentialKey(source), {
+          succeededAt: this.now(),
+          quota: cloneNewApiQuota(newApiData),
+        });
+      } catch (error) {
+        // The New API probe is optional. A normal OpenAI-compatible server
+        // commonly returns 401/404 here; preserve its connectivity result.
+        optionalProbeError = error;
+      }
+      if (!newApiQuota && optionalProbeError) {
+        const cacheKey = newApiCredentialKey(source);
+        const statusCode = Number(optionalProbeError?.statusCode || 0);
+        if ([401, 403, 404, 405, 501].includes(statusCode)) {
+          this.lastSuccessfulNewApiByCredential.delete(cacheKey);
+        } else {
+          const previous = this.lastSuccessfulNewApiByCredential.get(cacheKey);
+          if (previous && this.now() - previous.succeededAt <= LAST_GOOD_TTL_MS) {
+            return [{
+              ...base,
+              ...cloneNewApiQuota(previous.quota),
+              fetchedAt,
+              stale: true,
+              warning: formatFetchError(optionalProbeError),
+            }];
+          }
+        }
+      }
       return [{
         ...base,
         valid: true,
-        mode: 'openai_compatible',
-        status: 'active',
-        planName: 'OpenAI 兼容',
-        unit: '',
-        remaining: null,
-        balance: null,
-        quota: null,
-        subscription: null,
-        rateLimits: [],
-        expiresAt: '',
-        daysUntilExpiry: null,
-        today: null,
-        total: null,
+        ...openAiCompatibleQuota(newApiQuota),
       }];
     } catch (error) {
       return [fetchErrorQuota(base, sanitizeCredentialError(error, [{ apiKey: source.apiKey }]), {
@@ -481,7 +539,13 @@ export class SubQuotaService {
       const key = quotaItemKey(item, index);
       returnedKeys.add(key);
       if (isUsableQuota(item)) {
-        next.set(key, { succeededAt: now, quota: { ...item } });
+        if (!item.stale) {
+          next.set(key, { succeededAt: now, quota: { ...item } });
+        } else if (previous.has(key)) {
+          next.set(key, previous.get(key));
+        } else {
+          next.delete(key);
+        }
         return item;
       }
       if (item[TRANSIENT_FETCH_ERROR]) {
@@ -759,12 +823,31 @@ export class SubQuotaService {
     }
   }
 
+  async retryOptionalRead(request) {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await request();
+      } catch (error) {
+        const delayMs = NEW_API_USAGE_RETRY_DELAYS_MS[attempt];
+        if (delayMs === undefined || !isRetryableReadError(error)) throw error;
+        attempt += 1;
+        await this.sleep(delayMs);
+      }
+    }
+  }
+
   async requestJson(url, options = {}) {
+    const {
+      timeoutMs: requestedTimeoutMs,
+      ...requestOptions
+    } = options;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timeoutMs = positiveNumber(requestedTimeoutMs, this.timeoutMs);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await this.fetchImpl(url, {
-        ...options,
+        ...requestOptions,
         redirect: 'error',
         signal: controller.signal,
       });
@@ -989,6 +1072,22 @@ function credentialPoolKey(source) {
     quotaSourceId(source),
     cleanText(source?.baseUrl, MAX_BASE_URL_LENGTH),
   ].join('::');
+}
+
+function newApiCredentialKey(source) {
+  return `${credentialPoolKey(source)}::${cleanText(source?.credentialId, 80) || 'primary'}`;
+}
+
+function cloneNewApiQuota(quota) {
+  if (!isRecord(quota)) return quota;
+  return {
+    ...quota,
+    quota: isRecord(quota.quota) ? { ...quota.quota } : quota.quota,
+    rateLimits: Array.isArray(quota.rateLimits)
+      ? quota.rateLimits.map((item) => (isRecord(item) ? { ...item } : item))
+      : quota.rateLimits,
+    modelLimits: isRecord(quota.modelLimits) ? { ...quota.modelLimits } : quota.modelLimits,
+  };
 }
 
 function orderedSourceCredentials(source, activeCredentialId = '') {
@@ -1448,6 +1547,405 @@ export function normalizeDeepSeekBalance(data) {
     today: null,
     total: null,
   };
+}
+
+export function normalizeNewApiQuota(data, options = {}) {
+  const records = newApiRecordCandidates(data);
+  if (!records.length) throw new Error('New API 用户响应格式无效');
+  if (records.some((record) => (
+    isExplicitFalse(record.success)
+    || isExplicitFalse(record.ok)
+    || isExplicitFalse(record.code)
+  ))) {
+    throw new Error('New API 用户响应未成功');
+  }
+
+  const unlimited = firstNewApiBoolean(records, [
+    'unlimited_quota',
+    'unlimitedQuota',
+    'unlimited',
+  ]);
+  const totalAvailableField = findNewApiField(records, [
+    'total_available',
+    'totalAvailable',
+  ]);
+  const rawTotalAvailable = newApiQuotaNumber(totalAvailableField, {
+    allowNegative: unlimited === true,
+  });
+  const quotaField = findNewApiField(records, [
+    'quota',
+    'remain_quota',
+    'remainQuota',
+    'remaining_quota',
+    'remainingQuota',
+  ]);
+  const quotaObject = isRecord(quotaField) ? quotaField : null;
+  const rawRemaining = newApiQuotaNumber(
+    quotaObject
+      ? firstNewApiField(quotaObject, ['remaining', 'remain', 'value', 'amount', 'balance', 'quota'])
+      : quotaField,
+    { allowNegative: unlimited === true },
+  );
+  const resolvedRemaining = rawTotalAvailable === null ? rawRemaining : rawTotalAvailable;
+  // A numeric quota field is the recognition boundary. This avoids
+  // misidentifying arbitrary /api/user/self JSON from other gateways. New
+  // API token usage names the same value total_available.
+  if (resolvedRemaining === null) throw new Error('New API 用户响应缺少数字 quota');
+
+  const quotaRecords = quotaObject ? [quotaObject, ...records] : records;
+  const rawUsed = firstNewApiNumber(quotaRecords, [
+    'total_used',
+    'totalUsed',
+    'used_quota',
+    'usedQuota',
+    'used',
+    'consumed_quota',
+    'consumedQuota',
+    'consumed',
+    'usage',
+  ]);
+  const rawGranted = firstNewApiNumber(quotaRecords, [
+    'total_granted',
+    'totalGranted',
+    'granted_quota',
+    'grantedQuota',
+  ]);
+  let rawLimit = firstNewApiNumber(quotaRecords, [
+    'total_quota',
+    'totalQuota',
+    'quota_limit',
+    'quotaLimit',
+    'limit',
+    'total',
+    'max_quota',
+    'maxQuota',
+  ]);
+  if (rawLimit === null) rawLimit = rawGranted;
+  if (unlimited === true) {
+    rawLimit = null;
+  } else if (
+    (rawLimit === null || rawLimit === 0)
+    && resolvedRemaining >= 0
+    && rawUsed !== null
+  ) {
+    rawLimit = resolvedRemaining + rawUsed;
+  }
+
+  const statusData = options.statusData;
+  const statusRecords = newApiRecordCandidates(statusData);
+  const configuredQuotaPerUnit = firstPositiveNewApiNumber(
+    [...statusRecords, ...records],
+    ['quota_per_unit', 'quotaPerUnit', 'credits_per_usd', 'creditsPerUsd'],
+  );
+  const explicitUnit = normalizeNewApiUnit(
+    findNewApiField([...statusRecords, ...records], [
+      'unit',
+      'quota_unit',
+      'quotaUnit',
+      'currency',
+    ]),
+  );
+  const quotaPerUnit = configuredQuotaPerUnit
+    || ((!explicitUnit || explicitUnit === 'USD') ? NEW_API_DEFAULT_QUOTA_PER_UNIT : null);
+  const converted = quotaPerUnit !== null || explicitUnit === 'USD';
+  const unit = converted ? 'USD' : (explicitUnit || 'credits');
+  const divisor = converted
+    ? (quotaPerUnit || 1)
+    : 1;
+  const displayRawRemaining = unlimited === true ? null : Math.max(0, resolvedRemaining);
+  const remaining = normalizeNewApiAmount(displayRawRemaining, divisor);
+  const used = normalizeNewApiAmount(rawUsed, divisor);
+  const limit = normalizeNewApiAmount(rawLimit, divisor);
+
+  const explicitStatus = normalizeNewApiStatus(
+    findNewApiField(records, ['status', 'user_status', 'userStatus', 'state']),
+  );
+  const valid = explicitStatus === 'no_access' || explicitStatus === 'blocked'
+    ? false
+    : true;
+  const expiresAt = cleanNewApiExpiry(findNewApiField(records, [
+    'expires_at',
+    'expiresAt',
+    'expire_at',
+    'expireAt',
+  ]));
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const expiresMilliseconds = expiresAt ? Date.parse(expiresAt) : NaN;
+  const expired = Number.isFinite(expiresMilliseconds) && expiresMilliseconds <= now;
+  const status = !valid
+    ? explicitStatus
+    : explicitStatus && explicitStatus !== 'active'
+      ? explicitStatus
+      : expired
+        ? 'expired'
+        : unlimited === true
+          ? 'unlimited'
+          : remaining === 0
+            ? 'quota_exhausted'
+            : 'active';
+
+  const username = firstNewApiText(records, [
+    'username',
+    'user_name',
+    'userName',
+    'login',
+  ], 120);
+  const displayName = firstNewApiText(records, [
+    'display_name',
+    'displayName',
+    'nickname',
+    'name',
+  ], 120);
+  const group = firstNewApiText(records, [
+    'group',
+    'group_name',
+    'groupName',
+    'user_group',
+    'userGroup',
+    'token_group',
+    'tokenGroup',
+  ], 80);
+  const email = firstNewApiText(records, ['email', 'mail'], 160);
+  const userId = firstNewApiText(records, ['id', 'user_id', 'userId'], 80);
+  const planName = firstNewApiText(records, [
+    'plan_name',
+    'planName',
+    'plan',
+    'subscription_name',
+    'subscriptionName',
+  ], 100) || 'New API';
+  const daysUntilExpiry = Number.isFinite(expiresMilliseconds)
+    ? Math.max(0, Math.ceil((expiresMilliseconds - now) / (24 * 60 * 60 * 1000)))
+    : null;
+  const tokenName = firstNewApiText(records, ['name'], 120);
+  const objectType = firstNewApiText(records, ['object'], 80);
+  const modelLimits = findNewApiField(records, ['model_limits', 'modelLimits']);
+  const modelLimitsEnabled = firstNewApiBoolean(records, [
+    'model_limits_enabled',
+    'modelLimitsEnabled',
+  ]);
+
+  const result = {
+    valid,
+    mode: 'new_api',
+    status,
+    planName,
+    unit,
+    currency: unit,
+    remaining,
+    balance: remaining,
+    quota: {
+      used,
+      limit,
+      remaining,
+      unit,
+    },
+    quotaPoints: displayRawRemaining,
+    usedQuotaPoints: rawUsed,
+    totalQuotaPoints: rawLimit,
+    totalAvailablePoints: displayRawRemaining,
+    totalGrantedPoints: rawGranted,
+    totalUsedPoints: rawUsed,
+    quotaPerUnit,
+    balanceUsd: quotaPerUnit === null ? null : normalizeNewApiAmount(displayRawRemaining, quotaPerUnit),
+    remainingUsd: quotaPerUnit === null ? null : normalizeNewApiAmount(displayRawRemaining, quotaPerUnit),
+    usedQuotaUsd: quotaPerUnit === null ? null : normalizeNewApiAmount(rawUsed, quotaPerUnit),
+    totalQuotaUsd: quotaPerUnit === null ? null : normalizeNewApiAmount(rawLimit, quotaPerUnit),
+    subscription: null,
+    rateLimits: [],
+    expiresAt,
+    daysUntilExpiry,
+    today: null,
+    total: null,
+    unlimited: unlimited === true,
+    newApiDetected: true,
+  };
+  // Never expose the negative sentinel returned by unlimited token usage as a
+  // displayable balance. The used counter remains useful for diagnostics.
+  if (tokenName) result.tokenName = tokenName;
+  if (objectType) result.object = objectType;
+  if (isRecord(modelLimits)) result.modelLimits = modelLimits;
+  if (modelLimitsEnabled !== null) result.modelLimitsEnabled = modelLimitsEnabled;
+  if (username) result.username = username;
+  if (displayName) result.displayName = displayName;
+  if (group) result.group = group;
+  if (email) result.email = email;
+  if (userId) result.userId = userId;
+  return result;
+}
+
+export function normalizeOpenAiCompatibleQuota(data, options = {}) {
+  return normalizeNewApiQuota(data, options);
+}
+
+function mergeNewApiMetadata(quota, data) {
+  if (!quota || !isRecord(data)) return quota;
+  const records = newApiRecordCandidates(data);
+  if (!records.length) return quota;
+  const result = { ...quota };
+  const metadataFields = [
+    ['username', ['username', 'user_name', 'userName', 'login'], 120],
+    ['displayName', ['display_name', 'displayName', 'nickname'], 120],
+    ['group', ['group', 'group_name', 'groupName', 'user_group', 'userGroup', 'token_group', 'tokenGroup'], 80],
+    ['email', ['email', 'mail'], 160],
+    ['userId', ['id', 'user_id', 'userId'], 80],
+    ['planName', ['plan_name', 'planName', 'plan', 'subscription_name', 'subscriptionName'], 100],
+  ];
+  for (const [field, keys, maxLength] of metadataFields) {
+    if (String(result[field] || '').trim()) continue;
+    const value = firstNewApiText(records, keys, maxLength);
+    if (value) result[field] = value;
+  }
+  const tokenName = firstNewApiText(records, ['name'], 120);
+  if (tokenName && !result.tokenName) result.tokenName = tokenName;
+  const objectType = firstNewApiText(records, ['object'], 80);
+  if (objectType && !result.object) result.object = objectType;
+  return result;
+}
+
+function openAiCompatibleQuota(newApiQuota) {
+  if (newApiQuota) return newApiQuota;
+  return {
+    mode: 'openai_compatible',
+    status: 'active',
+    planName: 'OpenAI 兼容',
+    unit: '',
+    remaining: null,
+    balance: null,
+    quota: null,
+    subscription: null,
+    rateLimits: [],
+    expiresAt: '',
+    daysUntilExpiry: null,
+    today: null,
+    total: null,
+  };
+}
+
+function newApiEndpointUrl(baseUrl, path) {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  if (!base) return path;
+  if (/\/api$/i.test(base) && path.startsWith('/api/')) {
+    return `${base}${path.slice(4)}`;
+  }
+  return `${base}${path}`;
+}
+
+function newApiRecordCandidates(data) {
+  if (!isRecord(data)) return [];
+  const queue = [{ value: data, depth: 0 }];
+  const records = [];
+  const seen = new Set();
+  while (queue.length) {
+    const { value, depth } = queue.shift();
+    if (!isRecord(value) || seen.has(value) || depth > 3) continue;
+    seen.add(value);
+    records.push(value);
+    for (const key of ['data', 'user', 'user_info', 'userInfo', 'account', 'profile', 'result']) {
+      if (isRecord(value[key])) queue.push({ value: value[key], depth: depth + 1 });
+    }
+  }
+  return records;
+}
+
+function findNewApiField(records, keys) {
+  for (const record of records) {
+    const value = firstNewApiField(record, keys);
+    if (value !== undefined && value !== null) return value;
+  }
+  return undefined;
+}
+
+function firstNewApiField(record, keys) {
+  if (!isRecord(record)) return undefined;
+  for (const key of keys) {
+    if (Object.hasOwn(record, key) && record[key] !== undefined && record[key] !== null) {
+      return record[key];
+    }
+  }
+  return undefined;
+}
+
+function firstNewApiNumber(records, keys) {
+  for (const record of records) {
+    const value = newApiQuotaNumber(firstNewApiField(record, keys));
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function firstPositiveNewApiNumber(records, keys) {
+  const value = firstNewApiNumber(records, keys);
+  return value !== null && value > 0 ? value : null;
+}
+
+function firstNewApiBoolean(records, keys) {
+  for (const record of records) {
+    const value = firstNewApiField(record, keys);
+    if (value === true || value === false) return value;
+    const text = cleanText(value, 8).toLowerCase();
+    if (text === 'true' || text === '1') return true;
+    if (text === 'false' || text === '0') return false;
+  }
+  return null;
+}
+
+function firstNewApiText(records, keys, maxLength) {
+  for (const record of records) {
+    const value = firstNewApiField(record, keys);
+    if (typeof value === 'string' || typeof value === 'number') {
+      const text = cleanText(value, maxLength);
+      if (text) return text;
+    }
+  }
+  return '';
+}
+
+function newApiQuotaNumber(value, { allowNegative = false } = {}) {
+  if (typeof value === 'string') {
+    const text = value.trim().replace(/,/g, '');
+    if (!text) return null;
+    const number = finiteNumber(text);
+    if (number === null || (!allowNegative && number < 0)) return null;
+    return number === 0 ? 0 : number;
+  }
+  const number = finiteNumber(value);
+  if (number === null || (!allowNegative && number < 0)) return null;
+  return number === 0 ? 0 : number;
+}
+
+function normalizeNewApiAmount(value, divisor) {
+  if (value === null) return null;
+  const number = value / (Number.isFinite(divisor) && divisor > 0 ? divisor : 1);
+  if (!Number.isFinite(number)) return null;
+  return Number(number.toFixed(8));
+}
+
+function normalizeNewApiUnit(value) {
+  const text = cleanText(value, 24).toLowerCase();
+  if (!text) return '';
+  if (['usd', '$', 'dollar', 'dollars'].includes(text)) return 'USD';
+  if (['credit', 'credits', 'point', 'points', 'quota', 'quota_points', 'quota-points'].includes(text)) {
+    return 'credits';
+  }
+  return cleanText(value, 16);
+}
+
+function normalizeNewApiStatus(value) {
+  if (value === undefined || value === null || value === '') return '';
+  const text = cleanText(value, 32).toLowerCase().replace(/[\s-]+/g, '_');
+  if (['0', 'disabled', 'inactive', 'banned', 'suspended', 'no_access', 'unauthorized'].includes(text)) {
+    return 'no_access';
+  }
+  if (['blocked', 'forbidden', 'denied'].includes(text)) return 'blocked';
+  if (['quota_exhausted', 'exhausted', 'depleted', 'empty'].includes(text)) return 'quota_exhausted';
+  if (['enabled', 'active', 'normal', 'ok', 'success', '1'].includes(text)) return 'active';
+  return text;
+}
+
+function isExplicitFalse(value) {
+  if (value === false) return true;
+  return typeof value === 'string' && value.trim().toLowerCase() === 'false';
 }
 
 export async function detectSubQuotaProvider(baseUrl, apiKey, options = {}) {
@@ -2148,6 +2646,12 @@ function cleanQuotaTimestamp(value) {
     return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : '';
   }
   return cleanDate(value);
+}
+
+function cleanNewApiExpiry(value) {
+  // New API uses zero as the no-expiration sentinel for token keys.
+  if (value === 0 || (typeof value === 'string' && value.trim() === '0')) return '';
+  return cleanQuotaTimestamp(value);
 }
 
 function normalizeUsage(value) {
