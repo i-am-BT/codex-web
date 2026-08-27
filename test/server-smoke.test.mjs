@@ -1488,6 +1488,62 @@ test('active-writer recovery waits for a temporarily unavailable Desktop owner',
   assert.equal(desktopCalls, 3);
 });
 
+test('disabled Desktop IPC falls back to app-server when continuing a thread', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const disabled = Object.assign(new Error('Codex Desktop IPC 已禁用'), {
+    code: 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    reason: 'disabled',
+  });
+  let desktopCalls = 0;
+  let resumeCalls = 0;
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    'isCodexDesktopIpcUnavailableError',
+    'isAmbiguousDesktopTurnStartError',
+    'CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => {
+      resumeCalls += 1;
+      return { turnId: 'app-server-turn', transport: 'app-server' };
+    },
+    () => false,
+    () => new Error('unexpected active writer'),
+    async () => {},
+    async () => {
+      desktopCalls += 1;
+      throw disabled;
+    },
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    () => false,
+    [0, 0],
+    25,
+    40,
+  );
+
+  const result = await api.continueNativeTurn(
+    '019edad7-8eda-7622-bf2f-7c0bf4fdd063',
+    { provider: 'fake' },
+  );
+  assert.equal(result.turnId, 'app-server-turn');
+  assert.equal(desktopCalls, 1);
+  assert.equal(resumeCalls, 1);
+});
+
 test('active-writer recovery retries only an owner-discovery timeout', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('async function continueNativeTurn');
@@ -9236,6 +9292,7 @@ function startServer({
     CODEX_PROCESS_HOME: temporary,
     CODEX_WEB_ENV_FILE: webEnv,
     CODEX_WEB_RUNTIME_DIR: runtime,
+    CODEX_WEB_CWD_MIGRATIONS_FILE: path.join(temporary, 'project-migrations.tsv'),
     CODEX_CONFIG_WRITABLE: configWritable,
     CODEX_DESKTOP_IPC_ENABLED: desktopIpcEnabled,
     CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,

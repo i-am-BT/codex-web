@@ -38,6 +38,11 @@ import { normalizeSubQuotaBaseUrl, SubQuotaService } from './sub-quota.mjs';
 import { listCodexSkills } from './skills-catalog.mjs';
 import { listCodexPlugins } from './plugins-catalog.mjs';
 import { PlaygroundUpdater } from './playground-updater.mjs';
+import {
+  loadCwdMigrations,
+  remapMigratedCwd,
+  resolveCwdMigrationsFile,
+} from './cwd-migrations.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -94,6 +99,15 @@ const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const CODEX_PROCESS_HOME = resolveLocalPath(process.env.CODEX_PROCESS_HOME || homedir(), homedir());
+const CWD_MIGRATIONS_FILE = resolveCwdMigrationsFile(process.env.CODEX_WEB_CWD_MIGRATIONS_FILE);
+const CWD_MIGRATIONS = (() => {
+  try {
+    return loadCwdMigrations(CWD_MIGRATIONS_FILE);
+  } catch (error) {
+    console.warn(`项目迁移路径映射加载失败: ${error.message}`);
+    return [];
+  }
+})();
 const DOCKER_BIN = String(process.env.DOCKER_BIN || 'docker').trim() || 'docker';
 const GROK2API_CONSOLE_CONTAINER = safeDockerContainerName(process.env.GROK2API_CONSOLE_CONTAINER || 'grok2api');
 const GROK2API_CONSOLE_DEFAULT_TAIL = 160;
@@ -656,7 +670,7 @@ app.get('/api/config', requireAuth, (req, res) => {
       provider: defaults.provider || DEFAULT_PROVIDER,
       reasoningEffort: defaults.reasoningEffort || '',
       serviceTier: defaults.serviceTier === 'priority' ? 'priority' : null,
-      cwd: DEFAULT_CWD,
+      cwd: canonicalizeNativeCwd(DEFAULT_CWD),
       sandbox: FORCE_FULL_ACCESS ? 'danger-full-access' : DEFAULT_SANDBOX,
       approval: FORCE_FULL_ACCESS ? 'never' : DEFAULT_APPROVAL,
     },
@@ -1343,7 +1357,14 @@ app.get('/api/native-sessions/:id/subagents', requireAuth, (req, res) => {
       limit: positiveInteger(req.query.limit),
     });
     if (!subagent) return res.status(404).json({ error: '子代理尚未创建或已不可用' });
-    res.json({ subagent });
+    res.json({
+      subagent: subagent.metadata && typeof subagent.metadata === 'object'
+        ? {
+          ...subagent,
+          metadata: { ...subagent.metadata, cwd: canonicalizeNativeCwd(subagent.metadata.cwd) },
+        }
+        : subagent,
+    });
   } catch (err) {
     res.status(500).json({ error: `读取子代理进度失败: ${err.message}` });
   }
@@ -1392,7 +1413,7 @@ app.get('/api/native-sessions/:id/tool-images/:seq/:index', requireAuth, (req, r
       && item.role === 'tool'
       && item.kind === 'custom_tool_call_output'
     ));
-    const image = readNativeToolImage(imagePath, conversation.metadata?.cwd)
+    const image = readNativeToolImage(imagePath, canonicalizeNativeCwd(conversation.metadata?.cwd))
       || decodeNativeToolImageOutput(message, imageIndex)
       || decodeNativeToolImageOutput(adjacentOutput, imageIndex);
     if (!image) return res.status(404).json({ error: '工具图片不存在或不受支持' });
@@ -1945,7 +1966,7 @@ app.delete('/api/native-sessions/:id', requireAuth, async (req, res) => {
       return res.status(409).json({ error: `会话任务正在运行，自动停止失败：${err.message}` });
     }
   }
-  const threadCwd = conversation?.metadata?.cwd || DEFAULT_CWD;
+  const threadCwd = canonicalizeNativeCwd(conversation?.metadata?.cwd || DEFAULT_CWD);
 
   try {
     const archive = await archiveNativeThread(threadId, conversation);
@@ -4680,6 +4701,7 @@ function nativeSessionSummaries(includeIds = [], options = {}) {
     const active = nativeActiveTurnFor(session.id, session);
     const summary = {
       ...session,
+      cwd: canonicalizeNativeCwd(session.cwd),
       status: active?.status === 'running'
         ? 'running'
         : (active && active.status && active.status !== 'running'
@@ -4767,7 +4789,7 @@ function nativeArchivedThreadSummary(thread) {
     source: 'codex',
     title,
     preview: String(thread?.preview || '').trim().replace(/\\s+/g, ' ').slice(0, 240),
-    cwd: String(thread?.cwd || '').trim(),
+    cwd: canonicalizeNativeCwd(thread?.cwd),
     workspaceKind: nativeSessions.workspaceKindForThread?.(id) || '',
     createdAt,
     updatedAt,
@@ -4776,7 +4798,7 @@ function nativeArchivedThreadSummary(thread) {
 }
 
 function normalizeNativeProjectPath(value) {
-  const raw = String(value || '').trim();
+  const raw = canonicalizeNativeCwd(value);
   if (!raw) return '';
   const normalized = path.normalize(raw);
   const root = path.parse(normalized).root;
@@ -4957,7 +4979,7 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
   const persistedStartedAt = activeTurnId && String(conversation.latestTurnId || '') === String(activeTurnId)
     ? conversation.latestTurnStartedAt || ''
     : '';
-  const metadata = active?.status === 'running'
+  const runtimeMetadata = active?.status === 'running'
     ? {
       ...conversation.metadata,
       ...(active.provider ? { modelProvider: active.provider } : {}),
@@ -4965,6 +4987,9 @@ function decorateNativeConversation(conversation, { externalizeImages = false } 
       ...(Object.hasOwn(active, 'serviceTier') ? { serviceTier: active.serviceTier } : {}),
     }
     : conversation.metadata;
+  const metadata = runtimeMetadata && typeof runtimeMetadata === 'object'
+    ? { ...runtimeMetadata, cwd: canonicalizeNativeCwd(runtimeMetadata.cwd) }
+    : runtimeMetadata;
   return {
     ...conversation,
     metadata,
@@ -5096,7 +5121,7 @@ function isRetryableDesktopOwnerRecoveryError(error) {
     return true;
   }
   if (!isCodexDesktopIpcUnavailableError(error)) return false;
-  return ['socket-not-found', 'connect-failed', 'not-connected', 'no-client-found']
+  return ['disabled', 'socket-not-found', 'connect-failed', 'not-connected', 'no-client-found']
     .includes(String(error?.reason || ''));
 }
 
@@ -5250,7 +5275,7 @@ function recoverDesktopNativeTurn(threadId, conversation, turn = {}) {
 }
 
 async function steerNativeTurn(threadId, steer, expectedTurnId) {
-  const cwd = nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD;
+  const cwd = canonicalizeNativeCwd(nativeSessions.get(threadId)?.metadata?.cwd || DEFAULT_CWD);
   const baseline = nativeSessions.get(threadId);
   const requestedAt = Date.now();
   const clientUserMessageId = randomBytes(16).toString('hex');
@@ -5425,7 +5450,7 @@ async function stopNativeTurnForArchive(threadId) {
 
 async function notifyDesktopThreadArchived(threadId, cwd) {
   try {
-    await desktopIpcClient.threadArchived(threadId, cwd);
+    await desktopIpcClient.threadArchived(threadId, canonicalizeNativeCwd(cwd));
   } catch (error) {
     console.warn(`Codex Desktop IPC 归档同步失败: ${error.message}`);
   }
@@ -5434,7 +5459,7 @@ async function notifyDesktopThreadArchived(threadId, cwd) {
 
 async function notifyDesktopThreadUnarchived(threadId, cwd) {
   try {
-    await desktopIpcClient.threadUnarchived(threadId, cwd);
+    await desktopIpcClient.threadUnarchived(threadId, canonicalizeNativeCwd(cwd));
   } catch (error) {
     console.warn(`Codex Desktop IPC 取消归档同步失败: ${error.message}`);
   }
@@ -5539,9 +5564,9 @@ function buildDesktopRestoreMessage(steer, cwd, id) {
       ? original.context
       : {};
     const prompt = String(originalContext.prompt ?? original.text ?? steer.message ?? '').trim();
-    const restoreCwd = String(original.cwd || cwd);
+    const restoreCwd = canonicalizeNativeCwd(original.cwd || cwd);
     const workspaceRoots = Array.isArray(originalContext.workspaceRoots) && originalContext.workspaceRoots.length
-      ? originalContext.workspaceRoots
+      ? originalContext.workspaceRoots.map(canonicalizeNativeCwd).filter(Boolean)
       : [restoreCwd];
     return {
       ...original,
@@ -5686,7 +5711,7 @@ function nativeConversationFromThread(thread, activeTurnId, settings = {}) {
     activeTurnId,
     messages: [],
     metadata: {
-      cwd: String(settings.cwd || thread?.cwd || ''),
+      cwd: canonicalizeNativeCwd(settings.cwd || thread?.cwd),
       model: String(settings.model || thread?.model || ''),
       modelProvider: String(settings.modelProvider || thread?.modelProvider || ''),
       serviceTier: cleanServiceTier(settings.serviceTier),
@@ -7015,8 +7040,12 @@ function nativeSandboxPolicy(value, cwd) {
 }
 
 function normalizeCwd(value) {
-  const resolved = path.resolve(expandHome(String(value || DEFAULT_CWD)));
+  const resolved = path.resolve(canonicalizeNativeCwd(expandHome(String(value || DEFAULT_CWD))));
   return existsSync(resolved) ? resolved : '';
+}
+
+function canonicalizeNativeCwd(value) {
+  return remapMigratedCwd(value, CWD_MIGRATIONS);
 }
 
 function expandHome(value) {
@@ -7606,7 +7635,7 @@ function normalizeServerQueuedPrompt(item) {
     model: String(item.model || ''),
     reasoningEffort: String(item.reasoningEffort || ''),
     serviceTier: String(item.serviceTier || '').trim().toLowerCase() === 'priority' ? 'priority' : null,
-    cwd: String(item.cwd || ''),
+    cwd: canonicalizeNativeCwd(item.cwd),
     permissionMode,
     sandbox: String(item.sandbox || (permissionMode === 'custom' ? '' : 'read-only')),
     approval: String(item.approval || (permissionMode === 'custom' ? '' : 'on-request')),

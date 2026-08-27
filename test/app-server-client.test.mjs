@@ -86,9 +86,9 @@ process.stdin.on('data', (chunk) => {
     assert.deepEqual(
       (await readFile(traceFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line).args),
       [
-        ['app-server', '--disable', 'code_mode_host', '--stdio'],
-        ['app-server', '--disable', 'code_mode_host', '--stdio'],
-        ['app-server', '--disable', 'code_mode_host', '--stdio'],
+        ['app-server', '--stdio'],
+        ['app-server', '--stdio'],
+        ['app-server', '--stdio'],
       ],
     );
   } finally {
