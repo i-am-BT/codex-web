@@ -469,7 +469,11 @@ test('workspace-kind changes are watched and included in session signatures', ()
 test('project archive targeting excludes standalone tasks with the same cwd', () => {
   const archiveMatch = serverSource.match(/(function normalizeNativeProjectPath[\s\S]*?function nativeSessionMatchesProject[\s\S]*?\n})/);
   assert.ok(archiveMatch, 'missing native project archive matcher');
-  const api = new Function('path', `${archiveMatch[1]}; return nativeSessionMatchesProject;`)(path);
+  const api = new Function(
+    'path',
+    'canonicalizeNativeCwd',
+    `${archiveMatch[1]}; return nativeSessionMatchesProject;`,
+  )(path, (value) => String(value || '').trim());
   assert.equal(api({ workspaceKind: 'projectless', cwd: '/workspace/shared' }, '/workspace/shared'), false);
   assert.equal(api({ workspaceKind: 'project', cwd: '/workspace/shared/' }, '/workspace/shared'), true);
   assert.equal(api({ cwd: '/workspace/shared' }, '/workspace/shared'), true);

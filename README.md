@@ -190,6 +190,7 @@ cp .env.example .env
 | `PORT` | 固定监听端口，示例为 `36354` |
 | `CODEX_BIN` | Codex CLI 路径；初始化脚本会优先发现 ChatGPT/Codex App 内置版本 |
 | `CODEX_HOME` | Codex 配置、索引和原生会话目录，默认 `$HOME/.codex` |
+| `CODEX_WEB_CWD_MIGRATIONS_FILE` | 可选的工作目录迁移 TSV；仅在显式设置时启用，运行时将旧 `cwd` 映射到新目录 |
 | `CODEX_WEB_LOCAL_IMAGE_ROOTS` | 可选的绝对图片根目录白名单，多个目录用英文逗号分隔；用于显示助手消息中来自其他项目的本地图片 |
 | `APP_SERVER_REQUEST_TIMEOUT_MS` | `codex app-server` 单次协议请求超时，默认 30000 毫秒 |
 | `CODEX_DESKTOP_IPC_ENABLED` | macOS/Windows 默认开启；续聊优先交给当前打开任务的 Codex App 窗口 |
@@ -201,6 +202,19 @@ cp .env.example .env
 | `DEFAULT_CWD` | 新会话默认工作目录 |
 | `DEFAULT_SANDBOX` | Codex 默认沙箱模式 |
 | `DEFAULT_APPROVAL` | Codex 默认审批模式 |
+
+### 工作目录迁移
+
+移动项目目录后，历史会话中保存的旧 `cwd` 可能已经失效。可将 `CODEX_WEB_CWD_MIGRATIONS_FILE` 指向一个本机 TSV 文件，在会话列表、续聊、归档、队列、子代理和工具图片路径中按运行时映射使用新目录。未设置该变量时不会加载任何映射。
+
+TSV 必须包含 `source` 和 `destination` 列；可保留额外列。只有目标目录实际存在的条目会生效，源路径更具体的条目优先：
+
+```text
+id	source	destination	category
+my-project	/old/path/my-project	/new/path/my-project	active
+```
+
+该功能不会改写 Codex 的 JSONL、SQLite 或其他历史文件。映射文件通常包含本机路径，应保留在仓库之外。
 
 ### 额度监控
 
@@ -285,6 +299,8 @@ Image Prompt 的案例和模板保留仓库内置快照作为兜底。自动更�
 成功构建的当前版本和上一版本分别保存在 `runtime/playground/current/` 与 `runtime/playground/previous/`。切换失败时会自动恢复旧版本；旧页面引用的 hash 资源也可从上一版本回退读取。Docker 部署已持久化 `/data/runtime`，因此容器重建不会丢失已安装版本。设置 `PLAYGROUND_UPDATE_ENABLED=false` 可禁用按钮和更新接口。
 
 ## 模型与服务商
+
+> Codex app-server 不会强制覆盖 `code_mode_host`，而是使用 Codex 自身的功能默认值和配置。`code_mode` 仍是默认关闭的开发中功能；在所用模型工具集明确兼容前不要主动启用，否则可能出现 `code-mode host is disabled` 或 `Unsupported custom tool: 'exec'`。
 
 服务商配置保存在 `CODEX_HOME` 中，API Key 默认保存在 `$CODEX_HOME/.env`。Web 不会在仓库中保存真实密钥。
 

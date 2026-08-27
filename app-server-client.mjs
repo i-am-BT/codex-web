@@ -5,7 +5,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_INITIALIZE_TIMEOUT_MS = 15000;
 const DEFAULT_INITIALIZE_RETRY_COUNT = 1;
 const DEFAULT_INITIALIZE_RETRY_DELAY_MS = 150;
-const DEFAULT_APP_SERVER_ARGS = ['--disable', 'code_mode_host'];
+const DEFAULT_APP_SERVER_ARGS = [];
 
 export class CodexAppServerClient extends EventEmitter {
   constructor(options = {}) {
