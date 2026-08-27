@@ -10300,6 +10300,7 @@ function conversationSummaries(pinnedThreadIds = nativeSessions.listPinnedThread
 
 function pageHtml(authenticated) {
   const appName = escapeHtml(APP_NAME);
+  const sidebarSecurityBadge = '<div style="margin-top:8px"><span class="pill"><span></span>Protected</span></div>';
   let initialThemeMode = 'system';
   let initialTheme = 'light';
   let initialFxEnabled = false;
@@ -10310,7 +10311,7 @@ function pageHtml(authenticated) {
     initialFxEnabled = Boolean(savedAppearance?.fxEnabled);
   } catch {}
   const initialThemeModeLiteral = JSON.stringify(initialThemeMode);
-  return `<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -18414,8 +18415,6 @@ function enhanceInterface(){
     logo.appendChild(mark);
     logo.appendChild(copy);
   }
-  const protectedPill=document.querySelector('.pill');
-  setIconLabel(protectedPill,'shield-check','Protected');
   const sideActions=document.querySelector('.sideActions');
   enhanceSubQuota(sideActions);
   if(sideActions&&settingsToggle)sideActions.appendChild(settingsToggle);
@@ -27136,4 +27135,5 @@ async function send(){
   <script src="/effects.js?v=light-fx-20260802a"></script>
 </body>
 </html>`;
+  return html.replace(sidebarSecurityBadge, '');
 }

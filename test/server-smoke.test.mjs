@@ -4640,6 +4640,14 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+    const homepage = await fetch(`${baseUrl}/`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(homepage.status, 200);
+    const homepageHtml = await homepage.text();
+    assert.match(homepageHtml, /<title>Codex Web Test<\/title>/);
+    assert.doesNotMatch(homepageHtml, /class="pill"/);
+    assert.doesNotMatch(homepageHtml, />Protected</);
     const grok2ApiConsole = await fetch(`${baseUrl}/api/sub-quotas/grok2api/console?tail=999`, {
       headers: { Cookie: cookie },
     });
