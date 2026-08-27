@@ -103,11 +103,41 @@ test('routes a turn through the Codex Desktop owner IPC client', async () => {
       return;
     }
 
+    if (message.method === 'thread-owner-discovery') {
+      assert.equal(message.version, 1);
+      assert.equal(message.sourceClientId, 'web-client-id');
+      assert.deepEqual(message.params, {
+        hostId: 'local',
+        conversationId: 'thread-1',
+      });
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: {},
+      });
+      return;
+    }
+
     assert.equal(message.method, 'thread-follower-start-turn');
-    assert.equal(message.version, 1);
+    assert.equal(message.version, 2);
     assert.equal(message.sourceClientId, 'web-client-id');
-    assert.equal(message.params.conversationId, 'thread-1');
-    assert.equal(message.params.turnStartParams.input[0].text, '同步测试');
+    assert.equal(message.targetClientId, 'desktop-owner-id');
+    assert.deepEqual(message.params, {
+      conversationId: 'thread-1',
+      turnStart: {
+        request: {
+          input: [{ type: 'text', text: '同步测试', text_elements: [] }],
+          threadId: 'thread-1',
+        },
+        context: {
+          attachments: [],
+          commentAttachments: [],
+        },
+      },
+    });
     sendFrame(socket, {
       type: 'response',
       requestId: message.requestId,
@@ -225,6 +255,152 @@ test('marks a missing Desktop owner as a safe app-server fallback', async () => 
     await assert.rejects(
       client.startTurn('thread-2', { input: [{ type: 'text', text: 'fallback', text_elements: [] }] }),
       (error) => isCodexDesktopIpcUnavailableError(error) && error.reason === 'no-client-found',
+    );
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('bounds owner discovery and identifies the timed out IPC stage', async () => {
+  const fixture = await createRouterFixture();
+  const methods = [];
+  fixture.onMessage = (socket, message) => {
+    methods.push(message.method);
+    if (message.method !== 'initialize') return;
+    sendFrame(socket, {
+      type: 'response',
+      requestId: message.requestId,
+      resultType: 'success',
+      method: message.method,
+      result: { clientId: 'web-client-id' },
+    });
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    requestTimeoutMs: 1000,
+    ownerDiscoveryTimeoutMs: 40,
+  });
+  const startedAt = Date.now();
+
+  try {
+    await assert.rejects(
+      client.startTurn('thread-owner-timeout', {
+        input: [{ type: 'text', text: 'timeout safely', text_elements: [] }],
+      }),
+      (error) => (
+        error.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+        && error.desktopIpcMethod === 'thread-owner-discovery'
+      ),
+    );
+    assert.ok(Date.now() - startedAt < 500);
+    assert.deepEqual(methods, ['initialize', 'thread-owner-discovery']);
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('identifies an unconfirmed start-turn response as distinct from owner discovery', async () => {
+  const fixture = await createRouterFixture();
+  let startRequests = 0;
+  fixture.onMessage = (socket, message) => {
+    if (message.method === 'initialize') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        result: { clientId: 'web-client-id' },
+      });
+      return;
+    }
+    if (message.method === 'thread-owner-discovery') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: {},
+      });
+      return;
+    }
+    assert.equal(message.method, 'thread-follower-start-turn');
+    startRequests += 1;
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    requestTimeoutMs: 40,
+    ownerDiscoveryTimeoutMs: 40,
+  });
+
+  try {
+    await assert.rejects(
+      client.startTurn('thread-start-timeout', {
+        input: [{ type: 'text', text: 'accepted without response', text_elements: [] }],
+      }),
+      (error) => (
+        error.code === 'CODEX_DESKTOP_IPC_TIMEOUT'
+        && error.desktopIpcMethod === 'thread-follower-start-turn'
+      ),
+    );
+    assert.equal(startRequests, 1);
+  } finally {
+    client.close();
+    await fixture.close();
+  }
+});
+
+test('keeps a Desktop IPC version mismatch distinct from a missing owner', async () => {
+  const fixture = await createRouterFixture();
+  fixture.onMessage = (socket, message) => {
+    if (message.method === 'initialize') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: 'initialize',
+        result: { clientId: 'web-client-id' },
+      });
+      return;
+    }
+    if (message.method === 'thread-owner-discovery') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: {},
+      });
+      return;
+    }
+    sendFrame(socket, {
+      type: 'response',
+      requestId: message.requestId,
+      resultType: 'error',
+      error: 'request-version-mismatch',
+    });
+  };
+
+  const client = new CodexDesktopIpcClient({
+    socketPath: fixture.socketPath,
+    requestTimeoutMs: 1000,
+  });
+
+  try {
+    await assert.rejects(
+      client.startTurn('thread-version-mismatch', {
+        input: [{ type: 'text', text: 'do not fall back', text_elements: [] }],
+      }),
+      (error) => (
+        !isCodexDesktopIpcUnavailableError(error)
+        && error.code === 'request-version-mismatch'
+        && error.reason === 'request-version-mismatch'
+      ),
     );
   } finally {
     client.close();
@@ -419,6 +595,17 @@ test('reconnects after a transient Desktop IPC disconnect', async () => {
         resultType: 'success',
         method: message.method,
         result: { clientId: `web-client-${initializeCount}` },
+      });
+      return;
+    }
+    if (message.method === 'thread-owner-discovery') {
+      sendFrame(socket, {
+        type: 'response',
+        requestId: message.requestId,
+        resultType: 'success',
+        method: message.method,
+        handledByClientId: 'desktop-owner-id',
+        result: {},
       });
       return;
     }

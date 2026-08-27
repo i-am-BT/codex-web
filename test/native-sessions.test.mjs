@@ -1854,6 +1854,208 @@ test('native session store applies projectless state without a state database an
   }
 });
 
+test('native session store treats unassigned generated task workspaces as projectless', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-generated-projectless-'));
+  const codexHome = path.join(temporary, '.codex');
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '21');
+  const generatedId = '01a02017-a578-7b50-9358-fc426c9830d8';
+  const explicitProjectId = '01a02017-a578-7b50-9358-fc426c9830d9';
+  const legacyProjectId = '01a02017-a578-7b50-9358-fc426c9830da';
+  const generatedRoot = path.join(temporary, 'Documents', 'Codex');
+  const generatedCwd = path.join(generatedRoot, '2026-08-14', 'new-task');
+  const explicitProjectCwd = path.join(generatedRoot, '2026-08-14', 'saved-project');
+  const legacyProjectCwd = path.join(temporary, 'workspace', 'legacy-project');
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    for (const [id, cwd] of [
+      [generatedId, generatedCwd],
+      [explicitProjectId, explicitProjectCwd],
+      [legacyProjectId, legacyProjectCwd],
+    ]) {
+      await writeFile(path.join(sessionDir, `rollout-2026-08-21T08-00-00-${id}.jsonl`), jsonl([{
+        timestamp: '2026-08-21T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd, source: 'vscode', originator: 'Codex Desktop' },
+      }]));
+    }
+    await writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+      'projectless-thread-ids': [],
+      'thread-project-assignments': {
+        [explicitProjectId]: { projectKind: 'local', projectId: 'saved-project' },
+      },
+    }));
+
+    store = new NativeSessionStore(codexHome, {
+      watchChanges: false,
+      projectlessWorkspaceRoot: generatedRoot,
+    });
+    assert.deepEqual(
+      Object.fromEntries(store.list().map((session) => [session.id, session.workspaceKind])),
+      {
+        [generatedId]: 'projectless',
+        [explicitProjectId]: 'project',
+        [legacyProjectId]: 'project',
+      },
+    );
+    assert.equal(store.get(generatedId).metadata.workspaceKind, 'projectless');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session store follows Codex App project moves into continued rollout files', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-project-move-'));
+  const codexHome = path.join(temporary, '.codex');
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '22');
+  const id = '01a02017-a578-7b50-9358-fc426c9830d8';
+  const turnId = '01a027f2-3add-79f1-9c01-ed8c9c921bac';
+  const originalCwd = '/workspace/original';
+  const movedCwd = '/workspace/moved';
+  const originalProjectId = 'local-original';
+  const movedProjectId = 'local-moved';
+  const originalFile = path.join(sessionDir, `rollout-2026-08-22T12-00-00-${id}.jsonl`);
+  const continuedFile = path.join(sessionDir, `rollout-2026-08-22T13-00-00-${id}_${turnId}.jsonl`);
+  const globalStateFile = path.join(codexHome, '.codex-global-state.json');
+  const dbFile = path.join(codexHome, 'state_5.sqlite');
+  let store;
+
+  const globalState = (projectId, cwd) => JSON.stringify({
+    'projectless-thread-ids': [],
+    'thread-project-assignments': {
+      [id]: { projectKind: 'local', projectId },
+    },
+    'local-projects': {
+      [originalProjectId]: { id: originalProjectId, name: 'original', rootPaths: [originalCwd] },
+      [movedProjectId]: { id: movedProjectId, name: 'moved', rootPaths: [movedCwd] },
+    },
+    'electron-persisted-atom-state': {
+      [`thread-workspace-state-v1:${id}`]: {
+        project: { projectKind: 'local', projectId },
+        applied: {
+          projectSources: [cwd],
+          cwd,
+          runtimeWorkspaceRoots: [cwd],
+        },
+        pending: null,
+      },
+    },
+  });
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    const metadata = [{
+      timestamp: '2026-08-22T04:00:00.000Z',
+      type: 'session_meta',
+      payload: { id, cwd: originalCwd, source: 'vscode', originator: 'Codex Desktop' },
+    }];
+    await writeFile(originalFile, jsonl(metadata));
+    await writeFile(continuedFile, jsonl(metadata));
+    await writeFile(globalStateFile, globalState(originalProjectId, originalCwd));
+
+    const db = new DatabaseSync(dbFile);
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT NOT NULL,
+        source TEXT NOT NULL,
+        cwd TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        archived INTEGER NOT NULL DEFAULT 0,
+        preview TEXT NOT NULL DEFAULT '',
+        cli_version TEXT NOT NULL DEFAULT '',
+        thread_source TEXT,
+        created_at_ms INTEGER,
+        updated_at_ms INTEGER,
+        recency_at_ms INTEGER
+      )
+    `);
+    db.prepare(`
+      INSERT INTO threads (
+        id, rollout_path, source, cwd, title, archived, preview, cli_version, thread_source,
+        created_at_ms, updated_at_ms, recency_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      originalFile,
+      'vscode',
+      originalCwd,
+      '项目移动测试',
+      0,
+      'preview',
+      'test',
+      'user',
+      1787371200000,
+      1787371260000,
+      1787371260000,
+    );
+    db.close();
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.equal(store.list()[0]?.cwd, originalCwd);
+    assert.equal(store.get(id)?.metadata.cwd, originalCwd);
+
+    const projectMoved = once(store, 'change');
+    await writeFile(globalStateFile, globalState(movedProjectId, movedCwd));
+    store.refresh();
+    const [projectMoveChange] = await projectMoved;
+    assert.ok(projectMoveChange.changedIds.includes(id));
+    assert.equal(store.list()[0]?.cwd, movedCwd);
+    assert.equal(store.list()[0]?.workspaceKind, 'project');
+    assert.equal(store.get(id)?.metadata.cwd, movedCwd);
+
+    const rolloutContinued = once(store, 'change');
+    const writer = new DatabaseSync(dbFile);
+    writer.prepare(
+      'UPDATE threads SET rollout_path = ?, cwd = ?, updated_at_ms = ? WHERE id = ?',
+    ).run(continuedFile, originalCwd, 1787371320000, id);
+    writer.close();
+    store.refresh();
+    const [continuedChange] = await rolloutContinued;
+    assert.ok(continuedChange.changedIds.includes(id));
+    assert.equal(store.entries.get(id)?.filePath, continuedFile);
+    assert.equal(store.list()[0]?.cwd, movedCwd);
+    assert.equal(store.get(id)?.metadata.cwd, movedCwd);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('native session detail keeps the latest turn cwd without an App project assignment', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-turn-cwd-'));
+  const codexHome = path.join(temporary, '.codex');
+  const id = '019f4f84-ea9f-73c2-b997-deba7b4aa714';
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '22');
+  const sessionFile = path.join(sessionDir, `rollout-2026-08-22T14-00-00-${id}.jsonl`);
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-08-22T06:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: '/workspace/original', source: 'vscode' },
+      },
+      {
+        timestamp: '2026-08-22T06:00:01.000Z',
+        type: 'turn_context',
+        payload: { turn_id: 'turn-current-cwd', cwd: '/workspace/current' },
+      },
+    ]));
+
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.equal(store.get(id)?.metadata.cwd, '/workspace/current');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('native session store supports Codex state databases without recency_at_ms', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-legacy-schema-'));
   const codexHome = path.join(temporary, '.codex');

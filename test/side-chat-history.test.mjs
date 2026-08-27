@@ -79,7 +79,9 @@ test('native store persists side-chat-thread-ids and annotates list summaries', 
     );
     store.refresh();
     assert.equal(store.isSideChatThread(sideId), true);
-    assert.equal(store.workspaceKindForThread(mainId), 'projectless');
+    // A refreshed explicit Codex App project assignment takes precedence over
+    // the Web-only projectless hint while the local registry remains durable.
+    assert.equal(store.workspaceKindForThread(mainId), 'project');
 
     store.refresh();
     const list = store.list(100);

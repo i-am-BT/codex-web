@@ -19,6 +19,11 @@ function sourceBetween(start, end) {
   return source;
 }
 
+const nativeUiProtocolSource = sourceBetween(
+  'function nativeUiProtocolLine',
+  'function automationHeartbeatDisplayText',
+);
+
 const referencePlan = [
   { step: '对照 参考图', status: 'completed' },
   { step: '实现紧凑进度 pill', status: 'in_progress' },
@@ -294,7 +299,7 @@ test('response annotations render as hover details and touch toggles', () => {
   assert.equal((inlineScript.match(/responseAnnotations:msg\.responseAnnotations/g) || []).length, 2);
   assert.match(inlineScript, /responseAnnotations:message\.responseAnnotations/);
   assert.match(inlineScript, /function adoptRuntimeLiveForSnapshotMessage\(message\)\{[\s\S]*?rememberResponseAnnotationItems\(pausedTurnId,message\.responseAnnotations\)/s);
-  assert.match(inlineScript, /function ensureNativeRuntimeLiveElement\(live\)[\s\S]*?addMsg\('assistant','',\{streaming:true,kind:'live_progress',turnId:live\.turnId,autoScroll:false\}\)/);
+  assert.match(inlineScript, /function ensureNativeRuntimeLiveElement\(live\)\{[\s\S]*?addMsg\('assistant','',\{streaming:true,kind:'live_progress',turnId:live\.turnId,autoScroll:false\}\)/s);
   assert.match(inlineScript, /function newChat\(\)[\s\S]*?responseAnnotationsByTurn=new Map\(\)/);
   assert.match(inlineScript, /function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?clearNativeLiveItems\(\);\s*responseAnnotationsByTurn=new Map\(\);/s);
   assert.match(inlineScript, /document\.querySelectorAll\('\.browserAnnotationCard,\.responseAnnotationCard'\)/);
@@ -361,7 +366,15 @@ test('native connection retries and terminal upstream errors render inside the c
   assert.match(messageElementSource, /const terminalError=role==='process'&&\(\['task_error','error'\]\.includes\(kind\)\|\|transientLimitError\)/);
   assert.match(messageElementSource, /terminalError\?' terminalError':''/);
   assert.match(messageElementSource, /usageLimitError\?' usageLimitError':''/);
-  assert.match(messageElementSource, /terminalErrorContent'\+\(usageLimitError\?' compact':''\)/);
+  assert.match(messageElementSource, /const collapsibleError=!usageLimitError&&Boolean\(bodyText\|\|hint\)/);
+  assert.match(messageElementSource, /document\.createElement\(collapsibleError\?'details':'div'\)/);
+  assert.match(messageElementSource, /collapsibleError\?' terminalErrorDisclosure':''/);
+  assert.match(messageElementSource, /content\.open=false/);
+  assert.match(messageElementSource, /summary\.className='terminalErrorSummary'/);
+  assert.match(messageElementSource, /preview\.className='terminalErrorPreview'/);
+  assert.match(messageElementSource, /preview\.textContent=bodyText\|\|hint/);
+  assert.match(messageElementSource, /preview\.setAttribute\('aria-hidden','true'\)/);
+  assert.match(messageElementSource, /chevron\.className='terminalErrorChevron'/);
   assert.match(messageElementSource, /if\(bodyText\)content\.appendChild\(body\)/);
   assert.match(inlineScript, /Completed-history terminal cards should stay static/);
   assert.match(inlineScript, /Hold the restore veil through the first history fill/);
@@ -376,6 +389,10 @@ test('native connection retries and terminal upstream errors render inside the c
   assert.match(uiStyles, /\.terminalErrorTitle\s*\{[^}]*color:\s*var\(--danger\);[^}]*font-size:\s*11px/s);
   assert.match(uiStyles, /\.msg\.process\.terminalError > \.msgActions\s*\{[^}]*min-height:\s*28px;[^}]*margin:\s*-1px 0 0/s);
   assert.match(uiStyles, /@media \(min-width:\s*821px\)\s*\{\s*\.terminalErrorContent\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*baseline;/s);
+  assert.match(uiStyles, /\.terminalErrorDisclosure\s*\{[^}]*display:\s*block;[^}]*min-width:\s*0/s);
+  assert.match(uiStyles, /\.terminalErrorSummary\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) 16px/s);
+  assert.match(uiStyles, /\.terminalErrorPreview\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap/s);
+  assert.match(uiStyles, /\.terminalErrorDisclosure\[open\] > \.terminalErrorSummary \.terminalErrorChevron\s*\{[^}]*transform:\s*rotate\(90deg\)/s);
   assert.match(uiStyles, /\.msg\.process\.terminalError\.usageLimitError\s*\{/);
   assert.match(uiStyles, /@media \(max-width:\s*820px\)\s*\{[\s\S]*?\.msg\.process\.terminalError\.usageLimitError/s);
 });
@@ -773,6 +790,7 @@ test('a stop request freezes visible streaming without unlocking the running tur
   assert.match(deltaSource, /if\(!live&&cancelPending\)return;/);
   assert.match(deltaSource, /if\(!live\)live=adoptSnapshotLiveForRuntimeDelta\(itemId,runtimeTurnId,delta,runtime\.updatedAt\);/);
   assert.match(deltaSource, /live\.rawText=String\(live\.rawText\|\|''\)\+delta;\s*const targetText=nativeRuntimeTargetText\(live,live\.rawText\);/);
+  assert.match(deltaSource, /if\(cancelPending\|\|live\.cancelVisualPaused\)return;/);
   assert.match(pauseSource, /renderNativeLiveItemImmediately\(live\);\s*renderNativeLiveItemMarkdown\(live\);/);
   assert.match(scheduleSource, /if\(live\?\.cancelVisualPaused\)return;/);
   assert.match(snapshotSource, /if\(live\.cancelVisualPaused&&nativeCancelPendingMatches\(currentConversationId,pausedTurnId\)\)\{/);
@@ -1343,7 +1361,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
       let currentConversationId = 'thread-active';
       let activeNativeTurnId = 'turn-active';
       function nativeCancelPendingMatches() { return false; }
-      function stripNativeUiProtocolLines(value) { return String(value || ''); }
+      ${nativeUiProtocolSource}
       ${liveSource}
       return {
         shouldStream: isNativeSnapshotStreamingMessage,
@@ -1618,6 +1636,7 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
       function turnProcessElapsedMatches() { return true; }
       function activateTurnProcessElement() {}
       function removeNativeRunningElement() {}
+      ${nativeUiProtocolSource}
       ${liveSource}
       return {
         updateDelta: updateNativeLiveDelta,
@@ -2117,8 +2136,8 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(loadConversation, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\)/);
   assert.match(loadConversation, /const preserveHistoryFollowBottom=Boolean\(options\.historyScrollAnchor\)&&options\.preserveHistoryFollowBottom===true/);
   assert.match(loadConversation, /if\(options\.historyScrollAnchor&&!preserveHistoryFollowBottom\)setNativeLiveReadingHistory\(true\);\s*else resumeNativeLiveFollowBottom\(\);/);
-  assert.match(loadConversation, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);\s*if\(preserveHistoryFollowBottom\)resumeNativeLiveFollowBottom\(\);\s*else setNativeLiveReadingHistory\(true\)/);
-  assert.match(loadConversation, /loadEarlierNativeHistoryPage\(\{fillViewport:true\}\)/);
+  assert.match(loadConversation, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationId!==conversation\.id\|\|currentConversationSource!==\(conversation\.source==='codex'\?'codex':'web'\)\)return false;\s*if\(preserveHistoryFollowBottom\)resumeNativeLiveFollowBottom\(\);\s*else setNativeLiveReadingHistory\(true\)/);
+  assert.match(loadConversation, /loadEarlierNativeHistoryPage\(\{fillViewport:true,restoreRevision\}\)/);
   assert.match(nativeScrollTracking, /addEventListener\('wheel'[\s\S]*?event\.deltaY<0/);
   assert.match(nativeScrollTracking, /let historyTouchPageTriggered=false;[\s\S]*?addEventListener\('touchmove'[\s\S]*?!historyTouchPageTriggered[\s\S]*?currentY-historyTouchStartY>=28[\s\S]*?historyTouchPageTriggered=true/);
   assert.match(nativeScrollTracking, /addEventListener\('touchend',resetHistoryTouch/);
@@ -2577,17 +2596,113 @@ test('boot restores the last conversation chrome before content paints', () => {
   assert.match(inlineScript, /if\(!restoreBootConversationChrome\(\)\)setCurrentConversationTitle\('新任务'\)/);
   assert.match(inlineScript, /const modelsReady=loadModels\(provider\.value,data\.defaults\.model\)/);
   assert.match(inlineScript, /if\(target\)await loadConversation\(target\.id,target\.source\|\|'codex'\);await modelsReady/);
-  assert.match(inlineScript, /chat\.classList\.add\('conversationRestoring'\)/);
+  assert.match(inlineScript, /root\.classList\.add\('conversationRestoring'\)/);
   assert.match(inlineScript, /chat\.replaceChildren\(\)/);
+  assert.match(inlineScript, /function beginConversationRestoring/);
   assert.match(inlineScript, /function clearConversationRestoring/);
-  assert.match(inlineScript, /if\(!res\.ok\)\{clearConversationStatusLoading\(\);if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\)/);
-  assert.match(inlineScript, /restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);[\s\S]*?if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\)/s);
-  assert.match(inlineScript, /clearConversationRestoring\(\)/);
+  assert.match(inlineScript, /if\(!res\.ok\)\{clearConversationStatusLoading\(\);if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\{restoreRevision,id,source:nextConversationSource\}\)/);
+  assert.match(inlineScript, /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);[\s\S]*?if\(seq!==conversationLoadSeq\|\|currentConversationId!==conversation\.id\|\|currentConversationSource!==\(conversation\.source==='codex'\?'codex':'web'\)\)return false;[\s\S]*?if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\{/s);
   assert.match(inlineScript, /classList\.remove\('conversationRestoring'\)/);
   assert.match(uiStyles, /\.chat\.conversationRestoring/);
   assert.match(serverSource, /dataset\.bootRestore='1'/);
   assert.match(serverSource, /正在同步会话内容…/);
   assert.match(uiStyles, /html\[data-boot-restore="1"\]/);
+});
+
+test('conversation switches establish the restore veil before clearing old live chrome', () => {
+  const loadConversation = sourceBetween('async function loadConversation', 'function nativeRunningStatusTimestamp');
+  const rejectedSwitchGuard = loadConversation.indexOf('if(conversationChanged&&appQueueEditSaving)');
+  const veil = loadConversation.indexOf('if(restorePaint)beginConversationRestoring()');
+  assert.ok(rejectedSwitchGuard >= 0 && veil > rejectedSwitchGuard);
+  for(const marker of [
+    'clearSubagentTraceStates();',
+    'clearNativeLiveItems();',
+    'resetTurnProcessCollection();',
+    'const res=await fetch(requestUrl)',
+  ]){
+    const markerIndex = loadConversation.indexOf(marker);
+    assert.ok(markerIndex > veil, `${marker} must run after the restore veil`);
+  }
+  const replaceChildren = loadConversation.indexOf('chat.replaceChildren();');
+  const hydrateMessages = loadConversation.indexOf('messages.forEach((msg,index)=>{', replaceChildren);
+  const restorePlaceholder = loadConversation.indexOf('if(restorePaint)beginConversationRestoring();', hydrateMessages);
+  assert.ok(
+    replaceChildren >= 0 && hydrateMessages > replaceChildren && restorePlaceholder > hydrateMessages,
+    'the stable restore placeholder must be reinserted after message hydration removes empty nodes',
+  );
+});
+
+test('conversation restore ownership rejects stale A-B-A revisions and clears its placeholder', () => {
+  const restoreHelpers = sourceBetween('function conversationRestoreOwnerMatches', 'function clearConversationStatusLoading');
+  const rootClasses = new Set();
+  const nodes = [];
+  const matches = (node, selector) => {
+    const expected = selector.split('.').filter(Boolean);
+    const actual = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+    return expected.every((name) => actual.has(name));
+  };
+  const createElement = () => {
+    const node = {
+      className: '',
+      children: [],
+      textContent: '',
+      append(...children){ this.children.push(...children); },
+      remove(){
+        const index = nodes.indexOf(this);
+        if(index >= 0)nodes.splice(index, 1);
+      },
+    };
+    node.classList = {
+      add(name){
+        const names = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+        names.add(name);
+        node.className = [...names].join(' ');
+      },
+    };
+    return node;
+  };
+  const root = {
+    classList: {
+      add(name){ rootClasses.add(name); },
+      remove(name){ rootClasses.delete(name); },
+    },
+    querySelector(selector){ return nodes.find((node) => matches(node, selector)) || null; },
+    querySelectorAll(selector){ return nodes.filter((node) => matches(node, selector)); },
+    appendChild(node){ nodes.push(node); },
+  };
+  let refreshes = 0;
+  const api = new Function(
+    'conversationRestoreRevision',
+    'currentConversationId',
+    'currentConversationSource',
+    'chat',
+    'document',
+    'refreshIcons',
+    `${restoreHelpers}; return { beginConversationRestoring, clearConversationRestoring };`,
+  )(3, 'thread-a', 'codex', root, {
+    createElement,
+    getElementById(){ return root; },
+  }, () => { refreshes += 1; });
+
+  api.beginConversationRestoring();
+  api.beginConversationRestoring();
+  assert.equal(rootClasses.has('conversationRestoring'), true);
+  assert.equal(nodes.filter((node) => matches(node, '.conversationRestorePlaceholder')).length, 1);
+  assert.equal(api.clearConversationRestoring({
+    restoreRevision: 1,
+    id: 'thread-a',
+    source: 'codex',
+  }), false);
+  assert.equal(rootClasses.has('conversationRestoring'), true);
+  assert.equal(nodes.filter((node) => matches(node, '.conversationRestorePlaceholder')).length, 1);
+  assert.equal(api.clearConversationRestoring({
+    restoreRevision: 3,
+    id: 'thread-a',
+    source: 'codex',
+  }), true);
+  assert.equal(rootClasses.has('conversationRestoring'), false);
+  assert.equal(nodes.filter((node) => matches(node, '.conversationRestorePlaceholder')).length, 0);
+  assert.equal(refreshes, 1);
 });
 
 test('same-conversation refresh keeps the visible status instead of flashing Loading', () => {
@@ -3140,7 +3255,7 @@ test('mobile run controls combine goal, plan, and agent pills with tap details',
   assert.match(mobileGoalStyles, /body \.composer > \.threadGoalBar\.runtimeOnly,[\s\S]*?display:\s*block;/s);
   const refreshFilesSource = sourceBetween('function refreshLiveEditedFilesResult', 'function createWebPreviewResultCard');
   assert.equal((refreshFilesSource.match(/renderThreadGoalBar\(\)/g) || []).length, 2);
-  assert.match(serverSource, /ui\.css\?v=quota-project-actions-20260820a/);
+  assert.match(serverSource, /ui\.css\?v=[A-Za-z0-9._-]+/);
 });
 
 test('desktop live plan stays a compact pill with an on-demand detail popup', () => {
@@ -3250,11 +3365,12 @@ test('conversation load defers bottom alignment until the chat is laid out and p
 
 test('initial history fill keeps the restore veil until every page finishes', () => {
   const pagingSource = sourceBetween('async function loadEarlierNativeHistoryPage', 'async function loadConversation');
-  const loadConversation = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  const loadConversation = sourceBetween('async function loadConversation', 'function nativeRunningStatusTimestamp');
   const historyRestoreStart = loadConversation.indexOf('if(options.historyScrollAnchor){');
   const historyRestoreEnd = loadConversation.indexOf('}else{', historyRestoreStart);
   assert.ok(historyRestoreStart >= 0 && historyRestoreEnd > historyRestoreStart);
   const historyRestoreBranch = loadConversation.slice(historyRestoreStart, historyRestoreEnd);
+  const initialRestoreBranch = loadConversation.slice(historyRestoreEnd);
 
   assert.match(
     pagingSource,
@@ -3262,14 +3378,34 @@ test('initial history fill keeps the restore veil until every page finishes', ()
   );
   assert.match(
     pagingSource,
-    /historyScrollAnchor:anchor,[\s\S]*?holdConversationRestoring,[\s\S]*?skipPromptQueueSync:true/,
+    /const inheritedRestoreRevision=Number\(options\.restoreRevision\);[\s\S]*?const restoreRevision=Number\.isInteger\(inheritedRestoreRevision\)&&inheritedRestoreRevision>0[\s\S]*?\+\+conversationRestoreRevision/,
+  );
+  assert.match(
+    pagingSource,
+    /historyScrollAnchor:anchor,[\s\S]*?holdConversationRestoring,[\s\S]*?restoreRevision,[\s\S]*?skipPromptQueueSync:true/,
   );
   assert.match(
     loadConversation,
-    /if\(!res\.ok\)\{clearConversationStatusLoading\(\);if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\)/,
+    /const inheritedRestoreRevision=Number\(options\.restoreRevision\);[\s\S]*?const restoreRevision=Number\.isInteger\(inheritedRestoreRevision\)&&inheritedRestoreRevision>0[\s\S]*?\+\+conversationRestoreRevision/,
+  );
+  assert.match(
+    loadConversation,
+    /if\(!res\.ok\)\{clearConversationStatusLoading\(\);if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\{restoreRevision,id,source:nextConversationSource\}\)/,
   );
   assert.match(
     historyRestoreBranch,
-    /if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\)/,
+    /await restoreHistoryScrollAnchor\(chat,options\.historyScrollAnchor\);\s*if\(seq!==conversationLoadSeq\|\|currentConversationId!==conversation\.id\|\|currentConversationSource!==\(conversation\.source==='codex'\?'codex':'web'\)\)return false;/,
+  );
+  assert.match(
+    historyRestoreBranch,
+    /if\(!options\.holdConversationRestoring\)clearConversationRestoring\(\{\s*restoreRevision,\s*id:conversation\.id,\s*source:conversation\.source,\s*\}\)/,
+  );
+  assert.match(
+    initialRestoreBranch,
+    /const finishRestorePaint=\(\)=>\{\s*clearConversationRestoring\(\{restoreRevision,id:readyId,source:readySource\}\);\s*\}/,
+  );
+  assert.match(
+    initialRestoreBranch,
+    /void loadEarlierNativeHistoryPage\(\{fillViewport:true,restoreRevision\}\)\.finally\(finishRestorePaint\)/,
   );
 });

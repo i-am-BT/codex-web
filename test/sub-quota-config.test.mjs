@@ -15,6 +15,7 @@ test('stores and returns CPA and Sub2API quotas together', async () => {
   const codexHome = path.join(temporary, 'codex-home');
   const envFile = path.join(temporary, 'web.env');
   const fakeCodex = path.join(temporary, 'fake-codex.mjs');
+  let cpaUsageRequests = 0;
   let provider;
   let child;
   try {
@@ -61,8 +62,17 @@ if (process.argv[2] === 'app-server') {
         return;
       }
       if (req.url === '/v0/management/api-call') {
-        assert.equal(req.headers['x-management-key'], 'cpa-key');
-        assert.equal(JSON.parse(body).method, 'GET');
+        assert.equal(req.headers['x-management-key'], 'secret-cpa-credential-Z9X8');
+        const payload = JSON.parse(body);
+        assert.equal(payload.method, 'GET');
+        if (payload.url === 'https://chatgpt.com/backend-api/wham/usage') {
+          cpaUsageRequests += 1;
+          if (cpaUsageRequests === 1) {
+            res.statusCode = 502;
+            res.end(JSON.stringify({ error: 'temporary bad gateway' }));
+            return;
+          }
+        }
         res.end(JSON.stringify({
           status_code: 200,
           body: {
@@ -74,12 +84,12 @@ if (process.argv[2] === 'app-server') {
         return;
       }
       if (req.url === '/v1/usage') {
-        assert.equal(req.headers.authorization, 'Bearer sub-key');
+        assert.equal(req.headers.authorization, 'Bearer secret-sub-credential-Y7W6');
         res.end(JSON.stringify({ isValid: true, planName: 'Sub plan', remaining: 42, unit: 'USD' }));
         return;
       }
       if (req.url === '/user/balance') {
-        assert.equal(req.headers.authorization, 'Bearer deepseek-key');
+        assert.equal(req.headers.authorization, 'Bearer secret-deepseek-credential-V5U4');
         res.end(JSON.stringify({
           is_available: true,
           balance_infos: [{
@@ -149,9 +159,9 @@ if (process.argv[2] === 'app-server') {
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sources: [
-          { provider: 'cpa-codex', baseUrl: providerBaseUrl, apiKey: 'cpa-key' },
-          { provider: 'sub2api', baseUrl: providerBaseUrl, apiKey: 'sub-key' },
-          { provider: 'deepseek', baseUrl: providerBaseUrl, apiKey: 'deepseek-key' },
+          { provider: 'cpa-codex', baseUrl: providerBaseUrl, apiKey: 'secret-cpa-credential-Z9X8' },
+          { provider: 'sub2api', baseUrl: providerBaseUrl, apiKey: 'secret-sub-credential-Y7W6' },
+          { provider: 'deepseek', baseUrl: providerBaseUrl, apiKey: 'secret-deepseek-credential-V5U4' },
         ],
         order: ['sub2api', 'deepseek', 'cpa-codex', 'grok2api'],
       }),
@@ -162,18 +172,44 @@ if (process.argv[2] === 'app-server') {
     assert.equal(savedPayload.configuredCount, 3);
     assert.equal(savedPayload.sources.filter((source) => source.configured).length, 3);
     assert.deepEqual(savedPayload.sources.map((source) => source.provider), ['sub2api', 'deepseek', 'cpa-codex', 'grok2api']);
-    assert.doesNotMatch(JSON.stringify(savedPayload), /cpa-key|sub-key|deepseek-key/);
+    assert.doesNotMatch(
+      JSON.stringify(savedPayload),
+      /secret-cpa-credential-Z9X8|secret-sub-credential-Y7W6|secret-deepseek-credential-V5U4/,
+    );
+
+    const missingUrlSave = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sources: [{
+          id: 'missing-url',
+          name: 'Missing URL',
+          provider: 'sub2api',
+          baseUrl: '',
+          apiKeys: [{ label: 'Key 1', value: 'orphan-secret-Q3R2' }],
+        }],
+      }),
+    });
+    assert.equal(missingUrlSave.status, 400);
+    const missingUrlPayload = await missingUrlSave.json();
+    assert.match(missingUrlPayload.error, /请先填写上游 URL/);
+    assert.doesNotMatch(JSON.stringify(missingUrlPayload), /orphan-secret-Q3R2/);
 
     const configAfterSave = await fetch(`${baseUrl}/api/sub-quota-config`, { headers: { Cookie: cookie } });
     const configAfterSavePayload = await configAfterSave.json();
     assert.deepEqual(configAfterSavePayload.sources.map((source) => source.provider), ['sub2api', 'deepseek', 'cpa-codex', 'grok2api']);
 
     const quotas = await fetch(`${baseUrl}/api/sub-quotas?refresh=1`, { headers: { Cookie: cookie } });
-    assert.equal(quotas.status, 200);
-    const quotaPayload = await quotas.json();
+    const quotaText = await quotas.text();
+    assert.equal(quotas.status, 200, quotaText);
+    const quotaPayload = JSON.parse(quotaText);
     assert.equal(quotaPayload.count, 3);
     assert.deepEqual(quotaPayload.quotas.map((quota) => quota.provider), ['sub2api', 'deepseek', 'cpa-codex']);
-    assert.doesNotMatch(JSON.stringify(quotaPayload), /cpa-key|sub-key|deepseek-key/);
+    assert.equal(cpaUsageRequests, 2);
+    assert.doesNotMatch(
+      JSON.stringify(quotaPayload),
+      /secret-cpa-credential-Z9X8|secret-sub-credential-Y7W6|secret-deepseek-credential-V5U4/,
+    );
     const deepSeekQuota = quotaPayload.quotas.find((quota) => quota.provider === 'deepseek');
     assert.equal(deepSeekQuota.balance, 100);
     assert.equal(deepSeekQuota.currency, 'CNY');
@@ -181,9 +217,9 @@ if (process.argv[2] === 'app-server') {
     const persisted = await readFile(envFile, 'utf8');
     assert.match(persisted, /^SUB_QUOTA_PROVIDER="multi"$/m);
     assert.match(persisted, /^SUB_QUOTA_ORDER="sub2api,deepseek,cpa-codex,grok2api"$/m);
-    assert.match(persisted, /^CPA_QUOTA_API_KEY="cpa-key"$/m);
-    assert.match(persisted, /^SUB2API_API_KEY="sub-key"$/m);
-    assert.match(persisted, /^DEEPSEEK_API_KEY="deepseek-key"$/m);
+    assert.match(persisted, /^CPA_QUOTA_API_KEY="secret-cpa-credential-Z9X8"$/m);
+    assert.match(persisted, /^SUB2API_API_KEY="secret-sub-credential-Y7W6"$/m);
+    assert.match(persisted, /^DEEPSEEK_API_KEY="secret-deepseek-credential-V5U4"$/m);
 
     const visibilityOnlySave = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
@@ -210,9 +246,9 @@ if (process.argv[2] === 'app-server') {
       ],
     );
     const persistedAfterVisibilityOnlySave = await readFile(envFile, 'utf8');
-    assert.match(persistedAfterVisibilityOnlySave, /^CPA_QUOTA_API_KEY="cpa-key"$/m);
-    assert.match(persistedAfterVisibilityOnlySave, /^SUB2API_API_KEY="sub-key"$/m);
-    assert.match(persistedAfterVisibilityOnlySave, /^DEEPSEEK_API_KEY="deepseek-key"$/m);
+    assert.match(persistedAfterVisibilityOnlySave, /^CPA_QUOTA_API_KEY="secret-cpa-credential-Z9X8"$/m);
+    assert.match(persistedAfterVisibilityOnlySave, /^SUB2API_API_KEY="secret-sub-credential-Y7W6"$/m);
+    assert.match(persistedAfterVisibilityOnlySave, /^DEEPSEEK_API_KEY="secret-deepseek-credential-V5U4"$/m);
     assert.match(persistedAfterVisibilityOnlySave, /^DEEPSEEK_QUOTA_VISIBLE="false"$/m);
 
     await new Promise((resolve) => provider.close(resolve));
@@ -292,6 +328,8 @@ if (process.argv[2] === 'app-server') {
       if (req.url === '/v1/usage') {
         const source = authorization === 'Bearer sub-main-secret'
           ? { planName: 'Main Sub Plan', remaining: 81 }
+          : authorization === 'Bearer sub-main-alt-secret'
+            ? { planName: 'Main Sub Backup Plan', remaining: 62 }
           : authorization === 'Bearer sub-backup-secret'
             ? { planName: 'Backup Sub Plan', remaining: 37 }
             : null;
@@ -387,8 +425,32 @@ if (process.argv[2] === 'app-server') {
       return response.headers.get('set-cookie').split(';', 1)[0];
     };
 
+    await writeFile(sourcesFile, `${JSON.stringify({
+      version: 1,
+      codexAppVisible: false,
+      sources: [{
+        id: 'legacy-sub',
+        name: '旧版 Sub',
+        provider: 'sub2api',
+        order: 0,
+        baseUrl: providerBaseUrl,
+        apiKey: 'legacy-persisted-secret',
+        visible: true,
+        builtin: false,
+      }],
+    }, null, 2)}\n`);
     let baseUrl = await startServer();
     let cookie = await login(baseUrl);
+    const legacyConfig = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(legacyConfig.status, 200);
+    const legacyConfigPayload = await legacyConfig.json();
+    const legacySource = legacyConfigPayload.sources.find((source) => source.id === 'legacy-sub');
+    assert.equal(legacySource.keyConfigured, true);
+    assert.equal(legacySource.keyCount, 1);
+    assert.equal(legacySource.credentials.length, 1);
+    assert.doesNotMatch(JSON.stringify(legacyConfigPayload), /legacy-persisted-secret/);
     const initialSave = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -406,7 +468,7 @@ if (process.argv[2] === 'app-server') {
             removable: true,
           },
           {
-            id: 'sub-backup',
+            id: 'sub_main',
             name: '备用 Sub',
             provider: 'sub2api',
             baseUrl: providerBaseUrl,
@@ -426,7 +488,7 @@ if (process.argv[2] === 'app-server') {
             removable: true,
           },
         ],
-        order: ['compat-main', 'sub-backup', 'sub-main'],
+        order: ['compat-main', 'sub_main', 'sub-main'],
       }),
     });
     assert.equal(initialSave.status, 200);
@@ -452,7 +514,7 @@ if (process.argv[2] === 'app-server') {
           removable: true,
         },
         {
-          id: 'sub-backup',
+          id: 'sub_main',
           name: '备用 Sub',
           provider: 'sub2api',
           visible: false,
@@ -485,6 +547,7 @@ if (process.argv[2] === 'app-server') {
     assert.equal(initialConfig.status, 200);
     const initialConfigPayload = await initialConfig.json();
     assert.equal(initialConfigPayload.maxSources, 12);
+    assert.equal(initialConfigPayload.maxApiKeys, 8);
     assert.ok(
       initialConfigPayload.providerOptions.some((option) => (
         option.provider === 'openai-compatible' && option.label === 'OpenAI 兼容'
@@ -492,8 +555,10 @@ if (process.argv[2] === 'app-server') {
     );
     assert.deepEqual(
       initialConfigPayload.sources.slice(0, 3).map((source) => source.id),
-      ['compat-main', 'sub-backup', 'sub-main'],
+      ['compat-main', 'sub_main', 'sub-main'],
     );
+    assert.ok(initialConfigPayload.sources.slice(0, 3).every((source) => source.keyCount === 1));
+    assert.ok(initialConfigPayload.sources.slice(0, 3).every((source) => source.credentials.length === 1));
     assert.doesNotMatch(
       JSON.stringify(initialConfigPayload),
       /sub-main-secret|sub-backup-secret|compat-secret/,
@@ -502,18 +567,19 @@ if (process.argv[2] === 'app-server') {
     const initialQuotas = await fetch(`${baseUrl}/api/sub-quotas?refresh=1`, {
       headers: { Cookie: cookie },
     });
-    assert.equal(initialQuotas.status, 200);
-    const initialQuotaPayload = await initialQuotas.json();
+    const initialQuotaText = await initialQuotas.text();
+    assert.equal(initialQuotas.status, 200, initialQuotaText);
+    const initialQuotaPayload = JSON.parse(initialQuotaText);
     assert.deepEqual(
       initialQuotaPayload.quotas.map((quota) => quota.sourceId),
-      ['compat-main', 'sub-backup', 'sub-main'],
+      ['compat-main', 'sub_main', 'sub-main'],
     );
     assert.equal(initialQuotaPayload.quotas[0].mode, 'openai_compatible');
     assert.equal(initialQuotaPayload.quotas[0].balance, null);
     assert.equal(initialQuotaPayload.quotas[1].planName, 'Backup Sub Plan');
     assert.equal(initialQuotaPayload.quotas[2].planName, 'Main Sub Plan');
     assert.equal(initialQuotaPayload.visibility['compat-main'], true);
-    assert.equal(initialQuotaPayload.visibility['sub-backup'], false);
+    assert.equal(initialQuotaPayload.visibility.sub_main, false);
     assert.equal(initialQuotaPayload.visibility['sub-main'], true);
     assert.equal(initialQuotaPayload.codexApp.visible, false);
     assert.doesNotMatch(
@@ -535,18 +601,20 @@ if (process.argv[2] === 'app-server') {
     );
 
     const storedInitial = JSON.parse(await readFile(sourcesFile, 'utf8'));
+    assert.equal(storedInitial.version, 2);
     assert.equal(
-      storedInitial.sources.find((source) => source.id === 'sub-main').apiKey,
+      storedInitial.sources.find((source) => source.id === 'sub-main').apiKeys[0].value,
       'sub-main-secret',
     );
     assert.equal(
-      storedInitial.sources.find((source) => source.id === 'sub-backup').apiKey,
+      storedInitial.sources.find((source) => source.id === 'sub_main').apiKeys[0].value,
       'sub-backup-secret',
     );
     assert.equal(
-      storedInitial.sources.find((source) => source.id === 'compat-main').apiKey,
+      storedInitial.sources.find((source) => source.id === 'compat-main').apiKeys[0].value,
       'compat-secret',
     );
+    assert.ok(storedInitial.sources.every((source) => !Object.hasOwn(source, 'apiKey')));
 
     const retainedSave = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
@@ -557,6 +625,12 @@ if (process.argv[2] === 'app-server') {
           ...initialConfigPayload.sources.map((source) => ({
             ...source,
             apiKey: '',
+            ...(source.id === 'sub-main' ? {
+              apiKeys: [
+                ...source.credentials.map((credential) => ({ ...credential, value: '' })),
+                { label: '备用 Key', value: 'sub-main-alt-secret' },
+              ],
+            } : {}),
           })),
           {
             id: 'sub-empty',
@@ -569,7 +643,7 @@ if (process.argv[2] === 'app-server') {
             removable: true,
           },
         ],
-        order: ['compat-main', 'sub-empty', 'sub-main', 'sub-backup'],
+        order: ['compat-main', 'sub-empty', 'sub-main', 'sub_main'],
       }),
     });
     assert.equal(retainedSave.status, 200);
@@ -577,33 +651,32 @@ if (process.argv[2] === 'app-server') {
     assert.equal(retainedPayload.configuredCount, 3);
     assert.deepEqual(
       retainedPayload.sources.slice(0, 4).map((source) => source.id),
-      ['compat-main', 'sub-empty', 'sub-main', 'sub-backup'],
+      ['compat-main', 'sub-empty', 'sub-main', 'sub_main'],
     );
     assert.equal(retainedPayload.sources.find((source) => source.id === 'compat-main').keyConfigured, true);
     assert.equal(retainedPayload.sources.find((source) => source.id === 'sub-main').keyConfigured, true);
-    assert.equal(retainedPayload.sources.find((source) => source.id === 'sub-backup').keyConfigured, true);
+    assert.equal(retainedPayload.sources.find((source) => source.id === 'sub-main').keyCount, 2);
+    assert.equal(retainedPayload.sources.find((source) => source.id === 'sub-main').credentials.length, 2);
+    assert.equal(retainedPayload.sources.find((source) => source.id === 'sub_main').keyConfigured, true);
     assert.equal(retainedPayload.sources.find((source) => source.id === 'sub-empty').keyConfigured, false);
     assert.doesNotMatch(
       JSON.stringify(retainedPayload),
-      /sub-main-secret|sub-backup-secret|compat-secret/,
+      /sub-main-secret|sub-main-alt-secret|sub-backup-secret|compat-secret/,
     );
     const storedRetained = JSON.parse(await readFile(sourcesFile, 'utf8'));
-    assert.equal(
-      storedRetained.sources.find((source) => source.id === 'sub-main').apiKey,
-      'sub-main-secret',
+    assert.deepEqual(
+      storedRetained.sources.find((source) => source.id === 'sub-main').apiKeys.map((credential) => credential.value),
+      ['sub-main-secret', 'sub-main-alt-secret'],
     );
     assert.equal(
-      storedRetained.sources.find((source) => source.id === 'sub-backup').apiKey,
+      storedRetained.sources.find((source) => source.id === 'sub_main').apiKeys[0].value,
       'sub-backup-secret',
     );
     assert.equal(
-      storedRetained.sources.find((source) => source.id === 'compat-main').apiKey,
+      storedRetained.sources.find((source) => source.id === 'compat-main').apiKeys[0].value,
       'compat-secret',
     );
-    assert.equal(
-      storedRetained.sources.find((source) => source.id === 'sub-empty').apiKey,
-      '',
-    );
+    assert.deepEqual(storedRetained.sources.find((source) => source.id === 'sub-empty').apiKeys, []);
 
     const deleteBackup = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
@@ -613,7 +686,7 @@ if (process.argv[2] === 'app-server') {
         sources: retainedPayload.sources.map((source) => ({
           ...source,
           apiKey: '',
-          remove: source.id === 'sub-backup',
+          remove: source.id === 'sub_main',
         })),
         order: ['compat-main', 'sub-empty', 'sub-main'],
       }),
@@ -621,7 +694,7 @@ if (process.argv[2] === 'app-server') {
     assert.equal(deleteBackup.status, 200);
     const deletePayload = await deleteBackup.json();
     assert.equal(deletePayload.configuredCount, 2);
-    assert.equal(deletePayload.sources.some((source) => source.id === 'sub-backup'), false);
+    assert.equal(deletePayload.sources.some((source) => source.id === 'sub_main'), false);
     assert.deepEqual(
       deletePayload.sources.slice(0, 3).map((source) => source.id),
       ['compat-main', 'sub-empty', 'sub-main'],
@@ -631,7 +704,7 @@ if (process.argv[2] === 'app-server') {
       /sub-main-secret|sub-backup-secret|compat-secret/,
     );
     const storedAfterDelete = JSON.parse(await readFile(sourcesFile, 'utf8'));
-    assert.equal(storedAfterDelete.sources.some((source) => source.id === 'sub-backup'), false);
+    assert.equal(storedAfterDelete.sources.some((source) => source.id === 'sub_main'), false);
 
     await stopServer();
     await rm(path.join(runtime, 'port'), { force: true });
@@ -643,17 +716,18 @@ if (process.argv[2] === 'app-server') {
     assert.equal(restoredConfig.status, 200);
     const restoredConfigPayload = await restoredConfig.json();
     assert.equal(restoredConfigPayload.codexApp.visible, false);
-    assert.equal(restoredConfigPayload.sources.some((source) => source.id === 'sub-backup'), false);
+    assert.equal(restoredConfigPayload.sources.some((source) => source.id === 'sub_main'), false);
     assert.deepEqual(
       restoredConfigPayload.sources.slice(0, 3).map((source) => source.id),
       ['compat-main', 'sub-empty', 'sub-main'],
     );
     assert.equal(restoredConfigPayload.sources.find((source) => source.id === 'compat-main').keyConfigured, true);
     assert.equal(restoredConfigPayload.sources.find((source) => source.id === 'sub-main').keyConfigured, true);
+    assert.equal(restoredConfigPayload.sources.find((source) => source.id === 'sub-main').keyCount, 2);
     assert.equal(restoredConfigPayload.sources.find((source) => source.id === 'sub-empty').keyConfigured, false);
     assert.doesNotMatch(
       JSON.stringify(restoredConfigPayload),
-      /sub-main-secret|sub-backup-secret|compat-secret/,
+      /sub-main-secret|sub-main-alt-secret|sub-backup-secret|compat-secret/,
     );
 
     providerRequests.length = 0;
@@ -662,10 +736,11 @@ if (process.argv[2] === 'app-server') {
     });
     assert.equal(restoredQuotas.status, 200);
     const restoredQuotaPayload = await restoredQuotas.json();
-    assert.deepEqual(
-      restoredQuotaPayload.quotas.map((quota) => quota.sourceId),
-      ['compat-main', 'sub-main'],
-    );
+    assert.deepEqual(restoredQuotaPayload.quotas.map((quota) => quota.sourceId), [
+      'compat-main',
+      'sub-main',
+      'sub-main',
+    ]);
     assert.equal(
       providerRequests.some((request) => request.authorization === 'Bearer sub-backup-secret'),
       false,
@@ -675,12 +750,16 @@ if (process.argv[2] === 'app-server') {
       true,
     );
     assert.equal(
+      providerRequests.some((request) => request.authorization === 'Bearer sub-main-alt-secret'),
+      true,
+    );
+    assert.equal(
       providerRequests.some((request) => request.authorization === 'Bearer compat-secret'),
       true,
     );
     assert.doesNotMatch(
       JSON.stringify(restoredQuotaPayload),
-      /sub-main-secret|sub-backup-secret|compat-secret/,
+      /sub-main-secret|sub-main-alt-secret|sub-backup-secret|compat-secret/,
     );
   } finally {
     if (child && child.exitCode === null) {
