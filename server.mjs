@@ -18140,7 +18140,7 @@ function renderSubQuota(data){
     const rateLimits=Array.isArray(quota.rateLimits)?quota.rateLimits:[];
     for(const rateLimit of rateLimits){
       if(String(rateLimit?.window||'').toLowerCase()!=='5h')continue;
-      const label=isSub2Api?'5小时':subQuotaRateLimitLabel(rateLimit.window);
+      const label=isSub2Api?'5小时':subQuotaRateLimitLabel(rateLimit);
       detailCount+=appendSubQuotaWindow(source,label,rateLimit,rateLimit.unit||unit,rateLimitWindowOptions)?1:0;
     }
     if(quota.subscription){
@@ -18156,7 +18156,7 @@ function renderSubQuota(data){
     if(quota.quota)detailCount+=appendSubQuotaWindow(source,'总额度',quota.quota,unit,rateLimitWindowOptions)?1:0;
     for(const rateLimit of rateLimits){
       if(String(rateLimit?.window||'').toLowerCase()==='5h')continue;
-      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit.window),rateLimit,rateLimit.unit||unit,rateLimitWindowOptions)?1:0;
+      detailCount+=appendSubQuotaWindow(source,subQuotaRateLimitLabel(rateLimit),rateLimit,rateLimit.unit||unit,rateLimitWindowOptions)?1:0;
     }
     const walletBalance=finiteSubQuotaNumber(quota.balance??quota.remaining);
     if(!detailCount&&walletBalance!==null){
@@ -18171,7 +18171,7 @@ function renderSubQuota(data){
     if(quota.status)appendSubQuotaMeta(meta,'状态 '+formatSubQuotaStatus(quota.status));
     if(Number.isFinite(Number(quota.rateLimitResetCredits)))appendSubQuotaMeta(meta,'主动重置 '+Number(quota.rateLimitResetCredits).toLocaleString('zh-CN')+' 次');
     for(const rateLimit of isSub2Api?[]:(Array.isArray(quota.rateLimits)?quota.rateLimits:[])){
-      if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit.window)+'重置 '+formatSubQuotaDateTime(rateLimit.resetAt));
+      if(rateLimit.resetAt)appendSubQuotaMeta(meta,subQuotaRateLimitLabel(rateLimit)+'重置 '+formatSubQuotaDateTime(rateLimit.resetAt));
     }
     if(stale)appendSubQuotaMeta(meta,subQuotaStaleMetaText(quota));
     if(!detailCount&&!meta.childElementCount)continue;
@@ -18341,7 +18341,22 @@ function stopSubQuotaCountdowns(){
 }
 function appendSubQuotaMeta(parent,text){const item=document.createElement('span');item.textContent=text;parent.appendChild(item);return item}
 function finiteSubQuotaNumber(value){if(value===null||value===undefined||value==='')return null;const number=Number(value);return Number.isFinite(number)&&number>=0?number:null}
-function subQuotaRateLimitLabel(value){return({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[String(value||'').toLowerCase()]||String(value||'限速')}
+function subQuotaRateLimitLabel(value){
+  const rateLimit=value&&typeof value==='object'?value:null;
+  const window=String(rateLimit?.window??value??'').trim().toLowerCase();
+  const label=({'5h':'5 小时','1d':'每日','7d':'周限额','30d':'月限额'})[window]||String(window||'限速');
+  const id=String(rateLimit?.id||'').trim().toLowerCase();
+  const suffix=window?'-'+window:'';
+  const bucket=String(rateLimit?.bucket||(
+    suffix&&id.endsWith(suffix)?id.slice(0,-suffix.length):''
+  )).trim().toLowerCase();
+  const bucketLabel=({
+    'code-review':'代码审查',
+    'gpt-reserve':'GPT 预留',
+    'base-model-inference':'基础模型推理',
+  })[bucket]||(bucket?'附加额度':'');
+  return bucketLabel?bucketLabel+' · '+label:label;
+}
 function formatSubQuotaStatus(value){return({active:'正常',unlimited:'不限量',not_available:'未提供',quota_exhausted:'额度耗尽',expired:'已过期',no_access:'无访问权限',blocked:'已限制'})[String(value||'').toLowerCase()]||String(value||'')}
 function formatCodexAppUsdAmount(value){const number=finiteSubQuotaNumber(value)||0;return 'US$'+number.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}
 function formatSubQuotaAmount(value,unit,fixedCurrency=false){const number=finiteSubQuotaNumber(value)||0;if(unit==='%')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+'%';if(unit==='accounts')return number.toLocaleString('zh-CN',{maximumFractionDigits:0})+' 个';const formatted=number.toLocaleString('zh-CN',{minimumFractionDigits:unit==='USD'&&fixedCurrency?2:0,maximumFractionDigits:2});if(unit==='credits')return formatted+' 点';return unit==='USD'?'$'+formatted:formatted+(unit?' '+unit:'')}

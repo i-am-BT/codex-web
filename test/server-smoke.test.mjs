@@ -6042,7 +6042,7 @@ updated_at = 1784422800000
     assert.match(inlineScript, /\{displayUsed:true,showReset:true,fixedCurrency:true\}/);
     assert.match(inlineScript, /const rateLimitWindowOptions=quota\.provider==='cpa-codex'\s*\? \{displayUsed:true\}\s*: sub2ApiWindowOptions/);
     assert.match(inlineScript, /appendSubQuotaWindow\(source,label,rateLimit,rateLimit\.unit\|\|unit,rateLimitWindowOptions\)/);
-    assert.match(inlineScript, /appendSubQuotaWindow\(source,subQuotaRateLimitLabel\(rateLimit\.window\),rateLimit,rateLimit\.unit\|\|unit,rateLimitWindowOptions\)/);
+    assert.match(inlineScript, /appendSubQuotaWindow\(source,subQuotaRateLimitLabel\(rateLimit\),rateLimit,rateLimit\.unit\|\|unit,rateLimitWindowOptions\)/);
     assert.match(inlineScript, /bar\.dataset\.level=percent>=100\?'exhausted':percent>=80\?'warning':'normal'/);
     assert.match(inlineScript, /value.textContent='当前可用'/);
     assert.doesNotMatch(inlineScript, /用量未返回/);
@@ -6050,7 +6050,19 @@ updated_at = 1784422800000
     const dailySubscriptionWindow = inlineScript.indexOf("appendSubQuotaWindow(source,'每日',daily,unit,sub2ApiWindowOptions)");
     assert.ok(firstFiveHourWindow >= 0);
     assert.ok(dailySubscriptionWindow > firstFiveHourWindow);
-    assert.match(inlineScript, /const label=isSub2Api\?'5小时':subQuotaRateLimitLabel\(rateLimit\.window\)/);
+    assert.match(inlineScript, /const label=isSub2Api\?'5小时':subQuotaRateLimitLabel\(rateLimit\)/);
+    assert.match(inlineScript, /subQuotaRateLimitLabel\(rateLimit\)\+'重置 '\+formatSubQuotaDateTime\(rateLimit\.resetAt\)/);
+    const subQuotaRateLimitLabelHelper = inlineScript.match(/(function subQuotaRateLimitLabel[\s\S]*?)(?=function formatSubQuotaStatus)/)?.[1];
+    assert.ok(subQuotaRateLimitLabelHelper);
+    const subQuotaRateLimitLabel = new Function(
+      subQuotaRateLimitLabelHelper + '; return subQuotaRateLimitLabel;',
+    )();
+    assert.equal(subQuotaRateLimitLabel({ window: '7d' }), '周限额');
+    assert.equal(
+      subQuotaRateLimitLabel({ id: 'gpt-reserve-7d', window: '7d', bucket: 'gpt-reserve' }),
+      'GPT 预留 · 周限额',
+    );
+    assert.equal(subQuotaRateLimitLabel({ id: 'code-review-7d', window: '7d' }), '代码审查 · 周限额');
     assert.match(inlineScript, /const showDedicatedExpiry=isSub2ApiSubscription\|\|quota\.provider==='cpa-codex'/);
     assert.match(inlineScript, /if\(showDedicatedExpiry&&expiresAt\)appendSubQuotaExpiry\(source,expiresAt\)/);
     assert.match(inlineScript, /if\(!showDedicatedExpiry&&expiresAt\)appendSubQuotaMeta\(meta,'到期 '\+formatSubQuotaDate\(expiresAt\)\)/);

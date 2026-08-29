@@ -1289,15 +1289,29 @@ export function normalizeCpaCodexQuota(data, file = {}, options = {}) {
     ? (data.additional_rate_limits || data.additionalRateLimits)
     : [];
   const rateLimits = [
-    ...mapCodexRateLimitGroup(rateLimit, ''),
-    ...mapCodexRateLimitGroup(codeReview, 'code-review-'),
+    ...mapCodexRateLimitGroup(rateLimit),
+    ...mapCodexRateLimitGroup(codeReview, {
+      idPrefix: 'code-review-',
+      bucket: 'code-review',
+    }),
     ...additional.flatMap((item, index) => {
       const nested = item?.rate_limit || item?.rateLimit || item;
-      const prefix = cleanText(item?.limit_name || item?.limitName || item?.metered_feature || item?.meteredFeature || `extra-${index + 1}`, 40)
+      const bucket = cleanText(
+        item?.limit_name
+        || item?.limitName
+        || item?.metered_feature
+        || item?.meteredFeature
+        || `extra-${index + 1}`,
+        40,
+      );
+      const prefix = bucket
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-+|-+$/g, '') || `extra-${index + 1}`;
-      return mapCodexRateLimitGroup(nested, `${prefix}-`);
+      return mapCodexRateLimitGroup(nested, {
+        idPrefix: `${prefix}-`,
+        bucket,
+      });
     }),
   ];
   const allowed = rateLimit?.allowed;
@@ -2154,17 +2168,29 @@ export function normalizeSubQuotaBaseUrl(value, options = {}) {
   return url.toString().replace(/\/+$/, '');
 }
 
-function mapCodexRateLimitGroup(group, idPrefix = '') {
+function mapCodexRateLimitGroup(group, options = {}) {
   if (!isRecord(group)) return [];
+  const idPrefix = typeof options === 'string' ? options : cleanText(options.idPrefix, 80);
+  const bucket = typeof options === 'string' ? '' : cleanText(options.bucket, 80);
   const windows = pickCodexWindows(group);
   const limits = [];
   if (windows.fiveHour) {
-    limits.push(codexWindowToRateLimit(`${idPrefix}5h`.replace(/^-/, ''), '5h', windows.fiveHour));
+    limits.push(codexWindowToRateLimit(
+      `${idPrefix}5h`.replace(/^-/, ''),
+      '5h',
+      windows.fiveHour,
+      { bucket },
+    ));
   }
   if (windows.weekly) {
     const seconds = nonNegativeNumber(windows.weekly.limit_window_seconds ?? windows.weekly.limitWindowSeconds);
     const window = isMonthlyWindowSeconds(seconds) ? '30d' : '7d';
-    limits.push(codexWindowToRateLimit(`${idPrefix}${window}`.replace(/^-/, ''), window, windows.weekly));
+    limits.push(codexWindowToRateLimit(
+      `${idPrefix}${window}`.replace(/^-/, ''),
+      window,
+      windows.weekly,
+      { bucket },
+    ));
   }
   return limits.filter(Boolean);
 }
@@ -2186,12 +2212,13 @@ function pickCodexWindows(group) {
   return { fiveHour, weekly };
 }
 
-function codexWindowToRateLimit(id, window, data) {
+function codexWindowToRateLimit(id, window, data, options = {}) {
   if (!isRecord(data)) return null;
   const usedPercent = nonNegativeNumber(data.used_percent ?? data.usedPercent);
   const remainingPercent = usedPercent === null ? null : Math.max(0, 100 - usedPercent);
   const resetAtSeconds = nonNegativeNumber(data.reset_at ?? data.resetAt);
   const resetAfterSeconds = nonNegativeNumber(data.reset_after_seconds ?? data.resetAfterSeconds);
+  const bucket = cleanText(options.bucket, 80);
   let resetAt = '';
   if (resetAtSeconds !== null) resetAt = new Date(resetAtSeconds * 1000).toISOString();
   else if (resetAfterSeconds !== null) resetAt = new Date(Date.now() + resetAfterSeconds * 1000).toISOString();
@@ -2203,6 +2230,7 @@ function codexWindowToRateLimit(id, window, data) {
     remaining: remainingPercent,
     windowStart: '',
     resetAt,
+    ...(bucket ? { bucket } : {}),
   };
 }
 

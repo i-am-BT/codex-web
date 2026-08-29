@@ -161,6 +161,38 @@ test('normalizes CPA Codex usage windows with the current subscription entitleme
   assert.equal(quota.rateLimits[0].resetAt, '2026-07-27T08:39:33.000Z');
 });
 
+test('preserves a CPA Codex additional rate-limit bucket alongside the main weekly limit', () => {
+  const quota = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    rate_limit: {
+      primary_window: { used_percent: 62, limit_window_seconds: 18000 },
+      secondary_window: { used_percent: 42, limit_window_seconds: 604800 },
+    },
+    additional_rate_limits: [{
+      limit_name: 'gpt-reserve',
+      metered_feature: 'base_model_inference',
+      rate_limit: {
+        primary_window: {
+          used_percent: 0,
+          limit_window_seconds: 604800,
+          reset_at: 1787643180,
+        },
+      },
+    }],
+  });
+
+  assert.deepEqual(quota.rateLimits.map((item) => ({
+    id: item.id,
+    window: item.window,
+    bucket: item.bucket || '',
+    used: item.used,
+  })), [
+    { id: '5h', window: '5h', bucket: '', used: 62 },
+    { id: '7d', window: '7d', bucket: '', used: 42 },
+    { id: 'gpt-reserve-7d', window: '7d', bucket: 'gpt-reserve', used: 0 },
+  ]);
+});
+
 test('does not revive a stale auth-file expiry when live Plus entitlement is unavailable', () => {
   const file = {
     email: 'plus@example.com',
