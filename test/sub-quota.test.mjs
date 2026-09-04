@@ -5,6 +5,8 @@ import {
   normalizeCpaCodexQuota,
   normalizeDeepSeekBalance,
   normalizeGrok2ApiSummary,
+  normalizeNewApiQuota,
+  normalizeOpenAiCompatibleQuota,
   normalizeSubQuota,
   normalizeSub2ApiCodexAccounts,
   normalizeSub2ApiRateLimitProbe,
@@ -102,6 +104,14 @@ test('normalizes editable OpenAI-compatible API URLs and rejects unknown provide
     normalizeSubQuotaBaseUrl('https://openai-compatible.example.test/gateway/models', { provider: 'openai-compatible' }),
     'https://openai-compatible.example.test/gateway',
   );
+  assert.equal(
+    normalizeSubQuotaBaseUrl('https://openai-compatible.example.test/api/v1/models', { provider: 'openai-compatible' }),
+    'https://openai-compatible.example.test/api',
+  );
+  assert.equal(
+    normalizeSubQuotaBaseUrl('https://openai-compatible.example.test/gateway/v1', { provider: 'openai-compatible' }),
+    'https://openai-compatible.example.test/gateway',
+  );
   assert.throws(
     () => normalizeSubQuotaBaseUrl('https://unknown.example.test', { provider: 'unknown-provider' }),
     /不支持的额度来源 provider/,
@@ -149,6 +159,38 @@ test('normalizes CPA Codex usage windows with the current subscription entitleme
   assert.equal(quota.rateLimits[0].remaining, 82);
   assert.equal(quota.rateLimits[0].limit, 100);
   assert.equal(quota.rateLimits[0].resetAt, '2026-07-27T08:39:33.000Z');
+});
+
+test('preserves a CPA Codex additional rate-limit bucket alongside the main weekly limit', () => {
+  const quota = normalizeCpaCodexQuota({
+    plan_type: 'plus',
+    rate_limit: {
+      primary_window: { used_percent: 62, limit_window_seconds: 18000 },
+      secondary_window: { used_percent: 42, limit_window_seconds: 604800 },
+    },
+    additional_rate_limits: [{
+      limit_name: 'gpt-reserve',
+      metered_feature: 'base_model_inference',
+      rate_limit: {
+        primary_window: {
+          used_percent: 0,
+          limit_window_seconds: 604800,
+          reset_at: 1787643180,
+        },
+      },
+    }],
+  });
+
+  assert.deepEqual(quota.rateLimits.map((item) => ({
+    id: item.id,
+    window: item.window,
+    bucket: item.bucket || '',
+    used: item.used,
+  })), [
+    { id: '5h', window: '5h', bucket: '', used: 62 },
+    { id: '7d', window: '7d', bucket: '', used: 42 },
+    { id: 'gpt-reserve-7d', window: '7d', bucket: 'gpt-reserve', used: 0 },
+  ]);
 });
 
 test('does not revive a stale auth-file expiry when live Plus entitlement is unavailable', () => {
@@ -448,7 +490,245 @@ test('fetches DeepSeek official balance without leaking credentials', async () =
   assert.doesNotMatch(JSON.stringify(listed), /sk-deepseek/);
 });
 
-test('checks OpenAI-compatible sources through models without inventing quota values', async () => {
+test('normalizes New API user quota points with status currency metadata', () => {
+  const quota = normalizeNewApiQuota({
+    success: true,
+    data: {
+      id: 42,
+      username: 'alice',
+      display_name: 'Alice',
+      group: 'vip',
+      quota: '1000000',
+      used_quota: 250000,
+    },
+  }, {
+    statusData: {
+      success: true,
+      data: {
+        quota_per_unit: 500000,
+      },
+    },
+  });
+
+  assert.equal(quota.mode, 'new_api');
+  assert.equal(quota.valid, true);
+  assert.equal(quota.status, 'active');
+  assert.equal(quota.planName, 'New API');
+  assert.equal(quota.unit, 'USD');
+  assert.equal(quota.currency, 'USD');
+  assert.equal(quota.quotaPerUnit, 500000);
+  assert.equal(quota.balance, 2);
+  assert.equal(quota.remaining, 2);
+  assert.deepEqual(quota.quota, {
+    used: 0.5,
+    limit: 2.5,
+    remaining: 2,
+    unit: 'USD',
+  });
+  assert.equal(quota.quotaPoints, 1000000);
+  assert.equal(quota.usedQuotaPoints, 250000);
+  assert.equal(quota.totalQuotaPoints, 1250000);
+  assert.equal(quota.balanceUsd, 2);
+  assert.equal(quota.usedQuotaUsd, 0.5);
+  assert.equal(quota.totalQuotaUsd, 2.5);
+  assert.equal(quota.username, 'alice');
+  assert.equal(quota.displayName, 'Alice');
+  assert.equal(quota.group, 'vip');
+  assert.equal(quota.userId, '42');
+
+  const alias = normalizeOpenAiCompatibleQuota({
+    data: {
+      user: {
+        username: 'nested-user',
+        groupName: 'default',
+        quota: { remaining: 200000, used: 300000 },
+      },
+    },
+  }, {
+    statusData: { data: { quotaPerUnit: 100000 } },
+  });
+  assert.equal(alias.username, 'nested-user');
+  assert.equal(alias.group, 'default');
+  assert.equal(alias.balance, 2);
+  assert.deepEqual(alias.quota, {
+    used: 3,
+    limit: 5,
+    remaining: 2,
+    unit: 'USD',
+  });
+});
+
+test('uses the default New API quota conversion when status metadata is unavailable', () => {
+  const quota = normalizeNewApiQuota({
+    success: true,
+    data: {
+      quota: 123456,
+      used_quota: 100,
+      username: 'raw-user',
+    },
+  });
+
+  assert.equal(quota.mode, 'new_api');
+  assert.equal(quota.unit, 'USD');
+  assert.equal(quota.quotaPerUnit, 500000);
+  assert.equal(quota.balance, 0.246912);
+  assert.equal(quota.remaining, 0.246912);
+  assert.deepEqual(quota.quota, {
+    used: 0.0002,
+    limit: 0.247112,
+    remaining: 0.246912,
+    unit: 'USD',
+  });
+});
+
+test('recognizes zero New API quota as an exhausted but valid account', () => {
+  const quota = normalizeNewApiQuota({
+    success: true,
+    data: {
+      username: 'empty-user',
+      quota: 0,
+      used_quota: 1000000,
+      group: 'default',
+    },
+  }, {
+    statusData: { data: { quota_per_unit: 500000 } },
+  });
+
+  assert.equal(quota.valid, true);
+  assert.equal(quota.status, 'quota_exhausted');
+  assert.equal(quota.balance, 0);
+  assert.equal(quota.remaining, 0);
+  assert.deepEqual(quota.quota, {
+    used: 2,
+    limit: 2,
+    remaining: 0,
+    unit: 'USD',
+  });
+});
+
+test('recognizes an unallocated finite New API token as exhausted', () => {
+  const quota = normalizeNewApiQuota({
+    code: true,
+    data: {
+      total_available: 0,
+      total_granted: 0,
+      total_used: 0,
+      unlimited_quota: false,
+    },
+  });
+
+  assert.equal(quota.valid, true);
+  assert.equal(quota.status, 'quota_exhausted');
+  assert.equal(quota.balance, 0);
+  assert.equal(quota.quota.limit, 0);
+});
+
+test('respects an explicit credits unit when no conversion metadata is available', () => {
+  const quota = normalizeNewApiQuota({
+    code: true,
+    data: {
+      total_available: 120,
+      total_used: 30,
+      total_granted: 150,
+      unit: 'credits',
+      unlimited_quota: false,
+    },
+  });
+
+  assert.equal(quota.unit, 'credits');
+  assert.equal(quota.currency, 'credits');
+  assert.equal(quota.quotaPerUnit, null);
+  assert.equal(quota.remaining, 120);
+  assert.equal(quota.quota.limit, 150);
+});
+
+test('marks a New API token expired from the upstream expiry timestamp', () => {
+  const now = Date.parse('2026-08-27T12:00:00.000Z');
+  const quota = normalizeNewApiQuota({
+    code: true,
+    data: {
+      total_available: 500000,
+      total_used: 0,
+      total_granted: 500000,
+      unlimited_quota: false,
+      expires_at: Math.floor((now - 60_000) / 1000),
+    },
+  }, { now });
+
+  assert.equal(quota.valid, true);
+  assert.equal(quota.status, 'expired');
+  assert.equal(quota.daysUntilExpiry, 0);
+  assert.equal(quota.expiresAt, '2026-08-27T11:59:00.000Z');
+});
+
+test('normalizes unlimited New API token usage without exposing a negative balance', () => {
+  const quota = normalizeNewApiQuota({
+    success: true,
+    data: {
+      expires_at: 0,
+      model_limits: {},
+      model_limits_enabled: false,
+      name: '1',
+      object: 'token_usage',
+      total_available: -158646468,
+      total_granted: 0,
+      total_used: 158646468,
+      unlimited_quota: true,
+    },
+  }, {
+    statusData: { data: { quota_per_unit: 500000 } },
+  });
+
+  assert.equal(quota.valid, true);
+  assert.equal(quota.status, 'unlimited');
+  assert.equal(quota.unlimited, true);
+  assert.equal(quota.remaining, null);
+  assert.equal(quota.balance, null);
+  assert.equal(quota.quotaPoints, null);
+  assert.equal(quota.totalAvailablePoints, null);
+  assert.equal(quota.usedQuotaPoints, 158646468);
+  assert.equal(quota.totalUsedPoints, 158646468);
+  assert.equal(quota.totalGrantedPoints, 0);
+  assert.equal(quota.expiresAt, '');
+  assert.equal(quota.daysUntilExpiry, null);
+  assert.equal(quota.tokenName, '1');
+  assert.equal(quota.object, 'token_usage');
+  assert.equal(quota.modelLimitsEnabled, false);
+  assert.deepEqual(quota.modelLimits, {});
+  assert.deepEqual(quota.quota, {
+    used: 317.292936,
+    limit: null,
+    remaining: null,
+    unit: 'USD',
+  });
+  assert.doesNotMatch(JSON.stringify(quota), /-158646468/);
+});
+
+test('does not recognize arbitrary self responses without a numeric quota', () => {
+  assert.throws(
+    () => normalizeNewApiQuota({ success: true, data: { balance: 12, username: 'not-new-api' } }),
+    /缺少数字 quota/,
+  );
+  assert.throws(
+    () => normalizeNewApiQuota({ success: false, data: { quota: 12 } }),
+    /未成功/,
+  );
+});
+
+test('rejects an explicitly unsuccessful New API token usage response', () => {
+  assert.throws(
+    () => normalizeNewApiQuota({
+      code: false,
+      data: {
+        total_available: 100,
+        total_used: 0,
+      },
+    }),
+    /未成功/,
+  );
+});
+
+test('checks OpenAI-compatible sources through models and falls back when New API token usage is absent', async () => {
   const calls = [];
   const service = new SubQuotaService({
     sources: [
@@ -471,6 +751,9 @@ test('checks OpenAI-compatible sources through models without inventing quota va
     ],
     fetchImpl: async (url, options) => {
       calls.push({ url: String(url), authorization: options.headers.Authorization });
+      if (String(url).endsWith('/api/usage/token/')) {
+        return new Response('{}', { status: 404 });
+      }
       return new Response(JSON.stringify({
         object: 'list',
         data: [{ id: 'test-model', object: 'model' }],
@@ -494,8 +777,379 @@ test('checks OpenAI-compatible sources through models without inventing quota va
   assert.deepEqual(calls, [
     { url: 'https://first.example.test/v1/models', authorization: 'Bearer first-secret' },
     { url: 'https://second.example.test/v1/models', authorization: 'Bearer second-secret' },
+    { url: 'https://first.example.test/api/usage/token/', authorization: 'Bearer first-secret' },
+    { url: 'https://second.example.test/api/usage/token/', authorization: 'Bearer second-secret' },
   ]);
   assert.doesNotMatch(JSON.stringify(listed), /first-secret|second-secret/);
+});
+
+test('reads New API quota after OpenAI-compatible connectivity succeeds', async () => {
+  const calls = [];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'new-api',
+      name: 'New API',
+      provider: 'openai-compatible',
+      baseUrl: 'https://new-api.example.test',
+      apiKey: 'new-api-secret',
+    }],
+    fetchImpl: async (url, options) => {
+      calls.push({
+        url: String(url),
+        authorization: options.headers.Authorization,
+      });
+      if (String(url).endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ object: 'list', data: [{ id: 'gpt-test' }] }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/usage/token/')) {
+        return new Response(JSON.stringify({
+          success: true,
+          data: {
+            object: 'token_usage',
+            name: 'new-api-token',
+            total_available: 1500000,
+            total_granted: 2000000,
+            total_used: 500000,
+            unlimited_quota: false,
+            model_limits_enabled: false,
+            model_limits: {},
+          },
+        }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/status')) {
+        return new Response(JSON.stringify({
+          success: true,
+          data: { quota_per_unit: 500000 },
+        }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/user/self')) {
+        return new Response(JSON.stringify({
+          success: true,
+          data: {
+            username: 'new-api-user',
+            display_name: 'New API User',
+            group: 'vip',
+          },
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.count, 1);
+  assert.equal(listed.availableCount, 1);
+  assert.deepEqual(calls, [
+    {
+      url: 'https://new-api.example.test/v1/models',
+      authorization: 'Bearer new-api-secret',
+    },
+    {
+      url: 'https://new-api.example.test/api/usage/token/',
+      authorization: 'Bearer new-api-secret',
+    },
+    {
+      url: 'https://new-api.example.test/api/status',
+      authorization: 'Bearer new-api-secret',
+    },
+    {
+      url: 'https://new-api.example.test/api/user/self',
+      authorization: 'Bearer new-api-secret',
+    },
+  ]);
+  const quota = listed.quotas[0];
+  assert.equal(quota.mode, 'new_api');
+  assert.equal(quota.status, 'active');
+  assert.equal(quota.balance, 3);
+  assert.equal(quota.remaining, 3);
+  assert.deepEqual(quota.quota, {
+    used: 1,
+    limit: 4,
+    remaining: 3,
+    unit: 'USD',
+  });
+  assert.equal(quota.username, 'new-api-user');
+  assert.equal(quota.group, 'vip');
+  assert.equal(quota.tokenName, 'new-api-token');
+  assert.equal(quota.object, 'token_usage');
+  assert.equal(quota.modelLimitsEnabled, false);
+  assert.deepEqual(quota.modelLimits, {});
+  assert.equal(quota.quotaPoints, 1500000);
+  assert.equal(quota.usedQuotaPoints, 500000);
+  assert.equal(quota.totalQuotaPoints, 2000000);
+  assert.doesNotMatch(JSON.stringify(listed), /new-api-secret/);
+});
+
+test('keeps New API probes under API and gateway URL prefixes', async () => {
+  const cases = [
+    {
+      baseUrl: normalizeSubQuotaBaseUrl(
+        'https://new-api-prefix.example.test/api/v1/models',
+        { provider: 'openai-compatible' },
+      ),
+      modelsUrl: 'https://new-api-prefix.example.test/api/v1/models',
+      usageUrl: 'https://new-api-prefix.example.test/api/usage/token/',
+    },
+    {
+      baseUrl: normalizeSubQuotaBaseUrl(
+        'https://new-api-prefix.example.test/gateway/v1',
+        { provider: 'openai-compatible' },
+      ),
+      modelsUrl: 'https://new-api-prefix.example.test/gateway/v1/models',
+      usageUrl: 'https://new-api-prefix.example.test/gateway/api/usage/token/',
+    },
+  ];
+
+  for (const [index, item] of cases.entries()) {
+    const calls = [];
+    const service = new SubQuotaService({
+      sources: [{
+        id: `new-api-prefix-${index}`,
+        name: 'New API Prefix',
+        provider: 'openai-compatible',
+        baseUrl: item.baseUrl,
+        apiKey: 'prefix-secret',
+      }],
+      fetchImpl: async (url) => {
+        calls.push(String(url));
+        if (String(url) === item.modelsUrl) {
+          return new Response(JSON.stringify({ data: [{ id: 'model' }] }), { status: 200 });
+        }
+        if (String(url) === item.usageUrl) {
+          return new Response(JSON.stringify({
+            code: true,
+            data: {
+              total_available: 500000,
+              total_used: 0,
+              total_granted: 500000,
+              unlimited_quota: false,
+            },
+          }), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      },
+    });
+
+    const listed = await service.list({ refresh: true });
+    assert.equal(listed.quotas[0].mode, 'new_api');
+    assert.deepEqual(calls.slice(0, 2), [item.modelsUrl, item.usageUrl]);
+  }
+});
+
+test('retries a transient New API token usage failure once without failing connectivity', async () => {
+  let usageAttempts = 0;
+  const sleeps = [];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'new-api-retry',
+      name: 'New API Retry',
+      provider: 'openai-compatible',
+      baseUrl: 'https://new-api-retry.example.test',
+      apiKey: 'new-api-retry-secret',
+    }],
+    sleep: async (delayMs) => sleeps.push(delayMs),
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'model' }] }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/usage/token/')) {
+        usageAttempts += 1;
+        if (usageAttempts === 1) return new Response('{}', { status: 502 });
+        return new Response(JSON.stringify({
+          code: true,
+          data: {
+            total_available: 500000,
+            total_used: 0,
+            total_granted: 500000,
+            unlimited_quota: false,
+          },
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(usageAttempts, 2);
+  assert.deepEqual(sleeps, [250]);
+  assert.equal(listed.quotas[0].mode, 'new_api');
+  assert.equal(listed.quotas[0].balance, 1);
+});
+
+test('keeps the last New API quota visible after a transient probe failure', async () => {
+  let now = 1_000_000;
+  let transient = false;
+  let usageAttempts = 0;
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'new-api-stale',
+      name: 'New API Stale',
+      provider: 'openai-compatible',
+      baseUrl: 'https://new-api-stale.example.test',
+      apiKey: 'new-api-stale-secret',
+    }],
+    now: () => now,
+    sleep: async () => {},
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'model' }] }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/usage/token/')) {
+        if (transient) {
+          usageAttempts += 1;
+          return new Response('{}', { status: 502 });
+        }
+        return new Response(JSON.stringify({
+          code: true,
+          data: {
+            total_available: 750000,
+            total_used: 250000,
+            total_granted: 1000000,
+            unlimited_quota: false,
+          },
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    },
+  });
+
+  const fresh = await service.list({ refresh: true });
+  assert.equal(fresh.quotas[0].mode, 'new_api');
+  assert.equal(fresh.quotas[0].balance, 1.5);
+
+  transient = true;
+  now += 1_000;
+  const stale = await service.list({ refresh: true });
+  assert.equal(usageAttempts, 2);
+  assert.equal(stale.quotas[0].mode, 'new_api');
+  assert.equal(stale.quotas[0].stale, true);
+  assert.equal(stale.quotas[0].balance, 1.5);
+  assert.equal(stale.quotas[0].warning, 'HTTP 502');
+  assert.equal(service.lastSuccessfulBySource.get(service.sources[0]).get('new-api-stale').quota.stale, undefined);
+
+  now += 5 * 60 * 1000 + 1;
+  const expiredCache = await service.list({ refresh: true });
+  assert.equal(expiredCache.quotas[0].mode, 'openai_compatible');
+  assert.equal(expiredCache.quotas[0].status, 'active');
+});
+
+test('keeps ordinary OpenAI-compatible sources active when New API token usage is unavailable', async () => {
+  for (const status of [404, 401]) {
+    const calls = [];
+    const service = new SubQuotaService({
+      sources: [{
+        id: `compatible-${status}`,
+        name: 'Compatible',
+        provider: 'openai-compatible',
+        baseUrl: `https://compatible-${status}.example.test`,
+        apiKey: `compatible-${status}-secret`,
+      }],
+      fetchImpl: async (url, options) => {
+        calls.push({ url: String(url), authorization: options.headers.Authorization });
+        if (String(url).endsWith('/v1/models')) {
+          return new Response(JSON.stringify({ data: [{ id: 'model' }] }), { status: 200 });
+        }
+        if (String(url).endsWith('/api/usage/token/')) {
+          return new Response('{}', { status });
+        }
+        throw new Error(`unexpected optional request: ${url}`);
+      },
+    });
+
+    const listed = await service.list({ refresh: true });
+    assert.equal(listed.availableCount, 1);
+    assert.equal(listed.quotas[0].status, 'active');
+    assert.equal(listed.quotas[0].mode, 'openai_compatible');
+    assert.equal(listed.quotas[0].balance, null);
+    assert.equal(listed.quotas[0].remaining, null);
+    assert.equal(listed.quotas[0].quota, null);
+    assert.equal(listed.quotas[0].error, undefined);
+    assert.deepEqual(calls.map((item) => item.url), [
+      `https://compatible-${status}.example.test/v1/models`,
+      `https://compatible-${status}.example.test/api/usage/token/`,
+    ]);
+    assert.ok(service.lastSuccessfulBySource.get(service.sources[0])?.size === 1);
+    assert.doesNotMatch(JSON.stringify(listed), new RegExp(`compatible-${status}-secret`));
+  }
+});
+
+test('isolates New API quota probes and credentials across compatible keys', async () => {
+  const secrets = ['new-api-alpha-secret', 'new-api-beta-secret'];
+  const service = new SubQuotaService({
+    sources: [{
+      id: 'new-api-multi',
+      name: 'New API Multi',
+      provider: 'openai-compatible',
+      baseUrl: 'https://new-api-multi.example.test',
+      apiKeys: [
+        { id: 'alpha', label: 'Alpha', apiKey: secrets[0] },
+        { id: 'beta', label: 'Beta', apiKey: secrets[1] },
+      ],
+    }],
+    fetchImpl: async (url, options) => {
+      const authorization = options.headers.Authorization;
+      const index = authorization === `Bearer ${secrets[0]}` ? 0 : 1;
+      if (String(url).endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ data: [{ id: `model-${index}` }] }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/usage/token/')) {
+        return new Response(JSON.stringify({
+          success: true,
+          data: {
+            object: 'token_usage',
+            name: `token-${index}`,
+            total_available: index === 0 ? 100000 : 200000,
+            total_granted: index === 0 ? 110000 : 220000,
+            total_used: index === 0 ? 10000 : 20000,
+            unlimited_quota: false,
+          },
+        }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/status')) {
+        return new Response(JSON.stringify({ data: { quota_per_unit: 100000 } }), { status: 200 });
+      }
+      if (String(url).endsWith('/api/user/self')) {
+        return new Response(JSON.stringify({
+          success: true,
+          data: {
+            username: `user-${index}`,
+            group: index === 0 ? 'alpha-group' : 'beta-group',
+          },
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    },
+  });
+
+  const listed = await service.list({ refresh: true });
+  assert.equal(listed.count, 2);
+  assert.equal(listed.availableCount, 2);
+  assert.deepEqual(listed.quotas.map((quota) => ({
+    id: quota.id,
+    credentialId: quota.credentialId,
+    username: quota.username,
+    group: quota.group,
+    balance: quota.balance,
+    quotaPoints: quota.quotaPoints,
+  })), [
+    {
+      id: 'new-api-multi-credential-alpha',
+      credentialId: 'alpha',
+      username: 'user-0',
+      group: 'alpha-group',
+      balance: 1,
+      quotaPoints: 100000,
+    },
+    {
+      id: 'new-api-multi-credential-beta',
+      credentialId: 'beta',
+      username: 'user-1',
+      group: 'beta-group',
+      balance: 2,
+      quotaPoints: 200000,
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(listed), /new-api-alpha-secret|new-api-beta-secret/);
 });
 
 test('returns independent Sub2API quota results for structured API keys', async () => {
