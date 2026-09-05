@@ -4329,6 +4329,9 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.match(uiStyles, /body\[data-theme\] \.requestAction\s*\{[^}]*background:\s*var\(--surface-raised\);[^}]*color:\s*var\(--text\)/s);
     assert.match(uiStyles, /body\[data-theme\] \.requestAction\.danger\s*\{[^}]*background:\s*var\(--danger-soft\);[^}]*color:\s*var\(--danger\)/s);
     assert.match(uiStyles, /\.settingsDialog \.dreamSkinGenerator/);
+    assert.match(uiStyles, /\.settingsDialog \.providerModelField\s*\{[^}]*grid-column:\s*1 \/ -1/s);
+    assert.match(uiStyles, /\.settingsDialog \.providerModelRow\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) 42px/s);
+    assert.match(uiStyles, /\.settingsDialog \.providerModelActions\s*\{[^}]*display:\s*flex/s);
     assert.match(uiStyles, /\.dreamSkinConceptList\s*\{/);
     assert.match(uiStyles, /\.dreamSkinConcept\.active\s*\{/);
     assert.match(uiStyles, /\.dreamSkinConceptThumb\s*\{/);
@@ -5416,12 +5419,20 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=task-complete-sound-20260827a"/);
+    assert.match(page, /href="\/ui\.css\?v=manual-provider-models-20260905a"/);
     assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
     assert.doesNotMatch(page, /\['plain','纯净'\]|\['paper','纸张'\]|\['grid','网格'\]/);
     assert.match(page, /function createDreamSkinGenerator/);
+    assert.match(page, /function enhanceProviderModelEditor\(\)/);
+    assert.match(page, /rows\.id='newProviderModelRows'/);
+    assert.match(page, /list\.id='newProviderModelList'/);
+    assert.match(page, /add\.id='addProviderModel'/);
+    assert.match(page, /function collectNewProviderModels\(\)/);
+    assert.match(page, /model:models\[0\],models,wireApi:/);
+    assert.match(page, /setNewProviderModelSuggestions\(models\)/);
+    assert.match(page, /if\(!collectNewProviderModels\(\)\.length&&models\[0\]\)setNewProviderModels\(\[models\[0\]\]\)/);
     assert.match(page, /function renderDreamSkinConcepts/);
     assert.match(page, /function renderDreamSkinConceptPreview/);
     assert.match(page, /function selectDreamSkinConcept/);
@@ -10493,10 +10504,37 @@ test('writable provider changes preserve unrelated Codex config', { timeout: 300
   const fakeCodex = path.join(temporary, 'fake-codex.mjs');
   const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
   let child;
+  let modelProviderServer;
+  let failModelList = false;
 
   try {
+    modelProviderServer = createHttpServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      if (req.url !== '/v1/models') {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: 'not found' }));
+        return;
+      }
+      if (failModelList) {
+        res.statusCode = 503;
+        res.end(JSON.stringify({ error: 'temporarily unavailable' }));
+        return;
+      }
+      res.end(JSON.stringify({ data: [
+        { id: 'gamma-extra' },
+        { id: 'remote-only' },
+      ] }));
+    });
+    await new Promise((resolve, reject) => {
+      modelProviderServer.once('error', reject);
+      modelProviderServer.listen(0, '127.0.0.1', resolve);
+    });
+    const gammaBaseUrl = `http://127.0.0.1:${modelProviderServer.address().port}/v1`;
     await mkdir(runtime, { recursive: true });
     await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(runtime, 'provider-models.json'), JSON.stringify({
+      alpha: ['alpha-manual'],
+    }));
     await writeFile(path.join(codexHome, 'config.toml'), `model_provider = "alpha"
 model = "alpha-model"
 review_model = "alpha-model"
@@ -10586,28 +10624,113 @@ process.stdin.on('data', (chunk) => {
     assert.equal(appServerEnvironments[0].openaiBaseUrl, 'https://alpha.invalid/v1');
     assert.equal(appServerEnvironments[0].gammaApiKeyLength, 0);
 
+    const invalidModels = await fetch(`${baseUrl}/api/providers`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'invalid-models',
+        baseUrl: gammaBaseUrl,
+        apiKey: 'invalid-test-key',
+        models: [{ id: 'object-model' }, true],
+        wireApi: 'responses',
+      }),
+    });
+    assert.equal(invalidModels.status, 400);
+    assert.match((await invalidModels.json()).error, /至少填写一个模型/);
+
     const added = await fetch(`${baseUrl}/api/providers`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: 'gamma',
-        baseUrl: 'https://gamma.invalid/v1',
+        baseUrl: gammaBaseUrl,
         apiKey: 'gamma-test-key',
         model: 'gamma-model',
+        models: ['gamma-extra', { id: 'ignored' }, true, 'gamma-model', 'vendor/gamma-model'],
         wireApi: 'responses',
       }),
     });
     assert.equal(added.status, 200);
+    const addedPayload = await added.json();
+    assert.equal(addedPayload.model, 'gamma-model');
+    assert.deepEqual(addedPayload.models, ['gamma-model', 'gamma-extra', 'vendor/gamma-model']);
     appServerEnvironments = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
     assert.equal(appServerEnvironments.length, 2);
-    assert.equal(appServerEnvironments.at(-1).openaiBaseUrl, 'https://gamma.invalid/v1');
+    assert.equal(appServerEnvironments.at(-1).openaiBaseUrl, gammaBaseUrl);
     assert.equal(appServerEnvironments.at(-1).openaiApiKey, 'gamma-test-key');
     assert.equal(appServerEnvironments.at(-1).gammaApiKeyLength, 14);
 
+    const providerModelsFile = path.join(runtime, 'provider-models.json');
+    assert.deepEqual(JSON.parse(await readFile(providerModelsFile, 'utf8')), {
+      alpha: ['alpha-manual'],
+      gamma: ['gamma-model', 'gamma-extra', 'vendor/gamma-model'],
+    });
+    assert.equal((await stat(providerModelsFile)).mode & 0o777, 0o600);
+
+    const mergedModels = await fetch(`${baseUrl}/api/models`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'gamma' }),
+    });
+    assert.equal(mergedModels.status, 200);
+    assert.deepEqual((await mergedModels.json()).models, [
+      'gamma-model',
+      'gamma-extra',
+      'vendor/gamma-model',
+      'remote-only',
+    ]);
+
+    failModelList = true;
+    const fallbackModels = await fetch(`${baseUrl}/api/models`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'gamma' }),
+    });
+    assert.equal(fallbackModels.status, 200);
+    const fallbackModelsPayload = await fallbackModels.json();
+    assert.deepEqual(fallbackModelsPayload.models, ['gamma-model', 'gamma-extra', 'vendor/gamma-model']);
+    assert.match(fallbackModelsPayload.warning, /HTTP 503/);
+
+    const legacyAdded = await fetch(`${baseUrl}/api/providers`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'legacy',
+        baseUrl: gammaBaseUrl,
+        apiKey: 'legacy-test-key',
+        model: 'vendor/legacy-model',
+        wireApi: 'responses',
+      }),
+    });
+    assert.equal(legacyAdded.status, 200);
+    assert.deepEqual((await legacyAdded.json()).models, ['vendor/legacy-model']);
+    assert.deepEqual(JSON.parse(await readFile(providerModelsFile, 'utf8')), {
+      alpha: ['alpha-manual'],
+      gamma: ['gamma-model', 'gamma-extra', 'vendor/gamma-model'],
+      legacy: ['vendor/legacy-model'],
+    });
+
+    const legacyDeleted = await fetch(`${baseUrl}/api/providers/legacy`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(legacyDeleted.status, 200);
+    const legacyDeletedPayload = await legacyDeleted.json();
+    assert.equal(legacyDeletedPayload.provider, 'alpha');
+    assert.equal(legacyDeletedPayload.model, 'alpha-manual');
+    assert.deepEqual(JSON.parse(await readFile(providerModelsFile, 'utf8')), {
+      alpha: ['alpha-manual'],
+      gamma: ['gamma-model', 'gamma-extra', 'vendor/gamma-model'],
+    });
+    assert.match(await readFile(webEnv, 'utf8'), /^DEFAULT_PROVIDER="alpha"$/m);
+    assert.match(await readFile(webEnv, 'utf8'), /^DEFAULT_MODEL="alpha-manual"$/m);
+
     let config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    assert.match(config, /^model_provider = "alpha"$/m);
+    assert.match(config, /^model = "alpha-manual"$/m);
     assert.match(config, /notify = \["\/bin\/echo", "keep-me"\]/);
     assert.match(config, /\[mcp_servers\.keep\]/);
     assert.match(config, /\[projects\."\/keep"\]/);
@@ -10618,19 +10741,19 @@ process.stdin.on('data', (chunk) => {
     const defaults = await fetch(`${baseUrl}/api/defaults`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: 'gamma', model: 'gamma-model', reasoningEffort: 'max' }),
+      body: JSON.stringify({ provider: 'gamma', model: 'vendor/gamma-model', reasoningEffort: 'max' }),
     });
     assert.equal(defaults.status, 200);
     appServerEnvironments = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
-    assert.equal(appServerEnvironments.length, 3);
+    assert.equal(appServerEnvironments.length, 5);
     assert.equal(appServerEnvironments.at(-1).gammaApiKeyLength, 14);
 
     config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     assert.match(config, /^model_provider = "gamma"/m);
-    assert.match(config, /^model = "gamma-model"/m);
+    assert.match(config, /^model = "vendor\/gamma-model"/m);
     assert.match(config, /^model_reasoning_effort = "max"/m);
     assert.match(config, /\[mcp_servers\.keep\]/);
 
@@ -10639,22 +10762,59 @@ process.stdin.on('data', (chunk) => {
       headers: { Cookie: cookie },
     });
     assert.equal(deleted.status, 200);
+    const deletedPayload = await deleted.json();
+    assert.equal(deletedPayload.provider, 'alpha');
+    assert.equal(deletedPayload.model, 'alpha-manual');
     appServerEnvironments = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line));
-    assert.equal(appServerEnvironments.length, 4);
+    assert.equal(appServerEnvironments.length, 6);
     assert.equal(appServerEnvironments.at(-1).openaiBaseUrl, 'https://alpha.invalid/v1');
     assert.equal(appServerEnvironments.at(-1).gammaApiKeyLength, 0);
 
     config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    assert.match(config, /^model_provider = "alpha"$/m);
+    assert.match(config, /^model = "alpha-manual"$/m);
     assert.doesNotMatch(config, /\[model_providers\.gamma\]/);
     assert.match(config, /\[model_providers\.alpha\]/);
     assert.match(config, /\[model_providers\.beta\]/);
     assert.match(config, /\[mcp_servers\.keep\]/);
     assert.doesNotMatch(await readFile(webEnv, 'utf8'), /^GAMMA_API_KEY=/m);
+    assert.match(await readFile(webEnv, 'utf8'), /^DEFAULT_PROVIDER="alpha"$/m);
+    assert.match(await readFile(webEnv, 'utf8'), /^DEFAULT_MODEL="alpha-manual"$/m);
+    assert.deepEqual(JSON.parse(await readFile(providerModelsFile, 'utf8')), {
+      alpha: ['alpha-manual'],
+    });
+
+    const configBeforeMalformedStore = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    const webEnvBeforeMalformedStore = await readFile(webEnv, 'utf8');
+    const codexEnvFile = path.join(codexHome, '.env');
+    const codexEnvBeforeMalformedStore = await readFile(codexEnvFile, 'utf8');
+    await writeFile(providerModelsFile, '{ malformed json\n');
+    const malformedStoreWrite = await fetch(`${baseUrl}/api/providers`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'must-not-persist',
+        baseUrl: gammaBaseUrl,
+        apiKey: 'must-not-persist-key',
+        model: 'must-not-persist-model',
+        wireApi: 'responses',
+      }),
+    });
+    assert.equal(malformedStoreWrite.status, 500);
+    assert.match((await malformedStoreWrite.json()).error, /手动模型配置读取失败/);
+    assert.equal(await readFile(providerModelsFile, 'utf8'), '{ malformed json\n');
+    assert.equal(await readFile(path.join(codexHome, 'config.toml'), 'utf8'), configBeforeMalformedStore);
+    assert.equal(await readFile(webEnv, 'utf8'), webEnvBeforeMalformedStore);
+    assert.equal(await readFile(codexEnvFile, 'utf8'), codexEnvBeforeMalformedStore);
   } finally {
     if (child) await stopServer(child);
+    if (modelProviderServer) {
+      modelProviderServer.closeAllConnections?.();
+      await new Promise((resolve) => modelProviderServer.close(resolve));
+    }
     await rm(temporary, { recursive: true, force: true });
   }
 });
