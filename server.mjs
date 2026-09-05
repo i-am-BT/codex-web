@@ -76,6 +76,7 @@ const IMAGE_DIR = path.join(RUNTIME_DIR, 'images');
 const FILE_DIR = path.join(RUNTIME_DIR, 'files');
 const BACKGROUND_DIR = path.join(RUNTIME_DIR, 'backgrounds');
 const IMAGE_PROMPT_CACHE_DIR = path.join(RUNTIME_DIR, 'image-prompts');
+const PROVIDER_MODELS_FILE = path.join(RUNTIME_DIR, 'provider-models.json');
 const SUB_QUOTA_DEFAULT_ORDER = ['cpa-codex', 'sub2api', 'grok2api', 'deepseek'];
 const SUB_QUOTA_SUPPORTED_PROVIDERS = [...SUB_QUOTA_DEFAULT_ORDER, 'openai-compatible'];
 const SUB_QUOTA_BUILTIN_IDS = new Set(['cpa-codex', 'sub2api', 'grok2api', 'deepseek']);
@@ -2430,10 +2431,15 @@ app.post('/api/models', requireAuth, async (req, res) => {
   if (!isHttpUrl(baseUrl)) return res.status(400).json({ error: 'Base URL 无效' });
   if (!apiKey) return res.status(400).json({ error: 'API Key 不能为空' });
 
+  const savedModels = providerName ? getProviderModels(providerName) : [];
   try {
-    const models = await fetchModels(baseUrl, apiKey);
+    const remoteModels = await fetchModels(baseUrl, apiKey);
+    const models = mergeProviderModels(savedModels, remoteModels);
     res.json({ ok: true, models });
   } catch (err) {
+    if (savedModels.length) {
+      return res.json({ ok: true, models: savedModels, warning: err.message });
+    }
     res.status(502).json({ error: err.message });
   }
 });
@@ -2442,27 +2448,51 @@ app.post('/api/providers', requireAuth, requireConfigWrite, async (req, res) => 
   const name = cleanProviderName(req.body?.name);
   const baseUrl = String(req.body?.baseUrl || '').trim().replace(/\/+$/, '');
   const apiKey = String(req.body?.apiKey || '').trim();
-  const model = cleanValue(req.body?.model) || DEFAULT_MODEL;
+  const models = normalizeProviderModels(req.body?.models, req.body?.model);
+  const model = models[0] || '';
   const wireApi = ['responses', 'chat'].includes(req.body?.wireApi) ? req.body.wireApi : 'responses';
 
   if (!name) return res.status(400).json({ error: '服务商名称只能包含字母、数字、下划线和短横线' });
   if (!isHttpUrl(baseUrl)) return res.status(400).json({ error: 'Base URL 必须是 http/https URL' });
   if (!apiKey) return res.status(400).json({ error: 'API Key 不能为空' });
+  if (!model) return res.status(400).json({ error: '请至少填写一个模型' });
 
+  const envKey = `${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`;
+  let configurationSnapshot = null;
+  let mutationStarted = false;
+  let restartAttempted = false;
   try {
     assertAppServerConfigChangeAllowed();
-    const envKey = `${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`;
+    const providerModelsStore = readProviderModelsStore({ strict: true });
+    configurationSnapshot = captureConfigurationState(
+      [CODEX_CONFIG_FILE, PROVIDER_MODELS_FILE, CODEX_ENV_FILE, ENV_FILE],
+      [envKey, 'DEFAULT_PROVIDER', 'DEFAULT_MODEL'],
+    );
+    mutationStarted = true;
     upsertProvider({ name, baseUrl, envKey, wireApi, model });
+    saveProviderModels(name, models, providerModelsStore);
     updateEnvVar(CODEX_ENV_FILE, envKey, apiKey);
     updateEnvVar(ENV_FILE, 'DEFAULT_PROVIDER', name);
     updateEnvVar(ENV_FILE, 'DEFAULT_MODEL', model);
     process.env[envKey] = apiKey;
     process.env.DEFAULT_PROVIDER = name;
     process.env.DEFAULT_MODEL = model;
+    restartAttempted = true;
     await restartAppServerForConfigChange(`provider:${name}`);
-    res.json({ ok: true, provider: name, model, providers: readProviders() });
+    res.json({ ok: true, provider: name, model, models, providers: readProviders() });
   } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message });
+    let responseError = err;
+    if (configurationSnapshot && mutationStarted) {
+      const rollbackErrors = await rollbackConfigurationChange(configurationSnapshot, {
+        restartAppServer: restartAttempted,
+        reason: `rollback-provider:${name}`,
+      });
+      if (rollbackErrors.length) {
+        responseError = new Error(`${err.message}; 配置回滚失败: ${rollbackErrors.join('; ')}`);
+        responseError.statusCode = err.statusCode;
+      }
+    }
+    res.status(responseError.statusCode || 500).json({ error: responseError.message });
   }
 });
 
@@ -2470,20 +2500,52 @@ app.delete('/api/providers/:name', requireAuth, requireConfigWrite, async (req, 
   const name = cleanProviderName(req.params.name);
   if (!name) return res.status(400).json({ error: '服务商名称无效' });
 
+  let configurationSnapshot = null;
+  let mutationStarted = false;
+  let restartAttempted = false;
   try {
     assertAppServerConfigChangeAllowed();
-    const result = deleteProvider(name);
+    const providers = readProviderDetails();
+    const target = providers.find((provider) => provider.name === name);
+    if (!target) {
+      const error = new Error('服务商不存在');
+      error.statusCode = 404;
+      throw error;
+    }
+    if (providers.length <= 1) {
+      const error = new Error('至少保留一个服务商');
+      error.statusCode = 400;
+      throw error;
+    }
+    const providerModelsStore = readProviderModelsStore({ strict: true });
+    configurationSnapshot = captureConfigurationState(
+      [CODEX_CONFIG_FILE, PROVIDER_MODELS_FILE, CODEX_ENV_FILE, ENV_FILE],
+      [...providers.map((provider) => provider.envKey), 'DEFAULT_PROVIDER', 'DEFAULT_MODEL'],
+    );
+    mutationStarted = true;
+    const result = deleteProvider(name, providerModelsStore);
+    restartAttempted = true;
     await restartAppServerForConfigChange(`delete-provider:${name}`);
     res.json({ ok: true, ...result, providers: readProviders() });
   } catch (err) {
-    const status = err.statusCode || 500;
-    res.status(status).json({ error: err.message });
+    let responseError = err;
+    if (configurationSnapshot && mutationStarted) {
+      const rollbackErrors = await rollbackConfigurationChange(configurationSnapshot, {
+        restartAppServer: restartAttempted,
+        reason: `rollback-delete-provider:${name}`,
+      });
+      if (rollbackErrors.length) {
+        responseError = new Error(`${err.message}; 配置回滚失败: ${rollbackErrors.join('; ')}`);
+        responseError.statusCode = err.statusCode;
+      }
+    }
+    res.status(responseError.statusCode || 500).json({ error: responseError.message });
   }
 });
 
 app.post('/api/defaults', requireAuth, requireConfigWrite, async (req, res) => {
   const provider = cleanProviderName(req.body?.provider || '');
-  const model = cleanValue(req.body?.model) || '';
+  const model = cleanModelValue(req.body?.model) || '';
   let reasoningEffort;
   try {
     reasoningEffort = cleanReasoningEffort(req.body?.reasoningEffort);
@@ -2517,7 +2579,7 @@ app.post('/api/chat', requireAuth, (req, res) => {
   const message = String(req.body?.message || '').trim();
   const uploadedAttachments = normalizeUploadedAttachments(req.body?.attachments, req.body?.images);
   const promptMessage = appendAttachmentPrompt(message, uploadedAttachments);
-  const model = cleanValue(req.body?.model) || DEFAULT_MODEL;
+  const model = cleanModelValue(req.body?.model) || DEFAULT_MODEL;
   const provider = cleanValue(req.body?.provider) || DEFAULT_PROVIDER;
   const cwd = normalizeCwd(req.body?.cwd || DEFAULT_CWD);
   const { permissionMode, sandbox, approval } = permissionSettingsFromRequest(req.body || {});
@@ -6327,7 +6389,7 @@ function parseNativeThreadSettings(body, options = {}) {
     ? createProjectlessWorkspace(body)
     : normalizeCwd(requestedCwd || DEFAULT_CWD);
   if (!cwd) throw new Error(projectless ? '无法创建无项目工作目录' : '工作目录不存在');
-  const model = cleanValue(body.model) || DEFAULT_MODEL;
+  const model = cleanModelValue(body.model) || DEFAULT_MODEL;
   const provider = cleanValue(body.provider) || DEFAULT_PROVIDER;
   const permissions = permissionSettingsFromRequest(body);
   const reasoningEffort = cleanReasoningEffort(body.reasoningEffort);
@@ -6666,6 +6728,85 @@ function sessionCookie(token, maxAge) {
 function cleanValue(value) {
   const text = String(value || '').trim();
   return /^[A-Za-z0-9._:-]+$/.test(text) ? text : '';
+}
+
+function cleanModelValue(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  if (!text || text.length > 256 || /[\u0000-\u001f\u007f]/.test(text)) return '';
+  return text;
+}
+
+function normalizeProviderModels(models, fallbackModel = '') {
+  const values = Array.isArray(models) ? models : [];
+  const cleaned = [];
+  for (const item of [fallbackModel, ...values]) {
+    const model = cleanModelValue(item);
+    if (model && !cleaned.includes(model)) cleaned.push(model);
+  }
+  return cleaned.slice(0, 50);
+}
+
+function mergeProviderModels(...lists) {
+  const merged = [];
+  for (const item of lists.flat()) {
+    const model = cleanModelValue(item);
+    if (model && !merged.includes(model)) merged.push(model);
+  }
+  return merged;
+}
+
+function readProviderModelsStore({ strict = false } = {}) {
+  try {
+    if (!existsSync(PROVIDER_MODELS_FILE)) return {};
+    const raw = JSON.parse(readFileSync(PROVIDER_MODELS_FILE, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('根节点必须是对象');
+    }
+    const store = {};
+    for (const [name, models] of Object.entries(raw)) {
+      const provider = cleanProviderName(name);
+      if (!provider || !Array.isArray(models) || models.some((model) => !cleanModelValue(model))) {
+        if (strict) throw new Error(`服务商 ${name} 的模型列表无效`);
+        continue;
+      }
+      const list = normalizeProviderModels(models);
+      if (list.length) store[provider] = list;
+    }
+    return store;
+  } catch (error) {
+    if (strict) throw new Error(`手动模型配置读取失败: ${error.message}`);
+    return {};
+  }
+}
+
+function writeProviderModelsStore(store) {
+  atomicWriteFile(PROVIDER_MODELS_FILE, `${JSON.stringify(store, null, 2)}\n`);
+}
+
+function getProviderModels(name) {
+  const provider = cleanProviderName(name);
+  return provider ? readProviderModelsStore()[provider] || [] : [];
+}
+
+function saveProviderModels(name, models, currentStore = null) {
+  const provider = cleanProviderName(name);
+  if (!provider) return [];
+  const list = normalizeProviderModels(models);
+  const store = currentStore || readProviderModelsStore({ strict: true });
+  if (list.length) store[provider] = list;
+  else delete store[provider];
+  writeProviderModelsStore(store);
+  return list;
+}
+
+function deleteProviderModels(name, currentStore = null) {
+  const provider = cleanProviderName(name);
+  if (!provider) return;
+  const store = currentStore || readProviderModelsStore({ strict: true });
+  if (!Object.hasOwn(store, provider)) return;
+  delete store[provider];
+  writeProviderModelsStore(store);
 }
 
 function cleanProviderName(value) {
@@ -7879,10 +8020,10 @@ function readCodexDefaults() {
   if (!existsSync(CODEX_CONFIG_FILE)) return {};
   const content = readFileSync(CODEX_CONFIG_FILE, 'utf8');
   return {
-    provider: content.match(/^model_provider\s*=\s*"([^"]+)"/m)?.[1] || '',
-    model: content.match(/^model\s*=\s*"([^"]+)"/m)?.[1] || '',
-    reasoningEffort: content.match(/^model_reasoning_effort\s*=\s*"([^"]+)"/m)?.[1] || '',
-    serviceTier: String(content.match(/^service_tier\s*=\s*"([^"]+)"/m)?.[1] || '').trim().toLowerCase() === 'priority'
+    provider: readTopLevelTomlString(content, 'model_provider'),
+    model: readTopLevelTomlString(content, 'model'),
+    reasoningEffort: readTopLevelTomlString(content, 'model_reasoning_effort'),
+    serviceTier: String(readTopLevelTomlString(content, 'service_tier')).trim().toLowerCase() === 'priority'
       ? 'priority'
       : null,
   };
@@ -7898,12 +8039,12 @@ function readProviderDetails() {
     const block = content.slice(range.start, range.end);
     details.push({
       name,
-      displayName: block.match(/^name\s*=\s*"([^"]+)"/m)?.[1] || name,
-      baseUrl: block.match(/^base_url\s*=\s*"([^"]+)"/m)?.[1] || '',
-      envKey: block.match(/^env_key\s*=\s*"([^"]+)"/m)?.[1] || `${name.toUpperCase()}_API_KEY`,
-      wireApi: block.match(/^wire_api\s*=\s*"([^"]+)"/m)?.[1] || 'responses',
+      displayName: readTomlString(block, 'name') || name,
+      baseUrl: readTomlString(block, 'base_url'),
+      envKey: readTomlString(block, 'env_key') || `${name.toUpperCase()}_API_KEY`,
+      wireApi: readTomlString(block, 'wire_api') || 'responses',
       requiresOpenAIAuth: block.match(/^requires_openai_auth\s*=\s*(true|false)/m)?.[1] === 'true',
-      bearerToken: block.match(/^experimental_bearer_token\s*=\s*"([^"]+)"/m)?.[1] || '',
+      bearerToken: readTomlString(block, 'experimental_bearer_token'),
     });
   }
   return details;
@@ -7988,7 +8129,7 @@ function validateCodexConfigText(content) {
   }
 }
 
-function deleteProvider(name) {
+function deleteProvider(name, currentModelsStore = null) {
   if (!existsSync(CODEX_CONFIG_FILE)) throw new Error('Codex config 不存在');
   const providers = readProviderDetails();
   const target = providers.find((provider) => provider.name === name);
@@ -8008,10 +8149,16 @@ function deleteProvider(name) {
   const defaults = readCodexDefaults();
   const deletedDefault = defaults.provider === name || process.env.DEFAULT_PROVIDER === name;
   const nextProvider = deletedDefault ? fallbackProvider : defaults.provider;
-  const nextModel = defaults.model || DEFAULT_MODEL;
+  const providerModelsStore = currentModelsStore || readProviderModelsStore({ strict: true });
+  const fallbackModel = providerModelsStore[fallbackProvider]?.[0] || 'gpt-5.5';
+  const nextModel = deletedDefault ? fallbackModel : defaults.model || DEFAULT_MODEL;
   if (deletedDefault && fallbackProvider) {
-    updateEnvVar(ENV_FILE, 'DEFAULT_PROVIDER', fallbackProvider);
+    updateEnvVars(ENV_FILE, {
+      DEFAULT_PROVIDER: fallbackProvider,
+      DEFAULT_MODEL: nextModel,
+    });
     process.env.DEFAULT_PROVIDER = fallbackProvider;
+    process.env.DEFAULT_MODEL = nextModel;
   }
 
   let content = readFileSync(CODEX_CONFIG_FILE, 'utf8');
@@ -8020,6 +8167,7 @@ function deleteProvider(name) {
   content = replaceTopLevelTomlValue(content, 'model', nextModel);
   content = replaceTopLevelTomlValue(content, 'review_model', nextModel);
   writeCodexConfig(content);
+  deleteProviderModels(name, providerModelsStore);
   deleteEnvVar(CODEX_ENV_FILE, target.envKey);
   delete process.env[target.envKey];
   return { deleted: name, provider: nextProvider, model: nextModel };
@@ -8061,14 +8209,20 @@ function cleanServiceTier(value) {
 }
 
 function replaceTopLevelTomlValue(content, key, value) {
+  const source = String(content || '');
   const line = `${key} = "${tomlEscape(value)}"`;
-  const pattern = new RegExp(`^${key}\\s*=\\s*"[^"]*"`, 'm');
-  if (pattern.test(content)) return content.replace(pattern, line);
-  return `${line}\n${content}`;
+  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"(?:\\\\.|[^"\\\\])*"`, 'm');
+  const topLevelEnd = findTopLevelTomlEnd(source);
+  const topLevel = source.slice(0, topLevelEnd);
+  if (pattern.test(topLevel)) return `${topLevel.replace(pattern, line)}${source.slice(topLevelEnd)}`;
+  return `${line}\n${source}`;
 }
 
 function removeTopLevelTomlValue(content, key) {
-  return content.replace(new RegExp(`^${key}\\s*=.*(?:\\r?\\n|$)`, 'm'), '');
+  const source = String(content || '');
+  const topLevelEnd = findTopLevelTomlEnd(source);
+  const topLevel = source.slice(0, topLevelEnd);
+  return `${topLevel.replace(new RegExp(`^${escapeRegExp(key)}\\s*=.*(?:\\r?\\n|$)`, 'm'), '')}${source.slice(topLevelEnd)}`;
 }
 
 function updateEnvVars(file, values) {
@@ -8102,15 +8256,102 @@ function deleteEnvVar(file, key) {
   atomicWriteFile(file, next.filter((line, index, arr) => line || index < arr.length - 1).join('\n') + '\n');
 }
 
-function atomicWriteFile(file, content) {
+function captureConfigurationState(files, environmentKeys = []) {
+  const fileStates = [];
+  for (const file of [...new Set(files)]) {
+    try {
+      const stats = statSync(file);
+      if (!stats.isFile()) throw new Error(`${path.basename(file)} 不是普通文件`);
+      fileStates.push({ file, exists: true, content: readFileSync(file), mode: stats.mode & 0o777 });
+    } catch (error) {
+      if (error.code === 'ENOENT') fileStates.push({ file, exists: false });
+      else throw error;
+    }
+  }
+  const environment = [...new Set(environmentKeys)].map((key) => ({
+    key,
+    exists: Object.hasOwn(process.env, key),
+    value: process.env[key],
+  }));
+  return { fileStates, environment };
+}
+
+function restoreConfigurationState(snapshot) {
+  const errors = [];
+  for (const state of [...(snapshot?.fileStates || [])].reverse()) {
+    try {
+      if (state.exists) {
+        atomicWriteFile(state.file, state.content, state.mode);
+      } else {
+        try {
+          const stats = statSync(state.file);
+          if (!stats.isFile()) throw new Error(`${path.basename(state.file)} 不是普通文件`);
+          unlinkSync(state.file);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      }
+    } catch (error) {
+      errors.push(`${path.basename(state.file)}: ${error.message}`);
+    }
+  }
+  for (const state of snapshot?.environment || []) {
+    if (state.exists) process.env[state.key] = state.value;
+    else delete process.env[state.key];
+  }
+  return errors;
+}
+
+async function rollbackConfigurationChange(snapshot, { restartAppServer = false, reason = 'configuration-rollback' } = {}) {
+  const errors = restoreConfigurationState(snapshot);
+  if (restartAppServer && !errors.length) {
+    try {
+      await restartAppServerForConfigChange(reason);
+    } catch (error) {
+      errors.push(`app-server: ${error.message}`);
+    }
+  }
+  return errors;
+}
+
+function atomicWriteFile(file, content, mode = 0o600) {
   mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
-  writeFileSync(temporary, content, { mode: 0o600 });
-  renameSync(temporary, file);
+  try {
+    writeFileSync(temporary, content, { mode });
+    renameSync(temporary, file);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {}
+    throw error;
+  }
 }
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function readTomlString(content, key) {
+  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"((?:\\\\.|[^"\\\\])*)"`, 'm');
+  const raw = pattern.exec(String(content || ''))?.[1];
+  if (raw === undefined) return '';
+  try {
+    return JSON.parse(`"${raw}"`);
+  } catch {
+    return raw.replace(/\\(["\\])/g, '$1');
+  }
+}
+
+function readTopLevelTomlString(content, key) {
+  const source = String(content || '');
+  return readTomlString(source.slice(0, findTopLevelTomlEnd(source)), key);
+}
+
+function findTopLevelTomlEnd(content) {
+  const source = String(content || '');
+  const firstTable = /^\s*(?:\[[^\]\r\n]+\]|\[\[[^\]\r\n]+\]\])\s*(?:#.*)?$/m.exec(source);
+  return firstTable ? firstTable.index : source.length;
 }
 
 function tomlEscape(value) {
@@ -10336,7 +10577,7 @@ body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=task-complete-sound-20260827a">
+<link rel="stylesheet" href="/ui.css?v=manual-provider-models-20260905a">
   <link rel="stylesheet" href="/image-prompt.css?v=top-context-padding-20260801b">
 <script>
 (()=>{try{
@@ -10405,6 +10646,7 @@ jumpToLatest.appendChild(jumpToLatestDots);
 composer?.before(jumpToLatest);
 const dropZone = document.getElementById('dropZone'), attachFile = document.getElementById('attachFile'), fileInput = document.getElementById('fileInput'), attachmentTray = document.getElementById('attachmentTray');
 const provider = document.getElementById('provider'), model = document.getElementById('model'), reasoningEffort = document.getElementById('reasoningEffort'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');
+let newProviderModelRows = null, newProviderModelList = null, addProviderModelButton = null;
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
 const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
 const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
@@ -10625,6 +10867,7 @@ let nativeComposerSettingsWriteId = 0;
 let modelLoadRevision = 0;
 let modelOptionsProvider = null;
 let modelListCache = new Map();
+let modelLoadWarnings = new Map();
 let modelLoadInFlight = null;
 let composerModelLoadPromise = Promise.resolve(true);
 let composerProviderChangePromise = Promise.resolve(true);
@@ -11064,6 +11307,18 @@ async function loadNativeModelCapabilities(){
     nativeModelCapabilitiesLoaded=false;
     nativeModelDisplayNames=new Map();
     nativeModelCatalogIds=[];
+    const providerName=String(modelOptionsProvider!==null
+      ?modelOptionsProvider
+      :(typeof provider!=='undefined'?provider?.value||'':''));
+    const cached=modelListCache.get(providerName);
+    const cachedItems=Array.isArray(cached)?cached:[];
+    const currentModel=String(model.value||'').trim();
+    // A capability probe is independent of provider model discovery. If it
+    // fails before that discovery has populated a cache, keep the current
+    // selection instead of replacing a manual model with the generic default.
+    const selected=currentModel||cachedItems[0]||'';
+    if(typeof applyComposerModels==='function'&&(cachedItems.length||selected))applyComposerModels(providerName,cachedItems,selected);
+    else if(typeof syncComposerChrome==='function')syncComposerChrome();
     renderComposerFastToggle();
   }
 }
@@ -11196,6 +11451,9 @@ function renderComposerReasoningSlider(source,target=composerModelSubmenuOptions
   return range;
 }
 function openComposerModelSubmenu(kind){
+  const focus=arguments[1]?.focus!==false;
+  const preserveFocus=!focus&&typeof document!=='undefined'
+    &&composerModelSubmenuOptions?.contains?.(document.activeElement);
   const source=composerModelMenuSource(kind);
   if(!source||source.disabled||!composerModelSubmenuOptions)return;
   composerModelMainMenu?.classList.add('hidden');
@@ -11205,7 +11463,11 @@ function openComposerModelSubmenu(kind){
   composerModelSubmenuTitle.textContent=kind==='model'?'模型':kind==='reasoning'?'推理强度':'高级';
   composerModelSubmenuOptions.replaceChildren();
   if(kind==='reasoning'){
-    renderComposerReasoningSlider(source);
+    if(focus)renderComposerReasoningSlider(source);
+    else{
+      const range=renderComposerReasoningSlider(source,composerModelSubmenuOptions,{focus:false});
+      if(preserveFocus)range?.focus();
+    }
     return;
   }
   for(const option of source.options){
@@ -11238,9 +11500,11 @@ function openComposerModelSubmenu(kind){
     composerModelSubmenuOptions.appendChild(button);
   }
   refreshIcons(composerModelSubmenu);
-  const selected=composerModelSubmenuOptions.querySelector('[aria-selected="true"]');
-  selected?.scrollIntoView({block:'nearest'});
-  selected?.focus();
+  if(focus||preserveFocus){
+    const selected=composerModelSubmenuOptions.querySelector('[aria-selected="true"]');
+    selected?.scrollIntoView({block:'nearest'});
+    selected?.focus();
+  }
 }
 function createTrailingSingleFlight(task){
   let active=null;
@@ -14501,7 +14765,17 @@ function syncComposerChrome(){
     composerModelToggle.title=webRunActive&&currentConversationSource==='codex'?modelSummary+' · 修改将用于下一条消息':modelSummary;
     composerModelToggle.setAttribute('aria-label',composerModelToggle.title);
   }
-  renderComposerModelMenuState();
+  const activeSubmenu=composerModelPanel&&!composerModelPanel.classList.contains('hidden')
+    ?String(composerModelPanel.dataset.submenu||'')
+    :'';
+  const activeSubmenuSource=activeSubmenu?composerModelMenuSource(activeSubmenu):null;
+  if(activeSubmenu&&activeSubmenuSource&&!activeSubmenuSource.disabled){
+    openComposerModelSubmenu(activeSubmenu,{focus:false});
+  }else if(activeSubmenu){
+    showComposerModelMainMenu({focus:false});
+  }else{
+    renderComposerModelMenuState();
+  }
   const mode=composerPermissionDisplayMode();
   if(composerPermissionToggle){
     const profile=COMPOSER_PERMISSION_PROFILES[mode]||{label:'当前配置',icon:'sliders-horizontal'};
@@ -18416,6 +18690,99 @@ function renderSubQuotaEmpty(message,status=''){
   delete subQuotaStatus.dataset.state;
   subQuotaStatus.textContent=status;
 }
+function syncNewProviderModelRowLabels(){
+  const rows=[...(newProviderModelRows?.querySelectorAll('.providerModelRow')||[])];
+  rows.forEach((row,index)=>{
+    row.querySelector('.newProviderModelInput')?.setAttribute('aria-label','模型 '+(index+1));
+    const remove=row.querySelector('.providerModelRemove');
+    if(remove){remove.setAttribute('aria-label','删除模型 '+(index+1));remove.title='删除模型 '+(index+1)}
+  });
+}
+function collectNewProviderModels(){
+  const values=[...(newProviderModelRows?.querySelectorAll('.newProviderModelInput')||[])]
+    .map((field)=>String(field.value||'').trim())
+    .filter(Boolean);
+  return [...new Set(values)].slice(0,50);
+}
+function addNewProviderModelRow(value=''){
+  if(!newProviderModelRows)return null;
+  if(newProviderModelRows.querySelectorAll('.providerModelRow').length>=50){
+    providerMsg.textContent='最多添加 50 个模型';
+    return null;
+  }
+  const row=document.createElement('div');
+  row.className='providerModelRow';
+  const field=document.createElement('input');
+  field.className='newProviderModelInput';
+  field.setAttribute('list','newProviderModelList');
+  field.placeholder='例如 gpt-5.6-sol';
+  field.autocomplete='off';
+  field.spellcheck=false;
+  field.maxLength=256;
+  field.value=String(value||'');
+  const remove=document.createElement('button');
+  remove.type='button';
+  remove.className='miniDanger providerModelRemove';
+  remove.addEventListener('click',()=>{
+    const rows=newProviderModelRows.querySelectorAll('.providerModelRow');
+    if(rows.length<=1){field.value='';field.focus();return}
+    row.remove();
+    syncNewProviderModelRowLabels();
+  });
+  row.append(field,remove);
+  newProviderModelRows.appendChild(row);
+  setIconLabel(remove,'x','删除模型',false);
+  syncNewProviderModelRowLabels();
+  return field;
+}
+function setNewProviderModels(models){
+  if(!newProviderModelRows)return;
+  const values=[...new Set((models||[]).map((item)=>String(item||'').trim()).filter(Boolean))].slice(0,50);
+  newProviderModelRows.replaceChildren();
+  if(!values.length)addNewProviderModelRow('');
+  else for(const value of values)addNewProviderModelRow(value);
+}
+function setNewProviderModelSuggestions(models){
+  if(!newProviderModelList)return;
+  newProviderModelList.replaceChildren();
+  for(const value of [...new Set((models||[]).map((item)=>String(item||'').trim()).filter(Boolean))]){
+    const option=document.createElement('option');
+    option.value=value;
+    newProviderModelList.appendChild(option);
+  }
+}
+function resetNewProviderModelRows(){
+  setNewProviderModels([]);
+  setNewProviderModelSuggestions([]);
+}
+function enhanceProviderModelEditor(){
+  if(newProviderModelRows||!newProviderModel)return;
+  const field=newProviderModel.closest('.field');
+  if(!field)return;
+  field.classList.add('providerModelField');
+  const rows=document.createElement('div');
+  rows.id='newProviderModelRows';
+  rows.className='providerModelRows';
+  const list=document.createElement('datalist');
+  list.id='newProviderModelList';
+  const actions=document.createElement('div');
+  actions.className='providerModelActions';
+  const add=document.createElement('button');
+  add.id='addProviderModel';
+  add.type='button';
+  add.className='miniSecondary providerModelAdd';
+  const fetchButton=document.getElementById('fetchNewModels');
+  newProviderModel.replaceWith(rows);
+  actions.appendChild(add);
+  if(fetchButton)actions.appendChild(fetchButton);
+  field.append(list,actions);
+  newProviderModelRows=rows;
+  newProviderModelList=list;
+  addProviderModelButton=add;
+  addProviderModelButton.addEventListener('click',()=>addNewProviderModelRow('')?.focus());
+  setIconLabel(addProviderModelButton,'plus','添加模型');
+  resetNewProviderModelRows();
+}
 function enhanceInterface(){
   const sideBrand=document.querySelector('.side > div:first-child');
   sideBrand?.classList.add('sideBrand');
@@ -18439,6 +18806,7 @@ function enhanceInterface(){
   enhanceSubQuota(sideActions);
   if(sideActions&&settingsToggle)sideActions.appendChild(settingsToggle);
   enhanceSettingsModal();
+  enhanceProviderModelEditor();
   setIconLabel(document.getElementById('newChat'),'plus','新建任务');
   setIconLabel(archiveToggle,'archive','已归档任务',false);
   archiveToggle?.setAttribute('title','已归档任务');
@@ -18539,8 +18907,35 @@ document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();finishSideChatResize();app.classList.remove('menuOpen');renderSidebarWidth();renderSideChatWidth();syncMenuButton()});
 document.addEventListener('pointerdown',(event)=>{if(!promptQueueMenu||promptQueueMenu.classList.contains('hidden'))return;if(promptQueueMenu.contains(event.target)||event.target.closest?.('.promptQueueIconButton[aria-label="队列操作"]'))return;closePromptQueueMenu()});
 document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(historyUnreadPopover&&!historyUnreadPopover.hidden){closeHistoryUnreadPopover({restoreFocus:true});return}if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(codePreview&&!codePreview.classList.contains('hidden')){closeCodePreview();return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(grok2ApiConsoleOverlay&&!grok2ApiConsoleOverlay.classList.contains('hidden')){closeGrok2ApiConsole();return}if(projectRenameOverlay&&!projectRenameOverlay.classList.contains('hidden')){closeProjectRename();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
-providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
-document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
+providerForm?.addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  const models=collectNewProviderModels();
+  if(!models.length){
+    providerMsg.textContent='请至少填写一个模型';
+    newProviderModelRows?.querySelector('.newProviderModelInput')?.focus();
+    return;
+  }
+  providerMsg.textContent='保存中...';
+  const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:models[0],models,wireApi:document.getElementById('newProviderWire').value};
+  const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data=await res.json();
+  if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}
+  providerMsg.textContent='已保存';
+  document.getElementById('newProviderKey').value='';
+  resetNewProviderModelRows();
+  await boot();
+  provider.value=data.provider;
+  await loadModels(data.provider,data.model);
+});
+document.getElementById('fetchNewModels')?.addEventListener('click',async()=>{
+  providerMsg.textContent='获取模型中...';
+  const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});
+  if(data.error){providerMsg.textContent=data.error;return}
+  const models=[...new Set((data.models||[]).map((item)=>String(item||'').trim()).filter(Boolean))];
+  setNewProviderModelSuggestions(models);
+  if(!collectNewProviderModels().length&&models[0])setNewProviderModels([models[0]]);
+  providerMsg.textContent=models.length?'已获取 '+models.length+' 个模型':'没有返回模型，请手动填写模型名称';
+});
 provider?.addEventListener('change',()=>{void requestComposerProviderChange(provider.value)});
 model?.addEventListener('focus',()=>{composerModelValueBeforeChange=model.value});
 model?.addEventListener('change',()=>{
@@ -18691,7 +19086,7 @@ async function handleCustomBackground(file){if(!file){await saveAppearance({chat
 async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
 document.addEventListener('click',(event)=>{if(!event.target.closest('.msg.user, .msg.assistant, .msgActions'))clearMessageActionsOpen()});
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();const conversations=Array.isArray(data.conversations)?data.conversations:[];const saved=selectRecent?readActiveConversationPreference():null;const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=selectRecent&&conversations.length?(match||conversations[0]):null;if(target){if(saved?.title||target.title)setCurrentConversationTitle(saved?.title||target.title,'Chat');setTopStatusText('同步中',{running:false});chat?.classList?.add('conversationRestoring');}const modelsReady=loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(target)await loadConversation(target.id,target.source||'codex');await modelsReady;await restoreSideChatIfNeeded()}
+async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelLoadWarnings.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();const conversations=Array.isArray(data.conversations)?data.conversations:[];const saved=selectRecent?readActiveConversationPreference():null;const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=selectRecent&&conversations.length?(match||conversations[0]):null;if(target){if(saved?.title||target.title)setCurrentConversationTitle(saved?.title||target.title,'Chat');setTopStatusText('同步中',{running:false});chat?.classList?.add('conversationRestoring');}const modelsReady=loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(target)await loadConversation(target.id,target.source||'codex');await modelsReady;await restoreSideChatIfNeeded()}
 function historyRefreshBlocked(){return historyRefreshPointerId!==null||activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')}
 function beginHistoryRefreshPointerLock(event){
   if(event.button!==0||event.isPrimary===false||!event.target.closest?.('.hist'))return;
@@ -18762,34 +19157,31 @@ async function refreshHistory(){
   return historyRefreshInFlight;
 }
 function nativeRuntimeNeedsHistoryRefresh(type){return ['turn','turn-cleared','connection-error'].includes(String(type||''))}
+function uniqueComposerModelItems(items){return [...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))]}
 function composerModelItems(items,selected){
-  const providerItems=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];
+  const providerItems=uniqueComposerModelItems(items);
+  const catalog=uniqueComposerModelItems(nativeModelCatalogIds);
+  const list=providerItems.length?[...providerItems]:catalog;
   const selectedModel=String(selected||'').trim();
-  const providerSet=new Set(providerItems.map((item)=>item.toLowerCase()));
-  const catalog=(nativeModelCatalogIds||[]).map((item)=>String(item||'').trim()).filter(Boolean);
-  let list;
-  if(catalog.length){
-    // Prefer Codex model catalog order/labels for the picker, keep provider-only extras after it.
-    const catalogVisible=catalog.filter((item)=>!providerSet.size || providerSet.has(item.toLowerCase()) || item===selectedModel);
-    const extras=providerItems.filter((item)=>!catalog.some((entry)=>entry.toLowerCase()===item.toLowerCase()));
-    list=[...catalogVisible,...extras];
-  }else{
-    list=providerItems;
-  }
-  if(selectedModel&&!list.some((item)=>item===selectedModel))list.push(selectedModel);
-  return [...new Set(list)];
+  if(selectedModel&&!list.includes(selectedModel))list.push(selectedModel);
+  return list;
 }
 function selectComposerModel(selected){const selectedModel=String(selected||'').trim();if(!selectedModel)return false;if(![...model.options].some((option)=>option.value===selectedModel)){const option=document.createElement('option');option.value=selectedModel;option.textContent=selectedModel;model.appendChild(option)}model.value=selectedModel;return true}
 function applyComposerModels(providerName,items,selected){const list=composerModelItems(items,selected);fillSelect(model,list,selected||list[0]||'');modelOptionsProvider=String(providerName||'')}
+function providerModelFallbackMessage(warning,count){const detail=String(warning||'').trim();const prefix='远端模型获取失败，已使用 '+Number(count||0)+' 个手动模型';return detail?prefix+'：'+detail:prefix}
 function loadModels(providerName,selected,{force=false}={}){
   const requestedProvider=String(providerName||'');
   const selectedModel=String(selected||'').trim();
   if(!force&&modelLoadInFlight?.provider===requestedProvider){
-    const joined=modelLoadInFlight.promise.then((loaded)=>{if(String(provider.value||'')===requestedProvider)selectComposerModel(selectedModel);return loaded});
+    const joinedRevision=modelLoadRevision;
+    const joined=modelLoadInFlight.promise.then((loaded)=>{
+      if(String(provider.value||'')===requestedProvider&&modelLoadRevision===joinedRevision)selectComposerModel(selectedModel);
+      return loaded;
+    });
     composerModelLoadPromise=joined.catch(()=>false);
     return joined;
   }
-  if(!force&&modelListCache.has(requestedProvider)){
+  if(!force&&modelListCache.has(requestedProvider)&&!modelLoadWarnings.has(requestedProvider)){
     applyComposerModels(requestedProvider,modelListCache.get(requestedProvider),selectedModel);
     composerModelLoadPromise=Promise.resolve(true);
     return composerModelLoadPromise;
@@ -18797,13 +19189,30 @@ function loadModels(providerName,selected,{force=false}={}){
   const revision=++modelLoadRevision;
   modelOptionsProvider=requestedProvider;
   model.innerHTML='<option value="">获取模型中...</option>';
+  if(typeof syncComposerChrome==='function')syncComposerChrome();
   let pending;
   pending=(async()=>{
     const data=await requestModels({provider:requestedProvider});
-    if(revision!==modelLoadRevision||String(provider.value||'')!==requestedProvider)return false;
-    if(data.error){applyComposerModels(requestedProvider,[],selectedModel||'gpt-5.5');statusEl.textContent=data.error;return false}
-    const items=composerModelItems(data.models,'');
+    if(revision!==modelLoadRevision||String(provider.value||'')!==requestedProvider){
+      if(String(provider.value||'')===requestedProvider&&revision!==modelLoadRevision){
+        const latest=modelLoadInFlight;
+        if(latest?.provider===requestedProvider&&latest.promise!==pending)return latest.promise.catch(()=>false);
+      }
+      return false;
+    }
+    if(data.error){modelListCache.delete(requestedProvider);modelLoadWarnings.delete(requestedProvider);applyComposerModels(requestedProvider,[],selectedModel||'gpt-5.5');statusEl.textContent=data.error;return false}
+    const items=uniqueComposerModelItems(data.models);
+    const warning=String(data.warning||'').trim();
+    const previousWarning=modelLoadWarnings.get(requestedProvider);
     modelListCache.set(requestedProvider,items);
+    if(warning){
+      modelLoadWarnings.set(requestedProvider,{message:warning,count:items.length});
+      statusEl.textContent=providerModelFallbackMessage(warning,items.length);
+    }else{
+      modelLoadWarnings.delete(requestedProvider);
+      const previousStatus=previousWarning&&providerModelFallbackMessage(previousWarning.message,previousWarning.count);
+      if(previousStatus&&statusEl.textContent===previousStatus)statusEl.textContent='';
+    }
     applyComposerModels(requestedProvider,items,selectedModel||items[0]||'');
     return true;
   })().finally(()=>{if(modelLoadInFlight?.promise===pending)modelLoadInFlight=null});
@@ -18830,7 +19239,7 @@ async function changeComposerProvider(nextProvider){
   return settingsReady;
 }
 function requestComposerProviderChange(nextProvider){const pending=changeComposerProvider(nextProvider);composerProviderChangePromise=pending.catch(()=>false);return pending}
-async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const loaded=await loadModels(providerName,selected,{force:true});if(!loaded){defaultMsg.textContent='模型列表更新失败';return}const count=modelListCache.get(String(providerName||''))?.length||0;defaultMsg.textContent=count?'模型列表已更新，共 '+count+' 个':'没有返回模型'}
+async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const loaded=await loadModels(providerName,selected,{force:true});if(!loaded){defaultMsg.textContent='模型列表更新失败';return}const fallback=modelLoadWarnings.get(String(providerName||''));if(fallback){defaultMsg.textContent=providerModelFallbackMessage(fallback.message,fallback.count);return}const count=modelListCache.get(String(providerName||''))?.length||0;defaultMsg.textContent=count?'模型列表已更新，共 '+count+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
 async function deleteSelectedProvider(){const name=provider.value;if(!name){defaultMsg.textContent='请选择要删除的具体服务商';return}if(!confirm('删除服务商 '+name+'？该操作会移除对应配置和 API Key。'))return;defaultMsg.textContent='删除中...';const res=await fetch('/api/providers/'+encodeURIComponent(name),{method:'DELETE'});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'删除失败';return}defaultMsg.textContent='已删除服务商 '+name;await boot();if(data.provider){provider.value=data.provider;await loadModels(data.provider,data.model)}statusEl.textContent='Provider deleted'}
 async function requestModels(payload){try{const res=await fetch('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();return res.ok?data:{error:data.error||'获取模型失败'}}catch(e){return{error:e.message}}}
@@ -21846,17 +22255,24 @@ async function applyNativeConversationMetadata(metadata,{preserveProviderModel=f
     const effort=String(metadata.reasoningEffort||'').trim();
     if(['','low','medium','high','xhigh','max','ultra'].includes(effort))reasoningEffort.value=effort;
   }
+  let modelProviderMetadataHandled=false;
   if(!preserveProviderModel&&Object.hasOwn(metadata,'modelProvider')){
     const modelProvider=String(metadata.modelProvider||'').trim();
     if([...provider.options].some((opt)=>opt.value===modelProvider)){
+      modelProviderMetadataHandled=true;
       provider.value=modelProvider;
       const selectedModel=String(metadata.model||'').trim();
-      if(modelOptionsProvider!==modelProvider||modelLoadInFlight?.provider===modelProvider)await loadModels(modelProvider,selectedModel);
+      let modelLoadRevisionAtApply=modelLoadRevision;
+      if(modelOptionsProvider!==modelProvider||modelLoadInFlight?.provider===modelProvider){
+        const modelLoad=loadModels(modelProvider,selectedModel);
+        modelLoadRevisionAtApply=modelLoadRevision;
+        await modelLoad;
+      }
       if(String(provider.value||'')!==modelProvider)return false;
-      selectComposerModel(selectedModel);
+      if(modelLoadRevision===modelLoadRevisionAtApply&&Object.hasOwn(metadata,'model'))selectComposerModel(selectedModel);
     }
   }
-  if(!preserveProviderModel&&Object.hasOwn(metadata,'model')){
+  if(!preserveProviderModel&&Object.hasOwn(metadata,'model')&&!Object.hasOwn(metadata,'modelProvider')&&!modelProviderMetadataHandled){
     const selectedModel=String(metadata.model||'').trim();
     selectComposerModel(selectedModel);
   }

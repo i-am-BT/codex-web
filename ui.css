@@ -4515,6 +4515,58 @@ body[data-theme="light"] .settingsDialog .passwordSettings.settingsCard {
   border-radius: 12px;
 }
 
+.settingsDialog .providerModelField {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 8px;
+}
+
+.settingsDialog .providerModelRows {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settingsDialog .providerModelRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settingsDialog .providerModelRow .newProviderModelInput {
+  width: 100%;
+  min-width: 0;
+}
+
+.settingsDialog .providerModelRemove {
+  width: 42px;
+  min-width: 42px;
+  min-height: 42px;
+  padding: 0;
+  border-radius: 12px;
+}
+
+.settingsDialog .providerModelRemove .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.settingsDialog .providerModelActions {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.settingsDialog .providerModelActions .miniSecondary {
+  width: auto;
+  min-width: 0;
+  min-height: 42px;
+  flex: 1 1 0;
+  border-radius: 12px;
+}
+
 .settingsDialog .providerBox .providerFormFooter {
   display: flex;
   grid-column: 1 / -1;
