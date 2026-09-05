@@ -201,7 +201,7 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   assert.match(serverSource, /range\.setAttribute\('aria-valuetext',label\)/);
   assert.match(
     serverSource,
-    /if\(kind==='reasoning'\)\{\s*renderComposerReasoningSlider\(source\);\s*return;/,
+    /if\(kind==='reasoning'\)\{[\s\S]*?renderComposerReasoningSlider\(source\)[\s\S]*?return;/,
   );
   assert.match(
     serverSource,

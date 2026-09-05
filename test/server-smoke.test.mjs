@@ -5822,6 +5822,10 @@ updated_at = 1784422800000
     assert.match(page, /const providerReady=await waitForLatestComposerProviderChange\(\);\s*await waitForLatestComposerModelLoad\(\);\s*await nativeComposerSettingsQueue\.catch\(\(\)=>false\)/);
     assert.match(page, /const revision=\+\+modelLoadRevision[\s\S]*?revision!==modelLoadRevision/);
     assert.match(page, /modelListCache\.has\(requestedProvider\)/);
+    assert.match(page, /model\.innerHTML='<option value="">获取模型中\.\.\.<\/option>';\s*if\(typeof syncComposerChrome==='function'\)syncComposerChrome\(\)/);
+    assert.match(page, /latest\?\.provider===requestedProvider&&latest\.promise!==pending\)return latest\.promise\.catch/);
+    assert.match(page, /const joinedRevision=modelLoadRevision[\s\S]*?modelLoadRevision===joinedRevision/);
+    assert.match(page, /const activeSubmenu=composerModelPanel&&![\s\S]*?openComposerModelSubmenu\(activeSubmenu,\{focus:false\}\)/);
     assert.match(page, /composerModelSelect\.addEventListener\('change',\(\)=>\{\s*const previous=model\.value;[\s\S]*?composerModelSwitchConfirm\(previous,model\.value\)[\s\S]*?syncComposerChrome\(\)\}\)/);
     assert.match(page, /model\?\.addEventListener\('change',\(\)=>\{\s*if\(!composerModelSwitchConfirm\(composerModelValueBeforeChange,model\.value\)\)return;[\s\S]*?syncComposerChrome\(\)\}\)/);
     assert.match(page, /payload\.provider=String\(provider\.value\|\|''\)\.trim\(\)\|\|null/);
@@ -5830,9 +5834,10 @@ updated_at = 1784422800000
     assert.match(page, /function nativeComposerOverrideApplies\(threadId\)\{return Boolean\(nativeComposerOverride\?\.pending/);
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'reasoningEffort'\)\)/);
     assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'modelProvider'\)\)/);
-    assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'model'\)\)/);
+    assert.match(page, /let modelProviderMetadataHandled=false/);
+    assert.match(page, /if\(!preserveProviderModel&&Object\.hasOwn\(metadata,'model'\)&&!Object\.hasOwn\(metadata,'modelProvider'\)&&!modelProviderMetadataHandled\)/);
     assert.match(page, /async function applyNativeConversationMetadata\(metadata/);
-    assert.match(page, /if\(modelOptionsProvider!==modelProvider\|\|modelLoadInFlight\?\.provider===modelProvider\)await loadModels\(modelProvider,selectedModel\)/);
+    assert.match(page, /if\(modelOptionsProvider!==modelProvider\|\|modelLoadInFlight\?\.provider===modelProvider\)\{[\s\S]*?const modelLoad=loadModels\(modelProvider,selectedModel\);[\s\S]*?await modelLoad;/);
     assert.match(page, /selectComposerModel\(selectedModel\)/);
     assert.match(page, /function resetComposerProviderChange\(\)\{composerProviderChangePromise=Promise\.resolve\(true\)\}/);
     assert.match(page, /if\(conversationChanged\)\{clearNativeCancelPending\(\);resetComposerProviderChange\(\)\}/);
@@ -5855,7 +5860,7 @@ updated_at = 1784422800000
     assert.match(page, /range\.type='range';\s*range\.className='composerReasoningRange';\s*range\.min='0';\s*range\.max=String\(levels\.length-1\);\s*range\.step='1'/);
     assert.match(page, /range\.setAttribute\('aria-label','推理强度'\)/);
     assert.match(page, /range\.setAttribute\('aria-valuetext',label\)/);
-    assert.match(page, /if\(kind==='reasoning'\)\{\s*renderComposerReasoningSlider\(source\);\s*return;/);
+    assert.match(page, /if\(kind==='reasoning'\)\{[\s\S]*?renderComposerReasoningSlider\(source\)[\s\S]*?return;/);
     assert.match(page, /range\.addEventListener\('input',\(\)=>\{[\s\S]*selectValue\(levels\[sliderIndex\]\.value\)/);
     assert.match(page, /source\.dispatchEvent\(new Event\('change',\{bubbles:true\}\)\)/);
     assert.match(page, /row\.button\.classList\.toggle\('active',kind===activeKind\)/);
@@ -5900,11 +5905,235 @@ updated_at = 1784422800000
     assert.match(guardedPreview, /navigate-to &#39;none&#39;/);
     assert.match(guardedPreview, /name="referrer" content="no-referrer"/);
     assert.ok(guardedPreview.includes(hostilePreview));
-    const composerModelItemsHelper = inlineScript.match(/(function composerModelItems[\s\S]*?)(?=function selectComposerModel)/)?.[1];
+    const composerModelItemsHelper = inlineScript.match(/(function uniqueComposerModelItems[\s\S]*?)(?=function selectComposerModel)/)?.[1];
     assert.ok(composerModelItemsHelper);
-    const composerModelItems = new Function(`let nativeModelCatalogIds=[]; ${composerModelItemsHelper}; return composerModelItems;`)();
+    const buildComposerModelItems = (catalog) => new Function(
+      'nativeModelCatalogIds',
+      `${composerModelItemsHelper}; return { uniqueComposerModelItems, composerModelItems };`,
+    )(catalog);
+    const { composerModelItems } = buildComposerModelItems([]);
     assert.deepEqual(composerModelItems(['gpt-5.5', 'gpt-5.5', ''], 'retired-model'), ['gpt-5.5', 'retired-model']);
     assert.deepEqual(composerModelItems(['gpt-5.5', 'retired-model'], 'retired-model'), ['gpt-5.5', 'retired-model']);
+    const catalogAwareModelItems = buildComposerModelItems(['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.6-sol']).composerModelItems;
+    assert.deepEqual(
+      catalogAwareModelItems(['Vendor/Model-Z', 'gpt-5.5', 'Remote-X', 'Vendor/Model-Z'], ''),
+      ['Vendor/Model-Z', 'gpt-5.5', 'Remote-X'],
+    );
+    assert.deepEqual(catalogAwareModelItems(['GPT-5.5'], ''), ['GPT-5.5']);
+    assert.deepEqual(catalogAwareModelItems([], ''), ['gpt-5.6-sol', 'gpt-5.5']);
+    assert.deepEqual(catalogAwareModelItems(['manual-a'], 'retired/MODEL'), ['manual-a', 'retired/MODEL']);
+
+    const modelLoaderHelper = inlineScript.match(/(function providerModelFallbackMessage[\s\S]*?)(?=async function changeComposerProvider)/)?.[1];
+    const refreshProviderModelsHelper = inlineScript.match(/(async function refreshProviderModels[\s\S]*?)(?=async function saveDefaultModel)/)?.[1];
+    assert.ok(modelLoaderHelper);
+    assert.ok(refreshProviderModelsHelper);
+    const buildModelLoader = (responses) => new Function(
+      'responses',
+      `let modelLoadRevision=0;
+       let modelOptionsProvider=null;
+       let modelListCache=new Map();
+       let modelLoadWarnings=new Map();
+       let modelLoadInFlight=null;
+       let composerModelLoadPromise=Promise.resolve(true);
+       let nativeModelCatalogIds=['old-native'];
+       const provider={value:'gamma'};
+       const model={value:'',innerHTML:''};
+       const statusEl={textContent:''};
+       const defaultMsg={textContent:''};
+       const applied=[];
+       const selectedCalls=[];
+       let requestCount=0;
+       async function requestModels(){requestCount++;return responses.shift()}
+       ${composerModelItemsHelper}
+       function applyComposerModels(providerName,items,selected){applied.push({providerName,items:[...items],selected})}
+       function selectComposerModel(selected){selectedCalls.push(selected);model.value=selected;return true}
+       ${modelLoaderHelper}
+       ${refreshProviderModelsHelper}
+       return {
+         loadModels,
+         refreshProviderModels,
+         setNativeCatalog(items){nativeModelCatalogIds=[...items]},
+         modelItems(items,selected=''){return composerModelItems(items,selected)},
+         snapshot(){return {
+           requestCount,
+           cache:modelListCache.get('gamma'),
+           warning:modelLoadWarnings.get('gamma'),
+           status:statusEl.textContent,
+           refreshStatus:defaultMsg.textContent,
+           applied:[...applied],
+           selectedCalls:[...selectedCalls],
+         }},
+       };`,
+    )([...responses]);
+    const modelLoader = buildModelLoader([
+      { ok: true, models: ['manual-a'], warning: 'HTTP 503' },
+      { ok: true, models: ['manual-a', 'remote-b'] },
+    ]);
+    await modelLoader.refreshProviderModels();
+    let modelLoaderState = modelLoader.snapshot();
+    assert.equal(modelLoaderState.requestCount, 1);
+    assert.deepEqual(modelLoaderState.cache, ['manual-a']);
+    assert.deepEqual(modelLoaderState.warning, { message: 'HTTP 503', count: 1 });
+    assert.match(modelLoaderState.status, /远端模型获取失败.*手动模型.*HTTP 503/);
+    assert.match(modelLoaderState.refreshStatus, /远端模型获取失败.*手动模型.*HTTP 503/);
+    assert.doesNotMatch(modelLoaderState.refreshStatus, /模型列表已更新/);
+    assert.deepEqual(modelLoaderState.applied.at(-1), {
+      providerName: 'gamma',
+      items: ['manual-a'],
+      selected: 'manual-a',
+    });
+    assert.equal(await modelLoader.loadModels('gamma', 'manual-a'), true);
+    modelLoaderState = modelLoader.snapshot();
+    assert.equal(modelLoaderState.requestCount, 2, 'warning fallback must retry the upstream model list');
+    assert.deepEqual(modelLoaderState.cache, ['manual-a', 'remote-b']);
+    assert.equal(modelLoaderState.warning, undefined);
+    assert.equal(modelLoaderState.status, '', 'successful retry must clear the matching fallback warning');
+    assert.equal(await modelLoader.loadModels('gamma', 'manual-a'), true);
+    assert.equal(modelLoader.snapshot().requestCount, 2, 'healthy model list should use the cache');
+    const emptyProviderLoader = buildModelLoader([{ ok: true, models: [] }]);
+    assert.equal(await emptyProviderLoader.loadModels('gamma', ''), true);
+    const emptyProviderState = emptyProviderLoader.snapshot();
+    assert.deepEqual(emptyProviderState.cache, [], 'provider cache must not capture the current native catalog');
+    emptyProviderLoader.setNativeCatalog(['new-native']);
+    assert.deepEqual(emptyProviderLoader.modelItems(emptyProviderState.cache), ['new-native']);
+
+    let resolveFirstModelRequest;
+    let resolveSecondModelRequest;
+    const firstModelRequest = new Promise((resolve) => { resolveFirstModelRequest = resolve; });
+    const secondModelRequest = new Promise((resolve) => { resolveSecondModelRequest = resolve; });
+    const racingModelLoader = buildModelLoader([firstModelRequest, secondModelRequest]);
+    const firstLoad = racingModelLoader.loadModels('gamma', 'manual-a');
+    const forcedLoad = racingModelLoader.loadModels('gamma', 'manual-a', { force: true });
+    resolveFirstModelRequest({ ok: true, models: ['stale-model'] });
+    resolveSecondModelRequest({ ok: true, models: ['fresh-model'] });
+    assert.equal(await firstLoad, true, 'superseded provider load should follow the latest same-provider request');
+    assert.equal(await forcedLoad, true);
+    assert.deepEqual(racingModelLoader.snapshot().cache, ['fresh-model']);
+    assert.deepEqual(racingModelLoader.snapshot().applied.at(-1).items, ['fresh-model']);
+
+    let resolveJoinedFirst;
+    let resolveJoinedSecond;
+    const joinedFirstRequest = new Promise((resolve) => { resolveJoinedFirst = resolve; });
+    const joinedSecondRequest = new Promise((resolve) => { resolveJoinedSecond = resolve; });
+    const joiningModelLoader = buildModelLoader([joinedFirstRequest, joinedSecondRequest]);
+    const primaryLoad = joiningModelLoader.loadModels('gamma', 'primary-model');
+    const joinedLoad = joiningModelLoader.loadModels('gamma', 'stale-model');
+    const latestJoinedLoad = joiningModelLoader.loadModels('gamma', 'primary-model', { force: true });
+    resolveJoinedFirst({ ok: true, models: ['stale-model'] });
+    resolveJoinedSecond({ ok: true, models: ['fresh-model'] });
+    await Promise.all([primaryLoad, joinedLoad, latestJoinedLoad]);
+    assert.deepEqual(joiningModelLoader.snapshot().selectedCalls, [], 'a joined stale load must not overwrite a forced refresh');
+
+    const nativeModelCapabilitiesHelper = inlineScript.match(/(async function loadNativeModelCapabilities[\s\S]*?)(?=function composerSelectedOptionLabel)/)?.[1];
+    assert.ok(nativeModelCapabilitiesHelper);
+    const nativeCatalogFailureLoader = new Function(
+      `let nativeModelServiceTiers=new Map();
+       let nativeModelDisplayNames=new Map();
+       let nativeModelCatalogIds=['old-native'];
+       let nativeModelCapabilitiesLoaded=true;
+       let modelOptionsProvider='gamma';
+       let modelListCache=new Map([['gamma',['manual-a']]]);
+       const model={value:'old-native'};
+       const provider={value:'gamma'};
+       const applied=[];
+       const fetch=async()=>({ok:false,json:async()=>({error:'catalog unavailable'})});
+       function reconcileComposerFastSupport(){}
+       function renderComposerFastToggle(){}
+       function applyComposerModels(providerName,items,selected){applied.push({providerName,items:[...items],selected})}
+       ${nativeModelCapabilitiesHelper}
+       return {loadNativeModelCapabilities,snapshot(){return {catalog:[...nativeModelCatalogIds],applied:[...applied]}}};`,
+    )();
+    await nativeCatalogFailureLoader.loadNativeModelCapabilities();
+    assert.deepEqual(nativeCatalogFailureLoader.snapshot(), {
+      catalog: [],
+      applied: [{ providerName: 'gamma', items: ['manual-a'], selected: 'old-native' }],
+    });
+
+    const nativeCatalogNoCacheLoader = new Function(
+      `let nativeModelServiceTiers=new Map();
+       let nativeModelDisplayNames=new Map();
+       let nativeModelCatalogIds=['old-native'];
+       let nativeModelCapabilitiesLoaded=true;
+       let modelOptionsProvider='gamma';
+       let modelListCache=new Map();
+       const model={value:'manual-current'};
+       const provider={value:'gamma'};
+       const applied=[];
+       const fetch=async()=>({ok:false,json:async()=>({error:'catalog unavailable'})});
+       function reconcileComposerFastSupport(){}
+       function renderComposerFastToggle(){}
+       function applyComposerModels(providerName,items,selected){applied.push({providerName,items:[...items],selected})}
+       ${nativeModelCapabilitiesHelper}
+       return {loadNativeModelCapabilities,snapshot(){return {catalog:[...nativeModelCatalogIds],applied:[...applied]}}};`,
+    )();
+    await nativeCatalogNoCacheLoader.loadNativeModelCapabilities();
+    assert.deepEqual(nativeCatalogNoCacheLoader.snapshot(), {
+      catalog: [],
+      applied: [{ providerName: 'gamma', items: [], selected: 'manual-current' }],
+    });
+
+    const metadataHelper = inlineScript.match(/(async function applyNativeConversationMetadata[\s\S]*?)(?=async function rollbackConversation)/)?.[1];
+    assert.ok(metadataHelper);
+    let resolveMetadataModelLoad;
+    const metadataModelLoad = new Promise((resolve) => { resolveMetadataModelLoad = resolve; });
+    const metadataApplier = new Function(
+      'loadModels',
+      `let currentNativeWorkspaceKind='';
+       let forceFullAccess=false;
+       let modelLoadRevision=0;
+       let modelOptionsProvider='other';
+       let modelLoadInFlight=null;
+       let composerServiceTier=null;
+       let defaultComposerServiceTier=null;
+       const cwd={value:''};
+       const sandbox={value:'workspace-write'};
+       const approval={value:'on-request'};
+       const reasoningEffort={value:''};
+       let composerPermissionMode='legacy';
+       const provider={value:'alpha',options:[{value:'alpha'}]};
+       const model={value:'fresh-model'};
+       const selected=[];
+       function isAutoApprovalsReviewer(){return false}
+       function composerPermissionModeFromValues(){return 'legacy'}
+       function selectComposerModel(value){selected.push(value);model.value=value;return true}
+       function normalizeComposerServiceTier(value){return value||null}
+       function reconcileComposerFastSupport(){}
+       function updateSafetyHint(){}
+       function bumpModelRevision(){modelLoadRevision+=1}
+       ${metadataHelper}
+       return {
+         applyNativeConversationMetadata,
+         bumpModelRevision,
+         setModel(value){model.value=value},
+         clearSelected(){selected.length=0},
+         snapshot(){return {model:model.value,selected:[...selected],revision:modelLoadRevision}},
+       };`,
+    )(
+      () => metadataModelLoad,
+    );
+    const metadataApply = metadataApplier.applyNativeConversationMetadata({
+      modelProvider: 'alpha',
+      model: 'stale-model',
+    });
+    metadataApplier.bumpModelRevision();
+    resolveMetadataModelLoad(true);
+    await metadataApply;
+    assert.deepEqual(metadataApplier.snapshot(), {
+      model: 'fresh-model',
+      selected: [],
+      revision: 1,
+    }, 'stale metadata must not overwrite a newer model refresh');
+    metadataApplier.setModel('current-provider-model');
+    metadataApplier.clearSelected();
+    await metadataApplier.applyNativeConversationMetadata({
+      modelProvider: 'deleted-provider',
+      model: 'deleted-provider-model',
+    });
+    assert.deepEqual(metadataApplier.snapshot(), {
+      model: 'current-provider-model',
+      selected: [],
+      revision: 1,
+    }, 'metadata from a missing provider must not select its model');
 
     const providerChangeHelper = inlineScript.match(/(async function changeComposerProvider[\s\S]*?)(?=function requestComposerProviderChange)/)?.[1];
     assert.ok(providerChangeHelper);
@@ -10786,6 +11015,46 @@ process.stdin.on('data', (chunk) => {
     assert.deepEqual(JSON.parse(await readFile(providerModelsFile, 'utf8')), {
       alpha: ['alpha-manual'],
     });
+
+    const quotedModel = 'vendor"quoted\\model';
+    const quotedDefaults = await fetch(`${baseUrl}/api/defaults`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'alpha', model: quotedModel }),
+    });
+    assert.equal(quotedDefaults.status, 200);
+    assert.equal((await quotedDefaults.json()).model, quotedModel);
+    config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    assert.match(config, /^model = "vendor\\"quoted\\\\model"$/m);
+    const quotedConfig = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
+    assert.equal((await quotedConfig.json()).defaults.model, quotedModel);
+    const secondQuotedModel = 'vendor"again\\model';
+    const secondQuotedDefaults = await fetch(`${baseUrl}/api/defaults`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'alpha', model: secondQuotedModel }),
+    });
+    assert.equal(secondQuotedDefaults.status, 200);
+    assert.equal((await secondQuotedDefaults.json()).model, secondQuotedModel);
+    assert.equal((await (await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } })).json()).defaults.model, secondQuotedModel);
+
+    config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    const nestedModelConfig = config
+      .replace(/^model = .*\n/m, '')
+      .replace('[model_providers.alpha]\n', '[model_providers.alpha]\nmodel = "provider-shadow"\n');
+    await writeFile(path.join(codexHome, 'config.toml'), nestedModelConfig);
+    const configWithoutTopLevelModel = await fetch(`${baseUrl}/api/config`, { headers: { Cookie: cookie } });
+    assert.notEqual((await configWithoutTopLevelModel.json()).defaults.model, 'provider-shadow');
+    const restoredTopLevelModel = 'restored/manual-model';
+    const restoredDefaults = await fetch(`${baseUrl}/api/defaults`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'alpha', model: restoredTopLevelModel }),
+    });
+    assert.equal(restoredDefaults.status, 200);
+    config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    assert.match(config, /^model = "restored\/manual-model"$/m);
+    assert.match(config, /\[model_providers\.alpha\]\nmodel = "provider-shadow"\n/);
 
     const configBeforeMalformedStore = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     const webEnvBeforeMalformedStore = await readFile(webEnv, 'utf8');
