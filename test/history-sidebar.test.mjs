@@ -564,16 +564,19 @@ test('completion sound is persisted, success-only, and deduplicated by thread an
      };`,
   )(localStorage,{AudioContext});
 
-  assert.equal(api.enabled(),true);
+  assert.equal(api.enabled(),false);
   assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'running',threadId:'thread-a',turnId:'turn-1'}),false);
   assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'error',threadId:'thread-a',turnId:'turn-1'}),false);
   assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'interrupted',threadId:'thread-a',turnId:'turn-1'}),false);
-  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-1'}),true);
-  assert.equal(oscillatorStarts,2);
+  assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-1'}),false);
+  assert.equal(oscillatorStarts,0);
+  api.setTaskCompleteSoundEnabled(true);
+  assert.equal(values.get('codexWeb.taskCompleteSoundEnabled.v1'),'1');
+  assert.equal(api.readTaskCompleteSoundEnabled(),true);
   assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-1'}),false);
   assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-b',turnId:'turn-1'}),true);
   assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-2'}),true);
-  assert.equal(oscillatorStarts,6);
+  assert.equal(oscillatorStarts,4);
 
   api.setTaskCompleteSoundEnabled(false);
   assert.equal(values.get('codexWeb.taskCompleteSoundEnabled.v1'),'0');
@@ -583,7 +586,7 @@ test('completion sound is persisted, success-only, and deduplicated by thread an
   assert.equal(values.get('codexWeb.taskCompleteSoundEnabled.v1'),'1');
   assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-muted'}),false);
   assert.equal(api.maybePlayTaskCompleteSound({type:'turn',status:'done',threadId:'thread-a',turnId:'turn-3'}),true);
-  assert.equal(oscillatorStarts,8);
+  assert.equal(oscillatorStarts,6);
   assert.equal(api.remembered().length,3);
 });
 

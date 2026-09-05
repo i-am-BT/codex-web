@@ -19674,7 +19674,7 @@ async function deleteAllArchivedTasks(){
 function readRenamedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECT_NAMES_STORAGE_KEY)||'{}');if(!saved||Array.isArray(saved)||typeof saved!=='object')return new Map();return new Map(Object.entries(saved).filter(([key,value])=>key&&typeof value==='string'&&value.trim()).map(([key,value])=>[key,value.trim().replace(/\\s+/g,' ').slice(0,80)]))}catch{return new Map()}}
 function storeRenamedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECT_NAMES_STORAGE_KEY,JSON.stringify(Object.fromEntries([...renamedHistoryProjects.entries()].sort(([left],[right])=>left.localeCompare(right)))))}catch{}}
 function readTaskCompleteSoundEnabled(){
-  try{return localStorage.getItem(TASK_COMPLETE_SOUND_STORAGE_KEY)!=='0'}catch{return true}
+  try{return localStorage.getItem(TASK_COMPLETE_SOUND_STORAGE_KEY)==='1'}catch{return false}
 }
 function setTaskCompleteSoundEnabled(enabled){
   taskCompleteSoundEnabled=Boolean(enabled);
