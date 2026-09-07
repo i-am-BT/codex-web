@@ -120,6 +120,12 @@ const LOCAL_IMAGE_ROOTS = String(process.env.CODEX_WEB_LOCAL_IMAGE_ROOTS || '')
   .map((value) => value.trim())
   .filter(Boolean)
   .map((value) => resolveLocalPath(value, homedir()));
+const LOCAL_FILE_ROOTS = String(process.env.CODEX_WEB_LOCAL_FILE_ROOTS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
+  .map((value) => resolveLocalPath(value, homedir()));
+const LOCAL_FILE_MAX_BYTES = 2 * 1024 * 1024;
 
 loadEnv(CODEX_ENV_FILE, false);
 
@@ -1470,6 +1476,16 @@ app.get('/api/local-image', requireAuth, (req, res) => {
   }
 });
 
+app.get(/^\/(?:Users|Volumes|workspace|opt|var|tmp|home|root)\/.+$/, requireAuth, (req, res) => {
+  let requestedPath = '';
+  try {
+    requestedPath = decodeURIComponent(req.path);
+  } catch {
+    return res.status(400).json({ error: '文件路径无效' });
+  }
+  return sendAllowedLocalFile(res, requestedPath);
+});
+
 app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
@@ -2731,6 +2747,14 @@ app.post('/api/chat', requireAuth, (req, res) => {
 });
 
 app.get('/', (req, res) => {
+  const requestedToken = String(req.query.f || '').trim();
+  if (requestedToken) {
+    return requireAuth(req, res, () => {
+      const requestedPath = decodeLocalFileToken(requestedToken);
+      if (!requestedPath) return res.status(400).json({ error: '文件路径无效' });
+      return sendAllowedLocalFile(res, requestedPath, { html: true });
+    });
+  }
   res.setHeader('Cache-Control', 'no-store');
   res.type('html').send(pageHtml(Boolean(validateSession(req))));
 });
@@ -5652,6 +5676,49 @@ function isLocalImagePathAllowed(filePath, cwd) {
     });
   } catch {
     return false;
+  }
+}
+
+function resolveAllowedLocalFile(filePath) {
+  try {
+    const resolved = realpathSync(filePath);
+    const stats = statSync(resolved);
+    if (!stats.isFile() || stats.size > LOCAL_FILE_MAX_BYTES) return '';
+    return LOCAL_FILE_ROOTS.some((root) => {
+      try {
+        return isPathWithinRoot(resolved, realpathSync(root));
+      } catch {
+        return false;
+      }
+    }) ? resolved : '';
+  } catch {
+    return '';
+  }
+}
+
+function sendAllowedLocalFile(res, requestedPath, { html = false } = {}) {
+  if (!requestedPath || requestedPath.includes('\0')) {
+    return res.status(400).json({ error: '文件路径无效' });
+  }
+  const filePath = resolveAllowedLocalFile(requestedPath.replace(/:\d+(?::\d+)?$/, ''));
+  if (!filePath) return res.status(404).json({ error: '文件不存在或不受支持' });
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Security-Policy', "default-src 'none'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (html) {
+    const content = escapeHtml(readFileSync(filePath, 'utf8'));
+    return res.type('html').send(`<!doctype html><meta charset="utf-8"><title>${escapeHtml(path.basename(filePath))}</title><pre style="white-space:pre-wrap;word-break:break-word">${content}</pre>`);
+  }
+  return res.type('text/plain').sendFile(filePath);
+}
+
+function decodeLocalFileToken(token) {
+  const value = String(token || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,8192}$/.test(value)) return '';
+  try {
+    return decodeURIComponent(Buffer.from(value, 'base64url').toString('utf8'));
+  } catch {
+    return '';
   }
 }
 
@@ -23554,6 +23621,28 @@ function markdownLocalFileIcon(href){
   if(['png','jpg','jpeg','webp','gif','svg','avif'].includes(extension))return'image';
   return extension?'file-code-2':'file';
 }
+function markdownLocalFilePath(href){
+  const raw=String(href||'').trim();
+  if(!raw)return'';
+  let pathname='';
+  if(raw.startsWith('/'))pathname=raw.split(/[?#]/,1)[0];
+  else{
+    try{
+      const url=new URL(raw);
+      if(typeof window==='undefined'||url.origin!==window.location.origin)return'';
+      pathname=url.pathname;
+    }catch(e){return''}
+  }
+  try{return decodeURIComponent(pathname)}catch(e){return''}
+}
+function markdownLocalFileToken(filePath){
+  try{return btoa(encodeURIComponent(filePath)).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')}catch(e){return''}
+}
+function markdownLocalFileProxyUrl(href){
+  const path=markdownLocalFilePath(href);
+  const token=markdownLocalFileToken(path);
+  return markdownLocalFileIcon(path)&&token?'/?f='+token:'';
+}
 function decorateMarkdownLink(link,href){
   if(!link||!href)return link;
   link.classList.add('markdownLink');
@@ -23561,7 +23650,10 @@ function decorateMarkdownLink(link,href){
   link.rel='noopener noreferrer';
   if(!link.title)link.title=href;
   link.dataset.linkUrl=href;
-  const fileIcon=markdownLocalFileIcon(href);
+  const filePath=markdownLocalFilePath(href);
+  const fileProxy=markdownLocalFileProxyUrl(href);
+  const fileIcon=markdownLocalFileIcon(filePath);
+  if(fileProxy)link.href=fileProxy;
   if(fileIcon&&!link.querySelector(':scope > .markdownFileLinkIcon')){
     link.classList.add('markdownFileLink');
     const icon=document.createElement('i');
@@ -23722,7 +23814,7 @@ async function handleChatLinkMenuAction(action){
     return;
   }
   if(action==='open'){
-    window.open(url,'_blank','noopener,noreferrer');
+    window.open(markdownLocalFileProxyUrl(url)||url,'_blank','noopener,noreferrer');
   }
 }
 function bindChatLinkContextMenu(){

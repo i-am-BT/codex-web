@@ -3326,6 +3326,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const invalidSvgImagePath = path.join(temporary, 'not-really-svg.svg');
   let externalImageRoot = '';
   let externalImagePath = '';
+  let localFilePath = '';
+  let rejectedLocalFilePath = '';
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
   const nativeFirstTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa780';
   const nativeSecondTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa781';
@@ -3610,6 +3612,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     await mkdir(codexHome, { recursive: true });
     externalImageRoot = await mkdtemp(path.join(tmpdir(), 'codex-web-image-root-'));
     externalImagePath = path.join(externalImageRoot, 'gallery-preview.png');
+    localFilePath = path.join(externalImageRoot, 'AGENTS.md');
+    rejectedLocalFilePath = path.join(temporary, 'private-notes.md');
     await writeFile(appServerControlFile, '{}');
     await writeFile(
       toolImagePath,
@@ -3618,6 +3622,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     await writeFile(svgImagePath, '<?xml version="1.0"?>\n<!-- Grok SVG -->\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8"/></svg>');
     await writeFile(invalidSvgImagePath, '<html><body>not an SVG image</body></html>');
     await writeFile(externalImagePath, await readFile(toolImagePath));
+    await writeFile(localFilePath, '# AGENTS.md\n\nAllowed fixture file.\n');
+    await writeFile(rejectedLocalFilePath, 'Not in the configured root.\n');
     await writeFile(imagePromptFetchFixture, `
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (input, options) => {
@@ -4297,6 +4303,7 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
       desktopIpcTimeoutMs: '5000',
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
       localImageRoots: externalImageRoot,
+      localFileRoots: externalImageRoot,
       sub2ApiBaseUrl: providerBaseUrl,
       sub2ApiKey: 'test-sub-key',
     });
@@ -6252,14 +6259,25 @@ updated_at = 1784422800000
     assert.equal(isHandoffSummaryText('已完成 Context checkpoint 显示修复。'), false);
     const markdownFileIconHelper = inlineScript.match(/(function markdownLocalFileIcon[\s\S]*?)(?=function decorateMarkdownLink)/)?.[1];
     assert.ok(markdownFileIconHelper);
-    const markdownLocalFileIcon = new Function(
-      markdownFileIconHelper + '; return markdownLocalFileIcon;',
-    )();
+    const markdownFileHelpers = new Function(
+      'window',
+      markdownFileIconHelper + '; return { markdownLocalFileIcon, markdownLocalFileProxyUrl };',
+    )({ location: { origin: 'https://web.xazz.top' } });
+    const { markdownLocalFileIcon, markdownLocalFileProxyUrl } = markdownFileHelpers;
     assert.equal(markdownLocalFileIcon('/Volumes/ikirito/docker/codex-web/server.mjs:11980'), 'file-code-2');
     assert.equal(markdownLocalFileIcon('/Volumes/ikirito/docker/codex-web/ui.css'), 'hash');
     assert.equal(markdownLocalFileIcon('/Users/ikirito/Documents/notes.md'), 'file-text');
     assert.equal(markdownLocalFileIcon('https://example.com/app.js'), '');
     assert.equal(markdownLocalFileIcon('/playground/index.html'), '');
+    assert.equal(
+      markdownLocalFileProxyUrl('/Users/ikirito/Documents/ChatGPT/docker/AGENTS.md:2'),
+      '/?f=JTJGVXNlcnMlMkZpa2lyaXRvJTJGRG9jdW1lbnRzJTJGQ2hhdEdQVCUyRmRvY2tlciUyRkFHRU5UUy5tZCUzQTI',
+    );
+    assert.equal(
+      markdownLocalFileProxyUrl('https://web.xazz.top/Users/ikirito/Documents/ChatGPT/docker/AGENTS.md'),
+      '/?f=JTJGVXNlcnMlMkZpa2lyaXRvJTJGRG9jdW1lbnRzJTJGQ2hhdEdQVCUyRmRvY2tlciUyRkFHRU5UUy5tZA',
+    );
+    assert.equal(markdownLocalFileProxyUrl('https://example.com/Users/ikirito/notes.md'), '');
     assert.match(inlineScript, /link\.prepend\(icon\)/);
     assert.match(uiStyles, /\.markdownBody a\.markdownFileLink\s*\{[^}]*display:\s*inline-flex;[^}]*gap:\s*3px/s);
     assert.match(uiStyles, /\.markdownFileLinkIcon\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px/s);
@@ -8308,6 +8326,33 @@ updated_at = 1784422800000
     } finally {
       await rm(outOfScopeImagePath, { force: true });
     }
+
+    const localFileUrl = new URL(localFilePath, baseUrl);
+    const unauthorizedLocalFile = await fetch(localFileUrl);
+    assert.equal(unauthorizedLocalFile.status, 401);
+    const localFile = await fetch(localFileUrl, { headers: { Cookie: cookie } });
+    assert.equal(localFile.status, 200);
+    assert.match(localFile.headers.get('content-type') || '', /^text\/plain/);
+    assert.equal(localFile.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(localFile.headers.get('content-security-policy'), "default-src 'none'");
+    assert.equal(await localFile.text(), '# AGENTS.md\n\nAllowed fixture file.\n');
+    const localFileToken = Buffer.from(encodeURIComponent(localFilePath), 'utf8').toString('base64url');
+    const localFileProxyUrl = `${baseUrl}/?${new URLSearchParams({ f: localFileToken })}`;
+    const unauthorizedLocalFileProxy = await fetch(localFileProxyUrl);
+    assert.equal(unauthorizedLocalFileProxy.status, 401);
+    const localFileProxy = await fetch(localFileProxyUrl, { headers: { Cookie: cookie } });
+    assert.equal(localFileProxy.status, 200);
+    assert.match(localFileProxy.headers.get('content-type') || '', /^text\/html/);
+    assert.equal(localFileProxy.headers.get('content-security-policy'), "default-src 'none'");
+    assert.match(await localFileProxy.text(), /<pre[^>]*># AGENTS\.md\n\nAllowed fixture file\.\n<\/pre>/);
+    const malformedLocalFileProxy = await fetch(`${baseUrl}/?f=not%20a%20token`, { headers: { Cookie: cookie } });
+    assert.equal(malformedLocalFileProxy.status, 400);
+    const localFileAtLine = await fetch(new URL(`${localFilePath}:2`, baseUrl), { headers: { Cookie: cookie } });
+    assert.equal(localFileAtLine.status, 200);
+    const rejectedLocalFile = await fetch(new URL(rejectedLocalFilePath, baseUrl), {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(rejectedLocalFile.status, 404);
 
     const falseToolImageMessage = nativeConversation.messages.find((message) => (
       message.role === 'tool' && message.content.includes('not-a-real-image.png')
@@ -11103,6 +11148,7 @@ function startServer({
   desktopIpcTimeoutMs = '',
   playgroundProxyAllowedOrigins = '',
   localImageRoots = '',
+  localFileRoots = '',
   fetchFixture = '',
   dockerBin = '',
   sub2ApiBaseUrl,
@@ -11133,6 +11179,7 @@ function startServer({
     CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,
     PLAYGROUND_PROXY_ALLOWED_ORIGINS: playgroundProxyAllowedOrigins,
     CODEX_WEB_LOCAL_IMAGE_ROOTS: localImageRoots,
+    CODEX_WEB_LOCAL_FILE_ROOTS: localFileRoots,
     PLAYGROUND_PROXY_HEARTBEAT_MS: '20',
     HOMEPAGE_API_TOKEN: '',
     CODEX_WEB_QUOTA_MONITOR_TOKEN: quotaMonitorToken,
