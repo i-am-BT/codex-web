@@ -2288,6 +2288,7 @@ test('Desktop owner loss preserves running state until an authoritative status c
   const reconciliations = [];
   let refreshes = 0;
   const api = new Function(
+    'appServerLoadedThreads',
     'desktopSnapshotRequests',
     'desktopSnapshotRequestTimes',
     'desktopIpcClient',
@@ -2298,6 +2299,7 @@ test('Desktop owner loss preserves running state until an authoritative status c
     'reconcileNativeTurnStatusFromAppServer',
     `${serverSource.slice(helperStart, helperEnd)}; return { requestDesktopThreadSnapshot };`,
   )(
+    new Map([['desktop-turn', {}]]),
     new Map(),
     new Map(),
     {

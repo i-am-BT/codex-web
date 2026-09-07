@@ -3963,7 +3963,7 @@ function nativeConversationHasFreshRunningActivity(conversation, now = Date.now(
   return Number.isFinite(updatedAtMs) && updatedAtMs >= now - NATIVE_TURN_STATUS_ACTIVITY_GRACE_MS;
 }
 
-function applyAppServerTurnStatus(threadId, turn, conversation = null) {
+function applyAppServerTurnStatus(threadId, turn, conversation = null, options = {}) {
   const cleanId = cleanNativeThreadId(threadId);
   const turnId = String(turn?.id || '').trim();
   const rawStatus = String(turn?.status || '').trim().toLowerCase();
@@ -4023,6 +4023,9 @@ function applyAppServerTurnStatus(threadId, turn, conversation = null) {
   }
 
   if (current?.turnId === turnId && current.status === status) return true;
+  if (options.passive && ['interrupted', 'error'].includes(status)) {
+    setPromptQueuePause(cleanId, { reason: 'app-paused', message: 'Codex App 已暂停，等待手动继续' });
+  }
   setNativeTurnState(cleanId, {
     turnId,
     status,
@@ -4031,7 +4034,7 @@ function applyAppServerTurnStatus(threadId, turn, conversation = null) {
   });
   if (status !== 'running') {
     void releaseAppServerThreadAfterTurn(cleanId, turnId, { reason: 'status-terminal' });
-    scheduleServerPromptQueueDispatch(cleanId, 160);
+    if (!options.passive) scheduleServerPromptQueueDispatch(cleanId, 160);
   }
   return true;
 }
@@ -4086,7 +4089,7 @@ function requestDesktopThreadSnapshot(threadId, { force = false } = {}) {
   desktopSnapshotRequestTimes.set(threadId, now);
   const request = desktopIpcClient.loadCompleteHistory(threadId)
     .catch((error) => {
-      if (isCodexDesktopIpcUnavailableError(error) && error?.reason === 'no-client-found') {
+      if (isCodexDesktopIpcUnavailableError(error)) {
         return reconcileUnavailableDesktopThread(threadId);
       }
       return false;
@@ -4106,7 +4109,26 @@ function reconcileUnavailableDesktopThread(threadId) {
   try { nativeSessions.scheduleRefresh?.(); } catch {}
   // Losing the Desktop owner is not proof that its turn stopped. Keep the
   // running state until app-server status or persisted terminal history says so.
-  return reconcileNativeTurnStatusFromAppServer(cleanId, conversation, { force: true });
+  if (appServerLoadedThreads.has(cleanId)) return reconcileNativeTurnStatusFromAppServer(cleanId, conversation, { force: true });
+  return reconcileDetachedNativeTurn(cleanId, conversation);
+}
+
+async function reconcileDetachedNativeTurn(threadId, conversation) {
+  if (conversation?.status !== 'running' || !conversation.latestTurnId
+    || nativeConversationHasFreshRunningActivity(conversation)) return false;
+  const client = new CodexAppServerClient({ bin: CODEX_BIN, cwd: CODEX_PROCESS_HOME, env: buildCodexProcessEnvironment(), clientName: 'codex-web-status', requestTimeoutMs: NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS });
+  let result;
+  try {
+    result = await client.request('thread/turns/list', {
+      threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded',
+    }, { timeoutMs: NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS });
+  } catch { return false; }
+  finally { await client.close(); }
+  const turn = result?.data?.[0];
+  const latest = nativeSessions.get(threadId);
+  if (!turn || turn.id !== conversation.latestTurnId || turn.id !== latest?.latestTurnId
+    || appServerLoadedThreads.has(threadId) || nativeTurnStatus(turn.status) === 'running') return false;
+  return applyAppServerTurnStatus(threadId, turn, latest, { passive: true });
 }
 
 async function respondToNativeRequest(pending, response) {
@@ -11942,10 +11964,22 @@ async function hydratePromptQueuesFromServer(){
     if(currentConversationSource==='codex'&&currentConversationId)renderPromptQueue();
   }catch(e){}
 }
+const deferredPromptQueueEvents=new Map();
 function applyRemotePromptQueueEvent(event){
   const threadId=String(event?.threadId||'').trim();
   if(!threadId)return;
-  if(promptQueueServerSyncInflight.has(threadId)||promptQueueServerSyncTimers.has(threadId)||promptQueueOrderSyncing.has(threadId)||promptQueueOrderIntents.has(threadId))return;
+  if(promptQueueServerSyncInflight.has(threadId)||promptQueueServerSyncTimers.has(threadId)||promptQueueOrderSyncing.has(threadId)||promptQueueOrderIntents.has(threadId)){
+    const pending=deferredPromptQueueEvents.get(threadId);
+    if(pending){if(Number(event.revision||0)>=Number(pending.event.revision||0))pending.event=event;return;}
+    const deferred={event};
+    deferredPromptQueueEvents.set(threadId,deferred);
+    setTimeout(()=>{
+      deferredPromptQueueEvents.delete(threadId);
+      applyRemotePromptQueueEvent(deferred.event);
+    },350);
+    return;
+  }
+  if(Number.isInteger(event.revision)&&event.revision<(promptQueueServerRevisions.get(threadId)||0))return;
   const items=Array.isArray(event?.items)?event.items:[];
   if(Number.isInteger(event?.revision))promptQueueServerRevisions.set(threadId,event.revision);
   if(Object.prototype.hasOwnProperty.call(event||{},'pause'))setPromptQueuePauseLocal(threadId,event.pause);
@@ -14437,6 +14471,8 @@ function showNativePromptOptimistically(item){
   }
   nativeRunningElement=addMsg('assistant','');
   nativeRunningElement.innerHTML='<span class="spinner"></span> Codex 正在运行...';
+  scrollChatToLatest({force:true});
+  alignChatToBottomStable(12,conversationLoadSeq);
 }
 function showNativeSteerOptimistically(item){
   if(currentConversationSource!=='codex')return null;
@@ -22821,6 +22857,7 @@ function syncNativeAfterPageResume(){
   refreshHistory();
   void syncHistoryCompletionReadFromServer();
   if(currentConversationSource!=='codex'||!currentConversationId)return;
+  void pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
   if(nativeCompletionSync){scheduleNativeCompletionSync(nativeCompletionSync.threadId,nativeCompletionSync.turnId,0);return}
   syncCurrentNativeConversation();
 }
@@ -27743,6 +27780,9 @@ async function send(){
     statusEl.textContent='Ready';
     applyConversationMode();
     input.focus();
+    resumeNativeLiveFollowBottom();
+    scrollChatToLatest({force:true});
+    alignChatToBottomStable(12,conversationLoadSeq);
     refreshHistory();
   }
 }
