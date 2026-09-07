@@ -460,6 +460,7 @@ if (process.argv[2] === 'app-server') {
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         codexAppVisible: false,
+        codexAppCreditsVisible: false,
         sources: [
           {
             id: 'sub-main',
@@ -499,6 +500,7 @@ if (process.argv[2] === 'app-server') {
     const initialPayload = await initialSave.json();
     assert.equal(initialPayload.configuredCount, 3);
     assert.equal(initialPayload.codexApp.visible, false);
+    assert.equal(initialPayload.codexApp.creditsVisible, false);
     assert.deepEqual(
       initialPayload.sources.slice(0, 3).map((source) => ({
         id: source.id,
@@ -586,6 +588,7 @@ if (process.argv[2] === 'app-server') {
     assert.equal(initialQuotaPayload.visibility.sub_main, false);
     assert.equal(initialQuotaPayload.visibility['sub-main'], true);
     assert.equal(initialQuotaPayload.codexApp.visible, false);
+    assert.equal(initialQuotaPayload.codexApp.creditsVisible, false);
     assert.doesNotMatch(
       JSON.stringify(initialQuotaPayload),
       /sub-main-secret|sub-backup-secret|compat-secret/,
@@ -720,6 +723,7 @@ if (process.argv[2] === 'app-server') {
     assert.equal(restoredConfig.status, 200);
     const restoredConfigPayload = await restoredConfig.json();
     assert.equal(restoredConfigPayload.codexApp.visible, false);
+    assert.equal(restoredConfigPayload.codexApp.creditsVisible, false);
     assert.equal(restoredConfigPayload.sources.some((source) => source.id === 'sub_main'), false);
     assert.deepEqual(
       restoredConfigPayload.sources.slice(0, 3).map((source) => source.id),

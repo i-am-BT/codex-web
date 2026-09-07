@@ -2288,6 +2288,7 @@ test('Desktop owner loss preserves running state until an authoritative status c
   const reconciliations = [];
   let refreshes = 0;
   const api = new Function(
+    'appServerLoadedThreads',
     'desktopSnapshotRequests',
     'desktopSnapshotRequestTimes',
     'desktopIpcClient',
@@ -2298,6 +2299,7 @@ test('Desktop owner loss preserves running state until an authoritative status c
     'reconcileNativeTurnStatusFromAppServer',
     `${serverSource.slice(helperStart, helperEnd)}; return { requestDesktopThreadSnapshot };`,
   )(
+    new Map([['desktop-turn', {}]]),
     new Map(),
     new Map(),
     {
@@ -4862,6 +4864,7 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
       builtin: true,
       configured: true,
       visible: true,
+      creditsVisible: true,
     });
     assert.ok(subQuotaConfigPayload.sources.every((source) => source.visible === true));
     assert.doesNotMatch(JSON.stringify(subQuotaConfigPayload), /test-sub-key/);
@@ -4875,18 +4878,22 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.match(codexAppCredits.headers.get('cache-control'), /private, no-store/);
     const codexAppCreditsPayload = await codexAppCredits.json();
     assert.match(codexAppCreditsPayload.fetchedAt, /^\d{4}-\d{2}-\d{2}T/);
-    const { fetchedAt: _codexAppCreditsFetchedAt, ...codexAppCreditsStable } = codexAppCreditsPayload;
+    assert.equal(codexAppCreditsPayload.usage, undefined);
+    assert.deepEqual(codexAppCreditsPayload.cycleUsage, { available: false, loading: false });
+    const { fetchedAt: _codexAppCreditsFetchedAt, cycleUsage: _cycleUsage, ...codexAppCreditsStable } = codexAppCreditsPayload;
     assert.deepEqual(codexAppCreditsStable, {
       provider: 'codex-app',
       providerLabel: 'Codex App',
       name: 'Codex App',
       mode: 'codex_app_credits',
+      windows: [],
       valid: true,
       available: true,
       planType: 'plus',
       planName: 'Plus',
       unit: 'credits',
       balance: 1705.928725,
+      creditsVisible: true,
       pointsBalance: 1705.928725,
       pointsLimit: 2500,
       usdBalance: 68.2,
@@ -5699,7 +5706,7 @@ updated_at = 1784422800000
     assert.match(page, /const orderedIds=\[\.\.\.subQuotaSettingsSourceList\.querySelectorAll\('\.subQuotaSettingsSource'\)\]\.map\(\(element\)=>element\.dataset\.sourceId\)\.filter\(Boolean\)/);
     assert.match(page, /id:inputs\.id,\s*name:inputs\.nameInput\?\.value\.trim\(\)\|\|inputs\.sourceTitle\?\.textContent\|\|subQuotaSourceDefinition\(inputs\.provider\)\.title,\s*provider:inputs\.provider,\s*baseUrl:inputs\.baseUrlInput\.value,\s*apiKeys:inputs\.readCredentials\?\.\(\)\|\|\[\],\s*visible:subQuotaVisibilityValue\(inputs\.visibilityToggle\),/s);
     assert.match(page, /const order=orderedIds/);
-    assert.match(page, /JSON\.stringify\(\{sources,order,codexAppVisible\}\)/);
+    assert.match(page, /JSON\.stringify\(\{sources,order,codexAppVisible,codexAppCreditsVisible\}\)/);
     assert.match(page, /各来源独立保存并支持多 Key，检测失败不影响配置/);
     assert.match(page, /function openSubQuotaSettings\(\)/);
     assert.match(page, /void syncSubQuotaSettings\(\)\.then\(\(loaded\)=>\{/);

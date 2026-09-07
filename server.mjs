@@ -28,6 +28,7 @@ import {
   ImagePromptLibrary,
 } from './image-prompt-library.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
+import { createCycleUsageReader } from './cycle-usage.mjs';
 import { archiveInactiveNativeThread } from './native-thread-archive.mjs';
 import {
   AutomationStore,
@@ -96,6 +97,7 @@ const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
 const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
 const PLAYGROUND_PREVIOUS_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'previous');
 const CODEX_HOME = resolveLocalPath(process.env.CODEX_HOME || path.join(homedir(), '.codex'), homedir());
+const readCycleUsage = createCycleUsageReader(CODEX_HOME, path.join(RUNTIME_DIR, 'codex-cycle-usage.json'));
 const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path.join(CODEX_HOME, 'config.toml'), CODEX_HOME);
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
@@ -322,6 +324,7 @@ const SUB2API_ADMIN_API_KEY = String(process.env.SUB2API_ADMIN_API_KEY || '').tr
 const startupSubQuotaState = readStartupSubQuotaState(process.env);
 let subQuotaConfigs = startupSubQuotaState.sources;
 let codexAppQuotaVisible = startupSubQuotaState.codexAppVisible;
+let codexAppCreditsVisible = startupSubQuotaState.codexAppCreditsVisible;
 let codexAppQuotaCache = { value: null, expiresAt: 0, pending: null };
 delete process.env.CPA_QUOTA_API_KEY;
 delete process.env.SUB2API_API_KEY;
@@ -475,7 +478,7 @@ app.all('/api/monitor/quotas', (req, res, next) => {
     ]);
     res.json({
       ...data,
-      codexApp: { ...codexApp, visible: codexAppQuotaVisible },
+      codexApp: { ...codexApp, visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible },
       visibility: subQuotaVisibilityState(),
     });
   } catch (err) {
@@ -855,7 +858,7 @@ app.get('/api/automations', requireAuth, (_req, res) => {
 app.get('/api/codex-app-credits', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   const credits = await readCodexAppCredits({ refresh: req.query.refresh === '1' });
-  res.json({ ...credits, visible: codexAppQuotaVisible });
+  res.json({ ...credits, cycleUsage: readCycleUsage(credits), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible });
 });
 
 app.get('/api/sub-quotas', requireAuth, async (req, res) => {
@@ -868,7 +871,7 @@ app.get('/api/sub-quotas', requireAuth, async (req, res) => {
     ]);
     res.json({
       ...data,
-      codexApp: { ...codexApp, visible: codexAppQuotaVisible },
+      codexApp: { ...codexApp, cycleUsage: readCycleUsage(codexApp), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible },
       visibility: subQuotaVisibilityState(),
     });
   } catch (err) {
@@ -951,6 +954,7 @@ function writeHistoryCompletionReadFile() {
 }
 function readCodexAppUnreadThreadIds() {
   try {
+    const snapshotAt = statSync(CODEX_APP_GLOBAL_STATE_FILE).mtimeMs;
     const state = JSON.parse(readFileSync(CODEX_APP_GLOBAL_STATE_FILE, 'utf8'));
     const unread = state?.['electron-persisted-atom-state']?.['unread-thread-ids-by-host-v1']?.local;
     if (!Array.isArray(unread)) return null;
@@ -961,7 +965,9 @@ function readCodexAppUnreadThreadIds() {
       if (!id) return null;
       ids.push(id);
     }
-    return new Set(ids);
+    const result = new Set(ids);
+    result.snapshotAt = snapshotAt;
+    return result;
   } catch {
     return null;
   }
@@ -981,12 +987,15 @@ function syncServerHistoryCompletionReadFromCodexApp() {
     appUnreadThreadIds,
   ));
   lastCodexAppUnreadThreadIds = appUnreadThreadIds;
-  if (!removedThreadIds.size) return false;
   let changed = false;
   for (const item of nativeSessionSummaries()) {
     const id = cleanNativeThreadId(item?.id);
     const status = String(item?.status || '').toLowerCase();
-    if (!id || !['done', 'completed'].includes(status) || !removedThreadIds.has(id)) continue;
+    if (!id || !['done', 'completed'].includes(status)) continue;
+    const completedAt = Date.parse(item.updatedAt || item.recencyAt || item.createdAt || '');
+    const alreadyReadInApp = !appUnreadThreadIds.has(id)
+      && Number.isFinite(completedAt) && completedAt <= Number(appUnreadThreadIds.snapshotAt);
+    if (!removedThreadIds.has(id) && !alreadyReadInApp) continue;
     const key = `codex:${id}`;
     const version = serverHistoryCompletionVersion(item);
     const selected = selectServerHistoryCompletionReadVersion(serverHistoryCompletionRead[key], version);
@@ -1091,6 +1100,7 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
   try {
     const requestedSources = normalizeSubQuotaConfigRequest(req.body);
     const nextCodexAppVisible = normalizeSubQuotaVisibility(req.body?.codexAppVisible, codexAppQuotaVisible);
+    const nextCodexAppCreditsVisible = normalizeSubQuotaVisibility(req.body?.codexAppCreditsVisible, codexAppCreditsVisible);
     const existingConfigs = withBuiltinSubQuotaConfigs(subQuotaConfigs);
     const existingById = new Map(existingConfigs.map((config) => [config.id, config]));
     const requestedById = new Map(requestedSources.map((source) => [source.id, source]));
@@ -1167,13 +1177,14 @@ app.put('/api/sub-quota-config', requireAuth, async (req, res) => {
     const configured = configuredSubQuotaConfigs(normalizedNextConfigs);
 
     try {
-      persistSubQuotaConfigs(normalizedNextConfigs, { codexAppVisible: nextCodexAppVisible });
+      persistSubQuotaConfigs(normalizedNextConfigs, { codexAppVisible: nextCodexAppVisible, codexAppCreditsVisible: nextCodexAppCreditsVisible });
     } catch (error) {
       error.statusCode = 500;
       throw error;
     }
     subQuotaConfigs = normalizedNextConfigs;
     codexAppQuotaVisible = nextCodexAppVisible;
+    codexAppCreditsVisible = nextCodexAppCreditsVisible;
     subQuotaService = createSubQuotaService(subQuotaConfigs);
     const primary = configured[0] || publicSubQuotaConfigs(normalizedNextConfigs).find((source) => source.baseUrl);
     const sources = publicSubQuotaConfigs(normalizedNextConfigs);
@@ -3976,7 +3987,7 @@ function nativeConversationHasFreshRunningActivity(conversation, now = Date.now(
   return Number.isFinite(updatedAtMs) && updatedAtMs >= now - NATIVE_TURN_STATUS_ACTIVITY_GRACE_MS;
 }
 
-function applyAppServerTurnStatus(threadId, turn, conversation = null) {
+function applyAppServerTurnStatus(threadId, turn, conversation = null, options = {}) {
   const cleanId = cleanNativeThreadId(threadId);
   const turnId = String(turn?.id || '').trim();
   const rawStatus = String(turn?.status || '').trim().toLowerCase();
@@ -4036,6 +4047,9 @@ function applyAppServerTurnStatus(threadId, turn, conversation = null) {
   }
 
   if (current?.turnId === turnId && current.status === status) return true;
+  if (options.passive && ['interrupted', 'error'].includes(status)) {
+    setPromptQueuePause(cleanId, { reason: 'app-paused', message: 'Codex App 已暂停，等待手动继续' });
+  }
   setNativeTurnState(cleanId, {
     turnId,
     status,
@@ -4044,7 +4058,7 @@ function applyAppServerTurnStatus(threadId, turn, conversation = null) {
   });
   if (status !== 'running') {
     void releaseAppServerThreadAfterTurn(cleanId, turnId, { reason: 'status-terminal' });
-    scheduleServerPromptQueueDispatch(cleanId, 160);
+    if (!options.passive) scheduleServerPromptQueueDispatch(cleanId, 160);
   }
   return true;
 }
@@ -4099,7 +4113,7 @@ function requestDesktopThreadSnapshot(threadId, { force = false } = {}) {
   desktopSnapshotRequestTimes.set(threadId, now);
   const request = desktopIpcClient.loadCompleteHistory(threadId)
     .catch((error) => {
-      if (isCodexDesktopIpcUnavailableError(error) && error?.reason === 'no-client-found') {
+      if (isCodexDesktopIpcUnavailableError(error)) {
         return reconcileUnavailableDesktopThread(threadId);
       }
       return false;
@@ -4119,7 +4133,26 @@ function reconcileUnavailableDesktopThread(threadId) {
   try { nativeSessions.scheduleRefresh?.(); } catch {}
   // Losing the Desktop owner is not proof that its turn stopped. Keep the
   // running state until app-server status or persisted terminal history says so.
-  return reconcileNativeTurnStatusFromAppServer(cleanId, conversation, { force: true });
+  if (appServerLoadedThreads.has(cleanId)) return reconcileNativeTurnStatusFromAppServer(cleanId, conversation, { force: true });
+  return reconcileDetachedNativeTurn(cleanId, conversation);
+}
+
+async function reconcileDetachedNativeTurn(threadId, conversation) {
+  if (conversation?.status !== 'running' || !conversation.latestTurnId
+    || nativeConversationHasFreshRunningActivity(conversation)) return false;
+  const client = new CodexAppServerClient({ bin: CODEX_BIN, cwd: CODEX_PROCESS_HOME, env: buildCodexProcessEnvironment(), clientName: 'codex-web-status', requestTimeoutMs: NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS });
+  let result;
+  try {
+    result = await client.request('thread/turns/list', {
+      threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded',
+    }, { timeoutMs: NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS });
+  } catch { return false; }
+  finally { await client.close(); }
+  const turn = result?.data?.[0];
+  const latest = nativeSessions.get(threadId);
+  if (!turn || turn.id !== conversation.latestTurnId || turn.id !== latest?.latestTurnId
+    || appServerLoadedThreads.has(threadId) || nativeTurnStatus(turn.status) === 'running') return false;
+  return applyAppServerTurnStatus(threadId, turn, latest, { passive: true });
 }
 
 async function respondToNativeRequest(pending, response) {
@@ -6952,6 +6985,7 @@ function publicCodexAppQuotaConfig() {
     builtin: true,
     configured: true,
     visible: codexAppQuotaVisible,
+    creditsVisible: codexAppCreditsVisible,
   };
 }
 
@@ -6973,13 +7007,21 @@ function codexAppPlanLabel(value) {
 
 function normalizeCodexAppCredits(result) {
   const fetchedAt = new Date().toISOString();
-  const rateLimits = result?.rateLimits;
+  const rateLimits = result?.rateLimits || result?.rateLimitsByLimitId?.codex
+    || Object.values(result?.rateLimitsByLimitId || {})[0];
   const base = {
     provider: CODEX_APP_QUOTA_PROVIDER,
     providerLabel: 'Codex App',
     name: 'Codex App',
     mode: 'codex_app_credits',
     fetchedAt,
+    windows: Object.entries(result?.rateLimitsByLimitId || { codex: rateLimits }).flatMap(([id, limits]) =>
+      ['primary', 'secondary'].flatMap((key) => {
+        const window = limits?.[key];
+        if (!window || !Number.isFinite(window.usedPercent)) return [];
+        return [{ id, window: key, remainingPercent: Math.max(0, Math.min(100, 100 - window.usedPercent)),
+          windowDurationMins: window.windowDurationMins, resetsAt: window.resetsAt }];
+      })),
   };
   if (!rateLimits || typeof rateLimits !== 'object' || Array.isArray(rateLimits)) {
     return { ...base, valid: false, available: false, error: '本机 Codex 登录态未返回额度数据' };
@@ -7415,6 +7457,7 @@ function readStartupSubQuotaState(env = process.env) {
   const fallback = {
     sources: readLegacySubQuotaConfigs(env),
     codexAppVisible: parseBoolean(env.CODEX_APP_QUOTA_VISIBLE, true),
+    codexAppCreditsVisible: true,
   };
   if (!existsSync(SUB_QUOTA_SOURCES_FILE)) return fallback;
   try {
@@ -7423,6 +7466,7 @@ function readStartupSubQuotaState(env = process.env) {
     return {
       sources,
       codexAppVisible: normalizeSubQuotaVisibility(stored?.codexAppVisible, fallback.codexAppVisible),
+      codexAppCreditsVisible: normalizeSubQuotaVisibility(stored?.codexAppCreditsVisible, fallback.codexAppCreditsVisible),
     };
   } catch (error) {
     console.warn(`读取额度来源配置失败，已回退到 .env: ${error.message}`);
@@ -7554,7 +7598,7 @@ function subQuotaOrderValue(configs) {
     .join(',');
 }
 
-function persistSubQuotaConfigs(configs, { codexAppVisible = codexAppQuotaVisible } = {}) {
+function persistSubQuotaConfigs(configs, { codexAppVisible = codexAppQuotaVisible, codexAppCreditsVisible: creditsVisible = codexAppCreditsVisible } = {}) {
   const sources = withBuiltinSubQuotaConfigs(configs).map((source, index) => ({ ...source, order: index }));
   if (sources.length > SUB_QUOTA_MAX_SOURCES) throw new Error(`额度来源最多配置 ${SUB_QUOTA_MAX_SOURCES} 个`);
   const persistedSources = sources.map((source) => {
@@ -7565,6 +7609,7 @@ function persistSubQuotaConfigs(configs, { codexAppVisible = codexAppQuotaVisibl
     version: 2,
     updatedAt: new Date().toISOString(),
     codexAppVisible: codexAppVisible !== false,
+    codexAppCreditsVisible: creditsVisible !== false,
     sources: persistedSources,
   }, null, 2)}\n`);
   const configured = configuredSubQuotaConfigs(sources);
@@ -11146,6 +11191,7 @@ let historySessionRefreshActive=false;
 let historySessionRefreshQueued=false;
 let historyRefreshPending=false;
 let historyRefreshInFlight=null;
+let pageBootPending=true;
 let historyRefreshRerun=false;
 let historyRefreshPointerId=null;
 let historyRefreshReleaseTimer=null;
@@ -11204,7 +11250,7 @@ function composerModelLabel(value){
   }).join(' ');
   return titled.replace(/\\bDeepseek\\b/g,'DeepSeek');
 }
-function composerEffortLabel(value){return({'':'默认',low:'低',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'超高'})[String(value||'')]||String(value||'默认')}
+function composerEffortLabel(value){return({'':'默认',low:'轻度',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'超高'})[String(value||'')]||String(value||'默认')}
 function composerModelSwitchConfirm(previous,next){
   const oldModel=String(previous||'').trim();
   const newModel=String(next||'').trim();
@@ -11985,10 +12031,22 @@ async function hydratePromptQueuesFromServer(){
     if(currentConversationSource==='codex'&&currentConversationId)renderPromptQueue();
   }catch(e){}
 }
+const deferredPromptQueueEvents=new Map();
 function applyRemotePromptQueueEvent(event){
   const threadId=String(event?.threadId||'').trim();
   if(!threadId)return;
-  if(promptQueueServerSyncInflight.has(threadId)||promptQueueServerSyncTimers.has(threadId)||promptQueueOrderSyncing.has(threadId)||promptQueueOrderIntents.has(threadId))return;
+  if(promptQueueServerSyncInflight.has(threadId)||promptQueueServerSyncTimers.has(threadId)||promptQueueOrderSyncing.has(threadId)||promptQueueOrderIntents.has(threadId)){
+    const pending=deferredPromptQueueEvents.get(threadId);
+    if(pending){if(Number(event.revision||0)>=Number(pending.event.revision||0))pending.event=event;return;}
+    const deferred={event};
+    deferredPromptQueueEvents.set(threadId,deferred);
+    setTimeout(()=>{
+      deferredPromptQueueEvents.delete(threadId);
+      applyRemotePromptQueueEvent(deferred.event);
+    },350);
+    return;
+  }
+  if(Number.isInteger(event.revision)&&event.revision<(promptQueueServerRevisions.get(threadId)||0))return;
   const items=Array.isArray(event?.items)?event.items:[];
   if(Number.isInteger(event?.revision))promptQueueServerRevisions.set(threadId,event.revision);
   if(Object.prototype.hasOwnProperty.call(event||{},'pause'))setPromptQueuePauseLocal(threadId,event.pause);
@@ -14070,14 +14128,9 @@ let desktopQueueReorderAvailable=false;
 let promptQueueEnabled=readPromptQueueEnabledLocal();
 function readPromptQueueEnabledLocal(){try{return localStorage.getItem('codexWeb.promptQueueEnabled.v1')!=='0'}catch{return true}}
 function storePromptQueueEnabledLocal(){try{localStorage.setItem('codexWeb.promptQueueEnabled.v1',promptQueueEnabled?'1':'0')}catch{}}
-async function refreshDesktopQueueAvailability(){
-  try{
-    const res=await fetch('/api/config');
-    const data=await res.json();
-    if(!res.ok||!data)return;
-    desktopQueueReorderAvailable=Boolean(data.desktopConnected);
-    renderPromptQueue();
-  }catch{}
+function refreshDesktopQueueAvailability(data){
+  desktopQueueReorderAvailable=Boolean(data?.desktopConnected);
+  renderPromptQueue();
 }
 const PROMPT_QUEUE_DRAG_HOLD_MS=350;
 const PROMPT_QUEUE_DRAG_CANCEL_DISTANCE=10;
@@ -14485,6 +14538,8 @@ function showNativePromptOptimistically(item){
   }
   nativeRunningElement=addMsg('assistant','');
   nativeRunningElement.innerHTML='<span class="spinner"></span> Codex 正在运行...';
+  scrollChatToLatest({force:true});
+  alignChatToBottomStable(12,conversationLoadSeq);
 }
 function showNativeSteerOptimistically(item){
   if(currentConversationSource!=='codex')return null;
@@ -16807,6 +16862,7 @@ function ensureSubQuotaSettingsDialog(){
   codexPointsWrap.className='subQuotaCodexBalance';
   const codexPointsLabel=document.createElement('span');
   codexPointsLabel.textContent='剩余点数';
+  codexPointsWrap.title='额外点数余额；订阅额度见下方时间窗口';
   const codexPointsBalance=document.createElement('strong');
   codexPointsBalance.textContent='--';
   codexPointsWrap.append(codexPointsLabel,codexPointsBalance);
@@ -16814,6 +16870,7 @@ function ensureSubQuotaSettingsDialog(){
   codexUsdWrap.className='subQuotaCodexBalance';
   const codexUsdLabel=document.createElement('span');
   codexUsdLabel.textContent='剩余美元';
+  codexUsdWrap.title='按点数换算的美元参考值，并非实际消费账单';
   const codexUsdBalance=document.createElement('strong');
   codexUsdBalance.textContent='--';
   codexUsdWrap.append(codexUsdLabel,codexUsdBalance);
@@ -16825,15 +16882,26 @@ function ensureSubQuotaSettingsDialog(){
   codexMeta.setAttribute('role','status');
   codexMeta.textContent='等待检测';
   codexSummary.append(codexBalances,codexProgress,codexMeta);
-  codexSource.append(codexHead,codexSummary);
+  const codexCreditsVisibility=createSubQuotaVisibilityToggle('点数与美元余额');
+  const codexCreditsControl=document.createElement('div');
+  codexCreditsControl.className='subQuotaSettingsSourceHead';
+  const codexCreditsLabel=document.createElement('span');
+  codexCreditsLabel.textContent='在卡片显示点数与美元余额';
+  codexCreditsControl.append(codexCreditsLabel,codexCreditsVisibility);
+  const codexUsage=document.createElement('div');
+  codexUsage.className='subQuotaCodexUsage';
+  codexUsage.setAttribute('aria-live','polite');
+  codexSource.append(codexHead,codexCreditsControl,codexSummary,codexUsage);
   subQuotaSettingsCodexApp={
     source:codexSource,
     visibilityToggle:codexVisibility,
+    creditsVisibilityToggle:codexCreditsVisibility,
     refreshButton:codexRefresh,
     pointsBalance:codexPointsBalance,
     usdBalance:codexUsdBalance,
     progress:codexProgress,
     meta:codexMeta,
+    usage:codexUsage,
   };
   const createSourceFields=(sourceConfig={})=>{
     const provider=String(sourceConfig.provider||'cpa-codex');
@@ -17296,9 +17364,28 @@ function syncSubQuotaMoveButtons(){
     if(down)down.disabled=index===sources.length-1;
   });
 }
+function appendCodexCycleUsage(parent,stats){
+  if(!stats)return;
+  const grid=document.createElement('div');
+  grid.className='subQuotaCreditsGrid subQuotaCycleUsage';
+  grid.title=(stats.scope||'本周期本机用量')+'；'+(stats.pricingBasis||'');
+  const rows=stats.available?[
+    ['本周期 Tokens（本机）',formatSubQuotaAmount(stats.totalTokens,'')],
+    ['缓存命中 Tokens',stats.cachedInputTokens===null?'--':formatSubQuotaAmount(stats.cachedInputTokens,'')],
+    ['缓存命中率',stats.cacheHitPercent===null?'--':stats.cacheHitPercent.toFixed(2)+'%'],
+    ['费用估算（USD）',stats.estimatedUsd===null?'--':'$'+stats.estimatedUsd.toFixed(4)],
+  ]:[['本周期用量',stats.loading?'读取中…':'--']];
+  for(const [label,value] of rows){
+    const item=document.createElement('div');item.className='subQuotaCredits';
+    const caption=document.createElement('span');caption.textContent=label;
+    const amount=document.createElement('strong');amount.textContent=value;
+    item.append(caption,amount);grid.appendChild(item);
+  }
+  parent.appendChild(grid);
+}
 async function syncCodexAppCredits({refresh=false}={}){
   if(!subQuotaSettingsCodexApp)return;
-  const {refreshButton,pointsBalance,usdBalance,progress,meta}=subQuotaSettingsCodexApp;
+  const {refreshButton,pointsBalance,usdBalance,progress,meta,usage}=subQuotaSettingsCodexApp;
   refreshButton.disabled=true;
   pointsBalance.textContent='--';
   usdBalance.textContent='--';
@@ -17310,6 +17397,25 @@ async function syncCodexAppCredits({refresh=false}={}){
     const response=await fetch('/api/codex-app-credits'+(refresh?'?refresh=1':''),{headers:{Accept:'application/json'}});
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'额度检测失败');
+    usage.replaceChildren();
+    const addMetric=(label,value)=>{
+      const row=document.createElement('div');
+      row.className='subQuotaCodexBalance';
+      const caption=document.createElement('span');caption.textContent=label;
+      const amount=document.createElement('strong');amount.textContent=value;
+      row.append(caption,amount);usage.appendChild(row);
+    };
+    for(const window of data.windows||[]){
+      const minutes=window.windowDurationMins;
+      const label=minutes===10080?'每周':minutes===300?'5 小时':minutes?minutes+' 分钟':window.window;
+      addMetric(window.id+' · '+label+'剩余额度',formatSubQuotaAmount(window.remainingPercent,'%'));
+      addMetric('本周期已用',formatSubQuotaAmount(100-window.remainingPercent,'%'));
+      if(window.resetsAt)addMetric('额度重置时间',new Date(window.resetsAt*1000).toLocaleString('zh-CN'));
+    }
+    appendCodexCycleUsage(usage,data.cycleUsage);
+    if(data.cycleUsage?.loading)setTimeout(()=>{
+      if(!subQuotaSettingsOverlay?.classList.contains('hidden'))void syncCodexAppCredits();
+    },3000);
     const remainingPercent=finiteSubQuotaNumber(data.remainingPercent);
     if(data.unlimited){
       pointsBalance.textContent='不限量';
@@ -17354,6 +17460,7 @@ async function syncSubQuotaSettings(){
     subQuotaSettingsMaxSources=Math.max(4,Number(data.maxSources)||12);
     subQuotaSettingsMaxApiKeys=Math.max(1,Number(data.maxApiKeys)||8);
     setSubQuotaVisibilityToggle(subQuotaSettingsCodexApp?.visibilityToggle,data.codexApp?.visible!==false);
+    setSubQuotaVisibilityToggle(subQuotaSettingsCodexApp?.creditsVisibilityToggle,data.codexApp?.creditsVisible!==false);
     const incomingIds=new Set(sources.map((source)=>String(source.id||source.provider||'')));
     for(const [sourceId,inputs] of [...subQuotaSettingsInputs]){
       if(!inputs.builtin&&!incomingIds.has(sourceId))removeSubQuotaSettingsSource(sourceId);
@@ -17414,7 +17521,8 @@ async function submitSubQuotaSettings(event){
     }));
     const order=orderedIds;
     const codexAppVisible=subQuotaVisibilityValue(subQuotaSettingsCodexApp?.visibilityToggle);
-    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources,order,codexAppVisible})});
+    const codexAppCreditsVisible=subQuotaVisibilityValue(subQuotaSettingsCodexApp?.creditsVisibilityToggle);
+    const response=await fetch('/api/sub-quota-config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources,order,codexAppVisible,codexAppCreditsVisible})});
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'保存失败');
     await syncSubQuotaSettings();
@@ -18052,6 +18160,9 @@ async function loadSubQuota({refresh=false}={}){
     if(requestSeq!==subQuotaRequestSeq)return;
     if(!response.ok)throw new Error(data.error||'额度请求失败');
     renderSubQuota(data);
+    if(data.codexApp?.cycleUsage?.loading)setTimeout(()=>{
+      if(requestSeq===subQuotaRequestSeq&&!subQuotaPopover?.classList.contains('hidden'))void loadSubQuota();
+    },3000);
   }catch(error){
     if(requestSeq!==subQuotaRequestSeq)return;
     renderSubQuotaError(String(error?.message||'额度请求失败'));
@@ -18228,7 +18339,7 @@ function renderSubQuota(data){
       const usdValue=finiteSubQuotaNumber(quota.usdBalance);
       const remainingPercent=finiteSubQuotaNumber(quota.remainingPercent);
       let creditsGrid=null;
-      if(quota.unlimited||pointsValue!==null||usdValue!==null){
+      if(quota.creditsVisible!==false&&(quota.unlimited||pointsValue!==null||usdValue!==null)){
         creditsGrid=document.createElement('div');
         creditsGrid.className='subQuotaCreditsGrid';
         const credits=document.createElement('div');
@@ -18248,7 +18359,7 @@ function renderSubQuota(data){
         creditsGrid.append(credits,dollars);
         detailCount+=2;
       }
-      if(!quota.unlimited&&remainingPercent!==null){
+      if(quota.creditsVisible!==false&&!quota.unlimited&&remainingPercent!==null){
         const progressWrap=document.createElement('div');
         progressWrap.className='subQuotaCodexPreviewProgress';
         const progressHead=document.createElement('div');
@@ -18262,9 +18373,19 @@ function renderSubQuota(data){
         detailCount+=1;
       }
       if(creditsGrid)source.appendChild(creditsGrid);
+      for(const window of quota.windows||[]){
+        if(window.id==='codex_bengalfox'&&!(window.remainingPercent<100))continue;
+        const minutes=window.windowDurationMins;
+        const label=minutes===10080?'每周':minutes===300?'5 小时':minutes?minutes+' 分钟':window.window;
+        const resetAt=Number.isFinite(window.resetsAt)?new Date(window.resetsAt*1000).toISOString():null;
+        detailCount+=appendSubQuotaWindow(source,(window.id==='codex'?'Codex':window.id)+' · '+label+' · 已用 '+formatSubQuotaAmount(100-window.remainingPercent,'%'),{
+          remaining:window.remainingPercent,limit:100,resetAt,
+        },'%',{showReset:true})?1:0;
+      }
       const meta=document.createElement('div');
       meta.className='subQuotaMeta';
       if(quota.message)appendSubQuotaMeta(meta,quota.message);
+      if(quota.cycleUsage){appendCodexCycleUsage(source,quota.cycleUsage);detailCount++;}
       if(meta.childElementCount)source.appendChild(meta);
       if(detailCount||meta.childElementCount){
         subQuotaContent.appendChild(source);
@@ -19037,7 +19158,6 @@ window.addEventListener('pageshow',syncNativeAfterPageResume);
 window.addEventListener('online',syncNativeAfterPageResume);
 window.addEventListener('focus',syncNativeAfterPageResume);
 if (${authenticated ? 'true' : 'false'}) boot(true);
-void refreshDesktopQueueAvailability();
 function effectiveAppearanceTheme(){return appearance.theme==='dark'?'dark':appearance.theme==='light'?'light':systemThemeMedia.matches?'dark':'light'}
 function handleSystemThemeChange(){if(appearance.theme==='system')applyAppearance()}
 async function toggleTheme(){const next=appearance.theme==='system'?'light':appearance.theme==='light'?'dark':'system';await saveAppearance({theme:next})}
@@ -19153,7 +19273,17 @@ async function handleCustomBackground(file){if(!file){await saveAppearance({chat
 async function applyGeneratedImageBackground(source,button){if(!source||button.disabled)return;button.disabled=true;button.classList.add('loading');statusEl.textContent='正在应用背景...';try{const imageResponse=await fetch(source);if(!imageResponse.ok)throw new Error('读取生成图片失败');const blob=await imageResponse.blob();if(!/^image\\/(?:png|jpeg|webp|gif)$/.test(blob.type))throw new Error('该图片格式不能用作背景');const data=await readFileDataUrl(blob);const extension=blob.type==='image/jpeg'?'jpg':blob.type.split('/')[1];const concept=dreamSkinConcepts.find((item)=>item.id===dreamSkinSelectedConcept&&item.theme);const res=await fetch('/api/appearance/background',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:(concept?'Dream Skin · '+concept.name:'Dream Skin')+'.'+extension,type:blob.type,data,themeId:concept?.id||''})});const body=await res.json();if(!res.ok)throw new Error(body.error||'背景应用失败');appearance=body.appearance;applyAppearance();setIconLabel(button,'check','主题已应用',false);button.title='主题已应用';button.setAttribute('aria-label','主题已应用');statusEl.textContent=concept?'Dream Skin · '+concept.name+' 已应用':'Dream Skin 背景已应用'}catch(error){statusEl.textContent=error.message;button.disabled=false}finally{button.classList.remove('loading')}}
 async function deleteSelectedBackground(){const selected=cleanBackgroundValue(appearance.chatBackground);const custom=findCustomBackground(selected);if(!custom)return;if(!confirm('删除自定义背景 '+custom.name+'？'))return;statusEl.textContent='删除背景...';const res=await fetch('/api/appearance/background',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:selected})});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'背景删除失败';return}appearance=data.appearance;applyAppearance();statusEl.textContent='自定义背景已删除'}
 document.addEventListener('click',(event)=>{if(!event.target.closest('.msg.user, .msg.assistant, .msgActions'))clearMessageActionsOpen()});
-async function boot(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelLoadWarnings.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();const conversations=Array.isArray(data.conversations)?data.conversations:[];const saved=selectRecent?readActiveConversationPreference():null;const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=selectRecent&&conversations.length?(match||conversations[0]):null;if(target){if(saved?.title||target.title)setCurrentConversationTitle(saved?.title||target.title,'Chat');setTopStatusText('同步中',{running:false});chat?.classList?.add('conversationRestoring');}const modelsReady=loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(target)await loadConversation(target.id,target.source||'codex');await modelsReady;await restoreSideChatIfNeeded()}
+async function boot(selectRecent=false){
+  pageBootPending=true;
+  try{return await bootContent(selectRecent)}
+  finally{
+    pageBootPending=false;
+    void syncHistoryCompletionReadFromServer();
+    if(nativeSyncChangedIds.size)scheduleChangedNativeSessionSync([]);
+    if(historyRefreshPending)void refreshHistory();
+  }
+}
+async function bootContent(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();refreshDesktopQueueAvailability(data);modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelLoadWarnings.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();const conversations=Array.isArray(data.conversations)?data.conversations:[];const saved=selectRecent?readActiveConversationPreference():null;const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=selectRecent&&conversations.length?(match||conversations[0]):null;if(target){if(saved?.title||target.title)setCurrentConversationTitle(saved?.title||target.title,'Chat');setTopStatusText('同步中',{running:false});chat?.classList?.add('conversationRestoring');}const modelsReady=loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(target)await loadConversation(target.id,target.source||'codex',{historyPageLimit:NATIVE_HISTORY_PAGE_SIZE*2});await modelsReady;await restoreSideChatIfNeeded()}
 function historyRefreshBlocked(){return historyRefreshPointerId!==null||activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')}
 function beginHistoryRefreshPointerLock(event){
   if(event.button!==0||event.isPrimary===false||!event.target.closest?.('.hist'))return;
@@ -19203,6 +19333,7 @@ function scheduleHistoryRefreshFromSession(delay=HISTORY_SESSION_REFRESH_DELAY_M
 }
 async function refreshHistory(){
   if(historyRefreshBlocked()){historyRefreshPending=true;return}
+  if(pageBootPending){historyRefreshPending=true;return}
   if(historySessionRefreshTimer)clearTimeout(historySessionRefreshTimer);
   historySessionRefreshTimer=null;
   historySessionRefreshQueued=false;
@@ -22432,6 +22563,7 @@ function scheduleChangedNativeSessionSync(changedIds){
     const clean=String(id||'');
     if(clean)nativeSyncChangedIds.add(clean);
   }
+  if(pageBootPending)return;
   if(!nativeSyncChangedIds.size||nativeSyncTimer)return;
   const syncDelay=webRunActive&&currentConversationSource==='codex'?80:260;
   nativeSyncTimer=setTimeout(async()=>{
@@ -22465,6 +22597,7 @@ function connectSessionEvents(){
   if(sessionEvents||!window.EventSource)return;
   sessionEvents=new EventSource('/api/session-events');
   sessionEvents.addEventListener('open',async()=>{
+    if(pageBootPending)return;
     syncNativeAfterPageResume();
     if(currentConversationSource==='codex'&&currentConversationId){
       void pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
@@ -22786,10 +22919,12 @@ async function reconcileNativeCompletion(){
   scheduleNativeCompletionSync(pending.threadId,pending.turnId,Math.min(1500,180+pending.attempt*90));
 }
 function syncNativeAfterPageResume(){
+  if(pageBootPending)return;
   if(nativeLiveDocumentHidden())return;
   refreshHistory();
   void syncHistoryCompletionReadFromServer();
   if(currentConversationSource!=='codex'||!currentConversationId)return;
+  void pullPromptQueueFromServer(currentConversationId,{render:true,preferServer:true});
   if(nativeCompletionSync){scheduleNativeCompletionSync(nativeCompletionSync.threadId,nativeCompletionSync.turnId,0);return}
   syncCurrentNativeConversation();
 }
@@ -27737,6 +27872,9 @@ async function send(){
     statusEl.textContent='Ready';
     applyConversationMode();
     input.focus();
+    resumeNativeLiveFollowBottom();
+    scrollChatToLatest({force:true});
+    alignChatToBottomStable(12,conversationLoadSeq);
     refreshHistory();
   }
 }

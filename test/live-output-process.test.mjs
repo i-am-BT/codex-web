@@ -2595,7 +2595,7 @@ test('boot restores the last conversation chrome before content paints', () => {
   assert.match(inlineScript, /title:normalizeConversationTitle\(title\|\|currentConversationTitle\|\|'',\'Chat'\)/);
   assert.match(inlineScript, /if\(!restoreBootConversationChrome\(\)\)setCurrentConversationTitle\('新任务'\)/);
   assert.match(inlineScript, /const modelsReady=loadModels\(provider\.value,data\.defaults\.model\)/);
-  assert.match(inlineScript, /if\(target\)await loadConversation\(target\.id,target\.source\|\|'codex'\);await modelsReady/);
+  assert.match(inlineScript, /if\(target\)await loadConversation\(target\.id,target\.source\|\|'codex',\{historyPageLimit:NATIVE_HISTORY_PAGE_SIZE\*2\}\);await modelsReady/);
   assert.match(inlineScript, /root\.classList\.add\('conversationRestoring'\)/);
   assert.match(inlineScript, /chat\.replaceChildren\(\)/);
   assert.match(inlineScript, /function beginConversationRestoring/);
