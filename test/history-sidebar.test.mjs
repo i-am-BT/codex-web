@@ -589,7 +589,7 @@ test('completion sound is persisted, success-only, and deduplicated by thread an
      let completeAudioCtx=null;
      ${taskCompleteSoundSource}
      return {
-       maybePlayTaskCompleteSound,
+       maybePlayTaskCompleteSound:(runtime)=>maybePlayTaskCompleteSound({completionSoundEligible:true,...runtime}),
        readTaskCompleteSoundEnabled,
        setTaskCompleteSoundEnabled,
        enabled:()=>taskCompleteSoundEnabled,
