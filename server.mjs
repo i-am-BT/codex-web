@@ -17446,6 +17446,7 @@ function renderCodexMeter(parent,stats){
     const start=document.createElement('span');start.textContent='从 '+stats.startDate+' 开始统计';start.title=stats.scope;
     dailyHead.append(title,start);daily.appendChild(dailyHead);
     const scroll=document.createElement('div');scroll.className='codexMeterTableScroll';
+    scroll.tabIndex=0;scroll.setAttribute('role','region');scroll.setAttribute('aria-label','每日用量，可左右滚动查看完整表格');
     const table=document.createElement('table');const thead=document.createElement('thead');const header=document.createElement('tr');
     for(const label of ['日期','Credits','总 Tokens','输入 Tokens','缓存命中']){const th=document.createElement('th');th.scope='col';th.textContent=label;header.appendChild(th)}
     thead.appendChild(header);table.appendChild(thead);
@@ -17476,7 +17477,7 @@ function appendCodexCycleUsage(parent,stats,{details=false}={}){
     ['已用 Credits',codexMeterCompact(stats.creditsUsed)],
     ['Tokens',codexMeterCompact(stats.totalTokens)],
     ['缓存命中',Number.isFinite(stats.cacheHitPercent)?stats.cacheHitPercent.toFixed(1)+'%':'--'],
-    ['折算 USD',usd(stats.creditEquivalentUsd)],
+    ['推算周价值',stats.projectionConfidence?usd(stats.projectedUsd):'同步中'],
   ]:[['官方账号用量',stats.error?'读取失败，点击刷新':stats.loading?'读取中…':'未登录或未提供']];
   for(const [label,value] of rows){
     const item=document.createElement('div');item.className='subQuotaCredits';
@@ -17633,7 +17634,7 @@ function openSubQuotaSettings(){
   syncModalOpenState();
   void syncSubQuotaSettings().then((loaded)=>{
     if(!loaded||subQuotaSettingsOverlay?.classList.contains('hidden'))return;
-    requestAnimationFrame(()=>subQuotaSettingsInputs.values().next().value?.baseUrlInput?.focus());
+    requestAnimationFrame(()=>subQuotaSettingsCodexApp?.refreshButton?.focus({preventScroll:true}));
   });
 }
 function closeSubQuotaSettings(){

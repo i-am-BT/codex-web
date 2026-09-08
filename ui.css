@@ -898,7 +898,9 @@ body .subQuotaClose:hover {
 .subQuotaCycleUsage strong { white-space: normal; overflow-wrap: anywhere; }
 .subQuotaAnalyticsDaily { grid-column: 1 / -1; overflow: auto; font-size: 12px; }
 .subQuotaAnalyticsDaily summary { cursor: pointer; padding: 8px 0; }
-.subQuotaCodexUsage:has(.codexMeter) { display: block; border: 0; padding: 0; }
+.subQuotaCodexUsage:has(.codexMeter) { display: block; min-width: 0; max-width: 100%; border: 0; padding: 0; }
+.codexMeter, .codexMeterDaily, .codexMeterTableScroll { min-width: 0; max-width: 100%; }
+.subQuotaSettingsBuiltinSource:has(.codexMeter) { grid-template-columns: minmax(0, 1fr); }
 .codexMeter { --meter-card: #282828; --meter-border: #353535; --meter-text: #f5f5f5; --meter-muted: #ababab; background: #212121; color: var(--meter-text); padding: 12px; border-radius: 12px; }
 body[data-theme="light"] .codexMeter { --meter-card: #f6f6f6; --meter-border: #e5e5e5; --meter-text: #202020; --meter-muted: #666; background: #fff; }
 .codexMeter .codexMeterTitle { color: var(--meter-text); font-size: 18px; font-weight: 600; margin: 0 0 12px; }
@@ -924,7 +926,19 @@ body[data-theme="light"] .codexMeter { --meter-card: #f6f6f6; --meter-border: #e
 body[data-theme="light"] .codexMeterActions .codexMeterRefresh { color: #fff; }
 .codexMeterActions button:focus-visible { outline: 2px solid var(--meter-text); outline-offset: 3px; }
 .codexMeterActions button:disabled { opacity: .5; cursor: wait; }
-@media(max-width: 480px) { .codexMeter { padding: 12px; } .codexMeterCard { padding: 10px; border-radius: 12px; } .codexMeterCardTitle { font-size: 12px; gap: 6px; } .codexMeterValue { font-size: 22px; } .codexMeterActions button { min-height: 44px; padding: 8px 12px; } }
+@media(max-width: 480px) {
+  .codexMeter { padding: 8px; }
+  .codexMeterCard { padding: 10px; border-radius: 12px; }
+  .codexMeterCardTitle { font-size: 12px; gap: 6px; align-items: flex-start; }
+  .codexMeterCardTitle .lucide { margin-top: 2px; }
+  .codexMeterValue { font-size: 22px; }
+  .codexMeterDailyHead { align-items: flex-start; flex-direction: column; }
+  .codexMeterTableScroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .codexMeter table { min-width: 390px; }
+  .codexMeterActions { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; }
+  .codexMeterActions button { min-width: 0; min-height: 44px; padding: 8px 6px; }
+}
+@media(max-width: 360px) { .codexMeterGrid { grid-template-columns: minmax(0,1fr); } }
 .subQuotaAnalyticsDaily table { width: 100%; border-collapse: collapse; }
 .subQuotaAnalyticsDaily th, .subQuotaAnalyticsDaily td { padding: 6px; text-align: left; border-bottom: 1px solid var(--border); }
 
