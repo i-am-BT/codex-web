@@ -896,6 +896,10 @@ body .subQuotaClose:hover {
 
 .subQuotaCycleUsage { grid-column: 1 / -1; margin-top: 8px; }
 .subQuotaCycleUsage strong { white-space: normal; overflow-wrap: anywhere; }
+.subQuotaAnalyticsDaily { grid-column: 1 / -1; overflow: auto; font-size: 12px; }
+.subQuotaAnalyticsDaily summary { cursor: pointer; padding: 8px 0; }
+.subQuotaAnalyticsDaily table { width: 100%; border-collapse: collapse; }
+.subQuotaAnalyticsDaily th, .subQuotaAnalyticsDaily td { padding: 6px; text-align: left; border-bottom: 1px solid var(--border); }
 
 .subQuotaCredits {
   display: grid;

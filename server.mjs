@@ -28,7 +28,7 @@ import {
   ImagePromptLibrary,
 } from './image-prompt-library.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
-import { createCycleUsageReader } from './cycle-usage.mjs';
+import { createAccountAnalyticsReader } from './account-analytics.mjs';
 import { archiveInactiveNativeThread } from './native-thread-archive.mjs';
 import {
   AutomationStore,
@@ -97,7 +97,7 @@ const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
 const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
 const PLAYGROUND_PREVIOUS_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'previous');
 const CODEX_HOME = resolveLocalPath(process.env.CODEX_HOME || path.join(homedir(), '.codex'), homedir());
-const readCycleUsage = createCycleUsageReader(CODEX_HOME, path.join(RUNTIME_DIR, 'codex-cycle-usage.json'));
+const readAccountAnalytics = createAccountAnalyticsReader(CODEX_HOME);
 const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path.join(CODEX_HOME, 'config.toml'), CODEX_HOME);
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
@@ -858,7 +858,7 @@ app.get('/api/automations', requireAuth, (_req, res) => {
 app.get('/api/codex-app-credits', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   const credits = await readCodexAppCredits({ refresh: req.query.refresh === '1' });
-  res.json({ ...credits, cycleUsage: readCycleUsage(credits), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible });
+  res.json({ ...credits, cycleUsage: await readAccountAnalytics({ refresh: req.query.refresh === '1' }), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible });
 });
 
 app.get('/api/sub-quotas', requireAuth, async (req, res) => {
@@ -871,7 +871,7 @@ app.get('/api/sub-quotas', requireAuth, async (req, res) => {
     ]);
     res.json({
       ...data,
-      codexApp: { ...codexApp, cycleUsage: readCycleUsage(codexApp), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible },
+      codexApp: { ...codexApp, cycleUsage: await readAccountAnalytics({ refresh }), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible },
       visibility: subQuotaVisibilityState(),
     });
   } catch (err) {
@@ -17383,17 +17383,23 @@ function syncSubQuotaMoveButtons(){
     if(down)down.disabled=index===sources.length-1;
   });
 }
-function appendCodexCycleUsage(parent,stats){
+function appendCodexCycleUsage(parent,stats,{details=false}={}){
   if(!stats)return;
   const grid=document.createElement('div');
   grid.className='subQuotaCreditsGrid subQuotaCycleUsage';
-  grid.title=(stats.scope||'本周期本机用量')+'；'+(stats.pricingBasis||'');
+  grid.title=stats.error||[stats.scope,stats.pricingBasis].filter(Boolean).join('；');
+  const amount=value=>value===null||value===undefined?'--':formatSubQuotaAmount(value,'');
+  const usd=value=>Number.isFinite(value)?'$'+value.toFixed(2):'--';
   const rows=stats.available?[
-    ['本周期 Tokens（本机）',formatSubQuotaAmount(stats.totalTokens,'')],
-    ['缓存命中 Tokens',stats.cachedInputTokens===null?'--':formatSubQuotaAmount(stats.cachedInputTokens,'')],
-    ['缓存命中率',stats.cacheHitPercent===null?'--':stats.cacheHitPercent.toFixed(2)+'%'],
-    ['费用估算（USD）',stats.estimatedUsd===null?'--':'$'+stats.estimatedUsd.toFixed(4)],
-  ]:[['本周期用量',stats.loading?'读取中…':'--']];
+    ['已用 Credits（官方）',amount(stats.creditsUsed)],
+    ['本周期 Tokens（官方）',amount(stats.totalTokens)],
+    ['输入缓存命中率',Number.isFinite(stats.cacheHitPercent)?stats.cacheHitPercent.toFixed(2)+'%':'--'],
+    ['Credits 折算（USD）',usd(stats.creditEquivalentUsd)],
+  ]:[['官方账号用量',stats.error?'读取失败，点击刷新':stats.loading?'读取中…':'未登录或未提供']];
+  if(details&&stats.available)rows.push(
+    ['推算周期总 Credits',amount(stats.projectedCredits)],['推算周期价值（USD）',usd(stats.projectedUsd)],
+    ['输入 Tokens',amount(stats.inputTokens)],['缓存命中 Tokens',amount(stats.cachedInputTokens)],['输出 Tokens',amount(stats.outputTokens)],
+  );
   for(const [label,value] of rows){
     const item=document.createElement('div');item.className='subQuotaCredits';
     const caption=document.createElement('span');caption.textContent=label;
@@ -17401,6 +17407,23 @@ function appendCodexCycleUsage(parent,stats){
     item.append(caption,amount);grid.appendChild(item);
   }
   parent.appendChild(grid);
+  if(stats.available){
+    const stamp=document.createElement('small');
+    stamp.style.gridColumn='1 / -1';
+    stamp.textContent='自 '+stats.startDate+' 起按日汇总 · 获取于 '+new Date(stats.fetchedAt).toLocaleTimeString('zh-CN');
+    stamp.title='周期起始日整日计入，不精确到周期开始时刻；折算和推算金额均非实际扣费';
+    grid.appendChild(stamp);
+  }
+  if(details&&stats.available&&stats.daily?.length){
+    const panel=document.createElement('details');panel.className='subQuotaAnalyticsDaily';
+    const summary=document.createElement('summary');summary.textContent='每日用量';
+    const table=document.createElement('table');
+    const head=document.createElement('tr');
+    for(const text of ['日期','Credits','Tokens','缓存命中 Tokens']){const cell=document.createElement('th');cell.textContent=text;head.appendChild(cell)}
+    table.appendChild(head);
+    for(const day of stats.daily){const row=document.createElement('tr');for(const value of [day.date,amount(day.credits),amount(day.totalTokens),amount(day.cachedInputTokens)]){const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell)}table.appendChild(row)}
+    panel.append(summary,table);parent.appendChild(panel);
+  }
 }
 async function syncCodexAppCredits({refresh=false}={}){
   if(!subQuotaSettingsCodexApp)return;
@@ -17431,7 +17454,7 @@ async function syncCodexAppCredits({refresh=false}={}){
       addMetric('本周期已用',formatSubQuotaAmount(100-window.remainingPercent,'%'));
       if(window.resetsAt)addMetric('额度重置时间',new Date(window.resetsAt*1000).toLocaleString('zh-CN'));
     }
-    appendCodexCycleUsage(usage,data.cycleUsage);
+    appendCodexCycleUsage(usage,data.cycleUsage,{details:true});
     if(data.cycleUsage?.loading)setTimeout(()=>{
       if(!subQuotaSettingsOverlay?.classList.contains('hidden'))void syncCodexAppCredits();
     },3000);
