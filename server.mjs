@@ -1501,21 +1501,34 @@ app.get(/^\/(?:Users|Volumes|workspace|opt|var|tmp|home|root)\/.+$/, requireAuth
   return sendAllowedLocalFile(res, requestedPath);
 });
 
+async function requestNativeHistoryFork(method, params) {
+  const client = new CodexAppServerClient({
+    bin: CODEX_BIN, cwd: CODEX_PROCESS_HOME, env: buildCodexProcessEnvironment(),
+    clientName: 'codex-web-fork', requestTimeoutMs: APP_SERVER_REQUEST_TIMEOUT_MS,
+  });
+  let createdId = '';
+  try {
+    const result = await client.request(method, params);
+    createdId = cleanNativeThreadId(result?.thread?.id);
+    if (method === 'thread/fork' && createdId === params.threadId) { createdId = ''; throw new Error('分支未返回新的会话 ID'); }
+    return result;
+  } finally {
+    try { if (createdId) await client.request('thread/unsubscribe', { threadId: createdId }, { timeoutMs: 3000 }); }
+    catch {}
+    await client.close();
+  }
+}
 app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
   const source = nativeSessions.get(threadId);
   const active = nativeActiveTurnFor(threadId, source);
-  if (active?.status === 'running') {
-    return res.status(409).json({ error: '会话任务正在运行，不能创建历史分支' });
-  }
 
   const messageSeq = Number(req.body?.messageSeq);
   if (!Number.isInteger(messageSeq) || messageSeq < 1) {
     return res.status(400).json({ error: '消息序号无效' });
   }
 
-  let loadedForkedThreadId = '';
   try {
     if (!source) return res.status(404).json({ error: 'Codex App 会话不存在' });
     const target = source.messages.find((message) => (
@@ -1524,9 +1537,16 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       && message.turnId
     ));
     if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户或助手消息创建分支' });
+    if ((req.body?.turnId && req.body.turnId !== target.turnId) || (req.body?.role && req.body.role !== target.role)) {
+      return res.status(409).json({ error: '消息历史已变化，请刷新后重新选择分支位置' });
+    }
     const forkedThroughTurnId = target.role === 'assistant'
       ? target.retrySourceTurnId || target.turnId
       : target.previousTurnId;
+    const runningTurnId = active?.turnId || source.activeTurnId || source.latestTurnId;
+    if ((active?.status || source.status) === 'running' && forkedThroughTurnId === runningTurnId) {
+      return res.status(409).json({ error: '这一轮仍在运行，请选择已完成的回复创建分支' });
+    }
     if (target.role === 'user' && !forkedThroughTurnId && source.truncated) {
       return res.status(409).json({ error: '会话历史已截断，无法确定这条消息之前的 turn' });
     }
@@ -1536,7 +1556,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       : {};
     const settings = parseNativeThreadSettings(req.body || {}, settingsOptions);
     const result = forkedThroughTurnId
-      ? await requestLoadedAppServerThread('thread/fork', compactObjectWithServiceTier({
+      ? await requestNativeHistoryFork('thread/fork', compactObjectWithServiceTier({
         threadId,
         lastTurnId: forkedThroughTurnId,
         cwd: settings.cwd,
@@ -1547,7 +1567,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
         approvalsReviewer: settings.approvalsReviewer,
         threadSource: 'user',
       }, settings.serviceTier))
-      : await requestLoadedAppServerThread('thread/start', compactObjectWithServiceTier({
+      : await requestNativeHistoryFork('thread/start', compactObjectWithServiceTier({
         cwd: settings.cwd,
         model: settings.model,
         modelProvider: settings.provider,
@@ -1558,7 +1578,6 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       }, settings.serviceTier));
     const forkedThreadId = cleanNativeThreadId(result?.thread?.id);
     if (!forkedThreadId) throw new Error('Codex app-server 未返回有效分支 thread id');
-    loadedForkedThreadId = forkedThreadId;
 
     nativeSessions.refresh();
     const persisted = nativeSessions.get(forkedThreadId);
@@ -1580,10 +1599,6 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
     });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `创建 Codex App 历史分支失败: ${err.message}` });
-  } finally {
-    if (loadedForkedThreadId) {
-      await releaseAppServerThreadAfterTurn(loadedForkedThreadId, '', { reason: 'fork-loaded' });
-    }
   }
 });
 
@@ -22590,20 +22605,22 @@ function showForkToast(message,isError=false){
   if(forkToastTimer)clearTimeout(forkToastTimer);
   forkToastTimer=setTimeout(()=>{toast?.classList.remove('show')},3200);
 }
-async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId=''}={}){
+async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId='',turnId='',role=''}={}){
   const sourceThreadId=String(requestedThreadId||currentConversationId||'');
   if(!sourceThreadId||(!requestedThreadId&&currentConversationSource!=='codex'))return;
   if(nativeForkCreating)return;
+  const forkLoadSeq=conversationLoadSeq;
   nativeForkCreating=true;
   if(trigger){trigger.disabled=true;trigger.setAttribute('aria-busy','true')}
   statusEl.textContent='正在创建历史分支...';
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,turnId,role,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||'创建历史分支失败');
     const copiedMessages=Array.isArray(data.conversation?.messages)?data.conversation.messages:[];
     const afterSeq=copiedMessages.reduce((maximum,message)=>Math.max(maximum,Number(message.seq)||0),0);
     setNativeForkMarker(data.threadId,{afterSeq,afterTurnId:data.forkedThroughTurnId});
+    if(forkLoadSeq!==conversationLoadSeq){refreshHistory().catch(()=>{});showForkToast('分支已创建，可从任务列表打开');return;}
     clearPendingAttachments();
     const loaded=await loadConversation(data.threadId,'codex',{conversation:data.conversation,skipPromptQueueSync:true});
     if(!loaded){
@@ -22628,7 +22645,7 @@ async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=nu
     input.focus();
     refreshHistory().catch(()=>{});
   }catch(e){
-    statusEl.textContent=e.message;
+    if(forkLoadSeq===conversationLoadSeq)statusEl.textContent=e.message;
     showForkToast(e.message||'创建历史分支失败',true);
   }finally{
     nativeForkCreating=false;
@@ -26863,7 +26880,7 @@ function createConversationMessageElement(role,text,options={}){
     setIconLabel(copy,'copy','复制此消息',false);
     copy.addEventListener('click',(event)=>{event.stopPropagation();copyText(terminalError?normalizeTerminalErrorText(el.dataset.messageText||''):(el.dataset.messageText||''),copy)});
     actions.appendChild(copy);
-    const actionThreadId=String(options.actionThreadId||'');
+    const actionThreadId=String(options.actionThreadId||(currentConversationSource==='codex'?currentConversationId:'')||'');
     if(role==='user'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId){
       const fork=document.createElement('button');
       fork.type='button';
@@ -26872,7 +26889,7 @@ function createConversationMessageElement(role,text,options={}){
       fork.dataset.tooltip='从这里重新开始';
       fork.setAttribute('aria-label','从这里重新开始');
       setIconLabel(fork,'git-branch','从这里重新开始',false);
-      fork.addEventListener('click',(event)=>{event.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{trigger:fork,sourceThreadId:actionThreadId})});
+      fork.addEventListener('click',(event)=>{event.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{trigger:fork,sourceThreadId:actionThreadId,turnId:options.turnId,role:'user'})});
       actions.appendChild(fork);
     }else if(role==='user'&&Number.isInteger(options.messageIndex)){
       const rollback=document.createElement('button');
@@ -26893,7 +26910,7 @@ function createConversationMessageElement(role,text,options={}){
       continueTask.dataset.tooltip='在新任务中继续';
       continueTask.setAttribute('aria-label','在新任务中继续');
       setIconLabel(continueTask,'corner-up-right','在新任务中继续',false);
-      continueTask.addEventListener('click',(event)=>{event.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true,trigger:continueTask,sourceThreadId:actionThreadId})});
+      continueTask.addEventListener('click',(event)=>{event.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true,trigger:continueTask,sourceThreadId:actionThreadId,turnId:options.turnId,role:'assistant'})});
       actions.appendChild(continueTask);
     }
     if(['user','assistant'].includes(role)){
