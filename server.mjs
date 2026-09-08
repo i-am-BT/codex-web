@@ -17979,7 +17979,7 @@ function showSubQuotaPreview(){
   subQuotaToggle.setAttribute('aria-expanded','true');
   subQuotaToggle.dataset.previewOpen='1';
   startSubQuotaCountdowns();
-  if(wasHidden)void loadSubQuota();
+  if(wasHidden)void loadSubQuota({refresh:true});
 }
 function hideSubQuotaPreview(){
   if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
