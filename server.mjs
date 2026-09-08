@@ -12898,7 +12898,7 @@ function sideChatFinalizeTurn(state,message,target){
   const startedAt=turnProcessStartTimestamp(state.startedAt,completedAt);
   const elapsedSeconds=state.startedAt?Math.max(0,(completedAt-startedAt)/1000):NaN;
   const text=sideChatMessageText(message)||'任务完成';
-  const completion=createCompletionMessage(text,organized.processElements,state.turnId,elapsedSeconds,message?.tokenUsage);
+  const completion=createCompletionMessage(text,organized.processElements,state.turnId,elapsedSeconds,messageTokenUsage(message));
   if(anchor){
     target.insertBefore(completion,anchor);
     for(const item of organized.visibleElements)target.insertBefore(item,anchor);
@@ -22289,7 +22289,7 @@ async function loadConversation(id,source='web',options={}){
     chat.replaceChildren();
     messages.forEach((msg,index)=>{
       if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
-      addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
+      addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg),hydrating:true});
     });
     if(restorePaint)beginConversationRestoring();
   }finally{
@@ -22874,7 +22874,7 @@ async function syncCurrentNativeConversationOnce(){
     if(role==='assistant'&&adoptRuntimeLiveForSnapshotMessage(msg)){
       continue;
     }
-    addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage})
+    addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg)})
   }
   if(nativeForkMarkers[id])renderNativeForkDivider(syncMessages);
   nativeCursor=Number(conversation.cursor||nativeCursor);
@@ -25295,11 +25295,23 @@ function completionElapsedSeconds(text,fallbackSeconds=NaN){
   const parsed=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
   return Number.isFinite(parsed)?parsed:Number(fallbackSeconds);
 }
+function messageTokenUsage(message){return message?.tokenUsage?{...message.tokenUsage,details:message.tokenUsageDetails||null}:null}
+function turnTokenUsageDetailsLabel(tokenUsage){
+  const detail=tokenUsage?.details;
+  if(!detail)return'';
+  const count=value=>Number.isSafeInteger(value)&&value>=0?value.toLocaleString('zh-CN'):'未提供';
+  const amount=Number.isFinite(detail.estimatedUsd)?'$'+detail.estimatedUsd.toFixed(4):'未估算';
+  return '输入 '+count(detail.inputTokens)+' · 输出 '+count(detail.outputTokens)+' · 缓存命中 '+count(detail.cachedInputTokens)+' tokens（包含在输入中） · 模型 '+(detail.models?.filter(Boolean).join(' / ')||'未知')+' · 标准 API 估算 '+amount+'。包含本轮上下文及工具调用，非实际扣费。';
+}
 function turnTokenUsageLabel(tokenUsage){
   const total=Number(tokenUsage?.totalTokens);
   if(!Number.isFinite(total)||total<0)return'';
   const rounded=Math.round(total);
-  return '本轮累计 '+String(rounded).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')+' tokens';
+  let text='本轮累计 '+String(rounded).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')+' tokens';
+  const detail=tokenUsage?.details;
+  if(Number.isFinite(detail?.cacheHitPercent))text+=' · 缓存 '+detail.cacheHitPercent.toFixed(1)+'%';
+  if(Number.isFinite(detail?.estimatedUsd))text+=' · 估算 $'+detail.estimatedUsd.toFixed(4);
+  return text;
 }
 function liveProcessElapsedTitle(startedAt,now=Date.now()){
   const start=Number(startedAt);
@@ -25855,7 +25867,7 @@ function organizeTurnArtifactsForCompletion(artifacts=[],anchor=null){
 function createCompletionMessage(text,processElements=[],turnId='',elapsedSeconds=NaN,tokenUsage=null,nativeMessageSeq=null){
   // User/steer bubbles stay in the main chat stream; completed commentary and tool history fold together.
   const items=settleTurnProcessHistory(processElements).filter((item)=>Boolean(item)&&!item.classList?.contains('user')&&!item.classList?.contains('steeringUser'));
-  const collapsible=items.length>0;
+  const collapsible=items.length>0||Boolean(tokenUsage?.details);
   const el=document.createElement(collapsible?'details':'div');
   el.className='msg process completionSummary'+(collapsible?' collapsible':'');
   el.dataset.messageText=String(text||'');
@@ -25873,6 +25885,7 @@ function createCompletionMessage(text,processElements=[],turnId='',elapsedSecond
   const tokenLabel=turnTokenUsageLabel(tokenUsage);
   const usage=document.createElement('span');
   usage.className='completionTokenUsage';
+  usage.title=turnTokenUsageDetailsLabel(tokenUsage);
   usage.textContent=tokenLabel?'· '+tokenLabel:'';
   usage.classList.toggle('hidden',!tokenLabel);
   if(tokenLabel)el.dataset.tokenUsageLabel=tokenLabel;
@@ -25889,6 +25902,13 @@ function createCompletionMessage(text,processElements=[],turnId='',elapsedSecond
   if(collapsible){
     const content=document.createElement('div');
     content.className='completionContent';
+    const usageDetail=turnTokenUsageDetailsLabel(tokenUsage);
+    if(usageDetail){
+      const info=document.createElement('div');
+      info.className='completionUsageDetails';info.textContent=usageDetail;
+      info.title=tokenUsage.details.pricingBasis||'';
+      content.appendChild(info);
+    }
     const timeline=document.createElement('div');
     timeline.className='completionTimeline';
     for(const item of items)timeline.appendChild(item);
@@ -25922,6 +25942,12 @@ function updateCompletionMessage(completion,text,elapsedSeconds=NaN,tokenUsage=n
   if(usage){
     usage.textContent=tokenLabel?'· '+tokenLabel:'';
     usage.classList.toggle('hidden',!tokenLabel);
+    if(tokenUsage?.details){
+      usage.title=turnTokenUsageDetailsLabel(tokenUsage);
+      let info=completion.querySelector('.completionUsageDetails');
+      if(!info){info=document.createElement('div');info.className='completionUsageDetails';(completion.querySelector('.completionContent')||completion).appendChild(info);}
+      info.textContent=usage.title;info.title=tokenUsage.details.pricingBasis||'';
+    }
   }
   return completion;
 }

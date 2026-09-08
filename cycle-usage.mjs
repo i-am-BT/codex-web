@@ -12,6 +12,11 @@ const PRICES = {
   'gpt-5.5': [5, .5, 30], 'gpt-5.4': [2.5, .25, 15],
   'gpt-5.4-mini': [.75, .075, 4.5],
 };
+export function estimateTokenCost(model, input, cached, output) {
+  const price = PRICES[model];
+  if (!price || ![input, cached, output].every(value => Number.isSafeInteger(value) && value >= 0) || cached > input) return null;
+  return ((input - cached) * price[0] + cached * price[1] + output * price[2]) / 1e6;
+}
 const parse = line => { try { return JSON.parse(line); } catch { return null; } };
 const empty = () => ({ input: 0, output: 0, cached: 0, cost: 0, unpriced: 0, cacheKnown: true });
 function settingsProvider(settings) {

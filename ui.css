@@ -7485,6 +7485,7 @@ body .msg.process.completionSummary {
 .completionSummary > summary,
 .completionSummary > .completionRow {
   display: flex;
+  flex-wrap: wrap;
   min-height: 40px;
   width: 100%;
   max-width: 100%;
@@ -7527,8 +7528,11 @@ body .msg.process.completionSummary {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
+
+.completionUsageDetails { font-size: 12px; line-height: 1.7; padding-bottom: 12px; overflow-wrap: anywhere; }
 
 .completionSummary > summary .completionTokenUsage.hidden,
 .completionSummary > .completionRow .completionTokenUsage.hidden {
