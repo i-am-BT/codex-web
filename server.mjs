@@ -17455,14 +17455,13 @@ function appendCodexCycleUsage(parent,stats,{details=false}={}){
   if(details){renderCodexMeter(parent,stats);return;}
   const grid=document.createElement('div');
   grid.className='subQuotaCreditsGrid subQuotaCycleUsage';
-  grid.title=stats.error||[stats.scope,stats.pricingBasis].filter(Boolean).join('；');
-  const amount=value=>value===null||value===undefined?'--':formatSubQuotaAmount(value,'');
+  grid.title=stats.error||[stats.scope,stats.pricingBasis,stats.fetchedAt?'获取于 '+new Date(stats.fetchedAt).toLocaleString('zh-CN'):''].filter(Boolean).join('；');
   const usd=value=>Number.isFinite(value)?'$'+value.toFixed(2):'--';
   const rows=stats.available?[
-    ['已用 Credits（官方）',amount(stats.creditsUsed)],
-    ['本周期 Tokens（官方）',amount(stats.totalTokens)],
-    ['输入缓存命中率',Number.isFinite(stats.cacheHitPercent)?stats.cacheHitPercent.toFixed(2)+'%':'--'],
-    ['Credits 折算（USD）',usd(stats.creditEquivalentUsd)],
+    ['已用 Credits',codexMeterCompact(stats.creditsUsed)],
+    ['Tokens',codexMeterCompact(stats.totalTokens)],
+    ['缓存命中',Number.isFinite(stats.cacheHitPercent)?stats.cacheHitPercent.toFixed(1)+'%':'--'],
+    ['折算 USD',usd(stats.creditEquivalentUsd)],
   ]:[['官方账号用量',stats.error?'读取失败，点击刷新':stats.loading?'读取中…':'未登录或未提供']];
   for(const [label,value] of rows){
     const item=document.createElement('div');item.className='subQuotaCredits';
@@ -17471,13 +17470,6 @@ function appendCodexCycleUsage(parent,stats,{details=false}={}){
     item.append(caption,amount);grid.appendChild(item);
   }
   parent.appendChild(grid);
-  if(stats.available){
-    const stamp=document.createElement('small');
-    stamp.style.gridColumn='1 / -1';
-    stamp.textContent='自 '+stats.startDate+' 起按日汇总 · 获取于 '+new Date(stats.fetchedAt).toLocaleTimeString('zh-CN');
-    stamp.title='周期起始日整日计入，不精确到周期开始时刻；折算和推算金额均非实际扣费';
-    grid.appendChild(stamp);
-  }
 }
 async function syncCodexAppCredits({refresh=false}={}){
   if(!subQuotaSettingsCodexApp)return;
