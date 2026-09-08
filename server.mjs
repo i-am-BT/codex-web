@@ -1473,7 +1473,11 @@ app.get('/api/local-image', requireAuth, (req, res) => {
     if (/^[a-z]+:\/\//i.test(rawPath) || rawPath.includes('\0')) {
       return res.status(400).json({ error: '不支持的图片路径' });
     }
-    const cwd = normalizeCwd(req.query.cwd || DEFAULT_CWD);
+    const threadId = cleanNativeThreadId(req.query.threadId || '');
+    if (req.query.threadId && !threadId) return res.status(400).json({ error: '会话 ID 无效' });
+    const conversation = threadId ? nativeSessions.get(threadId) : null;
+    if (threadId && !conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    const cwd = canonicalizeNativeCwd(conversation?.metadata?.cwd || DEFAULT_CWD);
     if (!isLocalImagePathAllowed(rawPath, cwd)) {
       return res.status(404).json({ error: '图片不存在或不受支持' });
     }
@@ -3886,12 +3890,15 @@ function syncDesktopTurnState(threadId, state) {
   } else if (!current && conversation?.status !== 'running') {
     return false;
   }
+  if (status === 'interrupted' && !isPromptQueuePaused(threadId)) {
+    setPromptQueuePause(threadId, { reason: 'app-paused', message: 'Codex App 已暂停，等待手动继续' });
+  }
   setNativeTurnState(threadId, {
     turnId,
     status,
     transport: 'desktop-ipc',
   });
-  if (status !== 'running') scheduleServerPromptQueueDispatch(threadId, 160);
+  if (status !== 'running' && status !== 'interrupted') scheduleServerPromptQueueDispatch(threadId, 160);
   return true;
 }
 
@@ -5024,8 +5031,7 @@ function setPromptQueuePause(threadId, pause = null) {
     items,
     ...(nextPause ? { pause: nextPause } : {}),
   };
-  if (!items.length && !nextPause) delete queues[id];
-  else queues[id] = next;
+  queues[id] = next;
   savePromptQueuesWithDismissed(queues, dismissed);
   const state = getPromptQueueState(id);
   broadcastPromptQueueChange({
@@ -5683,24 +5689,12 @@ function isPathWithinRoot(targetPath, rootPath) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-// `/api/local-image` accepts a client-supplied absolute path (used to preview images
-// referenced in markdown/tool output). Without this check any authenticated user could
-// pass an unrelated absolute path and read arbitrary image files reachable by this
-// process, not just images tied to the current Codex session. Absolute paths are only
-// allowed inside the resolved session cwd, the OS temp dir (common for automation
-// screenshots), or an explicitly configured local image root. Relative paths are
-// unaffected since readNativeToolImage always resolves them against cwd.
+// Both relative and absolute paths must remain within a server-selected root
+// after resolving symlinks. The caller supplies cwd from persisted session metadata.
 function isLocalImagePathAllowed(filePath, cwd) {
-  if (!path.isAbsolute(filePath)) return true;
   try {
-    const resolved = realpathSync(filePath);
-    if (cwd) {
-      try {
-        if (isPathWithinRoot(resolved, realpathSync(cwd))) return true;
-      } catch {}
-    }
-    if (isPathWithinRoot(resolved, realpathSync(tmpdir()))) return true;
-    return LOCAL_IMAGE_ROOTS.some((root) => {
+    const resolved = realpathSync(path.resolve(cwd || DEFAULT_CWD, filePath));
+    return [cwd || DEFAULT_CWD, tmpdir(), IMAGE_DIR, ...LOCAL_IMAGE_ROOTS].some((root) => {
       try {
         return isPathWithinRoot(resolved, realpathSync(root));
       } catch {
@@ -7680,6 +7674,10 @@ async function proxyPlaygroundRequest(req, res) {
     return res.status(error.statusCode || 400).json({ error: error.message });
   }
 
+  // Upstream responses are data, never executable documents in the Web origin.
+  res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
   const wantsStream = req.method === 'POST' && req.body?.stream === true;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PLAYGROUND_PROXY_TIMEOUT_MS);
@@ -7724,6 +7722,11 @@ async function proxyPlaygroundRequest(req, res) {
     }
 
     const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    const mediaType = contentType.split(';', 1)[0].trim();
+    if (/^(?:text\/html|application\/xhtml\+xml|image\/svg\+xml|(?:application|text)\/xml)$/.test(mediaType)) {
+      await response.body?.cancel();
+      return res.status(502).json({ error: 'Playground proxy rejected an executable upstream document' });
+    }
     const isEventStream = contentType.includes('text/event-stream');
     const shouldStream = wantsStream || isEventStream;
 
@@ -10602,7 +10605,12 @@ async function dispatchNextServerQueuedPrompt(threadId) {
 }
 
 function broadcastPromptQueueChange(event) {
-  for (const client of sessionEventClients) writeNamedEvent(client, 'prompt-queue', event);
+  const payload = {
+    ...event,
+    pause: promptQueuePauseState(event.threadId),
+    dismissedItemIds: getPromptQueueDismissedItemIds(event.threadId),
+  };
+  for (const client of sessionEventClients) writeNamedEvent(client, 'prompt-queue', payload);
 }
 
 function loadConversations() {
@@ -10826,6 +10834,7 @@ let nativeCancelPending = null;
 let forceFullAccess = false;
 let nativeRunningElement = null;
 let nativeOptimisticElements = [];
+const failedNativeSendDrafts = new Map();
 let lastTurnErrorElement = null;
 let nativeConnectionStatusElement = null;
 let nativeOptimisticSteering = new Map();
@@ -11182,6 +11191,7 @@ let completeAudioCtx=null;
 let historyCompletionPushTimer=null;
 let historyCompletionSyncTimer=null;
 let historyCompletionSyncInFlight=null;
+let historyCompletionSyncQueued=false;
 let composerModelValueBeforeChange='';
 let activeHistoryProjectMenu=null;
 const HISTORY_SESSION_REFRESH_DELAY_MS=700;
@@ -12035,6 +12045,9 @@ const deferredPromptQueueEvents=new Map();
 function applyRemotePromptQueueEvent(event){
   const threadId=String(event?.threadId||'').trim();
   if(!threadId)return;
+  if(Number.isInteger(event.revision)&&event.revision<(promptQueueServerRevisions.get(threadId)||0))return;
+  // A stop must take effect even while queue contents are waiting for a PUT.
+  if(Object.prototype.hasOwnProperty.call(event||{},'pause'))setPromptQueuePauseLocal(threadId,event.pause);
   if(promptQueueServerSyncInflight.has(threadId)||promptQueueServerSyncTimers.has(threadId)||promptQueueOrderSyncing.has(threadId)||promptQueueOrderIntents.has(threadId)){
     const pending=deferredPromptQueueEvents.get(threadId);
     if(pending){if(Number(event.revision||0)>=Number(pending.event.revision||0))pending.event=event;return;}
@@ -12046,13 +12059,19 @@ function applyRemotePromptQueueEvent(event){
     },350);
     return;
   }
-  if(Number.isInteger(event.revision)&&event.revision<(promptQueueServerRevisions.get(threadId)||0))return;
   const items=Array.isArray(event?.items)?event.items:[];
+  const dismissedItemIds=Array.isArray(event.dismissedItemIds)?event.dismissedItemIds:[];
+  const localItems=promptQueueFor(threadId);
+  const remoteIds=new Set(items.map((item)=>String(item?.id||'')));
+  const missingLocalWebItemIds=missingUnconfirmedWebPromptQueueItemIds(localItems,remoteIds,dismissedItemIds);
+  const merged=mergePromptQueueSyncConflict(threadId,localItems,items,dismissedItemIds,{preferRemoteOrder:true});
   if(Number.isInteger(event?.revision))promptQueueServerRevisions.set(threadId,event.revision);
-  if(Object.prototype.hasOwnProperty.call(event||{},'pause'))setPromptQueuePauseLocal(threadId,event.pause);
+  acknowledgePromptQueueBeaconItems(threadId,items);
+  acknowledgePromptQueueBeaconItemIds(threadId,dismissedItemIds);
   promptQueueRemoteSyncing=true;
-  try{applyPromptQueueLocal(threadId,items,{persist:true,render:true});}
+  try{applyPromptQueueLocal(threadId,merged,{persist:true,render:true});}
   finally{promptQueueRemoteSyncing=false;}
+  if(missingLocalWebItemIds.length)schedulePromptQueueServerSync(threadId);
 }
 function createQueuedPrompt(message,attachments){return normalizeQueuedPrompt({
   id:makePromptQueueId(),message,attachments,provider:provider.value,model:model.value,
@@ -20539,7 +20558,8 @@ function markHistoryCompletionRead(item){
 async function syncHistoryCompletionReadFromServer(){
   if(historyCompletionSyncTimer)clearTimeout(historyCompletionSyncTimer);
   historyCompletionSyncTimer=null;
-  if(historyCompletionSyncInFlight)return historyCompletionSyncInFlight;
+  if(historyCompletionSyncInFlight){historyCompletionSyncQueued=true;return historyCompletionSyncInFlight}
+  historyCompletionSyncQueued=false;
   const pending=(async()=>{
     try{
       const res=await fetch('/api/history-completion-read');
@@ -20562,11 +20582,15 @@ async function syncHistoryCompletionReadFromServer(){
   })();
   historyCompletionSyncInFlight=pending;
   try{return await pending}finally{
-    if(historyCompletionSyncInFlight===pending)historyCompletionSyncInFlight=null;
+    if(historyCompletionSyncInFlight===pending){
+      historyCompletionSyncInFlight=null;
+      if(historyCompletionSyncQueued)scheduleHistoryCompletionReadSync(0);
+    }
   }
 }
 function scheduleHistoryCompletionReadSync(delay=HISTORY_COMPLETION_SYNC_DELAY_MS){
-  if(historyCompletionSyncTimer||historyCompletionSyncInFlight)return;
+  if(historyCompletionSyncInFlight){historyCompletionSyncQueued=true;return}
+  if(historyCompletionSyncTimer)return;
   historyCompletionSyncTimer=setTimeout(()=>{
     historyCompletionSyncTimer=null;
     void syncHistoryCompletionReadFromServer();
@@ -21852,7 +21876,7 @@ function syncNativeComposerSettings(changes={}){
   nativeComposerSettingsQueue=queued.catch(()=>false);
   return queued;
 }
-function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';setNativeNoticeText('Codex App 会话 · 双向同步',{visible:true});setTopStatusText('Ready',{running:false});input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';setNativeNoticeText('Codex App 会话 · 双向同步',{visible:true});setTopStatusText('Ready',{running:false});input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();renderFailedNativeSendDrafts()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -22275,6 +22299,7 @@ async function loadConversation(id,source='web',options={}){
   if(currentConversationSource==='codex')renderNativeForkDivider(messages);
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(!messages.length&&!webRunActive&&!nativeForkMarkers[currentConversationId])chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
+  renderFailedNativeSendDrafts();
   updateConversationStatus(conversation);
   applyConversationMode();
   setThreadGoal(currentConversationSource==='codex' ? (conversation.goal || null) : null);
@@ -23070,10 +23095,7 @@ function localImageProxyUrl(filePath){
   const clean=normalizeLocalImagePath(filePath);
   if(!clean)return '';
   const params=new URLSearchParams({path:clean});
-  try{
-    const cwd=window.__currentConversationCwd||'';
-    if(cwd)params.set('cwd',cwd);
-  }catch{}
+  if(currentConversationSource==='codex'&&currentConversationId)params.set('threadId',currentConversationId);
   return '/api/local-image?'+params.toString();
 }
 function createMarkdownImage(filePath,label){
@@ -27795,6 +27817,36 @@ async function cancelRun(){
     setTimeout(()=>{if(currentConversationSource==='codex'&&currentConversationId===threadId&&activeNativeTurnId===turnId)void loadConversation(threadId,'codex')},80);
   }
 }
+function renderFailedNativeSendDrafts(){
+  for(const notice of chat.querySelectorAll('.failedNativeSendDraft'))notice.remove();
+  const key=conversationKey(currentConversationSource,currentConversationId);
+  for(const draft of failedNativeSendDrafts.get(key)||[]){
+    const notice=document.createElement('div');
+    notice.className='failedNativeSendDraft';
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='miniSecondary';
+    button.textContent='将未发送消息追加到输入框';
+    button.title=(draft.error||'发送失败')+'：'+(draft.message||'附件消息');
+    button.addEventListener('click',()=>{
+      if(conversationKey(currentConversationSource,currentConversationId)!==key)return;
+      const drafts=failedNativeSendDrafts.get(key)||[];
+      const index=drafts.indexOf(draft);
+      if(index<0)return;
+      input.value=[input.value,draft.message].filter(Boolean).join(String.fromCharCode(10,10));
+      input.style.height='auto';
+      input.style.height=Math.min(input.scrollHeight,180)+'px';
+      pendingAttachments.push(...draft.attachments);
+      drafts.splice(index,1);
+      if(!drafts.length)failedNativeSendDrafts.delete(key);
+      renderAttachmentTray();
+      renderFailedNativeSendDrafts();
+      input.focus();
+    });
+    notice.appendChild(button);
+    chat.appendChild(notice);
+  }
+}
 async function send(){
   closeComposerPopovers();
   const text=input.value.trim();
@@ -27807,10 +27859,11 @@ async function send(){
   const sendLoadSeq=conversationLoadSeq;
   const sendConversationId=currentConversationId;
   const sendConversationSource=currentConversationSource;
+  const sendContextMatches=()=>sendLoadSeq===conversationLoadSeq&&sendConversationId===currentConversationId&&sendConversationSource===currentConversationSource;
   const providerReady=await waitForLatestComposerProviderChange();
   await waitForLatestComposerModelLoad();
   await nativeComposerSettingsQueue.catch(()=>false);
-  if(sendLoadSeq!==conversationLoadSeq||sendConversationId!==currentConversationId||sendConversationSource!==currentConversationSource)return;
+  if(!sendContextMatches())return;
   if(providerReady===false){statusEl.textContent='服务商模型尚未准备好，请重新选择后再发送';return}
   const existingId=currentConversationSource==='codex'?currentConversationId:'';
   if(existingId&&webRunActive){
@@ -27845,19 +27898,33 @@ async function send(){
     const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,attachments,provider:requestedProvider,model:requestedModel,reasoningEffort:reasoningEffort.value,serviceTier:requestedServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||res.statusText);
+    markPromptQueueTurnRunning(data.threadId,data.turnId||'');
+    if(!sendContextMatches()){refreshHistory();return}
     currentConversationSource='codex';
     currentConversationId=data.threadId;
     setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,{pending:true});
     activeNativeTurnId=data.turnId||'';
-    markPromptQueueTurnRunning(data.threadId,activeNativeTurnId);
     if(!existingId){nativeCursor=0;nativeGeneration=0}
     updateActiveHistory();
     if(lastTurnErrorElement?.isConnected)lastTurnErrorElement.remove();
     lastTurnErrorElement=null;
     nativeNotice.textContent='Codex App 会话 · 双向同步';
-    setTimeout(async()=>{try{await syncCurrentNativeConversation()}catch{}if(nativeComposerOverride?.threadId===data.threadId&&nativeComposerOverride?.pending)clearNativeComposerOverride()},240);
+    setTimeout(async()=>{
+      if(sendLoadSeq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==data.threadId)return;
+      try{await syncCurrentNativeConversation()}catch{}
+      if(sendLoadSeq===conversationLoadSeq&&currentConversationId===data.threadId&&nativeComposerOverride?.threadId===data.threadId&&nativeComposerOverride?.pending)clearNativeComposerOverride();
+    },240);
     refreshHistory();
   }catch(e){
+    if(!sendContextMatches()){
+      const key=conversationKey(sendConversationSource,sendConversationId);
+      const drafts=failedNativeSendDrafts.get(key)||[];
+      drafts.push({message:text,attachments,error:e.message});
+      failedNativeSendDrafts.set(key,drafts);
+      if(currentConversationSource===sendConversationSource&&currentConversationId===sendConversationId)renderFailedNativeSendDrafts();
+      refreshHistory();
+      return;
+    }
     webRunActive=false;
     activeNativeTurnId='';
     currentNativeRunStatus=previousNativeRunStatus;

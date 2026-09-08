@@ -7,7 +7,14 @@ test('queue events deferred during writes remove consumed items and reject stale
   const code=source.slice(source.indexOf('const deferredPromptQueueEvents='),source.indexOf('function createQueuedPrompt('));
   const busy=new Map([['thread',true]]),revisions=new Map(),timers=[],renders=[];
   const apply=new Function('promptQueueServerSyncInflight','promptQueueServerSyncTimers','promptQueueOrderSyncing','promptQueueOrderIntents','promptQueueServerRevisions','setTimeout','setPromptQueuePauseLocal','applyPromptQueueLocal',
-    'let promptQueueRemoteSyncing=false;'+code+';return applyRemotePromptQueueEvent;')(
+    `let promptQueueRemoteSyncing=false;
+    const promptQueueFor=()=>[];
+    const missingUnconfirmedWebPromptQueueItemIds=()=>[];
+    const mergePromptQueueSyncConflict=(_id,_local,items)=>items;
+    const acknowledgePromptQueueBeaconItems=()=>{};
+    const acknowledgePromptQueueBeaconItemIds=()=>{};
+    const schedulePromptQueueServerSync=()=>{};
+    `+code+';return applyRemotePromptQueueEvent;')(
     busy,new Map(),new Map(),new Map(),revisions,fn=>timers.push(fn),()=>{},(_id,items)=>renders.push(items));
   apply({threadId:'thread',revision:8,items:[{id:'old'}]});
   apply({threadId:'thread',revision:9,items:[]});

@@ -2153,6 +2153,7 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
   ]);
   const updates = [];
   const dispatches = [];
+  const pauses = [];
   const requestedSnapshots = [];
   const api = new Function(
     'desktopThreadStates',
@@ -2163,6 +2164,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
     'nativeSessions',
     'setNativeTurnState',
     'scheduleServerPromptQueueDispatch',
+    'isPromptQueuePaused',
+    'setPromptQueuePause',
     `${serverSource.slice(handlerStart, handlerEnd)}; return { handleDesktopIpcBroadcast };`,
   )(
     new Map(),
@@ -2176,6 +2179,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
       activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state });
     },
     (...args) => dispatches.push(args),
+    () => false,
+    (...args) => pauses.push(args),
   );
 
   api.handleDesktopIpcBroadcast({
@@ -2251,7 +2256,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
       state: { turnId: 'turn-c', status: 'running', transport: 'desktop-ipc' },
     },
   ]);
-  assert.deepEqual(dispatches, [['thread-a', 160], ['thread-b', 160]]);
+  assert.deepEqual(dispatches, [['thread-b', 160]]);
+  assert.deepEqual(pauses, [['thread-a', { reason: 'app-paused', message: 'Codex App 已暂停，等待手动继续' }]]);
 
   api.handleDesktopIpcBroadcast({
     method: 'thread-stream-state-changed',

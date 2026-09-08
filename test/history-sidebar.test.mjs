@@ -301,6 +301,7 @@ test('a stale server sync cannot revive a completion dot after it was clicked', 
      let historyCompletionPushTimer=null;
      let historyCompletionSyncTimer=null;
      let historyCompletionSyncInFlight=null;
+     let historyCompletionSyncQueued=false;
      ${completionStateSource}
      return {
        trackHistoryCompletionState,
@@ -634,9 +635,10 @@ test('unread completion popover exposes a persistent sound toggle', () => {
 
 test('history completion read sync is single-flight and delayed during session churn', () => {
   assert.match(inlineScript, /let historyCompletionSyncInFlight=null/);
-  assert.match(completionStateSource, /if\(historyCompletionSyncInFlight\)return historyCompletionSyncInFlight/);
+  assert.match(completionStateSource, /if\(historyCompletionSyncInFlight\)\{historyCompletionSyncQueued=true;return historyCompletionSyncInFlight\}/);
   assert.match(completionStateSource, /function scheduleHistoryCompletionReadSync\(delay=HISTORY_COMPLETION_SYNC_DELAY_MS\)/);
-  assert.match(completionStateSource, /if\(historyCompletionSyncTimer\|\|historyCompletionSyncInFlight\)return/);
+  assert.match(completionStateSource, /if\(historyCompletionSyncInFlight\)\{historyCompletionSyncQueued=true;return\}/);
+  assert.match(completionStateSource, /if\(historyCompletionSyncQueued\)scheduleHistoryCompletionReadSync\(0\)/);
 });
 
 test('project headers can start a new task in the current project path', () => {
