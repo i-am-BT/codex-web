@@ -17971,6 +17971,7 @@ function handleSubQuotaToggleClick(event){
   // Desktop / fine pointer: click opens configuration; hover already covers preview.
   openSubQuotaSettings();
 }
+let lastSubQuotaHoverRefreshAt=-Infinity;
 function showSubQuotaPreview(){
   if(!subQuotaPopover||!subQuotaToggle)return;
   cancelSubQuotaPreviewHide();
@@ -17979,7 +17980,11 @@ function showSubQuotaPreview(){
   subQuotaToggle.setAttribute('aria-expanded','true');
   subQuotaToggle.dataset.previewOpen='1';
   startSubQuotaCountdowns();
-  if(wasHidden)void loadSubQuota({refresh:true});
+  const now=Date.now();
+  if(wasHidden&&now-lastSubQuotaHoverRefreshAt>=60000){
+    lastSubQuotaHoverRefreshAt=now;
+    void loadSubQuota({refresh:true});
+  }
 }
 function hideSubQuotaPreview(){
   if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
