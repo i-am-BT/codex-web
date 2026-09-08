@@ -5334,6 +5334,19 @@ function buildNativeRequestResponse(request, body) {
   }
 }
 
+function isTaskCompleteSoundThread(threadId) {
+  try {
+    const source = nativeSessions.getThreadSource(threadId);
+    // A task started/resumed by Web can finish before its rollout is indexed.
+    // This map records explicit Web subscriptions, not global child events.
+    if (!source) return appServerLoadedThreads.has(threadId);
+    return typeof source === 'string'
+      && ['cli', 'vscode', 'appServer', 'app_server', 'exec'].includes(source);
+  } catch {
+    return false;
+  }
+}
+
 function setNativeTurnState(threadId, state) {
   const cleanId = cleanNativeThreadId(threadId);
   if (!cleanId) return;
@@ -5357,7 +5370,10 @@ function setNativeTurnState(threadId, state) {
   else if (Object.hasOwn(current || {}, 'serviceTier')) next.serviceTier = current.serviceTier;
   activeNativeTurns.set(cleanId, next);
   if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
-  broadcastNativeRuntime({ type: 'turn', threadId: cleanId, ...next });
+  broadcastNativeRuntime({
+    type: 'turn', threadId: cleanId, ...next,
+    completionSoundEligible: status === 'done' && isTaskCompleteSoundThread(cleanId),
+  });
   nativeSessions.scheduleRefresh();
 }
 
@@ -20329,6 +20345,7 @@ async function playTaskCompleteSound(){
 }
 function maybePlayTaskCompleteSound(runtime){
   if(runtime?.type!=='turn'||String(runtime?.status||'').toLowerCase()!=='done')return false;
+  if(runtime.completionSoundEligible!==true)return false;
   if(!rememberTaskCompleteSoundTurn(runtime.threadId,runtime.turnId))return false;
   if(!taskCompleteSoundEnabled)return false;
   void playTaskCompleteSound();

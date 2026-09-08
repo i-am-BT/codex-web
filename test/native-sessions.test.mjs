@@ -1717,6 +1717,7 @@ test('native session store only exposes visible, non-archived Codex App threads'
     assert.equal(store.get(archived), null);
     assert.equal(store.get(execSession), null);
     assert.equal(store.get(subagent), null);
+    assert.equal(store.getThreadSource(subagent), 'subagent');
     const subagentConversation = store.getSubagent(visibleNewer, 'ui_trace');
     assert.equal(subagentConversation.id, subagent);
     assert.equal(subagentConversation.source, 'subagent');
