@@ -898,6 +898,33 @@ body .subQuotaClose:hover {
 .subQuotaCycleUsage strong { white-space: normal; overflow-wrap: anywhere; }
 .subQuotaAnalyticsDaily { grid-column: 1 / -1; overflow: auto; font-size: 12px; }
 .subQuotaAnalyticsDaily summary { cursor: pointer; padding: 8px 0; }
+.subQuotaCodexUsage:has(.codexMeter) { display: block; border: 0; padding: 0; }
+.codexMeter { --meter-card: #282828; --meter-border: #353535; --meter-text: #f5f5f5; --meter-muted: #ababab; background: #212121; color: var(--meter-text); padding: 18px; border-radius: 16px; }
+body[data-theme="light"] .codexMeter { --meter-card: #f6f6f6; --meter-border: #e5e5e5; --meter-text: #202020; --meter-muted: #666; background: #fff; }
+.codexMeter .codexMeterTitle { color: var(--meter-text); font-size: 24px; font-weight: 600; margin: 0 0 22px; }
+.codexMeterGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.codexMeterCard { min-width: 0; background: var(--meter-card); border: 1px solid var(--meter-border); border-radius: 20px; padding: 20px; }
+.codexMeterCardTitle { display: flex; align-items: center; gap: 10px; color: var(--meter-muted); font-size: 14px; font-weight: 600; line-height: 1.5; }
+.codexMeterCardTitle .lucide { width: 19px; height: 19px; flex: 0 0 19px; }
+.codexMeterValue { display: block; font-size: clamp(25px, 2.5vw, 36px); font-weight: 650; line-height: 1.2; margin: 20px 0 14px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.codexMeterCard p { color: var(--meter-muted); font-size: 12px; line-height: 1.55; margin: 0; }
+.codexMeterDaily { margin-top: 28px; }
+.codexMeterDailyHead { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; color: var(--meter-muted); margin-bottom: 16px; }
+.codexMeterDailyHead h4 { margin: 0; font-size: 18px; font-weight: 600; }
+.codexMeterDailyHead span { font-size: 12px; }
+.codexMeterTableScroll { overflow-x: auto; }
+.codexMeter table { width: 100%; border-collapse: collapse; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; }
+.codexMeter th, .codexMeter td { padding: 12px 8px; text-align: left; border-bottom: 1px solid var(--meter-border); }
+.codexMeter th { color: var(--meter-muted); font-weight: 500; }
+.codexMeter tfoot { font-weight: 650; }
+.codexMeterActions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
+.codexMeterActions button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 42px; border-radius: 999px; border: 1px solid var(--meter-border); background: transparent; color: var(--meter-text); padding: 8px 16px; font-size: 14px; }
+.codexMeterActions button .lucide { width: 17px; height: 17px; }
+.codexMeterActions .codexMeterRefresh { background: var(--meter-text); color: #212121; }
+body[data-theme="light"] .codexMeterActions .codexMeterRefresh { color: #fff; }
+.codexMeterActions button:focus-visible { outline: 2px solid var(--meter-text); outline-offset: 3px; }
+.codexMeterActions button:disabled { opacity: .5; cursor: wait; }
+@media(max-width: 480px) { .codexMeter { padding: 12px; } .codexMeterCard { padding: 14px; border-radius: 16px; } .codexMeterCardTitle { font-size: 12px; gap: 6px; } .codexMeterValue { font-size: 25px; } .codexMeterActions button { padding: 8px 12px; } }
 .subQuotaAnalyticsDaily table { width: 100%; border-collapse: collapse; }
 .subQuotaAnalyticsDaily th, .subQuotaAnalyticsDaily td { padding: 6px; text-align: left; border-bottom: 1px solid var(--border); }
 

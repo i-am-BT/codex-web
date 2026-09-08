@@ -17383,8 +17383,76 @@ function syncSubQuotaMoveButtons(){
     if(down)down.disabled=index===sources.length-1;
   });
 }
+function codexMeterCompact(value){
+  if(!Number.isFinite(value))return '--';
+  for(const [scale,suffix] of [[1e9,'B'],[1e6,'M'],[1e3,'K']])if(Math.abs(value)>=scale)return (value/scale).toFixed(2)+suffix;
+  return value.toLocaleString('zh-CN');
+}
+function exportCodexMeter(stats,format){
+  const columns=['日期','Credits','总 Tokens','输入 Tokens','缓存命中 Tokens','输出 Tokens','折算金额','轮数'];
+  const rows=(stats.daily||[]).map(day=>[day.date,day.credits,day.totalTokens,day.inputTokens,day.cachedInputTokens,day.outputTokens,day.credits===null?null:day.credits*0.04,day.turns]);
+  const quote=value=>'"'+String(value??'').replaceAll('"','""')+'"';
+  const content=format==='json'?JSON.stringify(stats,null,2):[columns,...rows].map(row=>row.map(quote).join(',')).join(String.fromCharCode(10));
+  const url=URL.createObjectURL(new Blob([content],{type:format==='json'?'application/json':'text/csv;charset=utf-8'}));
+  const link=document.createElement('a');link.href=url;link.download='codex-meter-'+stats.startDate+'.'+format;link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function renderCodexMeter(parent,stats){
+  const root=document.createElement('section');root.className='codexMeter';root.setAttribute('aria-label','Codex Meter');
+  const heading=document.createElement('h3');heading.className='codexMeterTitle';heading.textContent='Codex Meter';root.appendChild(heading);
+  const fixed=(value,digits=2)=>Number.isFinite(value)?value.toFixed(digits):'--';
+  if(!stats.available){
+    const status=document.createElement('p');status.setAttribute('role','status');status.textContent=stats.error||'暂无官方用量数据';root.appendChild(status);
+  }else{
+    const confidence=({low:'低可信',medium:'中可信',high:'高可信'})[stats.projectionConfidence];
+    const projection=confidence?confidence+'：每日 Credits ÷ 官方已用比例。':'等待每日 Credits 与官方比例同步。';
+    const grid=document.createElement('div');grid.className='codexMeterGrid';
+    const metrics=[
+      ['gauge','本周期剩余额度比例',fixed(stats.remainingPercent,1)+'%','来自官方每周限额进度。'],
+      ['coins','本周期已用 Credits',fixed(stats.creditsUsed),'按每日用量明细加总。'],
+      ['cpu','本周期总 Tokens',codexMeterCompact(stats.totalTokens),'按每日用量明细汇总的全部 Tokens。'],
+      ['trending-up','推算周总 Credits',confidence?'~'+fixed(stats.projectedCredits,stats.projectedCredits>=1000?0:1):'同步中',projection],
+      ['layers','输入缓存命中率',fixed(stats.cacheHitPercent,1)+'%','缓存输入占全部输入 Tokens 的比例。'],
+      ['wallet','推算周价值',confidence?'$ '+fixed(stats.projectedUsd):'同步中',projection],
+    ];
+    for(const [icon,label,value,hint] of metrics){
+      const card=document.createElement('article');card.className='codexMeterCard';
+      const title=document.createElement('div');title.className='codexMeterCardTitle';
+      const symbol=document.createElement('i');symbol.setAttribute('data-lucide',icon);symbol.setAttribute('aria-hidden','true');
+      const caption=document.createElement('span');caption.textContent=label;title.append(symbol,caption);
+      const number=document.createElement('strong');number.className='codexMeterValue';number.textContent=value;
+      const description=document.createElement('p');description.textContent=hint;
+      card.append(title,number,description);grid.appendChild(card);
+    }
+    root.appendChild(grid);
+    const daily=document.createElement('section');daily.className='codexMeterDaily';
+    const dailyHead=document.createElement('div');dailyHead.className='codexMeterDailyHead';
+    const title=document.createElement('h4');title.textContent='本周期每日用量';
+    const start=document.createElement('span');start.textContent='从 '+stats.startDate+' 开始统计';start.title=stats.scope;
+    dailyHead.append(title,start);daily.appendChild(dailyHead);
+    const scroll=document.createElement('div');scroll.className='codexMeterTableScroll';
+    const table=document.createElement('table');const thead=document.createElement('thead');const header=document.createElement('tr');
+    for(const label of ['日期','Credits','总 Tokens','输入 Tokens','缓存命中']){const th=document.createElement('th');th.scope='col';th.textContent=label;header.appendChild(th)}
+    thead.appendChild(header);table.appendChild(thead);
+    const tbody=document.createElement('tbody');
+    const addRow=(container,date,credits,total,input,cached)=>{
+      const row=document.createElement('tr');
+      for(const value of [date,fixed(credits,3),codexMeterCompact(total),codexMeterCompact(input),input>0&&Number.isFinite(cached)?(cached/input*100).toFixed(0)+'%':'--']){const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell)}
+      container.appendChild(row);
+    };
+    for(const day of stats.daily||[])addRow(tbody,day.date,day.credits,day.totalTokens,day.inputTokens,day.cachedInputTokens);
+    table.appendChild(tbody);const tfoot=document.createElement('tfoot');addRow(tfoot,'合计',stats.creditsUsed,stats.totalTokens,stats.inputTokens,stats.cachedInputTokens);table.appendChild(tfoot);
+    scroll.appendChild(table);daily.appendChild(scroll);root.appendChild(daily);
+  }
+  const actions=document.createElement('div');actions.className='codexMeterActions';
+  for(const format of ['csv','json']){const button=document.createElement('button');button.type='button';button.disabled=!stats.available;setIconLabel(button,format==='csv'?'file-spreadsheet':'file-json',format.toUpperCase());button.addEventListener('click',()=>exportCodexMeter(stats,format));actions.appendChild(button)}
+  const refresh=document.createElement('button');refresh.type='button';refresh.className='codexMeterRefresh';setIconLabel(refresh,'refresh-cw','刷新');
+  refresh.addEventListener('click',async()=>{refresh.disabled=true;try{await syncCodexAppCredits({refresh:true})}finally{refresh.disabled=false}});actions.appendChild(refresh);root.appendChild(actions);
+  parent.appendChild(root);refreshIcons(root);
+}
 function appendCodexCycleUsage(parent,stats,{details=false}={}){
   if(!stats)return;
+  if(details){renderCodexMeter(parent,stats);return;}
   const grid=document.createElement('div');
   grid.className='subQuotaCreditsGrid subQuotaCycleUsage';
   grid.title=stats.error||[stats.scope,stats.pricingBasis].filter(Boolean).join('；');
@@ -17396,10 +17464,6 @@ function appendCodexCycleUsage(parent,stats,{details=false}={}){
     ['输入缓存命中率',Number.isFinite(stats.cacheHitPercent)?stats.cacheHitPercent.toFixed(2)+'%':'--'],
     ['Credits 折算（USD）',usd(stats.creditEquivalentUsd)],
   ]:[['官方账号用量',stats.error?'读取失败，点击刷新':stats.loading?'读取中…':'未登录或未提供']];
-  if(details&&stats.available)rows.push(
-    ['推算周期总 Credits',amount(stats.projectedCredits)],['推算周期价值（USD）',usd(stats.projectedUsd)],
-    ['输入 Tokens',amount(stats.inputTokens)],['缓存命中 Tokens',amount(stats.cachedInputTokens)],['输出 Tokens',amount(stats.outputTokens)],
-  );
   for(const [label,value] of rows){
     const item=document.createElement('div');item.className='subQuotaCredits';
     const caption=document.createElement('span');caption.textContent=label;
@@ -17413,16 +17477,6 @@ function appendCodexCycleUsage(parent,stats,{details=false}={}){
     stamp.textContent='自 '+stats.startDate+' 起按日汇总 · 获取于 '+new Date(stats.fetchedAt).toLocaleTimeString('zh-CN');
     stamp.title='周期起始日整日计入，不精确到周期开始时刻；折算和推算金额均非实际扣费';
     grid.appendChild(stamp);
-  }
-  if(details&&stats.available&&stats.daily?.length){
-    const panel=document.createElement('details');panel.className='subQuotaAnalyticsDaily';
-    const summary=document.createElement('summary');summary.textContent='每日用量';
-    const table=document.createElement('table');
-    const head=document.createElement('tr');
-    for(const text of ['日期','Credits','Tokens','缓存命中 Tokens']){const cell=document.createElement('th');cell.textContent=text;head.appendChild(cell)}
-    table.appendChild(head);
-    for(const day of stats.daily){const row=document.createElement('tr');for(const value of [day.date,amount(day.credits),amount(day.totalTokens),amount(day.cachedInputTokens)]){const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell)}table.appendChild(row)}
-    panel.append(summary,table);parent.appendChild(panel);
   }
 }
 async function syncCodexAppCredits({refresh=false}={}){
@@ -17440,20 +17494,6 @@ async function syncCodexAppCredits({refresh=false}={}){
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'额度检测失败');
     usage.replaceChildren();
-    const addMetric=(label,value)=>{
-      const row=document.createElement('div');
-      row.className='subQuotaCodexBalance';
-      const caption=document.createElement('span');caption.textContent=label;
-      const amount=document.createElement('strong');amount.textContent=value;
-      row.append(caption,amount);usage.appendChild(row);
-    };
-    for(const window of data.windows||[]){
-      const minutes=window.windowDurationMins;
-      const label=minutes===10080?'每周':minutes===300?'5 小时':minutes?minutes+' 分钟':window.window;
-      addMetric(window.id+' · '+label+'剩余额度',formatSubQuotaAmount(window.remainingPercent,'%'));
-      addMetric('本周期已用',formatSubQuotaAmount(100-window.remainingPercent,'%'));
-      if(window.resetsAt)addMetric('额度重置时间',new Date(window.resetsAt*1000).toLocaleString('zh-CN'));
-    }
     appendCodexCycleUsage(usage,data.cycleUsage,{details:true});
     if(data.cycleUsage?.loading)setTimeout(()=>{
       if(!subQuotaSettingsOverlay?.classList.contains('hidden'))void syncCodexAppCredits();

@@ -16,6 +16,8 @@ test('native official totals match Meter conventions and do not confuse spent va
   assert.equal(value.projectedUsd.toFixed(2),'2003.50');
   assert.equal(value.cacheHitPercent.toFixed(2),'96.36');
   assert.equal(value.startDate,'2026-09-08');
+  assert.equal(value.remainingPercent,70);
+  assert.equal(value.projectionConfidence,'medium');
   const noSpend=normalizeAccountAnalytics(payload,{...window,used_percent:0},now);
   assert.equal(noSpend.projectedCredits,null);
   const missing=normalizeAccountAnalytics({...payload,data:[{date:'2026-09-08',totals:{credits:1}}]},window,now);
@@ -37,7 +39,7 @@ test('official reader uses only server credentials, caches per account and refus
       const id=options.headers['ChatGPT-Account-Id'];
       assert.equal(options.headers.Authorization,'Bearer dummy-secret-'+id);
       if(url.endsWith('/usage'))return Response.json({account_id:id,rate_limit:{primary_window:window}});
-      assert.match(url,/start_date=2026-09-08/);
+      assert.ok(new URL(url).searchParams.get('start_date')<'2026-09-08');
       if(switchDuringDaily)await auth('B');
       return Response.json(payload);
     }});

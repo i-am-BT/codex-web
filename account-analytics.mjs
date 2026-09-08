@@ -24,6 +24,14 @@ export function normalizeAccountAnalytics(data, window, now = Date.now()) {
   const input = sum(daily.map(row => row.inputTokens)), cached = sum(daily.map(row => row.cachedInputTokens));
   const used = number(window.used_percent);
   const projectedCredits = credits !== null && used > 0 && used <= 100 ? credits / (used / 100) : null;
+  const recentCredits = data.data.filter(row => row?.date && row.date < start).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7).map(row => number(row.totals?.credits) ?? 0);
+  const positive = recentCredits.filter(value => value > 0).sort((a, b) => a - b);
+  const middle = Math.floor(positive.length / 2);
+  const median = positive.length ? (positive.length % 2 ? positive[middle] : (positive[middle - 1] + positive[middle]) / 2) : 0;
+  const cycleAgeHours = Math.max(0, (now - (window.reset_at - window.limit_window_seconds) * 1000) / 3600000);
+  const projectionConfidence = projectedCredits === null || credits === 0 ? null
+    : used < 10 || cycleAgeHours < 8 || (median > 0 && credits < median * 0.2) || (sum(recentCredits) > 0 && projectedCredits < sum(recentCredits) * 0.25) ? 'low'
+      : used < 20 || cycleAgeHours < 24 ? 'medium' : 'high';
   return {
     available: true, loading: false, source: 'official-analytics', aggregation: 'day',
     cycleStart: new Date((window.reset_at - window.limit_window_seconds) * 1000).toISOString(),
@@ -34,6 +42,7 @@ export function normalizeAccountAnalytics(data, window, now = Date.now()) {
     turns: sum(daily.map(row => row.turns)),
     creditEquivalentUsd: credits === null ? null : credits * USD_PER_CREDIT,
     projectedCredits, projectedUsd: projectedCredits === null ? null : projectedCredits * USD_PER_CREDIT,
+    remainingPercent: used === null || used > 100 ? null : 100 - used, projectionConfidence,
     daily, fetchedAt: new Date(now).toISOString(),
     scope: '官方账号每日用量；周期起始日整日计入',
     pricingBasis: 'Credits × $0.04 折算；推算周期额度不等于实际总额度，折算金额非账单扣费',
@@ -67,7 +76,8 @@ export function createAccountAnalyticsReader(codexHome, { fetchImpl = fetch, now
         if (!window) throw new Error('官方账号未返回额度周期');
         const start = new Date((window.reset_at - window.limit_window_seconds) * 1000).toISOString().slice(0, 10);
         const end = new Date(now() + 86400000).toISOString().slice(0, 10);
-        const query = new URLSearchParams({ start_date: start, end_date: end, group_by: 'day' });
+        const lookback = new Date(now() - 45 * 86400000).toISOString().slice(0, 10);
+        const query = new URLSearchParams({ start_date: start < lookback ? start : lookback, end_date: end, group_by: 'day' });
         const daily = await get('/backend-api/wham/analytics/daily-workspace-usage-counts?' + query, auth);
         const current = JSON.parse(await readFile(path.join(codexHome, 'auth.json'), 'utf8'))?.tokens;
         if (current?.account_id !== auth.account_id) throw new Error('账号已切换，请重新刷新');
