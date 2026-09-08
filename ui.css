@@ -13362,11 +13362,17 @@ body .composer > .box:focus-within {
     flex-wrap: wrap;
   }
 
-  .subQuotaAddSourceType,
-  .subQuotaSourceTypeSelect {
+  .subQuotaAddSourceType {
     min-width: 0;
     min-height: 40px;
     flex: 1 1 160px;
+  }
+
+  .subQuotaSourceTypeSelect {
+    min-width: 0;
+    height: 40px;
+    min-height: 40px;
+    flex: 0 0 auto;
   }
 
   .subQuotaAddSourceButton {
