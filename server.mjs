@@ -1942,7 +1942,7 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
         await requestLoadedAppServerThread('thread/resume', {
           threadId,
           modelProvider: provider,
-          model,
+          ...(hasModel ? { model } : {}),
           excludeTurns: true,
         });
       } else {
