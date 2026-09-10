@@ -12,8 +12,19 @@ const PRICES = {
   'gpt-5.5': [5, .5, 30], 'gpt-5.4': [2.5, .25, 15],
   'gpt-5.4-mini': [.75, .075, 4.5],
 };
+export function estimateTokenCost(model, input, cached, output) {
+  const price = PRICES[model];
+  if (!price || ![input, cached, output].every(value => Number.isSafeInteger(value) && value >= 0) || cached > input) return null;
+  return ((input - cached) * price[0] + cached * price[1] + output * price[2]) / 1e6;
+}
 const parse = line => { try { return JSON.parse(line); } catch { return null; } };
 const empty = () => ({ input: 0, output: 0, cached: 0, cost: 0, unpriced: 0, cacheKnown: true });
+function settingsProvider(settings) {
+  for (const key of ['modelProvider', 'model_provider_id', 'model_provider']) {
+    if (Object.hasOwn(settings || {}, key)) return String(settings[key] || '');
+  }
+  return undefined;
+}
 
 export function usageDelta(previous, current) {
   if (!current || !Number.isFinite(current.input_tokens) || !Number.isFinite(current.output_tokens)) return null;
@@ -25,12 +36,15 @@ export function usageDelta(previous, current) {
 }
 
 // Locate the pre-cycle baseline from the tail, not by parsing the entire history.
-async function findStart(file, size, since) {
+async function findStart(file, size, since, initialProvider) {
   const handle = await open(file, 'r');
-  let position = size, prefix = Buffer.alloc(0), baseline = null;
+  let position = size, prefix = Buffer.alloc(0), baseline = null, context = null, provider;
   try {
     while (position > 0) {
-      const count = Math.min(position, 256 * 1024);
+      const lookback = baseline === null ? Infinity : 2 * 1024 * 1024 - (baseline - position);
+      // ponytail: attribution beyond this lookback stays unknown; never rescan an old multi-GB tool result.
+      if (lookback <= 0) return { offset: context ?? baseline, provider: '' };
+      const count = Math.min(position, 256 * 1024, lookback);
       position -= count;
       const chunk = Buffer.alloc(count);
       const { bytesRead } = await handle.read(chunk, 0, count, position);
@@ -40,15 +54,19 @@ async function findStart(file, size, since) {
         if (block[i] !== 10) continue;
         const line = block.subarray(i + 1, end).toString();
         end = i;
-        if (!line.includes('token_count') && !line.includes('turn_context')) continue;
+        if (!line.includes('token_count') && !line.includes('turn_context') && !line.includes('thread_settings_applied')) continue;
         const event = parse(line);
         if (!baseline && event?.type === 'event_msg' && event.payload?.type === 'token_count'
           && Date.parse(event.timestamp) < since) baseline = position + i + 1;
-        if (baseline !== null && event?.type === 'turn_context') return position + i + 1;
+        if (baseline !== null && provider === undefined) {
+          provider = settingsProvider(event?.type === 'turn_context' ? event.payload : event?.payload?.thread_settings);
+        }
+        if (baseline !== null && context === null && event?.type === 'turn_context') context = position + i + 1;
+        if (context !== null && provider !== undefined) return { offset: context, provider };
       }
       prefix = block.subarray(0, end);
     }
-    return baseline ?? 0;
+    return { offset: context ?? baseline ?? 0, provider: provider ?? initialProvider };
   } finally { await handle.close(); }
 }
 
@@ -65,9 +83,10 @@ export function createCycleUsageReader(codexHome, cacheFile) {
       const auth = parse(readFileSync(path.join(codexHome, 'auth.json'), 'utf8'));
       account = String(auth?.tokens?.account_id || '');
     } catch {}
+    if (!account) return null;
     const identity = createHash('sha256').update(account).digest('hex');
     const end = window.resetsAt * 1000;
-    return { key: identity + ':' + end, start: end - window.windowDurationMins * 60000, end, unused: window.remainingPercent === 100 };
+    return { key: identity + ':' + end, identity, start: end - window.windowDurationMins * 60000, end, unused: window.remainingPercent === 100 };
   }
   function result(cycle, totals, loading = false) {
     return {
@@ -82,7 +101,7 @@ export function createCycleUsageReader(codexHome, cacheFile) {
     if (target !== state) return;
     await mkdir(path.dirname(cacheFile), { recursive: true });
     const tmp = cacheFile + '.' + process.pid + '.tmp';
-    await writeFile(tmp, JSON.stringify({ version: 1, key: target.cycle.key, start: target.cycle.start, value: target.value, files: [...target.files] }), { mode: 0o600 });
+    await writeFile(tmp, JSON.stringify({ version: 2, key: target.cycle.key, start: target.cycle.start, value: target.value, files: [...target.files] }), { mode: 0o600 });
     if (target === state) await rename(tmp, cacheFile);
     target.needsSave = false;
   }
@@ -109,9 +128,9 @@ export function createCycleUsageReader(codexHome, cacheFile) {
           finally { lines.close(); input.destroy(); }
           const start = Math.max(target.cycle.start, meta?.forked_from_id ? Date.parse(meta.timestamp) || 0 : 0);
           record = { id: meta?.id || file, provider: meta?.model_provider, start, totals: empty(), previous: null, model: '', offset: 0 };
-          record.offset = record.provider === 'openai' ? await findStart(file, info.size, start) : info.size;
+          Object.assign(record, await findStart(file, info.size, start, record.provider));
         }
-        if (record.provider === 'openai' && record.offset < info.size) {
+        if (record.offset < info.size) {
           const input = createReadStream(file, { start: record.offset, end: info.size - 1 });
           const lines = createInterface({ input, crlfDelay: Infinity });
           try {
@@ -119,16 +138,22 @@ export function createCycleUsageReader(codexHome, cacheFile) {
               const bytes = Buffer.byteLength(line) + 1;
               if (record.offset + bytes > info.size) break;
               record.offset += bytes;
-              if (!line.includes('token_count') && !line.includes('turn_context')) continue;
+              if (!line.includes('token_count') && !line.includes('turn_context') && !line.includes('thread_settings_applied')) continue;
               const event = parse(line);
-              if (event?.type === 'turn_context') { record.model = event.payload?.model || ''; continue; }
+              const settings = event?.type === 'turn_context' ? event.payload : event?.payload?.type === 'thread_settings_applied' ? event.payload.thread_settings : null;
+              if (settings) {
+                const provider = settingsProvider(settings);
+                if (provider !== undefined) record.provider = provider;
+                if (Object.hasOwn(settings, 'model')) record.model = settings.model || '';
+                continue;
+              }
               if (event?.type !== 'event_msg' || event.payload?.type !== 'token_count') continue;
               const current = event.payload.info?.total_token_usage;
               const delta = usageDelta(record.previous, current);
               if (!delta) continue;
               record.previous = current;
               const timestamp = Date.parse(event.timestamp);
-              if (!(timestamp >= record.start && timestamp < target.cycle.end)) continue;
+              if (record.provider !== 'openai' || !(timestamp >= record.start && timestamp < target.cycle.end)) continue;
               const totals = record.totals;
               totals.input += delta.input; totals.output += delta.output;
               totals.cacheKnown &&= delta.cached !== null;
@@ -161,8 +186,11 @@ export function createCycleUsageReader(codexHome, cacheFile) {
     const cycle = select(quota);
     if (!cycle) return { available: false, loading: false };
     if (state?.cycle.key !== cycle.key || cycle.unused !== state.cycle.unused) {
-      const saved = !cycle.unused && cached?.version === 1 && cached.key === cycle.key;
+      const previousIdentity = state?.cycle.identity || String(cached?.key || '').split(':')[0];
+      const accountChanged = !previousIdentity || previousIdentity !== cycle.identity;
+      const saved = !cycle.unused && cached?.version === 2 && cached.key === cycle.key;
       if (saved && Number.isFinite(cached.start)) cycle.start = Math.max(cycle.start, cached.start);
+      if (accountChanged) cycle.start = Math.max(cycle.start, Date.now());
       if (state?.cycle.key === cycle.key) cycle.start = Math.max(cycle.start, state.cycle.start);
       if (cycle.unused) cycle.start = Math.max(cycle.start, Date.now());
       state = { cycle, files: new Map(saved ? cached.files : []), value: saved ? cached.value : result(cycle, empty(), !cycle.unused), checkedAt: 0, needsSave: true };

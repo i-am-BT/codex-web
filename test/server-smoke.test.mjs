@@ -2153,6 +2153,7 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
   ]);
   const updates = [];
   const dispatches = [];
+  const pauses = [];
   const requestedSnapshots = [];
   const api = new Function(
     'desktopThreadStates',
@@ -2163,6 +2164,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
     'nativeSessions',
     'setNativeTurnState',
     'scheduleServerPromptQueueDispatch',
+    'isPromptQueuePaused',
+    'setPromptQueuePause',
     `${serverSource.slice(handlerStart, handlerEnd)}; return { handleDesktopIpcBroadcast };`,
   )(
     new Map(),
@@ -2176,6 +2179,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
       activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state });
     },
     (...args) => dispatches.push(args),
+    () => false,
+    (...args) => pauses.push(args),
   );
 
   api.handleDesktopIpcBroadcast({
@@ -2251,7 +2256,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
       state: { turnId: 'turn-c', status: 'running', transport: 'desktop-ipc' },
     },
   ]);
-  assert.deepEqual(dispatches, [['thread-a', 160], ['thread-b', 160]]);
+  assert.deepEqual(dispatches, [['thread-b', 160]]);
+  assert.deepEqual(pauses, [['thread-a', { reason: 'app-paused', message: 'Codex App 已暂停，等待手动继续' }]]);
 
   api.handleDesktopIpcBroadcast({
     method: 'thread-stream-state-changed',
@@ -5784,7 +5790,7 @@ updated_at = 1784422800000
     assert.match(page, /async function renameConversation\(id,title,source='codex'\)\{[\s\S]*?currentConversationId===id[\s\S]*?setCurrentConversationTitle\(clean\)/);
     assert.match(page, /function newChat\(\)\{[^\n]*setCurrentConversationTitle\('新任务'\)/);
     assert.match(page, /async function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(conversation\.title\|\|'Chat','Chat'\)/);
-    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId=''\}=\{\}\)\{[\s\S]*?const sourceThreadId=String\(requestedThreadId\|\|currentConversationId\|\|''\)[\s\S]*?loadConversation\(data\.threadId,'codex',\{conversation:data\.conversation,skipPromptQueueSync:true\}\)[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
+    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId='',turnId='',role=''\}=\{\}\)\{[\s\S]*?const sourceThreadId=String\(requestedThreadId\|\|currentConversationId\|\|''\)[\s\S]*?loadConversation\(data\.threadId,'codex',\{conversation:data\.conversation,skipPromptQueueSync:true\}\)[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
     assert.doesNotMatch(page, /forkNativeConversation[\s\S]{0,500}confirm\(/);
     assert.match(page, /input\.focus\(\);\s*refreshHistory\(\)\.catch\(\(\)=>\{\}\)/);
     assert.match(page, /currentConversationSource==='codex'&&!options\.skipPromptQueueSync\)await pullPromptQueueFromServer/);
@@ -6378,7 +6384,7 @@ updated_at = 1784422800000
       'loadSubQuota',
       'startSubQuotaCountdowns',
       'stopSubQuotaCountdowns',
-      subQuotaPreviewHelpers + '; return { showSubQuotaPreview, hideSubQuotaPreview };',
+      'let lastSubQuotaHoverRefreshAt=-Infinity;' + subQuotaPreviewHelpers + '; return { showSubQuotaPreview, hideSubQuotaPreview };',
     )(
       previewPopover,
       previewToggle,
@@ -6399,7 +6405,7 @@ updated_at = 1784422800000
     assert.equal(previewAttributes.get('aria-expanded'), 'false');
     assert.equal(previewToggle.dataset.previewOpen, undefined);
     subQuotaPreviewApi.showSubQuotaPreview();
-    assert.equal(subQuotaLoads, 2);
+    assert.equal(subQuotaLoads, 1);
     const renderSubQuotaHelper = inlineScript.match(/(function renderSubQuota\(data\)[\s\S]*?)(?=function subQuotaProgressPercent)/)?.[1];
     assert.ok(renderSubQuotaHelper);
     const newApiQuotaHelpers = inlineScript.match(/(function isSubQuotaNewApi\(quota\)[\s\S]*?)(?=function renderSubQuota)/)?.[1];

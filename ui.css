@@ -896,6 +896,51 @@ body .subQuotaClose:hover {
 
 .subQuotaCycleUsage { grid-column: 1 / -1; margin-top: 8px; }
 .subQuotaCycleUsage strong { white-space: normal; overflow-wrap: anywhere; }
+.subQuotaAnalyticsDaily { grid-column: 1 / -1; overflow: auto; font-size: 12px; }
+.subQuotaAnalyticsDaily summary { cursor: pointer; padding: 8px 0; }
+.subQuotaCodexUsage:has(.codexMeter) { display: block; min-width: 0; max-width: 100%; border: 0; padding: 0; }
+.codexMeter, .codexMeterDaily, .codexMeterTableScroll { min-width: 0; max-width: 100%; }
+.subQuotaSettingsBuiltinSource:has(.codexMeter) { grid-template-columns: minmax(0, 1fr); }
+.codexMeter { --meter-card: #282828; --meter-border: #353535; --meter-text: #f5f5f5; --meter-muted: #ababab; background: #212121; color: var(--meter-text); padding: 12px; border-radius: 12px; }
+body[data-theme="light"] .codexMeter { --meter-card: #f6f6f6; --meter-border: #e5e5e5; --meter-text: #202020; --meter-muted: #666; background: #fff; }
+.codexMeter .codexMeterTitle { color: var(--meter-text); font-size: 18px; font-weight: 600; margin: 0 0 12px; }
+.codexMeterGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.codexMeterCard { min-width: 0; background: var(--meter-card); border: 1px solid var(--meter-border); border-radius: 12px; padding: 12px; }
+.codexMeterCardTitle { display: flex; align-items: center; gap: 6px; color: var(--meter-muted); font-size: 12px; font-weight: 600; line-height: 1.5; }
+.codexMeterCardTitle .lucide { width: 15px; height: 15px; flex: 0 0 15px; }
+.codexMeterValue { display: block; font-size: 24px; font-weight: 650; line-height: 1.2; margin: 10px 0 8px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.codexMeterCard p { color: var(--meter-muted); font-size: 11px; line-height: 1.45; margin: 0; }
+.codexMeterDaily { margin-top: 16px; }
+.codexMeterDailyHead { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; color: var(--meter-muted); margin-bottom: 8px; }
+.codexMeterDailyHead h4 { margin: 0; font-size: 14px; font-weight: 600; }
+.codexMeterDailyHead span { font-size: 12px; }
+.codexMeterTableScroll { overflow-x: auto; }
+.codexMeter table { width: 100%; border-collapse: collapse; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; }
+.codexMeter th, .codexMeter td { padding: 7px 5px; text-align: left; border-bottom: 1px solid var(--meter-border); }
+.codexMeter th { color: var(--meter-muted); font-weight: 500; }
+.codexMeter tfoot { font-weight: 650; }
+.codexMeterActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.codexMeterActions button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; border-radius: 999px; border: 1px solid var(--meter-border); background: transparent; color: var(--meter-text); padding: 6px 12px; font-size: 12px; }
+.codexMeterActions button .lucide { width: 15px; height: 15px; }
+.codexMeterActions .codexMeterRefresh { background: var(--meter-text); color: #212121; }
+body[data-theme="light"] .codexMeterActions .codexMeterRefresh { color: #fff; }
+.codexMeterActions button:focus-visible { outline: 2px solid var(--meter-text); outline-offset: 3px; }
+.codexMeterActions button:disabled { opacity: .5; cursor: wait; }
+@media(max-width: 480px) {
+  .codexMeter { padding: 8px; }
+  .codexMeterCard { padding: 10px; border-radius: 12px; }
+  .codexMeterCardTitle { font-size: 12px; gap: 6px; align-items: flex-start; }
+  .codexMeterCardTitle .lucide { margin-top: 2px; }
+  .codexMeterValue { font-size: 22px; }
+  .codexMeterDailyHead { align-items: flex-start; flex-direction: column; }
+  .codexMeterTableScroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .codexMeter table { min-width: 390px; }
+  .codexMeterActions { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; }
+  .codexMeterActions button { min-width: 0; min-height: 44px; padding: 8px 6px; }
+}
+@media(max-width: 360px) { .codexMeterGrid { grid-template-columns: minmax(0,1fr); } }
+.subQuotaAnalyticsDaily table { width: 100%; border-collapse: collapse; }
+.subQuotaAnalyticsDaily th, .subQuotaAnalyticsDaily td { padding: 6px; text-align: left; border-bottom: 1px solid var(--border); }
 
 .subQuotaCredits {
   display: grid;
@@ -7485,6 +7530,7 @@ body .msg.process.completionSummary {
 .completionSummary > summary,
 .completionSummary > .completionRow {
   display: flex;
+  flex-wrap: wrap;
   min-height: 40px;
   width: 100%;
   max-width: 100%;
@@ -7527,8 +7573,11 @@ body .msg.process.completionSummary {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
+
+.completionUsageDetails { font-size: 12px; line-height: 1.7; padding-bottom: 12px; overflow-wrap: anywhere; }
 
 .completionSummary > summary .completionTokenUsage.hidden,
 .completionSummary > .completionRow .completionTokenUsage.hidden {
@@ -13313,11 +13362,17 @@ body .composer > .box:focus-within {
     flex-wrap: wrap;
   }
 
-  .subQuotaAddSourceType,
-  .subQuotaSourceTypeSelect {
+  .subQuotaAddSourceType {
     min-width: 0;
     min-height: 40px;
     flex: 1 1 160px;
+  }
+
+  .subQuotaSourceTypeSelect {
+    min-width: 0;
+    height: 40px;
+    min-height: 40px;
+    flex: 0 0 auto;
   }
 
   .subQuotaAddSourceButton {

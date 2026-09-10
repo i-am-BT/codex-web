@@ -28,7 +28,7 @@ import {
   ImagePromptLibrary,
 } from './image-prompt-library.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
-import { createCycleUsageReader } from './cycle-usage.mjs';
+import { createAccountAnalyticsReader } from './account-analytics.mjs';
 import { archiveInactiveNativeThread } from './native-thread-archive.mjs';
 import {
   AutomationStore,
@@ -97,7 +97,7 @@ const PLAYGROUND_UPDATE_DIR = path.join(RUNTIME_DIR, 'playground');
 const PLAYGROUND_CURRENT_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'current');
 const PLAYGROUND_PREVIOUS_DIR = path.join(PLAYGROUND_UPDATE_DIR, 'previous');
 const CODEX_HOME = resolveLocalPath(process.env.CODEX_HOME || path.join(homedir(), '.codex'), homedir());
-const readCycleUsage = createCycleUsageReader(CODEX_HOME, path.join(RUNTIME_DIR, 'codex-cycle-usage.json'));
+const readAccountAnalytics = createAccountAnalyticsReader(CODEX_HOME);
 const CODEX_CONFIG_FILE = resolveLocalPath(process.env.CODEX_CONFIG_FILE || path.join(CODEX_HOME, 'config.toml'), CODEX_HOME);
 const CODEX_ENV_FILE = resolveLocalPath(process.env.CODEX_ENV_FILE || path.join(CODEX_HOME, '.env'), CODEX_HOME);
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
@@ -858,7 +858,7 @@ app.get('/api/automations', requireAuth, (_req, res) => {
 app.get('/api/codex-app-credits', requireAuth, async (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   const credits = await readCodexAppCredits({ refresh: req.query.refresh === '1' });
-  res.json({ ...credits, cycleUsage: readCycleUsage(credits), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible });
+  res.json({ ...credits, cycleUsage: await readAccountAnalytics({ refresh: req.query.refresh === '1' }), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible });
 });
 
 app.get('/api/sub-quotas', requireAuth, async (req, res) => {
@@ -871,7 +871,7 @@ app.get('/api/sub-quotas', requireAuth, async (req, res) => {
     ]);
     res.json({
       ...data,
-      codexApp: { ...codexApp, cycleUsage: readCycleUsage(codexApp), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible },
+      codexApp: { ...codexApp, cycleUsage: await readAccountAnalytics({ refresh }), visible: codexAppQuotaVisible, creditsVisible: codexAppCreditsVisible },
       visibility: subQuotaVisibilityState(),
     });
   } catch (err) {
@@ -1473,7 +1473,11 @@ app.get('/api/local-image', requireAuth, (req, res) => {
     if (/^[a-z]+:\/\//i.test(rawPath) || rawPath.includes('\0')) {
       return res.status(400).json({ error: '不支持的图片路径' });
     }
-    const cwd = normalizeCwd(req.query.cwd || DEFAULT_CWD);
+    const threadId = cleanNativeThreadId(req.query.threadId || '');
+    if (req.query.threadId && !threadId) return res.status(400).json({ error: '会话 ID 无效' });
+    const conversation = threadId ? nativeSessions.get(threadId) : null;
+    if (threadId && !conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    const cwd = canonicalizeNativeCwd(conversation?.metadata?.cwd || DEFAULT_CWD);
     if (!isLocalImagePathAllowed(rawPath, cwd)) {
       return res.status(404).json({ error: '图片不存在或不受支持' });
     }
@@ -1497,21 +1501,34 @@ app.get(/^\/(?:Users|Volumes|workspace|opt|var|tmp|home|root)\/.+$/, requireAuth
   return sendAllowedLocalFile(res, requestedPath);
 });
 
+async function requestNativeHistoryFork(method, params) {
+  const client = new CodexAppServerClient({
+    bin: CODEX_BIN, cwd: CODEX_PROCESS_HOME, env: buildCodexProcessEnvironment(),
+    clientName: 'codex-web-fork', requestTimeoutMs: APP_SERVER_REQUEST_TIMEOUT_MS,
+  });
+  let createdId = '';
+  try {
+    const result = await client.request(method, params);
+    createdId = cleanNativeThreadId(result?.thread?.id);
+    if (method === 'thread/fork' && createdId === params.threadId) { createdId = ''; throw new Error('分支未返回新的会话 ID'); }
+    return result;
+  } finally {
+    try { if (createdId) await client.request('thread/unsubscribe', { threadId: createdId }, { timeoutMs: 3000 }); }
+    catch {}
+    await client.close();
+  }
+}
 app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
   const threadId = cleanNativeThreadId(req.params.id);
   if (!threadId) return res.status(400).json({ error: 'Codex App 会话 ID 无效' });
   const source = nativeSessions.get(threadId);
   const active = nativeActiveTurnFor(threadId, source);
-  if (active?.status === 'running') {
-    return res.status(409).json({ error: '会话任务正在运行，不能创建历史分支' });
-  }
 
   const messageSeq = Number(req.body?.messageSeq);
   if (!Number.isInteger(messageSeq) || messageSeq < 1) {
     return res.status(400).json({ error: '消息序号无效' });
   }
 
-  let loadedForkedThreadId = '';
   try {
     if (!source) return res.status(404).json({ error: 'Codex App 会话不存在' });
     const target = source.messages.find((message) => (
@@ -1520,9 +1537,16 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       && message.turnId
     ));
     if (!target) return res.status(400).json({ error: '只能从带有 turn ID 的用户或助手消息创建分支' });
+    if ((req.body?.turnId && req.body.turnId !== target.turnId) || (req.body?.role && req.body.role !== target.role)) {
+      return res.status(409).json({ error: '消息历史已变化，请刷新后重新选择分支位置' });
+    }
     const forkedThroughTurnId = target.role === 'assistant'
       ? target.retrySourceTurnId || target.turnId
       : target.previousTurnId;
+    const runningTurnId = active?.turnId || source.activeTurnId || source.latestTurnId;
+    if ((active?.status || source.status) === 'running' && forkedThroughTurnId === runningTurnId) {
+      return res.status(409).json({ error: '这一轮仍在运行，请选择已完成的回复创建分支' });
+    }
     if (target.role === 'user' && !forkedThroughTurnId && source.truncated) {
       return res.status(409).json({ error: '会话历史已截断，无法确定这条消息之前的 turn' });
     }
@@ -1532,7 +1556,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       : {};
     const settings = parseNativeThreadSettings(req.body || {}, settingsOptions);
     const result = forkedThroughTurnId
-      ? await requestLoadedAppServerThread('thread/fork', compactObjectWithServiceTier({
+      ? await requestNativeHistoryFork('thread/fork', compactObjectWithServiceTier({
         threadId,
         lastTurnId: forkedThroughTurnId,
         cwd: settings.cwd,
@@ -1543,7 +1567,7 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
         approvalsReviewer: settings.approvalsReviewer,
         threadSource: 'user',
       }, settings.serviceTier))
-      : await requestLoadedAppServerThread('thread/start', compactObjectWithServiceTier({
+      : await requestNativeHistoryFork('thread/start', compactObjectWithServiceTier({
         cwd: settings.cwd,
         model: settings.model,
         modelProvider: settings.provider,
@@ -1554,7 +1578,6 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
       }, settings.serviceTier));
     const forkedThreadId = cleanNativeThreadId(result?.thread?.id);
     if (!forkedThreadId) throw new Error('Codex app-server 未返回有效分支 thread id');
-    loadedForkedThreadId = forkedThreadId;
 
     nativeSessions.refresh();
     const persisted = nativeSessions.get(forkedThreadId);
@@ -1576,10 +1599,6 @@ app.post('/api/native-sessions/:id/fork', requireAuth, async (req, res) => {
     });
   } catch (err) {
     res.status(nativeAppErrorStatus(err)).json({ error: `创建 Codex App 历史分支失败: ${err.message}` });
-  } finally {
-    if (loadedForkedThreadId) {
-      await releaseAppServerThreadAfterTurn(loadedForkedThreadId, '', { reason: 'fork-loaded' });
-    }
   }
 });
 
@@ -1923,7 +1942,7 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
         await requestLoadedAppServerThread('thread/resume', {
           threadId,
           modelProvider: provider,
-          model,
+          ...(hasModel ? { model } : {}),
           excludeTurns: true,
         });
       } else {
@@ -3886,12 +3905,15 @@ function syncDesktopTurnState(threadId, state) {
   } else if (!current && conversation?.status !== 'running') {
     return false;
   }
+  if (status === 'interrupted' && !isPromptQueuePaused(threadId)) {
+    setPromptQueuePause(threadId, { reason: 'app-paused', message: 'Codex App 已暂停，等待手动继续' });
+  }
   setNativeTurnState(threadId, {
     turnId,
     status,
     transport: 'desktop-ipc',
   });
-  if (status !== 'running') scheduleServerPromptQueueDispatch(threadId, 160);
+  if (status !== 'running' && status !== 'interrupted') scheduleServerPromptQueueDispatch(threadId, 160);
   return true;
 }
 
@@ -5024,8 +5046,7 @@ function setPromptQueuePause(threadId, pause = null) {
     items,
     ...(nextPause ? { pause: nextPause } : {}),
   };
-  if (!items.length && !nextPause) delete queues[id];
-  else queues[id] = next;
+  queues[id] = next;
   savePromptQueuesWithDismissed(queues, dismissed);
   const state = getPromptQueueState(id);
   broadcastPromptQueueChange({
@@ -5699,24 +5720,12 @@ function isPathWithinRoot(targetPath, rootPath) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-// `/api/local-image` accepts a client-supplied absolute path (used to preview images
-// referenced in markdown/tool output). Without this check any authenticated user could
-// pass an unrelated absolute path and read arbitrary image files reachable by this
-// process, not just images tied to the current Codex session. Absolute paths are only
-// allowed inside the resolved session cwd, the OS temp dir (common for automation
-// screenshots), or an explicitly configured local image root. Relative paths are
-// unaffected since readNativeToolImage always resolves them against cwd.
+// Both relative and absolute paths must remain within a server-selected root
+// after resolving symlinks. The caller supplies cwd from persisted session metadata.
 function isLocalImagePathAllowed(filePath, cwd) {
-  if (!path.isAbsolute(filePath)) return true;
   try {
-    const resolved = realpathSync(filePath);
-    if (cwd) {
-      try {
-        if (isPathWithinRoot(resolved, realpathSync(cwd))) return true;
-      } catch {}
-    }
-    if (isPathWithinRoot(resolved, realpathSync(tmpdir()))) return true;
-    return LOCAL_IMAGE_ROOTS.some((root) => {
+    const resolved = realpathSync(path.resolve(cwd || DEFAULT_CWD, filePath));
+    return [cwd || DEFAULT_CWD, tmpdir(), IMAGE_DIR, ...LOCAL_IMAGE_ROOTS].some((root) => {
       try {
         return isPathWithinRoot(resolved, realpathSync(root));
       } catch {
@@ -7696,6 +7705,10 @@ async function proxyPlaygroundRequest(req, res) {
     return res.status(error.statusCode || 400).json({ error: error.message });
   }
 
+  // Upstream responses are data, never executable documents in the Web origin.
+  res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
   const wantsStream = req.method === 'POST' && req.body?.stream === true;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PLAYGROUND_PROXY_TIMEOUT_MS);
@@ -7740,6 +7753,11 @@ async function proxyPlaygroundRequest(req, res) {
     }
 
     const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    const mediaType = contentType.split(';', 1)[0].trim();
+    if (/^(?:text\/html|application\/xhtml\+xml|image\/svg\+xml|(?:application|text)\/xml)$/.test(mediaType)) {
+      await response.body?.cancel();
+      return res.status(502).json({ error: 'Playground proxy rejected an executable upstream document' });
+    }
     const isEventStream = contentType.includes('text/event-stream');
     const shouldStream = wantsStream || isEventStream;
 
@@ -10618,7 +10636,12 @@ async function dispatchNextServerQueuedPrompt(threadId) {
 }
 
 function broadcastPromptQueueChange(event) {
-  for (const client of sessionEventClients) writeNamedEvent(client, 'prompt-queue', event);
+  const payload = {
+    ...event,
+    pause: promptQueuePauseState(event.threadId),
+    dismissedItemIds: getPromptQueueDismissedItemIds(event.threadId),
+  };
+  for (const client of sessionEventClients) writeNamedEvent(client, 'prompt-queue', payload);
 }
 
 function loadConversations() {
@@ -10684,6 +10707,7 @@ function pageHtml(authenticated) {
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta name="theme-color" content="${initialTheme === 'dark' ? '#0b0d10' : '#f3f5f7'}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 <title>${appName}</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -10753,6 +10777,14 @@ body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="pla
 <script src="/vendor/lucide.js"></script>
 <script>
 if(document.body.dataset.themeMode==='system')document.body.dataset.theme=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+function syncBrowserTheme(){
+  const theme=document.body.dataset.theme==='dark'?'dark':'light';
+  const color=getComputedStyle(document.body).getPropertyValue('--canvas').trim()||(theme==='dark'?'#0b0d10':'#f3f5f7');
+  document.documentElement.style.colorScheme=theme;
+  document.documentElement.style.backgroundColor=color;
+  document.querySelector('meta[name="theme-color"]').setAttribute('content',color);
+}
+syncBrowserTheme();
 const login = document.getElementById('login'), app = document.getElementById('app'), loginForm = document.getElementById('loginForm'), loginError = document.getElementById('loginError');
 const chat = document.getElementById('chat'), composer = document.querySelector('.composer'), input = document.getElementById('input'), sendBtn = document.getElementById('send'), cancelBtn = document.getElementById('cancelRun'), statusEl = document.getElementById('status');
 const jumpToLatest=document.createElement('button');
@@ -10842,6 +10874,7 @@ let nativeCancelPending = null;
 let forceFullAccess = false;
 let nativeRunningElement = null;
 let nativeOptimisticElements = [];
+const failedNativeSendDrafts = new Map();
 let lastTurnErrorElement = null;
 let nativeConnectionStatusElement = null;
 let nativeOptimisticSteering = new Map();
@@ -11198,6 +11231,7 @@ let completeAudioCtx=null;
 let historyCompletionPushTimer=null;
 let historyCompletionSyncTimer=null;
 let historyCompletionSyncInFlight=null;
+let historyCompletionSyncQueued=false;
 let composerModelValueBeforeChange='';
 let activeHistoryProjectMenu=null;
 const HISTORY_SESSION_REFRESH_DELAY_MS=700;
@@ -12051,6 +12085,9 @@ const deferredPromptQueueEvents=new Map();
 function applyRemotePromptQueueEvent(event){
   const threadId=String(event?.threadId||'').trim();
   if(!threadId)return;
+  if(Number.isInteger(event.revision)&&event.revision<(promptQueueServerRevisions.get(threadId)||0))return;
+  // A stop must take effect even while queue contents are waiting for a PUT.
+  if(Object.prototype.hasOwnProperty.call(event||{},'pause'))setPromptQueuePauseLocal(threadId,event.pause);
   if(promptQueueServerSyncInflight.has(threadId)||promptQueueServerSyncTimers.has(threadId)||promptQueueOrderSyncing.has(threadId)||promptQueueOrderIntents.has(threadId)){
     const pending=deferredPromptQueueEvents.get(threadId);
     if(pending){if(Number(event.revision||0)>=Number(pending.event.revision||0))pending.event=event;return;}
@@ -12062,13 +12099,19 @@ function applyRemotePromptQueueEvent(event){
     },350);
     return;
   }
-  if(Number.isInteger(event.revision)&&event.revision<(promptQueueServerRevisions.get(threadId)||0))return;
   const items=Array.isArray(event?.items)?event.items:[];
+  const dismissedItemIds=Array.isArray(event.dismissedItemIds)?event.dismissedItemIds:[];
+  const localItems=promptQueueFor(threadId);
+  const remoteIds=new Set(items.map((item)=>String(item?.id||'')));
+  const missingLocalWebItemIds=missingUnconfirmedWebPromptQueueItemIds(localItems,remoteIds,dismissedItemIds);
+  const merged=mergePromptQueueSyncConflict(threadId,localItems,items,dismissedItemIds,{preferRemoteOrder:true});
   if(Number.isInteger(event?.revision))promptQueueServerRevisions.set(threadId,event.revision);
-  if(Object.prototype.hasOwnProperty.call(event||{},'pause'))setPromptQueuePauseLocal(threadId,event.pause);
+  acknowledgePromptQueueBeaconItems(threadId,items);
+  acknowledgePromptQueueBeaconItemIds(threadId,dismissedItemIds);
   promptQueueRemoteSyncing=true;
-  try{applyPromptQueueLocal(threadId,items,{persist:true,render:true});}
+  try{applyPromptQueueLocal(threadId,merged,{persist:true,render:true});}
   finally{promptQueueRemoteSyncing=false;}
+  if(missingLocalWebItemIds.length)schedulePromptQueueServerSync(threadId);
 }
 function createQueuedPrompt(message,attachments){return normalizeQueuedPrompt({
   id:makePromptQueueId(),message,attachments,provider:provider.value,model:model.value,
@@ -12895,7 +12938,7 @@ function sideChatFinalizeTurn(state,message,target){
   const startedAt=turnProcessStartTimestamp(state.startedAt,completedAt);
   const elapsedSeconds=state.startedAt?Math.max(0,(completedAt-startedAt)/1000):NaN;
   const text=sideChatMessageText(message)||'任务完成';
-  const completion=createCompletionMessage(text,organized.processElements,state.turnId,elapsedSeconds,message?.tokenUsage);
+  const completion=createCompletionMessage(text,organized.processElements,state.turnId,elapsedSeconds,messageTokenUsage(message));
   if(anchor){
     target.insertBefore(completion,anchor);
     for(const item of organized.visibleElements)target.insertBefore(item,anchor);
@@ -17380,17 +17423,87 @@ function syncSubQuotaMoveButtons(){
     if(down)down.disabled=index===sources.length-1;
   });
 }
-function appendCodexCycleUsage(parent,stats){
+function codexMeterCompact(value){
+  if(!Number.isFinite(value))return '--';
+  for(const [scale,suffix] of [[1e9,'B'],[1e6,'M'],[1e3,'K']])if(Math.abs(value)>=scale)return (value/scale).toFixed(2)+suffix;
+  return value.toLocaleString('zh-CN');
+}
+function exportCodexMeter(stats,format){
+  const columns=['日期','Credits','总 Tokens','输入 Tokens','缓存命中 Tokens','输出 Tokens','折算金额','轮数'];
+  const rows=(stats.daily||[]).map(day=>[day.date,day.credits,day.totalTokens,day.inputTokens,day.cachedInputTokens,day.outputTokens,day.credits===null?null:day.credits*0.04,day.turns]);
+  const quote=value=>'"'+String(value??'').replaceAll('"','""')+'"';
+  const content=format==='json'?JSON.stringify(stats,null,2):[columns,...rows].map(row=>row.map(quote).join(',')).join(String.fromCharCode(10));
+  const url=URL.createObjectURL(new Blob([content],{type:format==='json'?'application/json':'text/csv;charset=utf-8'}));
+  const link=document.createElement('a');link.href=url;link.download='codex-meter-'+stats.startDate+'.'+format;link.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function renderCodexMeter(parent,stats){
+  const root=document.createElement('section');root.className='codexMeter';root.setAttribute('aria-label','Codex Meter');
+  const heading=document.createElement('h3');heading.className='codexMeterTitle';heading.textContent='Codex Meter';root.appendChild(heading);
+  const fixed=(value,digits=2)=>Number.isFinite(value)?value.toFixed(digits):'--';
+  if(!stats.available){
+    const status=document.createElement('p');status.setAttribute('role','status');status.textContent=stats.error||'暂无官方用量数据';root.appendChild(status);
+  }else{
+    const confidence=({low:'低可信',medium:'中可信',high:'高可信'})[stats.projectionConfidence];
+    const projection=confidence?confidence+'：每日 Credits ÷ 官方已用比例。':'等待每日 Credits 与官方比例同步。';
+    const grid=document.createElement('div');grid.className='codexMeterGrid';
+    const metrics=[
+      ['gauge','本周期剩余额度比例',fixed(stats.remainingPercent,1)+'%','来自官方每周限额进度。'],
+      ['coins','本周期已用 Credits',fixed(stats.creditsUsed),'按每日用量明细加总。'],
+      ['cpu','本周期总 Tokens',codexMeterCompact(stats.totalTokens),'按每日用量明细汇总的全部 Tokens。'],
+      ['trending-up','推算周总 Credits',confidence?'~'+fixed(stats.projectedCredits,stats.projectedCredits>=1000?0:1):'同步中',projection],
+      ['layers','输入缓存命中率',fixed(stats.cacheHitPercent,1)+'%','缓存输入占全部输入 Tokens 的比例。'],
+      ['wallet','推算周价值',confidence?'$ '+fixed(stats.projectedUsd):'同步中',projection],
+    ];
+    for(const [icon,label,value,hint] of metrics){
+      const card=document.createElement('article');card.className='codexMeterCard';
+      const title=document.createElement('div');title.className='codexMeterCardTitle';
+      const symbol=document.createElement('i');symbol.setAttribute('data-lucide',icon);symbol.setAttribute('aria-hidden','true');
+      const caption=document.createElement('span');caption.textContent=label;title.append(symbol,caption);
+      const number=document.createElement('strong');number.className='codexMeterValue';number.textContent=value;
+      const description=document.createElement('p');description.textContent=hint;
+      card.append(title,number,description);grid.appendChild(card);
+    }
+    root.appendChild(grid);
+    const daily=document.createElement('section');daily.className='codexMeterDaily';
+    const dailyHead=document.createElement('div');dailyHead.className='codexMeterDailyHead';
+    const title=document.createElement('h4');title.textContent='本周期每日用量';
+    const start=document.createElement('span');start.textContent='从 '+stats.startDate+' 开始统计';start.title=stats.scope;
+    dailyHead.append(title,start);daily.appendChild(dailyHead);
+    const scroll=document.createElement('div');scroll.className='codexMeterTableScroll';
+    scroll.tabIndex=0;scroll.setAttribute('role','region');scroll.setAttribute('aria-label','每日用量，可左右滚动查看完整表格');
+    const table=document.createElement('table');const thead=document.createElement('thead');const header=document.createElement('tr');
+    for(const label of ['日期','Credits','总 Tokens','输入 Tokens','缓存命中']){const th=document.createElement('th');th.scope='col';th.textContent=label;header.appendChild(th)}
+    thead.appendChild(header);table.appendChild(thead);
+    const tbody=document.createElement('tbody');
+    const addRow=(container,date,credits,total,input,cached)=>{
+      const row=document.createElement('tr');
+      for(const value of [date,fixed(credits,3),codexMeterCompact(total),codexMeterCompact(input),input>0&&Number.isFinite(cached)?(cached/input*100).toFixed(0)+'%':'--']){const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell)}
+      container.appendChild(row);
+    };
+    for(const day of stats.daily||[])addRow(tbody,day.date,day.credits,day.totalTokens,day.inputTokens,day.cachedInputTokens);
+    table.appendChild(tbody);const tfoot=document.createElement('tfoot');addRow(tfoot,'合计',stats.creditsUsed,stats.totalTokens,stats.inputTokens,stats.cachedInputTokens);table.appendChild(tfoot);
+    scroll.appendChild(table);daily.appendChild(scroll);root.appendChild(daily);
+  }
+  const actions=document.createElement('div');actions.className='codexMeterActions';
+  for(const format of ['csv','json']){const button=document.createElement('button');button.type='button';button.disabled=!stats.available;setIconLabel(button,format==='csv'?'file-spreadsheet':'file-json',format.toUpperCase());button.addEventListener('click',()=>exportCodexMeter(stats,format));actions.appendChild(button)}
+  const refresh=document.createElement('button');refresh.type='button';refresh.className='codexMeterRefresh';setIconLabel(refresh,'refresh-cw','刷新');
+  refresh.addEventListener('click',async()=>{refresh.disabled=true;try{await syncCodexAppCredits({refresh:true})}finally{refresh.disabled=false}});actions.appendChild(refresh);root.appendChild(actions);
+  parent.appendChild(root);refreshIcons(root);
+}
+function appendCodexCycleUsage(parent,stats,{details=false}={}){
   if(!stats)return;
+  if(details){renderCodexMeter(parent,stats);return;}
   const grid=document.createElement('div');
   grid.className='subQuotaCreditsGrid subQuotaCycleUsage';
-  grid.title=(stats.scope||'本周期本机用量')+'；'+(stats.pricingBasis||'');
+  grid.title=stats.error||[stats.scope,stats.pricingBasis,stats.fetchedAt?'获取于 '+new Date(stats.fetchedAt).toLocaleString('zh-CN'):''].filter(Boolean).join('；');
+  const usd=value=>Number.isFinite(value)?'$'+value.toFixed(2):'--';
   const rows=stats.available?[
-    ['本周期 Tokens（本机）',formatSubQuotaAmount(stats.totalTokens,'')],
-    ['缓存命中 Tokens',stats.cachedInputTokens===null?'--':formatSubQuotaAmount(stats.cachedInputTokens,'')],
-    ['缓存命中率',stats.cacheHitPercent===null?'--':stats.cacheHitPercent.toFixed(2)+'%'],
-    ['费用估算（USD）',stats.estimatedUsd===null?'--':'$'+stats.estimatedUsd.toFixed(4)],
-  ]:[['本周期用量',stats.loading?'读取中…':'--']];
+    ['已用 Credits',codexMeterCompact(stats.creditsUsed)],
+    ['Tokens',codexMeterCompact(stats.totalTokens)],
+    ['缓存命中',Number.isFinite(stats.cacheHitPercent)?stats.cacheHitPercent.toFixed(1)+'%':'--'],
+    ['推算周价值',stats.projectionConfidence?usd(stats.projectedUsd):'同步中'],
+  ]:[['官方账号用量',stats.error?'读取失败，点击刷新':stats.loading?'读取中…':'未登录或未提供']];
   for(const [label,value] of rows){
     const item=document.createElement('div');item.className='subQuotaCredits';
     const caption=document.createElement('span');caption.textContent=label;
@@ -17414,21 +17527,7 @@ async function syncCodexAppCredits({refresh=false}={}){
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error(data.error||'额度检测失败');
     usage.replaceChildren();
-    const addMetric=(label,value)=>{
-      const row=document.createElement('div');
-      row.className='subQuotaCodexBalance';
-      const caption=document.createElement('span');caption.textContent=label;
-      const amount=document.createElement('strong');amount.textContent=value;
-      row.append(caption,amount);usage.appendChild(row);
-    };
-    for(const window of data.windows||[]){
-      const minutes=window.windowDurationMins;
-      const label=minutes===10080?'每周':minutes===300?'5 小时':minutes?minutes+' 分钟':window.window;
-      addMetric(window.id+' · '+label+'剩余额度',formatSubQuotaAmount(window.remainingPercent,'%'));
-      addMetric('本周期已用',formatSubQuotaAmount(100-window.remainingPercent,'%'));
-      if(window.resetsAt)addMetric('额度重置时间',new Date(window.resetsAt*1000).toLocaleString('zh-CN'));
-    }
-    appendCodexCycleUsage(usage,data.cycleUsage);
+    appendCodexCycleUsage(usage,data.cycleUsage,{details:true});
     if(data.cycleUsage?.loading)setTimeout(()=>{
       if(!subQuotaSettingsOverlay?.classList.contains('hidden'))void syncCodexAppCredits();
     },3000);
@@ -17560,7 +17659,7 @@ function openSubQuotaSettings(){
   syncModalOpenState();
   void syncSubQuotaSettings().then((loaded)=>{
     if(!loaded||subQuotaSettingsOverlay?.classList.contains('hidden'))return;
-    requestAnimationFrame(()=>subQuotaSettingsInputs.values().next().value?.baseUrlInput?.focus());
+    requestAnimationFrame(()=>subQuotaSettingsCodexApp?.refreshButton?.focus({preventScroll:true}));
   });
 }
 function closeSubQuotaSettings(){
@@ -17913,6 +18012,7 @@ function handleSubQuotaToggleClick(event){
   // Desktop / fine pointer: click opens configuration; hover already covers preview.
   openSubQuotaSettings();
 }
+let lastSubQuotaHoverRefreshAt=-Infinity;
 function showSubQuotaPreview(){
   if(!subQuotaPopover||!subQuotaToggle)return;
   cancelSubQuotaPreviewHide();
@@ -17921,7 +18021,11 @@ function showSubQuotaPreview(){
   subQuotaToggle.setAttribute('aria-expanded','true');
   subQuotaToggle.dataset.previewOpen='1';
   startSubQuotaCountdowns();
-  if(wasHidden)void loadSubQuota();
+  const now=Date.now();
+  if(wasHidden&&now-lastSubQuotaHoverRefreshAt>=60000){
+    lastSubQuotaHoverRefreshAt=now;
+    void loadSubQuota({refresh:true});
+  }
 }
 function hideSubQuotaPreview(){
   if(!subQuotaPopover||subQuotaPopover.classList.contains('hidden'))return;
@@ -19179,7 +19283,7 @@ function handleSystemThemeChange(){if(appearance.theme==='system')applyAppearanc
 async function toggleTheme(){const next=appearance.theme==='system'?'light':appearance.theme==='light'?'dark':'system';await saveAppearance({theme:next})}
 function colorWithAlpha(value,alpha){const match=String(value||'').match(/^#([0-9a-f]{6})$/i);if(!match)return value;const hex=match[1];return'rgba('+parseInt(hex.slice(0,2),16)+','+parseInt(hex.slice(2,4),16)+','+parseInt(hex.slice(4,6),16)+','+alpha+')'}
 function applyDreamSkinTheme(concept,theme){const root=document.documentElement;for(const property of DREAM_SKIN_THEME_PROPERTIES)root.style.removeProperty(property);delete document.body.dataset.skinConcept;delete document.body.dataset.skinSafeArea;const palette=concept?.theme?.colors?.[theme];if(!palette)return;const art=concept.theme.art||{};const variables={'--canvas':palette.background,'--surface':palette.panel,'--surface-raised':palette.panelAlt,'--surface-hover':colorWithAlpha(palette.accent,theme==='light'?.09:.14),'--surface-active':colorWithAlpha(palette.accent,theme==='light'?.15:.2),'--border':palette.line,'--border-strong':colorWithAlpha(palette.accent,.5),'--text':palette.text,'--text-muted':palette.muted,'--text-subtle':colorWithAlpha(palette.muted,.82),'--primary':palette.accent,'--primary-hover':palette.accentAlt,'--primary-soft':colorWithAlpha(palette.accent,.14),'--primary-line':palette.line,'--info':palette.secondary,'--thinking':palette.highlight,'--user-bg':palette.accent,'--code-bg':palette.panelAlt,'--skin-canvas-wash':colorWithAlpha(palette.background,theme==='light'?.08:.26),'--skin-content-wash':colorWithAlpha(palette.background,theme==='light'?.24:.38),'--skin-surface':colorWithAlpha(palette.panel,.74),'--skin-surface-soft':colorWithAlpha(palette.panel,.58),'--skin-surface-strong':colorWithAlpha(palette.panel,.88),'--skin-accent-glow':colorWithAlpha(palette.accent,.2),'--skin-art-position':((Number(art.focusX)||.72)*100).toFixed(2)+'% '+((Number(art.focusY)||.45)*100).toFixed(2)+'%'};for(const [property,value] of Object.entries(variables))root.style.setProperty(property,value);document.body.dataset.skinConcept=concept.id;document.body.dataset.skinSafeArea=art.safeArea||'left'}
-function applyAppearance(){const theme=effectiveAppearanceTheme();const themeMode=['light','dark'].includes(appearance.theme)?appearance.theme:'system';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const dream=findDreamSkinConcept(selected);const skin=dream||(custom?.themeId?dreamSkinConcepts.find((concept)=>concept.id===custom.themeId&&concept.theme):null);const backgroundUrl=custom?.url||dream?.wallpaper||'';const bg=skin&&backgroundUrl?'skin':backgroundUrl?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.themeMode=themeMode;document.body.dataset.chatBg=bg;document.body.dataset.fx=appearance.fxEnabled?'on':'off';if(fxEnabledInput)fxEnabledInput.checked=appearance.fxEnabled===true;applyDreamSkinTheme(skin,theme);document.body.style.setProperty('--custom-chat-bg',backgroundUrl?'url("'+backgroundUrl+'")':'none');if(themeToggle){const icon=themeMode==='system'?'monitor':themeMode==='light'?'sun':'moon';setIconLabel(themeToggle,icon,'',false);const action=themeMode==='system'?'跟随系统；点击切换明亮模式':themeMode==='light'?'明亮模式；点击切换黑暗模式':'黑暗模式；点击恢复跟随系统';themeToggle.title=action;themeToggle.setAttribute('aria-label',action);themeToggle.dataset.themeMode=themeMode}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
+function applyAppearance(){const theme=effectiveAppearanceTheme();const themeMode=['light','dark'].includes(appearance.theme)?appearance.theme:'system';const selected=cleanBackgroundValue(appearance.chatBackground);const custom=selected.startsWith('bg:')?findCustomBackground(selected):null;const dream=findDreamSkinConcept(selected);const skin=dream||(custom?.themeId?dreamSkinConcepts.find((concept)=>concept.id===custom.themeId&&concept.theme):null);const backgroundUrl=custom?.url||dream?.wallpaper||'';const bg=skin&&backgroundUrl?'skin':backgroundUrl?'custom':selected;document.body.dataset.theme=theme;document.body.dataset.themeMode=themeMode;document.body.dataset.chatBg=bg;document.body.dataset.fx=appearance.fxEnabled?'on':'off';if(fxEnabledInput)fxEnabledInput.checked=appearance.fxEnabled===true;applyDreamSkinTheme(skin,theme);syncBrowserTheme();document.body.style.setProperty('--custom-chat-bg',backgroundUrl?'url("'+backgroundUrl+'")':'none');if(themeToggle){const icon=themeMode==='system'?'monitor':themeMode==='light'?'sun':'moon';setIconLabel(themeToggle,icon,'',false);const action=themeMode==='system'?'跟随系统；点击切换明亮模式':themeMode==='light'?'明亮模式；点击切换黑暗模式':'黑暗模式；点击恢复跟随系统';themeToggle.title=action;themeToggle.setAttribute('aria-label',action);themeToggle.dataset.themeMode=themeMode}renderBackgroundOptions(selected);updateDeleteBackgroundButton(selected)}
 async function saveAppearance(patch){const res=await fetch('/api/appearance',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});const data=await res.json();if(!res.ok){statusEl.textContent=data.error||'外观保存失败';applyAppearance();return null}appearance=data.appearance;applyAppearance();return appearance}
 function renderBackgroundOptions(selected){if(!chatBackground)return;const options=[['default','默认'],['dream-skin','Dream Skin']];for(const item of appearance.customBackgrounds||[])options.push([item.value,item.name]);options.push(['custom','自定义']);chatBackground.innerHTML='';for(const [value,label] of options){const opt=document.createElement('option');opt.value=value;opt.textContent=label;chatBackground.appendChild(opt)}chatBackground.value=findDreamSkinConcept(selected)?'dream-skin':options.some(([value])=>value===selected)?selected:'default'}
 function cleanBackgroundValue(value){const text=String(value||'');if(text==='default'||findDreamSkinConcept(text))return text;return findCustomBackground(text)?text:'default'}
@@ -20556,7 +20660,8 @@ function markHistoryCompletionRead(item){
 async function syncHistoryCompletionReadFromServer(){
   if(historyCompletionSyncTimer)clearTimeout(historyCompletionSyncTimer);
   historyCompletionSyncTimer=null;
-  if(historyCompletionSyncInFlight)return historyCompletionSyncInFlight;
+  if(historyCompletionSyncInFlight){historyCompletionSyncQueued=true;return historyCompletionSyncInFlight}
+  historyCompletionSyncQueued=false;
   const pending=(async()=>{
     try{
       const res=await fetch('/api/history-completion-read');
@@ -20579,11 +20684,15 @@ async function syncHistoryCompletionReadFromServer(){
   })();
   historyCompletionSyncInFlight=pending;
   try{return await pending}finally{
-    if(historyCompletionSyncInFlight===pending)historyCompletionSyncInFlight=null;
+    if(historyCompletionSyncInFlight===pending){
+      historyCompletionSyncInFlight=null;
+      if(historyCompletionSyncQueued)scheduleHistoryCompletionReadSync(0);
+    }
   }
 }
 function scheduleHistoryCompletionReadSync(delay=HISTORY_COMPLETION_SYNC_DELAY_MS){
-  if(historyCompletionSyncTimer||historyCompletionSyncInFlight)return;
+  if(historyCompletionSyncInFlight){historyCompletionSyncQueued=true;return}
+  if(historyCompletionSyncTimer)return;
   historyCompletionSyncTimer=setTimeout(()=>{
     historyCompletionSyncTimer=null;
     void syncHistoryCompletionReadFromServer();
@@ -21869,7 +21978,7 @@ function syncNativeComposerSettings(changes={}){
   nativeComposerSettingsQueue=queued.catch(()=>false);
   return queued;
 }
-function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';setNativeNoticeText('Codex App 会话 · 双向同步',{visible:true});setTopStatusText('Ready',{running:false});input.value='';input.style.height='auto';clearPendingAttachments();closeMenu()}
+function newChat(){setThreadGoal(null);showChatView();persistActiveConversation('','codex');closeComposerPopovers();resetNewTaskComposerCwd();clearNativeCompletionSync();clearNativeCancelPending();clearNativeComposerOverride();resetComposerProviderChange();clearSubagentTraceStates();clearNativeLiveItems();clearNativeHistoryDeferredSync();conversationLoadSeq++;currentConversationId='';currentConversationSource='codex';syncComposerContextWindow(null);try{window.__currentConversationCwd=''}catch{};nativeCursor=0;nativeGeneration=0;nativeHistoryPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryNextPageLimit=NATIVE_HISTORY_PAGE_SIZE;nativeHistoryHasEarlierMessages=false;nativeHistoryPageLoading=false;nativeHistoryLoadReady=false;nativeHistorySyncDeferred=false;activeNativeTurnId='';currentNativeRunStatus='';webRunActive=false;steerSubmitting=false;appQueueEditDraft=null;appQueueEditSaving=false;nativeRunningElement=null;nativeOptimisticElements=[];nativeOptimisticSteering=new Map();responseAnnotationsByTurn=new Map();latestToolElement=null;latestAssistantElement=null;latestFinalAssistantElement=null;latestUserElement=null;resetTurnProcessCollection();resumeNativeLiveFollowBottom();setCurrentConversationTitle('新任务');applyConversationMode();updateActiveHistory();chat.innerHTML='<div class="empty"><b>新任务</b><span>项目路径可选，直接输入即可。</span></div>';setNativeNoticeText('Codex App 会话 · 双向同步',{visible:true});setTopStatusText('Ready',{running:false});input.value='';input.style.height='auto';clearPendingAttachments();closeMenu();renderFailedNativeSendDrafts()}
 function readActiveConversationPreference(){
   try{
     const parsed=JSON.parse(localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)||'null');
@@ -22282,7 +22391,7 @@ async function loadConversation(id,source='web',options={}){
     chat.replaceChildren();
     messages.forEach((msg,index)=>{
       if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
-      addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage,hydrating:true});
+      addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg),hydrating:true});
     });
     if(restorePaint)beginConversationRestoring();
   }finally{
@@ -22292,6 +22401,7 @@ async function loadConversation(id,source='web',options={}){
   if(currentConversationSource==='codex')renderNativeForkDivider(messages);
   if(webRunActive&&(!turnProcessElapsedLabel||!turnProcessElapsedMatches(activeNativeTurnId))){if(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId))beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);else ensureTurnProcessElapsedRunning(activeStartedAt,Date.now(),activeNativeTurnId)}
   if(!messages.length&&!webRunActive&&!nativeForkMarkers[currentConversationId])chat.innerHTML='<div class="empty"><b>Empty</b><span>暂无可显示消息。</span></div>';
+  renderFailedNativeSendDrafts();
   updateConversationStatus(conversation);
   applyConversationMode();
   setThreadGoal(currentConversationSource==='codex' ? (conversation.goal || null) : null);
@@ -22522,20 +22632,22 @@ function showForkToast(message,isError=false){
   if(forkToastTimer)clearTimeout(forkToastTimer);
   forkToastTimer=setTimeout(()=>{toast?.classList.remove('show')},3200);
 }
-async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId=''}={}){
+async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId='',turnId='',role=''}={}){
   const sourceThreadId=String(requestedThreadId||currentConversationId||'');
   if(!sourceThreadId||(!requestedThreadId&&currentConversationSource!=='codex'))return;
   if(nativeForkCreating)return;
+  const forkLoadSeq=conversationLoadSeq;
   nativeForkCreating=true;
   if(trigger){trigger.disabled=true;trigger.setAttribute('aria-busy','true')}
   statusEl.textContent='正在创建历史分支...';
   try{
-    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
+    const res=await fetch('/api/native-sessions/'+encodeURIComponent(sourceThreadId)+'/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageSeq,turnId,role,provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value,serviceTier:composerServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||'创建历史分支失败');
     const copiedMessages=Array.isArray(data.conversation?.messages)?data.conversation.messages:[];
     const afterSeq=copiedMessages.reduce((maximum,message)=>Math.max(maximum,Number(message.seq)||0),0);
     setNativeForkMarker(data.threadId,{afterSeq,afterTurnId:data.forkedThroughTurnId});
+    if(forkLoadSeq!==conversationLoadSeq){refreshHistory().catch(()=>{});showForkToast('分支已创建，可从任务列表打开');return;}
     clearPendingAttachments();
     const loaded=await loadConversation(data.threadId,'codex',{conversation:data.conversation,skipPromptQueueSync:true});
     if(!loaded){
@@ -22560,7 +22672,7 @@ async function forkNativeConversation(messageSeq,{continueAfter=false,trigger=nu
     input.focus();
     refreshHistory().catch(()=>{});
   }catch(e){
-    statusEl.textContent=e.message;
+    if(forkLoadSeq===conversationLoadSeq)statusEl.textContent=e.message;
     showForkToast(e.message||'创建历史分支失败',true);
   }finally{
     nativeForkCreating=false;
@@ -22866,7 +22978,7 @@ async function syncCurrentNativeConversationOnce(){
     if(role==='assistant'&&adoptRuntimeLiveForSnapshotMessage(msg)){
       continue;
     }
-    addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:msg.tokenUsage})
+    addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg)})
   }
   if(nativeForkMarkers[id])renderNativeForkDivider(syncMessages);
   nativeCursor=Number(conversation.cursor||nativeCursor);
@@ -23087,10 +23199,7 @@ function localImageProxyUrl(filePath){
   const clean=normalizeLocalImagePath(filePath);
   if(!clean)return '';
   const params=new URLSearchParams({path:clean});
-  try{
-    const cwd=window.__currentConversationCwd||'';
-    if(cwd)params.set('cwd',cwd);
-  }catch{}
+  if(currentConversationSource==='codex'&&currentConversationId)params.set('threadId',currentConversationId);
   return '/api/local-image?'+params.toString();
 }
 function createMarkdownImage(filePath,label){
@@ -25290,11 +25399,23 @@ function completionElapsedSeconds(text,fallbackSeconds=NaN){
   const parsed=Number(String(text||'').match(/耗时\\s*([\\d.]+)s/)?.[1]);
   return Number.isFinite(parsed)?parsed:Number(fallbackSeconds);
 }
+function messageTokenUsage(message){return message?.tokenUsage?{...message.tokenUsage,details:message.tokenUsageDetails||null}:null}
+function turnTokenUsageDetailsLabel(tokenUsage){
+  const detail=tokenUsage?.details;
+  if(!detail)return'';
+  const count=value=>Number.isSafeInteger(value)&&value>=0?value.toLocaleString('zh-CN'):'未提供';
+  const amount=Number.isFinite(detail.estimatedUsd)?'$'+detail.estimatedUsd.toFixed(4):'未估算';
+  return '输入 '+count(detail.inputTokens)+' · 输出 '+count(detail.outputTokens)+' · 缓存命中 '+count(detail.cachedInputTokens)+' tokens（包含在输入中） · 模型 '+(detail.models?.filter(Boolean).join(' / ')||'未知')+' · 标准 API 估算 '+amount+'。包含本轮上下文及工具调用，非实际扣费。';
+}
 function turnTokenUsageLabel(tokenUsage){
   const total=Number(tokenUsage?.totalTokens);
   if(!Number.isFinite(total)||total<0)return'';
   const rounded=Math.round(total);
-  return '本轮累计 '+String(rounded).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')+' tokens';
+  let text='本轮累计 '+String(rounded).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')+' tokens';
+  const detail=tokenUsage?.details;
+  if(Number.isFinite(detail?.cacheHitPercent))text+=' · 缓存 '+detail.cacheHitPercent.toFixed(1)+'%';
+  if(Number.isFinite(detail?.estimatedUsd))text+=' · 估算 $'+detail.estimatedUsd.toFixed(4);
+  return text;
 }
 function liveProcessElapsedTitle(startedAt,now=Date.now()){
   const start=Number(startedAt);
@@ -25850,7 +25971,7 @@ function organizeTurnArtifactsForCompletion(artifacts=[],anchor=null){
 function createCompletionMessage(text,processElements=[],turnId='',elapsedSeconds=NaN,tokenUsage=null,nativeMessageSeq=null){
   // User/steer bubbles stay in the main chat stream; completed commentary and tool history fold together.
   const items=settleTurnProcessHistory(processElements).filter((item)=>Boolean(item)&&!item.classList?.contains('user')&&!item.classList?.contains('steeringUser'));
-  const collapsible=items.length>0;
+  const collapsible=items.length>0||Boolean(tokenUsage?.details);
   const el=document.createElement(collapsible?'details':'div');
   el.className='msg process completionSummary'+(collapsible?' collapsible':'');
   el.dataset.messageText=String(text||'');
@@ -25868,6 +25989,7 @@ function createCompletionMessage(text,processElements=[],turnId='',elapsedSecond
   const tokenLabel=turnTokenUsageLabel(tokenUsage);
   const usage=document.createElement('span');
   usage.className='completionTokenUsage';
+  usage.title=turnTokenUsageDetailsLabel(tokenUsage);
   usage.textContent=tokenLabel?'· '+tokenLabel:'';
   usage.classList.toggle('hidden',!tokenLabel);
   if(tokenLabel)el.dataset.tokenUsageLabel=tokenLabel;
@@ -25884,6 +26006,13 @@ function createCompletionMessage(text,processElements=[],turnId='',elapsedSecond
   if(collapsible){
     const content=document.createElement('div');
     content.className='completionContent';
+    const usageDetail=turnTokenUsageDetailsLabel(tokenUsage);
+    if(usageDetail){
+      const info=document.createElement('div');
+      info.className='completionUsageDetails';info.textContent=usageDetail;
+      info.title=tokenUsage.details.pricingBasis||'';
+      content.appendChild(info);
+    }
     const timeline=document.createElement('div');
     timeline.className='completionTimeline';
     for(const item of items)timeline.appendChild(item);
@@ -25917,6 +26046,12 @@ function updateCompletionMessage(completion,text,elapsedSeconds=NaN,tokenUsage=n
   if(usage){
     usage.textContent=tokenLabel?'· '+tokenLabel:'';
     usage.classList.toggle('hidden',!tokenLabel);
+    if(tokenUsage?.details){
+      usage.title=turnTokenUsageDetailsLabel(tokenUsage);
+      let info=completion.querySelector('.completionUsageDetails');
+      if(!info){info=document.createElement('div');info.className='completionUsageDetails';(completion.querySelector('.completionContent')||completion).appendChild(info);}
+      info.textContent=usage.title;info.title=tokenUsage.details.pricingBasis||'';
+    }
   }
   return completion;
 }
@@ -26772,7 +26907,7 @@ function createConversationMessageElement(role,text,options={}){
     setIconLabel(copy,'copy','复制此消息',false);
     copy.addEventListener('click',(event)=>{event.stopPropagation();copyText(terminalError?normalizeTerminalErrorText(el.dataset.messageText||''):(el.dataset.messageText||''),copy)});
     actions.appendChild(copy);
-    const actionThreadId=String(options.actionThreadId||'');
+    const actionThreadId=String(options.actionThreadId||(currentConversationSource==='codex'?currentConversationId:'')||'');
     if(role==='user'&&Number.isInteger(options.nativeMessageSeq)&&options.turnId){
       const fork=document.createElement('button');
       fork.type='button';
@@ -26781,7 +26916,7 @@ function createConversationMessageElement(role,text,options={}){
       fork.dataset.tooltip='从这里重新开始';
       fork.setAttribute('aria-label','从这里重新开始');
       setIconLabel(fork,'git-branch','从这里重新开始',false);
-      fork.addEventListener('click',(event)=>{event.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{trigger:fork,sourceThreadId:actionThreadId})});
+      fork.addEventListener('click',(event)=>{event.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{trigger:fork,sourceThreadId:actionThreadId,turnId:options.turnId,role:'user'})});
       actions.appendChild(fork);
     }else if(role==='user'&&Number.isInteger(options.messageIndex)){
       const rollback=document.createElement('button');
@@ -26802,7 +26937,7 @@ function createConversationMessageElement(role,text,options={}){
       continueTask.dataset.tooltip='在新任务中继续';
       continueTask.setAttribute('aria-label','在新任务中继续');
       setIconLabel(continueTask,'corner-up-right','在新任务中继续',false);
-      continueTask.addEventListener('click',(event)=>{event.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true,trigger:continueTask,sourceThreadId:actionThreadId})});
+      continueTask.addEventListener('click',(event)=>{event.stopPropagation();forkNativeConversation(options.nativeMessageSeq,{continueAfter:true,trigger:continueTask,sourceThreadId:actionThreadId,turnId:options.turnId,role:'assistant'})});
       actions.appendChild(continueTask);
     }
     if(['user','assistant'].includes(role)){
@@ -27812,6 +27947,36 @@ async function cancelRun(){
     setTimeout(()=>{if(currentConversationSource==='codex'&&currentConversationId===threadId&&activeNativeTurnId===turnId)void loadConversation(threadId,'codex')},80);
   }
 }
+function renderFailedNativeSendDrafts(){
+  for(const notice of chat.querySelectorAll('.failedNativeSendDraft'))notice.remove();
+  const key=conversationKey(currentConversationSource,currentConversationId);
+  for(const draft of failedNativeSendDrafts.get(key)||[]){
+    const notice=document.createElement('div');
+    notice.className='failedNativeSendDraft';
+    const button=document.createElement('button');
+    button.type='button';
+    button.className='miniSecondary';
+    button.textContent='将未发送消息追加到输入框';
+    button.title=(draft.error||'发送失败')+'：'+(draft.message||'附件消息');
+    button.addEventListener('click',()=>{
+      if(conversationKey(currentConversationSource,currentConversationId)!==key)return;
+      const drafts=failedNativeSendDrafts.get(key)||[];
+      const index=drafts.indexOf(draft);
+      if(index<0)return;
+      input.value=[input.value,draft.message].filter(Boolean).join(String.fromCharCode(10,10));
+      input.style.height='auto';
+      input.style.height=Math.min(input.scrollHeight,180)+'px';
+      pendingAttachments.push(...draft.attachments);
+      drafts.splice(index,1);
+      if(!drafts.length)failedNativeSendDrafts.delete(key);
+      renderAttachmentTray();
+      renderFailedNativeSendDrafts();
+      input.focus();
+    });
+    notice.appendChild(button);
+    chat.appendChild(notice);
+  }
+}
 async function send(){
   closeComposerPopovers();
   const text=input.value.trim();
@@ -27824,10 +27989,11 @@ async function send(){
   const sendLoadSeq=conversationLoadSeq;
   const sendConversationId=currentConversationId;
   const sendConversationSource=currentConversationSource;
+  const sendContextMatches=()=>sendLoadSeq===conversationLoadSeq&&sendConversationId===currentConversationId&&sendConversationSource===currentConversationSource;
   const providerReady=await waitForLatestComposerProviderChange();
   await waitForLatestComposerModelLoad();
   await nativeComposerSettingsQueue.catch(()=>false);
-  if(sendLoadSeq!==conversationLoadSeq||sendConversationId!==currentConversationId||sendConversationSource!==currentConversationSource)return;
+  if(!sendContextMatches())return;
   if(providerReady===false){statusEl.textContent='服务商模型尚未准备好，请重新选择后再发送';return}
   const existingId=currentConversationSource==='codex'?currentConversationId:'';
   if(existingId&&webRunActive){
@@ -27862,19 +28028,33 @@ async function send(){
     const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,attachments,provider:requestedProvider,model:requestedModel,reasoningEffort:reasoningEffort.value,serviceTier:requestedServiceTier,cwd:cwd.value,...composerPermissionPayload()})});
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||res.statusText);
+    markPromptQueueTurnRunning(data.threadId,data.turnId||'');
+    if(!sendContextMatches()){refreshHistory();return}
     currentConversationSource='codex';
     currentConversationId=data.threadId;
     setNativeComposerOverride(data.threadId,requestedProvider,requestedModel,requestedReasoningEffort,requestedPermissionMode,requestedSandbox,requestedApproval,requestedServiceTier,{pending:true});
     activeNativeTurnId=data.turnId||'';
-    markPromptQueueTurnRunning(data.threadId,activeNativeTurnId);
     if(!existingId){nativeCursor=0;nativeGeneration=0}
     updateActiveHistory();
     if(lastTurnErrorElement?.isConnected)lastTurnErrorElement.remove();
     lastTurnErrorElement=null;
     nativeNotice.textContent='Codex App 会话 · 双向同步';
-    setTimeout(async()=>{try{await syncCurrentNativeConversation()}catch{}if(nativeComposerOverride?.threadId===data.threadId&&nativeComposerOverride?.pending)clearNativeComposerOverride()},240);
+    setTimeout(async()=>{
+      if(sendLoadSeq!==conversationLoadSeq||currentConversationSource!=='codex'||currentConversationId!==data.threadId)return;
+      try{await syncCurrentNativeConversation()}catch{}
+      if(sendLoadSeq===conversationLoadSeq&&currentConversationId===data.threadId&&nativeComposerOverride?.threadId===data.threadId&&nativeComposerOverride?.pending)clearNativeComposerOverride();
+    },240);
     refreshHistory();
   }catch(e){
+    if(!sendContextMatches()){
+      const key=conversationKey(sendConversationSource,sendConversationId);
+      const drafts=failedNativeSendDrafts.get(key)||[];
+      drafts.push({message:text,attachments,error:e.message});
+      failedNativeSendDrafts.set(key,drafts);
+      if(currentConversationSource===sendConversationSource&&currentConversationId===sendConversationId)renderFailedNativeSendDrafts();
+      refreshHistory();
+      return;
+    }
     webRunActive=false;
     activeNativeTurnId='';
     currentNativeRunStatus=previousNativeRunStatus;

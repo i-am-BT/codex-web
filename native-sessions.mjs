@@ -13,6 +13,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { estimateTokenCost } from './cycle-usage.mjs';
 
 const SESSION_UUID_SOURCE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const SESSION_ID_PATTERN = new RegExp(`(${SESSION_UUID_SOURCE})\\.jsonl$`, 'i');
@@ -1637,6 +1638,7 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
     cache.activeTaskTurnId = turnId;
     updateNativeTurnId(cache, turnId, true);
     cache.currentTurnTokenUsage = null;
+    cache.currentTurnTokenUsageDetails = null;
     cache.currentTurnTokenUsageBaseline = tokenUsageBaseline(cache.latestTotalTokenUsage);
     cache.currentTurnFallbackTokenUsage = null;
     const contextWindowTokens = normalizeContextTokenCount(payload.model_context_window);
@@ -1701,6 +1703,7 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
         restoreRolledBackRetryAssistant(cache, maxMessages);
         appendNativeMessage(cache, 'process', errorMessage, record, maxMessages, pauseLike ? 'turn_aborted' : 'task_error', {
           ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+          ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
         });
         break;
       }
@@ -1713,15 +1716,31 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
       const content = Number.isFinite(duration) ? `任务完成，耗时 ${(duration / 1000).toFixed(1)}s` : '任务完成';
       appendNativeMessage(cache, 'process', content, record, maxMessages, payload.type, {
         ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+        ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
       });
       break;
     }
     case 'token_count': {
+      const previousDetails = cache.currentTurnTokenUsageDetails;
       updateCurrentTurnTokenUsage(
         cache,
         payload.info?.last_token_usage,
         payload.info?.total_token_usage,
       );
+      const snapshot = normalizeTurnTokenUsageSnapshot(payload.info?.total_token_usage)
+        || normalizeTurnTokenUsageSnapshot(payload.info?.last_token_usage);
+      if (snapshot && cache.currentTurnTokenUsage) {
+        const models = [...new Set([...(previousDetails?.models || []), String(cache.metadata?.model || '')])];
+        const fields = [...snapshot.fields].filter(field => !previousDetails || previousDetails.fields.includes(field));
+        const value = field => fields.includes(field) ? cache.currentTurnTokenUsage[field] : null;
+        const input = value('inputTokens'), cached = value('cachedInputTokens'), output = value('outputTokens');
+        cache.currentTurnTokenUsageDetails = {
+          models, fields, inputTokens: input, outputTokens: output, cachedInputTokens: cached,
+          cacheHitPercent: input > 0 && cached !== null && cached <= input ? cached / input * 100 : null,
+          estimatedUsd: models.length === 1 ? estimateTokenCost(models[0], input, cached, output) : null,
+          pricingBasis: '标准短上下文 API 等价估算，非实际扣费；不含加速、长上下文、缓存写入及工具附加费用',
+        };
+      }
       const contextUsedTokens = normalizeContextUsedTokens(payload.info?.last_token_usage);
       if (contextUsedTokens !== null) cache.contextUsedTokens = contextUsedTokens;
       const contextWindowTokens = normalizeContextTokenCount(
@@ -1740,6 +1759,10 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
         record,
         maxMessages,
         payload.type,
+        {
+          ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+          ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
+        },
       );
       break;
     case 'task_error':
@@ -1755,6 +1778,10 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
         record,
         maxMessages,
         pauseLike ? 'turn_aborted' : payload.type,
+        {
+          ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+          ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
+        },
       );
       break;
     }
@@ -2903,6 +2930,7 @@ function updateNativeTurnId(cache, value, force = false) {
   cache.currentTurnId = turnId;
   cache.currentTurnStartedAt = '';
   cache.currentTurnTokenUsage = null;
+  cache.currentTurnTokenUsageDetails = null;
   cache.turnStartScanComplete = false;
   cache.displayUserMessagesInTurn = 0;
 }

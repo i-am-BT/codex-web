@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createCycleUsageReader, usageDelta } from '../cycle-usage.mjs';
+import { createHash } from 'node:crypto';
 
 test('usage deltas deduplicate snapshots and handle counter resets', () => {
   const old = {input_tokens:100,output_tokens:20,cached_input_tokens:50};
@@ -22,6 +23,9 @@ test('cycle-only accounting, fork inheritance, provider filtering, warm cache an
   const context=line({type:'turn_context',payload:{model:'gpt-6-astra'}});
   try {
     await mkdir(path.join(root,'sessions'));await mkdir(path.join(root,'archived_sessions'));
+    await writeFile(path.join(root,'auth.json'),JSON.stringify({tokens:{account_id:'known-account'}}));
+    // Account was already observed before these fixture calls; totals are rebuilt from records.
+    await writeFile(cache,JSON.stringify({key:createHash('sha256').update('known-account').digest('hex')+':'+(start+604800000)}));
     const parent=line({type:'session_meta',payload:{id:'parent',model_provider:'openai'}})+context+token(start-1000,100,20,10)+token(start+1000,150,40,20)+token(start+2000,150,40,20);
     await writeFile(path.join(root,'sessions','parent.jsonl'),parent);
     await writeFile(path.join(root,'archived_sessions','parent.jsonl'),parent);
