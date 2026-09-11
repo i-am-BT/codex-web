@@ -44,6 +44,14 @@ import {
   remapMigratedCwd,
   resolveCwdMigrationsFile,
 } from './cwd-migrations.mjs';
+import {
+  MessageMediaError,
+  closeVerifiedMp4,
+  createVerifiedMp4Stream,
+  extractVisibleAssistantMp4Links,
+  openVerifiedMp4,
+  planMp4Response,
+} from './message-media.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -128,6 +136,12 @@ const LOCAL_FILE_ROOTS = String(process.env.CODEX_WEB_LOCAL_FILE_ROOTS || '')
   .filter(Boolean)
   .map((value) => resolveLocalPath(value, homedir()));
 const LOCAL_FILE_MAX_BYTES = 2 * 1024 * 1024;
+const MESSAGE_MEDIA_MAX_BYTES = (() => {
+  const megabytes = Number(process.env.CODEX_WEB_MESSAGE_MEDIA_MAX_MB || 1024);
+  if (!Number.isFinite(megabytes) || megabytes <= 0) return 1024 * 1024 * 1024;
+  return Math.max(1, Math.min(Math.floor(megabytes * 1024 * 1024), Number.MAX_SAFE_INTEGER));
+})();
+const MESSAGE_MEDIA_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
 
 loadEnv(CODEX_ENV_FILE, false);
 
@@ -1463,6 +1477,82 @@ app.get('/api/native-sessions/:id/tool-images/:seq/:index', requireAuth, (req, r
     res.type(image.type).send(image.data);
   } catch (err) {
     res.status(500).json({ error: `读取工具图片失败: ${err.message}` });
+  }
+});
+
+app.get('/api/native-sessions/:id/messages/:seq/videos/:index', requireAuth, (req, res) => {
+  let video = null;
+  try {
+    const threadId = cleanNativeThreadId(req.params.id);
+    const sequence = Number(req.params.seq);
+    const linkIndex = Number(req.params.index);
+    const generation = Number(req.query.generation);
+    if (
+      !threadId
+      || !Number.isSafeInteger(sequence)
+      || sequence < 1
+      || !Number.isSafeInteger(linkIndex)
+      || linkIndex < 1
+      || !Number.isSafeInteger(generation)
+      || generation < 1
+    ) {
+      return res.status(400).json({ error: '消息视频参数无效' });
+    }
+    if (Object.hasOwn(req.query, 'path') || Object.hasOwn(req.query, 'p')) {
+      return res.status(400).json({ error: '消息视频接口不接受文件路径' });
+    }
+
+    const conversation = nativeSessions.getVisibleConversation(threadId);
+    if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    if (generation !== conversation.generation) {
+      return res.status(404).json({ error: '消息视频记录已更新' });
+    }
+    const message = conversation.messages.find((item) => item.seq === sequence);
+    if (!message || message.role !== 'assistant') {
+      return res.status(404).json({ error: '消息视频不存在或未获授权' });
+    }
+    const filePath = extractVisibleAssistantMp4Links(message.content)[linkIndex - 1];
+    if (!filePath) return res.status(404).json({ error: '消息视频不存在或未获授权' });
+
+    video = openVerifiedMp4(filePath, { maxBytes: MESSAGE_MEDIA_MAX_BYTES });
+    const headRequest = req.method === 'HEAD';
+    const response = planMp4Response(headRequest ? null : req.headers.range, video.size);
+    res.set({
+      ...response.headers,
+      'Cache-Control': 'private, no-store',
+      'Content-Type': 'video/mp4',
+      'Cross-Origin-Resource-Policy': 'same-origin',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.status(response.statusCode);
+    if (response.statusCode === 416 || headRequest) {
+      closeVerifiedMp4(video);
+      video = null;
+      return res.end();
+    }
+
+    const stream = createVerifiedMp4Stream(video, response);
+    video = null;
+    res.setTimeout(MESSAGE_MEDIA_IDLE_TIMEOUT_MS, () => res.destroy());
+    stream.once('error', (error) => {
+      if (!res.headersSent && !res.destroyed) {
+        for (const header of ['Accept-Ranges', 'Content-Length', 'Content-Range', 'Content-Type']) {
+          res.removeHeader(header);
+        }
+        res.status(500).json({ error: '读取消息视频失败' });
+      }
+      else res.destroy(error);
+    });
+    res.once('close', () => stream.destroy());
+    stream.pipe(res);
+  } catch (err) {
+    if (video) {
+      try { closeVerifiedMp4(video); } catch {}
+    }
+    const status = err instanceof MessageMediaError ? err.statusCode : 500;
+    res.status(status).json({
+      error: status === 404 ? '消息视频不存在或未获授权' : '读取消息视频失败',
+    });
   }
 });
 
@@ -12983,6 +13073,7 @@ function renderSideChatMessages(messages,context={}){
   }
   const renderContext={
     threadId:String(context.threadId||sideChatThreadId||''),
+    generation:Number(context.generation)||0,
     activeTurnId:String(context.activeTurnId||''),
     running:Boolean(context.running),
     startedAt:String(context.startedAt||''),
@@ -13031,6 +13122,8 @@ function renderSideChatMessages(messages,context={}){
           at:message.at,
           turnId,
           nativeMessageSeq:Number.isInteger(Number(message.seq))&&Number(message.seq)>0?Number(message.seq):undefined,
+          messageMediaThreadId:renderContext.threadId,
+          messageMediaGeneration:renderContext.generation,
           browserTarget:message.browserTarget,
           actionThreadId:renderContext.threadId,
           scrollContainer:sideChatMessages,
@@ -13055,6 +13148,8 @@ function renderSideChatMessages(messages,context={}){
           at:message.at,
           turnId,
           nativeMessageSeq:Number.isInteger(Number(message.seq))&&Number(message.seq)>0?Number(message.seq):undefined,
+          messageMediaThreadId:renderContext.threadId,
+          messageMediaGeneration:renderContext.generation,
           streaming,
           actionThreadId:renderContext.threadId,
           scrollContainer:sideChatMessages,
@@ -13167,6 +13262,7 @@ async function syncSideChatConversation(options={}){
     sideChatActiveTurnId=String(conversation.activeTurnId||'');
     await renderSideChatMessages(messages,{
       threadId:syncId,
+      generation:conversation.generation,
       activeTurnId:sideChatActiveTurnId,
       running:sideChatRunning,
       startedAt:conversation.activeTurnStartedAt||conversation.updatedAt||'',
@@ -22391,7 +22487,7 @@ async function loadConversation(id,source='web',options={}){
     chat.replaceChildren();
     messages.forEach((msg,index)=>{
       if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
-      addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg),hydrating:true});
+      addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,messageMediaThreadId:currentConversationSource==='codex'?conversation.id:undefined,messageMediaGeneration:currentConversationSource==='codex'?conversation.generation:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg),hydrating:true});
     });
     if(restorePaint)beginConversationRestoring();
   }finally{
@@ -22848,7 +22944,7 @@ function refreshNativeResetImage(message){
   if(image.getAttribute('src')!==source)image.setAttribute('src',source);
   return true;
 }
-function reconcileNativeResetMessage(message){
+function reconcileNativeResetMessage(message,conversation=null){
   if(message?.role==='image')return refreshNativeResetImage(message);
   const existing=nativeMessageElementBySequence(message?.seq);
   if(!existing)return false;
@@ -22863,11 +22959,14 @@ function reconcileNativeResetMessage(message){
   if(message.responseAnnotations)rememberResponseAnnotationItems(message.turnId,message.responseAnnotations);
   const before=normalizeAssistantDedupeText(existing.dataset.messageText||'');
   const after=normalizeAssistantDedupeText(text);
+  const mediaContextChanged=message.role==='assistant'
+    ?setNativeMessageMediaContext(existing,conversation?.id||currentConversationId,conversation?.generation||nativeGeneration)
+    :false;
   existing.dataset.messageText=text;
   existing.dataset.messageKind=String(message.kind||'');
   existing.dataset.turnId=String(message.turnId||'');
   if(message.at)existing.dataset.messageAt=String(message.at);
-  if(existing._messageBody&&before!==after){
+  if(existing._messageBody&&(before!==after||mediaContextChanged)){
     if(message.role==='assistant')renderAssistantMarkdown(existing._messageBody,text);
     else if(message.role==='user'&&existing.classList.contains('browserCommentSteering'))renderBrowserCommentMessageBody(existing._messageBody,text);
     else if(message.role==='user')renderMessageMarkdown(existing._messageBody,automationInstructionDisplayText(text));
@@ -22898,7 +22997,7 @@ function nativeResetMessagesForIncrementalSync(conversation){
   for(const message of messages){
     const sequence=Number(message.seq);
     if(Number.isInteger(sequence)&&sequence>previousCursor){pending.push(message);continue}
-    if(reconcileNativeResetMessage(message))continue;
+    if(reconcileNativeResetMessage(message,conversation))continue;
     if(['assistant','user'].includes(message.role))pending.push(message);
   }
   return pending;
@@ -22975,10 +23074,10 @@ async function syncCurrentNativeConversationOnce(){
       upsertNativeSnapshotLiveMessage(msg,conversation,{renderImmediately:renderSnapshotImmediately});
       continue;
     }
-    if(role==='assistant'&&adoptRuntimeLiveForSnapshotMessage(msg)){
+    if(role==='assistant'&&adoptRuntimeLiveForSnapshotMessage(msg,conversation)){
       continue;
     }
-    addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg)})
+    addMsg(role,msg.content,{nativeMessageSeq:msg.seq,messageMediaThreadId:id,messageMediaGeneration:conversation.generation,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg)})
   }
   if(nativeForkMarkers[id])renderNativeForkDivider(syncMessages);
   nativeCursor=Number(conversation.cursor||nativeCursor);
@@ -23378,7 +23477,7 @@ function enhanceMarkdownImages(body){
   }
   flushRun(run);
 }
-function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
+function renderMessageMarkdown(body,text,{assistantArtifacts=false,messageMedia=null}={}){
   const rawSource=String(text||'');
   const memoryParsed=assistantArtifacts?extractMemoryCitations(rawSource):{markdown:rawSource,citations:[]};
   const parsed=assistantArtifacts?extractCodeComments(memoryParsed.markdown):{markdown:memoryParsed.markdown,comments:[]};
@@ -23405,6 +23504,7 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
   // Keep markdown HTML even if link/code enhancements fail.
   try{enhanceMarkdownLinks(body)}catch(e){}
   try{enhanceMarkdownImages(body)}catch(e){}
+  try{if(assistantArtifacts)enhanceMarkdownVideos(body,messageMedia,rawSource)}catch(e){}
   try{if(assistantArtifacts)enhanceMarkdownCodeBlocks(body)}catch(e){}
   if(inboxParsed.items.length)renderInboxItems(body,inboxParsed.items);
   if(parsed.comments.length)renderReviewComments(body,parsed.comments);
@@ -23842,9 +23942,9 @@ function automationInstructionDisplayText(text){
     return instructionText;
   }catch(e){return original}
 }
-function renderAssistantMarkdown(body,text,turnId=''){
+function renderAssistantMarkdown(body,text,turnId='',messageMedia=null){
   const displayText=stripNativeUiProtocolLines(automationHeartbeatDisplayText(text));
-  renderMessageMarkdown(body,displayText,{assistantArtifacts:true});
+  renderMessageMarkdown(body,displayText,{assistantArtifacts:true,messageMedia});
   const messageTurnId=String(turnId||body?.closest?.('.msg')?.dataset?.turnId||'');
   enhanceResponseAnnotationDirectives(body,responseAnnotationsForTurn(messageTurnId));
 }
@@ -23985,8 +24085,119 @@ function enhanceMarkdownLinks(body){
     decorateMarkdownLink(link, href.startsWith('http')?href:normalizeMarkdownUrl(href)||href);
   }
 }
+function normalizeMarkdownLocalVideoTarget(value){
+  const raw=String(value||'').trim();
+  if(!raw||markdownUtf8ByteLength(raw)>12288||!raw.startsWith('/')||raw.startsWith('//')||[0,10,13].some((code)=>raw.includes(String.fromCharCode(code)))||raw.includes('?')||raw.includes('#'))return'';
+  let decoded='';
+  try{decoded=decodeURIComponent(raw)}catch(e){return''}
+  if(!decoded.startsWith('/')||[0,10,13].some((code)=>decoded.includes(String.fromCharCode(code)))||decoded.includes('?')||decoded.includes('#')||markdownUtf8ByteLength(decoded)>4096)return'';
+  const segments=[];
+  for(const segment of decoded.split('/')){
+    if(!segment||segment==='.')continue;
+    if(segment==='..'){segments.pop();continue}
+    segments.push(segment);
+  }
+  const lexicalPath='/'+segments.join('/');
+  if(markdownUtf8ByteLength(lexicalPath)>4096)return'';
+  const basename=String(segments.at(-1)||'').toLowerCase();
+  return basename!=='.mp4'&&basename.endsWith('.mp4')?lexicalPath:'';
+}
+function markdownUtf8ByteLength(value){
+  let bytes=0;
+  for(const char of String(value||'')){
+    const code=char.codePointAt(0);
+    bytes+=code<=127?1:code<=2047?2:code<=65535?3:4;
+  }
+  return bytes;
+}
+function markdownLocalVideoTargets(source){
+  if(!window.marked?.lexer||!window.marked?.walkTokens)return[];
+  try{
+    const targets=[];
+    const tokens=window.marked.lexer(String(source||''));
+    window.marked.walkTokens(tokens,(token)=>{
+      if(token?.type!=='link')return;
+      const target=normalizeMarkdownLocalVideoTarget(token.href);
+      if(target)targets.push(target);
+    });
+    return targets;
+  }catch(e){return[]}
+}
+function setNativeMessageMediaContext(element,threadId,generation){
+  if(!element?.dataset)return false;
+  const cleanThreadId=String(threadId||'').trim();
+  const cleanGeneration=Number(generation);
+  const beforeThread=String(element.dataset.messageMediaThreadId||'');
+  const beforeGeneration=String(element.dataset.messageMediaGeneration||'');
+  if(cleanThreadId)element.dataset.messageMediaThreadId=cleanThreadId;
+  else delete element.dataset.messageMediaThreadId;
+  if(Number.isSafeInteger(cleanGeneration)&&cleanGeneration>0)element.dataset.messageMediaGeneration=String(cleanGeneration);
+  else delete element.dataset.messageMediaGeneration;
+  return beforeThread!==String(element.dataset.messageMediaThreadId||'')
+    ||beforeGeneration!==String(element.dataset.messageMediaGeneration||'');
+}
+function nativeMessageMediaContext(body,provided=null){
+  const message=body?.closest?.('.msg')||null;
+  const threadId=String(provided?.threadId||message?.dataset?.messageMediaThreadId||'').trim();
+  const sequence=Number(provided?.messageSeq??message?.dataset?.nativeMessageSeq);
+  const generation=Number(provided?.generation??message?.dataset?.messageMediaGeneration);
+  if(!threadId||!Number.isSafeInteger(sequence)||sequence<1||!Number.isSafeInteger(generation)||generation<1)return null;
+  return{threadId,messageSeq:sequence,generation};
+}
+function nativeMessageVideoUrl(context,linkIndex){
+  const clean=nativeMessageMediaContext(null,context);
+  const index=Number(linkIndex);
+  if(!clean||!Number.isSafeInteger(index)||index<1)return'';
+  return '/api/native-sessions/'+encodeURIComponent(clean.threadId)
+    +'/messages/'+clean.messageSeq+'/videos/'+index
+    +'?generation='+clean.generation;
+}
+function enhanceMarkdownVideos(body,providedContext=null,source=''){
+  if(!body)return;
+  const context=nativeMessageMediaContext(body,providedContext);
+  if(!context)return;
+  const targets=markdownLocalVideoTargets(source);
+  if(!targets.length)return;
+  const links=[...body.querySelectorAll('a[data-link-url]')];
+  let searchFrom=0;
+  targets.forEach((target,targetIndex)=>{
+    let link=null;
+    for(let index=searchFrom;index<links.length;index+=1){
+      if(normalizeMarkdownLocalVideoTarget(links[index].dataset.linkUrl)!==target)continue;
+      link=links[index];
+      searchFrom=index+1;
+      break;
+    }
+    if(!link)return;
+    const mediaUrl=nativeMessageVideoUrl(context,targetIndex+1);
+    if(!mediaUrl)return;
+    link.href=mediaUrl;
+    link.dataset.messageMediaUrl=mediaUrl;
+    link.classList.add('markdownLocalVideoLink');
+    link.removeAttribute('download');
+    const existing=link.nextElementSibling;
+    if(existing?.classList?.contains('markdownLocalVideo')){
+      const existingVideo=existing.querySelector(':scope > video');
+      if(existingVideo&&existingVideo.getAttribute('src')!==mediaUrl)existingVideo.src=mediaUrl;
+      return;
+    }
+    const wrap=document.createElement('span');
+    wrap.className='markdownLocalVideo';
+    const video=document.createElement('video');
+    video.controls=true;
+    video.playsInline=true;
+    video.setAttribute('playsinline','');
+    video.preload='metadata';
+    video.src=mediaUrl;
+    video.setAttribute('aria-label','播放 '+(String(link.textContent||'').trim()||'本地 MP4 视频'));
+    video.addEventListener('error',()=>wrap.classList.add('unavailable'));
+    wrap.appendChild(video);
+    link.after(wrap);
+  });
+}
 let chatLinkMenu=null;
 let chatLinkMenuUrl='';
+let chatLinkMenuOpenUrl='';
 function ensureChatLinkMenu(){
   if(chatLinkMenu)return chatLinkMenu;
   chatLinkMenu=document.createElement('div');
@@ -24028,10 +24239,12 @@ function hideChatLinkMenu(){
   if(!chatLinkMenu)return;
   chatLinkMenu.classList.add('hidden');
   chatLinkMenuUrl='';
+  chatLinkMenuOpenUrl='';
 }
-function showChatLinkMenu(clientX,clientY,url){
+function showChatLinkMenu(clientX,clientY,url,openUrl=''){
   const menu=ensureChatLinkMenu();
   chatLinkMenuUrl=String(url||'').trim();
+  chatLinkMenuOpenUrl=String(openUrl||'').trim();
   if(!chatLinkMenuUrl){hideChatLinkMenu();return}
   menu.classList.remove('hidden');
   const pad=8;
@@ -24062,6 +24275,7 @@ function insertTextIntoComposer(text){
 }
 async function handleChatLinkMenuAction(action){
   const url=chatLinkMenuUrl;
+  const openUrl=chatLinkMenuOpenUrl;
   hideChatLinkMenu();
   if(!url)return;
   if(action==='add'){
@@ -24075,7 +24289,7 @@ async function handleChatLinkMenuAction(action){
     return;
   }
   if(action==='open'){
-    window.open(markdownLocalFileProxyUrl(url)||url,'_blank','noopener,noreferrer');
+    window.open(openUrl||markdownLocalFileProxyUrl(url)||url,'_blank','noopener,noreferrer');
   }
 }
 function bindChatLinkContextMenu(){
@@ -24085,10 +24299,11 @@ function bindChatLinkContextMenu(){
     const link=event.target?.closest?.('a.markdownLink, .markdownBody a[href]');
     if(link&&chat.contains(link)){
       const href=String(link.dataset.linkUrl||link.getAttribute('href')||'').trim();
+      const openUrl=String(link.dataset.messageMediaUrl||'').trim();
       if(href&&!href.startsWith('#')&&!href.startsWith('javascript:')){
         event.preventDefault();
         event.stopPropagation();
-        showChatLinkMenu(event.clientX,event.clientY,href);
+        showChatLinkMenu(event.clientX,event.clientY,href,openUrl);
         return;
       }
     }
@@ -25005,7 +25220,11 @@ function appendSubagentTraceMessage(state,message,conversation){
     }
     const body=document.createElement('div');
     body.className='subagentTraceMarkdown';
-    renderAssistantMarkdown(body,message.content);
+    renderAssistantMarkdown(body,message.content,message.turnId,{
+      threadId:conversation.id,
+      messageSeq:Number(message.seq),
+      generation:Number(conversation.generation),
+    });
     node.appendChild(head);
     node.appendChild(body);
     node._subagentTraceLabel=label;
@@ -26845,6 +27064,7 @@ function createConversationMessageElement(role,text,options={}){
   el.dataset.messageAt=String(options.at||'');
   el.dataset.turnId=String(options.turnId||'');
   if(Number.isInteger(options.nativeMessageSeq))el.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+  if(role==='assistant')setNativeMessageMediaContext(el,options.messageMediaThreadId,options.messageMediaGeneration);
   if(browserCommentUser){el.classList.add('browserCommentSteering');el.dataset.browserTarget=String(options.browserTarget||'')}
   if(steeringUser){
     el.classList.add('steeringUser');
@@ -26887,7 +27107,11 @@ function createConversationMessageElement(role,text,options={}){
     const body=document.createElement('div');
     body.className='msgBody';
     if(browserCommentUser)renderBrowserCommentMessageBody(body,text);
-    else if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text,options.turnId);
+    else if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text,options.turnId,{
+      threadId:options.messageMediaThreadId,
+      messageSeq:options.nativeMessageSeq,
+      generation:options.messageMediaGeneration,
+    });
     else if(role==='user')renderMessageMarkdown(body,automationInstructionDisplayText(text));
     else body.textContent=terminalError?terminalErrorDisplayText(text):text;
     const actions=document.createElement('div');
@@ -27230,13 +27454,14 @@ function addMsg(role,text,options={}){
     const duplicate=findDuplicateAssistantBubble(text,options);
     if(duplicate){
       const targetText=String(text||'');
-      if(targetText&&normalizeAssistantDedupeText(duplicate.dataset.messageText||'')!==normalizeAssistantDedupeText(targetText)){
-        duplicate.dataset.messageText=targetText;
-        if(duplicate._messageBody)renderAssistantMarkdown(duplicate._messageBody,targetText);
-      }
+      const textChanged=Boolean(targetText&&normalizeAssistantDedupeText(duplicate.dataset.messageText||'')!==normalizeAssistantDedupeText(targetText));
       if(options.kind)duplicate.dataset.messageKind=String(options.kind);
       if(options.turnId)duplicate.dataset.turnId=String(options.turnId);
       if(Number.isInteger(options.nativeMessageSeq))duplicate.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+      const mediaContextChanged=setNativeMessageMediaContext(duplicate,options.messageMediaThreadId,options.messageMediaGeneration);
+      if(textChanged)duplicate.dataset.messageText=targetText;
+      const renderText=textChanged?targetText:String(duplicate.dataset.messageText||'');
+      if((textChanged||mediaContextChanged)&&duplicate._messageBody)renderAssistantMarkdown(duplicate._messageBody,renderText,options.turnId);
       if(options.at)duplicate.dataset.messageAt=String(options.at);
       if(options.kind==='final_answer'){
         duplicate.classList.remove('progressCommentary');
@@ -27462,7 +27687,7 @@ function findRuntimeLiveForSnapshotMessage(message){
   }
   return null;
 }
-function adoptRuntimeLiveForSnapshotMessage(message){
+function adoptRuntimeLiveForSnapshotMessage(message,conversation=null){
   const live=findRuntimeLiveForSnapshotMessage(message);
   if(!live?.element)return null;
   const targetText=nativeLiveDisplayText(message.content||'');
@@ -27481,6 +27706,7 @@ function adoptRuntimeLiveForSnapshotMessage(message){
     live.element.dataset.turnId=pausedTurnId;
     if(message.responseAnnotations)rememberResponseAnnotationItems(pausedTurnId,message.responseAnnotations);
     if(Number.isInteger(message.seq))live.element.dataset.nativeMessageSeq=String(message.seq);
+    setNativeMessageMediaContext(live.element,conversation?.id||currentConversationId,conversation?.generation||nativeGeneration);
     if(message.at)live.element.dataset.messageAt=String(message.at);
     return live.element;
   }
@@ -27492,6 +27718,7 @@ function adoptRuntimeLiveForSnapshotMessage(message){
   delete live.element.dataset.nativeLiveSource;
   if(message.responseAnnotations)rememberResponseAnnotationItems(pausedTurnId,message.responseAnnotations);
   if(Number.isInteger(message.seq))live.element.dataset.nativeMessageSeq=String(message.seq);
+  setNativeMessageMediaContext(live.element,conversation?.id||currentConversationId,conversation?.generation||nativeGeneration);
   if(message.at)live.element.dataset.messageAt=String(message.at);
   if(live.element._messageBody)renderAssistantMarkdown(live.element._messageBody,targetText);
   moveAssistantBubbleToMainChat(live.element,message.kind,targetText);
@@ -27565,7 +27792,7 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
   if(!targetText)return null;
   const cancelPending=nativeCancelPendingMatches(currentConversationId,message.turnId);
   // Prefer adopting the runtime stream bubble so live deltas and history never create twins.
-  const adopted=adoptRuntimeLiveForSnapshotMessage(message);
+  const adopted=adoptRuntimeLiveForSnapshotMessage(message,conversation);
   if(adopted){
     nativeRenderedMessageKeys.add(key);
     return null;
@@ -27596,7 +27823,7 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
   if(!live){
     if(nativeRenderedMessageKeys.has(key))return null;
     const followBottom=captureNativeLiveFollowBottom();
-    const element=addMsg('assistant','',{nativeMessageSeq:message.seq,turnId:message.turnId,autoTrackAgent:true,autoScroll:false,streaming:true,kind:message.kind,at:message.at,annotationCount:message.annotationCount,browserTarget:message.browserTarget,responseAnnotations:message.responseAnnotations,fileChanges:message.fileChanges});
+    const element=addMsg('assistant','',{nativeMessageSeq:message.seq,messageMediaThreadId:conversation.id,messageMediaGeneration:conversation.generation,turnId:message.turnId,autoTrackAgent:true,autoScroll:false,streaming:true,kind:message.kind,at:message.at,annotationCount:message.annotationCount,browserTarget:message.browserTarget,responseAnnotations:message.responseAnnotations,fileChanges:message.fileChanges});
     if(!element)return null;
     live={key,source:'snapshot',turnId:String(message.turnId||''),messageSeq:message.seq,role:'assistant',element,text:'',targetText:'',complete:true,renderTimer:null,followBottom};
     nativeLiveItems.set(key,live);
@@ -27605,6 +27832,7 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
   live.targetText=targetText;
   live.complete=true;
   if(Number.isInteger(message.seq))live.element.dataset.nativeMessageSeq=String(message.seq);
+  setNativeMessageMediaContext(live.element,conversation.id,conversation.generation);
   if(renderImmediately||!nativeLiveTypewriterEnabled())renderNativeLiveItemImmediately(live);
   else if(live.text.length<live.targetText.length)scheduleNativeLiveRender(live);else settleNativeLiveItem(live);
   return live;
