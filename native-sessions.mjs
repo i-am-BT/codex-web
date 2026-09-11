@@ -814,6 +814,19 @@ export class NativeSessionStore extends EventEmitter {
     return this.getConversationFromEntries(id, options, false);
   }
 
+  getVisibleConversation(id, options = {}) {
+    const threadId = String(id || '').trim().toLowerCase();
+    const conversation = this.get(threadId, options);
+    if (conversation) return conversation;
+    let entry = this.subagentEntries.get(threadId);
+    if (!entry) {
+      this.refresh();
+      entry = this.subagentEntries.get(threadId);
+    }
+    if (!entry) return null;
+    return this.getSubagent(entry.parentThreadId, entry.id, options);
+  }
+
   getThreadSource(id) {
     if (this.subagentThreads.has(id) || this.subagentEntries.has(id)) return 'subagent';
     const entry = this.entries.get(id);

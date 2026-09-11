@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer, request as createHttpRequest } from 'node:http';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -3332,6 +3332,10 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const toolImagePath = path.join(temporary, 'tool-preview.png');
   const svgImagePath = path.join(temporary, 'grok-preview.svg');
   const invalidSvgImagePath = path.join(temporary, 'not-really-svg.svg');
+  const nativeVideoPath = path.join(temporary, 'message-video.mp4');
+  const fakeNativeVideoPath = path.join(temporary, 'fake-message-video.mp4');
+  const linkedNativeVideoPath = path.join(temporary, 'linked-message-video.mp4');
+  const missingNativeVideoPath = path.join(temporary, 'missing-message-video.mp4');
   let externalImageRoot = '';
   let externalImagePath = '';
   let localFilePath = '';
@@ -3629,6 +3633,12 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     );
     await writeFile(svgImagePath, '<?xml version="1.0"?>\n<!-- Grok SVG -->\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8"/></svg>');
     await writeFile(invalidSvgImagePath, '<html><body>not an SVG image</body></html>');
+    await writeFile(
+      nativeVideoPath,
+      Buffer.from('000000186674797069736f6d0000000069736f6d6d7034320000002c6d6f6f76000000247472616b0000001c6d6469610000001468646c720000000000000000766964650000000c6d64617474657374', 'hex'),
+    );
+    await writeFile(fakeNativeVideoPath, 'not an MP4 file');
+    await symlink(nativeVideoPath, linkedNativeVideoPath);
     await writeFile(externalImagePath, await readFile(toolImagePath));
     await writeFile(localFilePath, '# AGENTS.md\n\nAllowed fixture file.\n');
     await writeFile(rejectedLocalFilePath, 'Not in the configured root.\n');
@@ -3777,6 +3787,25 @@ experimental_bearer_token = "switch-test-token"
           timestamp: '2026-07-11T04:52:31.997Z',
           type: 'response_item',
           payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{
+              type: 'output_text',
+              text: [
+                `::git-file{path="[hidden](${fakeNativeVideoPath})"}`,
+                `[play](${nativeVideoPath})`,
+                `[fake](${fakeNativeVideoPath})`,
+                `[linked](${linkedNativeVideoPath})`,
+                `[missing](${missingNativeVideoPath})`,
+              ].join('\n'),
+            }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:31.997Z',
+          type: 'response_item',
+          payload: {
             type: 'custom_tool_call',
             name: 'exec',
             call_id: 'false-tool-image-patch',
@@ -3884,6 +3913,16 @@ experimental_bearer_token = "switch-test-token"
           timestamp: '2026-07-11T04:52:35.004Z',
           type: 'response_item',
           payload: { type: 'function_call', call_id: 'subagent-call', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-11T04:52:35.500Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            phase: 'commentary',
+            content: [{ type: 'output_text', text: `子代理视频\n\n[play](${nativeVideoPath})` }],
+          },
         }),
         JSON.stringify({
           timestamp: '2026-07-11T04:52:36.000Z',
@@ -5903,6 +5942,7 @@ updated_at = 1784422800000
     assert.match(page, /async function boot\(selectRecent=false\)/);
     const inlineScript = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]).sort((a, b) => b.length - a.length)[0];
     assert.ok(inlineScript);
+    assert.doesNotThrow(() => new Function(inlineScript), 'served inline application script must compile');
     const codePreviewHelpers = inlineScript.match(/(function markdownCodeLanguage[\s\S]*?)(?=function enhanceMarkdownCodeBlocks)/)?.[1];
     assert.ok(codePreviewHelpers);
     const codePreviewApi = new Function(
@@ -6681,7 +6721,7 @@ updated_at = 1784422800000
     assert.match(inlineScript, /const longUser=role==='user'&&!steeringUser&&shouldCollapseUserMessage\(text\)/);
     assert.match(inlineScript, /if\(longUser\)bindLongUserMessage\(el,body,options\.scrollContainer\|\|chat\)/);
     assert.match(inlineScript, /function automationHeartbeatDisplayText\(text\)/);
-    assert.match(inlineScript, /const displayText=stripNativeUiProtocolLines\(automationHeartbeatDisplayText\(text\)\);\s*renderMessageMarkdown\(body,displayText,\{assistantArtifacts:true\}\)/);
+    assert.match(inlineScript, /const displayText=stripNativeUiProtocolLines\(automationHeartbeatDisplayText\(text\)\);\s*renderMessageMarkdown\(body,displayText,\{assistantArtifacts:true,messageMedia\}\)/);
     const heartbeatDisplayHelper = inlineScript.match(/(function automationHeartbeatDisplayText[\s\S]*?)(?=function automationInstructionDisplayText)/)?.[1];
     assert.ok(heartbeatDisplayHelper);
     class TestHeartbeatDOMParser {
@@ -8247,6 +8287,16 @@ updated_at = 1784422800000
     assert.ok(subagentConversation.messages.some((message) => message.content === '子代理正在检查界面'));
     assert.ok(subagentConversation.messages.some((message) => message.content.includes('exec_command')));
     assert.ok(subagentConversation.messages.some((message) => message.content === '子代理检查完成'));
+    const subagentVideoMessage = subagentConversation.messages.find((message) => (
+      message.role === 'assistant' && message.content.includes(`[play](${nativeVideoPath})`)
+    ));
+    assert.ok(subagentVideoMessage);
+    const subagentVideo = await fetch(
+      `${baseUrl}/api/native-sessions/${subagentNativeSessionId}/messages/${subagentVideoMessage.seq}/videos/1?generation=${subagentConversation.generation}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(subagentVideo.status, 200);
+    assert.deepEqual(Buffer.from(await subagentVideo.arrayBuffer()), await readFile(nativeVideoPath));
     const incrementalSubagentResponse = await fetch(
       `${baseUrl}/api/native-sessions/${nativeSessionId}/subagents?agent=%2Froot%2Fui_trace&after=${subagentConversation.cursor}&generation=${subagentConversation.generation}`,
       { headers: { Cookie: cookie } },
@@ -8274,6 +8324,66 @@ updated_at = 1784422800000
     assert.equal(nativeAssistantMessage.turnId, nativeFirstTurnId);
     assert.equal(nativeTargetMessage.turnId, nativeSecondTurnId);
     assert.equal(nativeTargetMessage.previousTurnId, nativeFirstTurnId);
+    const nativeVideoMessage = nativeConversation.messages.find((message) => (
+      message.role === 'assistant' && message.content.includes(`[play](${nativeVideoPath})`)
+    ));
+    assert.ok(nativeVideoMessage);
+    const nativeVideoUrl = `/api/native-sessions/${nativeSessionId}/messages/${nativeVideoMessage.seq}/videos/1?generation=${nativeConversation.generation}`;
+    assert.equal(nativeVideoUrl.includes(nativeVideoPath), false);
+    assert.equal(nativeVideoUrl.includes('path='), false);
+    const unauthorizedNativeVideo = await fetch(`${baseUrl}${nativeVideoUrl}`);
+    assert.equal(unauthorizedNativeVideo.status, 401);
+    const nativeVideo = await fetch(`${baseUrl}${nativeVideoUrl}`, { headers: { Cookie: cookie } });
+    assert.equal(nativeVideo.status, 200);
+    assert.equal(nativeVideo.headers.get('content-type'), 'video/mp4');
+    assert.equal(nativeVideo.headers.get('accept-ranges'), 'bytes');
+    assert.equal(nativeVideo.headers.get('cache-control'), 'private, no-store');
+    assert.equal(nativeVideo.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(nativeVideo.headers.get('cross-origin-resource-policy'), 'same-origin');
+    const nativeVideoBytes = await readFile(nativeVideoPath);
+    assert.deepEqual(Buffer.from(await nativeVideo.arrayBuffer()), nativeVideoBytes);
+    const rangedNativeVideo = await fetch(`${baseUrl}${nativeVideoUrl}`, {
+      headers: { Cookie: cookie, Range: 'bytes=8-15' },
+    });
+    assert.equal(rangedNativeVideo.status, 206);
+    assert.equal(rangedNativeVideo.headers.get('content-range'), `bytes 8-15/${nativeVideoBytes.length}`);
+    assert.equal(rangedNativeVideo.headers.get('content-length'), '8');
+    assert.deepEqual(Buffer.from(await rangedNativeVideo.arrayBuffer()), nativeVideoBytes.subarray(8, 16));
+    const headNativeVideo = await fetch(`${baseUrl}${nativeVideoUrl}`, {
+      method: 'HEAD',
+      headers: { Cookie: cookie, Range: 'bytes=8-15' },
+    });
+    assert.equal(headNativeVideo.status, 200);
+    assert.equal(headNativeVideo.headers.get('content-length'), String(nativeVideoBytes.length));
+    assert.equal(headNativeVideo.headers.get('content-range'), null);
+    assert.equal((await headNativeVideo.arrayBuffer()).byteLength, 0);
+    const unsatisfiedNativeVideo = await fetch(`${baseUrl}${nativeVideoUrl}`, {
+      headers: { Cookie: cookie, Range: 'bytes=0-1,4-5' },
+    });
+    assert.equal(unsatisfiedNativeVideo.status, 416);
+    assert.equal(unsatisfiedNativeVideo.headers.get('content-range'), `bytes */${nativeVideoBytes.length}`);
+    assert.equal((await unsatisfiedNativeVideo.arrayBuffer()).byteLength, 0);
+    const forgedNativeVideo = await fetch(`${baseUrl}${nativeVideoUrl}&path=${encodeURIComponent(localFilePath)}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(forgedNativeVideo.status, 400);
+    const staleNativeVideo = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/messages/${nativeVideoMessage.seq}/videos/1?generation=${nativeConversation.generation + 1}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(staleNativeVideo.status, 404);
+    const userMessageVideo = await fetch(
+      `${baseUrl}/api/native-sessions/${nativeSessionId}/messages/${nativeTargetMessage.seq}/videos/1?generation=${nativeConversation.generation}`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(userMessageVideo.status, 404);
+    for (const index of [2, 3, 4, 5]) {
+      const rejectedVideo = await fetch(
+        `${baseUrl}/api/native-sessions/${nativeSessionId}/messages/${nativeVideoMessage.seq}/videos/${index}?generation=${nativeConversation.generation}`,
+        { headers: { Cookie: cookie } },
+      );
+      assert.equal(rejectedVideo.status, 404, `video link ${index}`);
+    }
     assert.ok(nativeConversation.messages.some((message) => (
       message.role === 'image'
       && message.kind === 'input_image'

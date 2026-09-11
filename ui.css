@@ -14810,6 +14810,34 @@ body[data-chat-bg="skin"] .sideChatSend {
   object-position: center top;
 }
 
+.markdownBody .markdownLocalVideo,
+.msgBody.markdownBody .markdownLocalVideo,
+.subagentTraceMarkdown .markdownLocalVideo {
+  display: block;
+  width: min(720px, 100%);
+  margin: 10px 0 14px;
+}
+.markdownBody .markdownLocalVideo video,
+.msgBody.markdownBody .markdownLocalVideo video,
+.subagentTraceMarkdown .markdownLocalVideo video {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+  border-radius: 8px;
+  background: #000;
+  object-fit: contain;
+}
+.markdownBody .markdownLocalVideo.unavailable::after,
+.subagentTraceMarkdown .markdownLocalVideo.unavailable::after {
+  content: '视频暂时无法加载，可点击上方链接重试';
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* Standalone image messages also use compact thumbs; click still opens preview */
 body[data-theme] .msg.image:not(.inputImage) {
   width: fit-content;
