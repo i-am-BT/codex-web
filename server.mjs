@@ -10819,7 +10819,7 @@ body[data-theme="light"]{background:linear-gradient(135deg,#f8fbff,#edf2f7)}body
 body[data-chat-bg="default"] .chat{background:transparent}body[data-chat-bg="plain"] .chat{background:var(--bg)}body[data-chat-bg="paper"] .chat{background:#f4ecd8;color:#1f2937}body[data-chat-bg="paper"] .chat .empty,body[data-chat-bg="paper"] .chat .meta{color:#725f43}body[data-chat-bg="grid"] .chat{background-color:var(--bg);background-image:linear-gradient(rgba(106,168,255,.11) 1px,transparent 1px),linear-gradient(90deg,rgba(106,168,255,.11) 1px,transparent 1px);background-size:28px 28px}body[data-chat-bg="custom"] .chat{background-color:var(--bg);background-image:var(--custom-chat-bg);background-size:cover;background-position:center;background-repeat:no-repeat}body[data-theme="light"][data-chat-bg="grid"] .chat{background-image:linear-gradient(rgba(37,99,235,.12) 1px,transparent 1px),linear-gradient(90deg,rgba(37,99,235,.12) 1px,transparent 1px)}body[data-theme="light"][data-chat-bg="paper"] .chat{background:#f7efd9}
 @media(min-width:821px){.app{display:block;height:100vh;overflow:hidden}.side{position:fixed;left:0;top:0;bottom:0;width:292px;height:100vh;z-index:10}.main{margin-left:292px;height:100vh}}
 </style>
-<link rel="stylesheet" href="/ui.css?v=manual-provider-models-20260905a">
+<link rel="stylesheet" href="/ui.css?v=provider-model-picker-20260912a">
   <link rel="stylesheet" href="/image-prompt.css?v=top-context-padding-20260801b">
 <script>
 (()=>{try{
@@ -10896,7 +10896,8 @@ jumpToLatest.appendChild(jumpToLatestDots);
 composer?.before(jumpToLatest);
 const dropZone = document.getElementById('dropZone'), attachFile = document.getElementById('attachFile'), fileInput = document.getElementById('fileInput'), attachmentTray = document.getElementById('attachmentTray');
 const provider = document.getElementById('provider'), model = document.getElementById('model'), reasoningEffort = document.getElementById('reasoningEffort'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');
-let newProviderModelRows = null, newProviderModelList = null, addProviderModelButton = null;
+let newProviderModelRows = null, addProviderModelButton = null;
+let newProviderModelSuggestions = [], activeProviderModelPicker = null, providerModelPickerSequence = 0;
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
 const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
 const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
@@ -17787,6 +17788,7 @@ function openSettings({returnFocus=settingsToggle,focusTarget=settingsClose}={})
 }
 function closeSettings(){
   if(!settingsOverlay||settingsOverlay.classList.contains('hidden'))return;
+  closeNewProviderModelPicker();
   settingsOverlay.classList.add('hidden');
   syncModalOpenState();
   settingsToggle.setAttribute('aria-expanded','false');
@@ -19094,6 +19096,114 @@ function renderSubQuotaEmpty(message,status=''){
   delete subQuotaStatus.dataset.state;
   subQuotaStatus.textContent=status;
 }
+function closeNewProviderModelPicker(){
+  activeProviderModelPicker?.close();
+  activeProviderModelPicker=null;
+}
+function createNewProviderModelPicker(field){
+  const wrapper=document.createElement('div');
+  wrapper.className='providerModelPicker';
+  const toggle=document.createElement('button');
+  toggle.type='button';
+  toggle.className='providerModelToggle';
+  toggle.title='显示全部已获取模型';
+  toggle.setAttribute('aria-label','显示全部已获取模型');
+  toggle.setAttribute('aria-haspopup','listbox');
+  const list=document.createElement('div');
+  list.id='provider-model-options-'+(++providerModelPickerSequence);
+  list.className='providerModelOptions';
+  list.setAttribute('role','listbox');
+  list.setAttribute('aria-label','已获取模型');
+  list.hidden=true;
+  field.setAttribute('role','combobox');
+  field.setAttribute('aria-autocomplete','list');
+  field.setAttribute('aria-controls',list.id);
+  toggle.setAttribute('aria-controls',list.id);
+  let visible=[],activeIndex=-1,query='';
+  const setActive=(index)=>{
+    activeIndex=index;
+    [...list.querySelectorAll('[role="option"]')].forEach((option,i)=>option.classList.toggle('active',i===index));
+    const option=list.children[index];
+    if(option&&visible[index]!==undefined){
+      field.setAttribute('aria-activedescendant',option.id);
+      option.scrollIntoView({block:'nearest'});
+    }else field.removeAttribute('aria-activedescendant');
+  };
+  const close=()=>{
+    list.hidden=true;
+    field.setAttribute('aria-expanded','false');
+    toggle.setAttribute('aria-expanded','false');
+    field.removeAttribute('aria-activedescendant');
+    activeIndex=-1;
+  };
+  const choose=(value)=>{
+    field.value=value;
+    closeNewProviderModelPicker();
+    field.focus();
+    field.dispatchEvent(new Event('change',{bubbles:true}));
+  };
+  const render=()=>{
+    visible=newProviderModelSuggestions.filter((value)=>value.toLowerCase().includes(query));
+    list.replaceChildren();
+    for(const [index,value] of visible.entries()){
+      const option=document.createElement('div');
+      option.id=list.id+'-'+index;
+      option.className='providerModelOption';
+      option.setAttribute('role','option');
+      option.setAttribute('aria-selected',String(value===field.value));
+      option.textContent=value;
+      option.addEventListener('click',()=>choose(value));
+      list.appendChild(option);
+    }
+    if(!visible.length){
+      const empty=document.createElement('div');
+      empty.className='providerModelEmpty';
+      empty.setAttribute('role','status');
+      empty.textContent=newProviderModelSuggestions.length?'无匹配模型，可直接使用手动输入的名称':'暂无候选模型，请先获取模型或手动输入';
+      list.appendChild(empty);
+    }
+    setActive(-1);
+  };
+  const picker={close,refresh:()=>{if(!list.hidden)render()}};
+  const open=(filter='')=>{
+    if(activeProviderModelPicker!==picker)closeNewProviderModelPicker();
+    activeProviderModelPicker=picker;
+    query=String(filter).toLowerCase();
+    render();
+    list.hidden=false;
+    field.setAttribute('aria-expanded','true');
+    toggle.setAttribute('aria-expanded','true');
+  };
+  toggle.addEventListener('click',()=>{
+    const closeOnly=!list.hidden&&query==='';
+    field.focus();
+    if(closeOnly)closeNewProviderModelPicker();else open();
+  });
+  field.addEventListener('input',()=>open(field.value.trim()));
+  field.addEventListener('click',()=>open());
+  wrapper.addEventListener('keydown',(event)=>{
+    if(event.isComposing)return;
+    if(event.key==='Escape'&&!list.hidden){
+      event.preventDefault();event.stopPropagation();closeNewProviderModelPicker();return;
+    }
+    if(event.key==='Tab'){if(activeProviderModelPicker===picker)closeNewProviderModelPicker();return}
+    if(event.target!==field)return;
+    if(event.key==='ArrowDown'||event.key==='ArrowUp'){
+      event.preventDefault();
+      if(list.hidden)open();
+      if(visible.length)setActive(activeIndex<0?(event.key==='ArrowDown'?0:visible.length-1):(activeIndex+(event.key==='ArrowDown'?1:-1)+visible.length)%visible.length);
+    }else if(event.key==='Enter'&&!list.hidden){
+      event.preventDefault();
+      if(activeIndex>=0)choose(visible[activeIndex]);else closeNewProviderModelPicker();
+    }
+  });
+  // Keep input focus while selecting with a mouse; touch scrolling stays native.
+  list.addEventListener('mousedown',(event)=>event.preventDefault());
+  wrapper.append(field,toggle,list);
+  setIconLabel(toggle,'chevron-down','',false);
+  close();
+  return wrapper;
+}
 function syncNewProviderModelRowLabels(){
   const rows=[...(newProviderModelRows?.querySelectorAll('.providerModelRow')||[])];
   rows.forEach((row,index)=>{
@@ -19118,7 +19228,6 @@ function addNewProviderModelRow(value=''){
   row.className='providerModelRow';
   const field=document.createElement('input');
   field.className='newProviderModelInput';
-  field.setAttribute('list','newProviderModelList');
   field.placeholder='例如 gpt-5.6-sol';
   field.autocomplete='off';
   field.spellcheck=false;
@@ -19128,12 +19237,13 @@ function addNewProviderModelRow(value=''){
   remove.type='button';
   remove.className='miniDanger providerModelRemove';
   remove.addEventListener('click',()=>{
+    closeNewProviderModelPicker();
     const rows=newProviderModelRows.querySelectorAll('.providerModelRow');
     if(rows.length<=1){field.value='';field.focus();return}
     row.remove();
     syncNewProviderModelRowLabels();
   });
-  row.append(field,remove);
+  row.append(createNewProviderModelPicker(field),remove);
   newProviderModelRows.appendChild(row);
   setIconLabel(remove,'x','删除模型',false);
   syncNewProviderModelRowLabels();
@@ -19141,19 +19251,15 @@ function addNewProviderModelRow(value=''){
 }
 function setNewProviderModels(models){
   if(!newProviderModelRows)return;
+  closeNewProviderModelPicker();
   const values=[...new Set((models||[]).map((item)=>String(item||'').trim()).filter(Boolean))].slice(0,50);
   newProviderModelRows.replaceChildren();
   if(!values.length)addNewProviderModelRow('');
   else for(const value of values)addNewProviderModelRow(value);
 }
 function setNewProviderModelSuggestions(models){
-  if(!newProviderModelList)return;
-  newProviderModelList.replaceChildren();
-  for(const value of [...new Set((models||[]).map((item)=>String(item||'').trim()).filter(Boolean))]){
-    const option=document.createElement('option');
-    option.value=value;
-    newProviderModelList.appendChild(option);
-  }
+  newProviderModelSuggestions=[...new Set((models||[]).map((item)=>String(item||'').trim()).filter(Boolean))];
+  activeProviderModelPicker?.refresh();
 }
 function resetNewProviderModelRows(){
   setNewProviderModels([]);
@@ -19167,8 +19273,6 @@ function enhanceProviderModelEditor(){
   const rows=document.createElement('div');
   rows.id='newProviderModelRows';
   rows.className='providerModelRows';
-  const list=document.createElement('datalist');
-  list.id='newProviderModelList';
   const actions=document.createElement('div');
   actions.className='providerModelActions';
   const add=document.createElement('button');
@@ -19179,13 +19283,16 @@ function enhanceProviderModelEditor(){
   newProviderModel.replaceWith(rows);
   actions.appendChild(add);
   if(fetchButton)actions.appendChild(fetchButton);
-  field.append(list,actions);
+  field.append(actions);
   newProviderModelRows=rows;
-  newProviderModelList=list;
   addProviderModelButton=add;
   addProviderModelButton.addEventListener('click',()=>addNewProviderModelRow('')?.focus());
   setIconLabel(addProviderModelButton,'plus','添加模型');
   resetNewProviderModelRows();
+  // Closing on pointerdown/blur can move the clicked control before pointerup.
+  document.addEventListener('click',(event)=>{
+    if(!event.target.closest?.('.providerModelPicker'))closeNewProviderModelPicker();
+  });
 }
 function enhanceInterface(){
   const sideBrand=document.querySelector('.side > div:first-child');

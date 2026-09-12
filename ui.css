@@ -4597,7 +4597,7 @@ body[data-theme="light"] .settingsDialog .passwordSettings.settingsCard {
 .settingsDialog .providerModelRow {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 42px;
-  align-items: stretch;
+  align-items: start;
   gap: 8px;
   min-width: 0;
 }
@@ -4605,6 +4605,84 @@ body[data-theme="light"] .settingsDialog .passwordSettings.settingsCard {
 .settingsDialog .providerModelRow .newProviderModelInput {
   width: 100%;
   min-width: 0;
+  padding-right: 44px;
+  grid-area: 1 / 1;
+}
+
+.settingsDialog .providerModelPicker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+
+.settingsDialog .providerModelToggle {
+  grid-area: 1 / 1;
+  justify-self: end;
+  align-self: stretch;
+  z-index: 1;
+  width: 42px;
+  min-height: 42px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.settingsDialog .providerModelToggle:hover,
+.settingsDialog .providerModelToggle:focus-visible {
+  background: var(--surface-hover);
+}
+
+.settingsDialog .providerModelToggle .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.settingsDialog .providerModelOptions {
+  max-height: 220px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin-top: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.settingsDialog .providerModelOptions[hidden] {
+  display: none;
+}
+
+.settingsDialog .providerModelOption,
+.settingsDialog .providerModelEmpty {
+  padding: 10px;
+  min-height: 40px;
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.settingsDialog .providerModelOption {
+  cursor: pointer;
+}
+
+.settingsDialog .providerModelOption:hover,
+.settingsDialog .providerModelOption.active {
+  background: var(--surface-hover);
+}
+
+.settingsDialog .providerModelOption[aria-selected="true"] {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.settingsDialog .providerModelEmpty {
+  color: var(--text-muted);
 }
 
 .settingsDialog .providerModelRemove {
