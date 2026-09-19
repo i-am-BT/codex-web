@@ -7,6 +7,21 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { NativeSessionStore } from '../native-sessions.mjs';
 
+test('native session store uses a five-second fallback poll by default', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-poll-'));
+  const codexHome = path.join(temporary, '.codex');
+  let store;
+
+  try {
+    await mkdir(codexHome, { recursive: true });
+    store = new NativeSessionStore(codexHome, { watchChanges: false });
+    assert.equal(store.pollIntervalMs, 5000);
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test('Codex App global state changes emit a completion-read-only event', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-completion-read-'));
   const codexHome = path.join(temporary, '.codex');

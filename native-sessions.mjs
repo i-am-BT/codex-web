@@ -28,7 +28,7 @@ const DEFAULT_TURN_START_SCAN_BYTES = 32 * 1024 * 1024;
 const TURN_START_RECORD_LIMIT_BYTES = 256 * 1024;
 const DEFAULT_MAX_MESSAGES = 0;
 const DEFAULT_MAX_SESSIONS = 100;
-const DEFAULT_POLL_INTERVAL_MS = 1000;
+const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_RUNNING_WINDOW_MS = 6 * 60 * 60 * 1000;
 const HISTORY_PAGE_TURN_HINT_COUNT = 2;
 const HISTORY_PAGE_TURN_TAIL_LIMIT = 60;
@@ -77,6 +77,7 @@ export class NativeSessionStore extends EventEmitter {
     this.sessionMetadataCache = new Map();
     this.indexStamp = '';
     this.globalStateStamp = null;
+    this.globalStateSnapshot = null;
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
     this.projectThreadIds = new Set();
@@ -105,16 +106,16 @@ export class NativeSessionStore extends EventEmitter {
       try {
         this.watcher = watch(this.codexHome, { recursive: true }, (_eventType, filename) => {
           const relative = String(filename || '').replace(/\\/g, '/');
+          // SQLite shared-memory files churn during ordinary reads/writes and do not
+          // represent durable state changes. Watching the database and WAL is enough.
           if (
             relative
             && relative !== '.codex-global-state.json'
             && relative !== 'session_index.jsonl'
             && relative !== 'state_5.sqlite'
             && relative !== 'state_5.sqlite-wal'
-            && relative !== 'state_5.sqlite-shm'
             && relative !== 'goals_1.sqlite'
             && relative !== 'goals_1.sqlite-wal'
-            && relative !== 'goals_1.sqlite-shm'
             && !relative.startsWith('sessions/')
           ) return;
           this.scheduleRefresh();
@@ -209,12 +210,16 @@ export class NativeSessionStore extends EventEmitter {
     } catch {}
     const completionReadStateChanged = this.globalStateStamp !== null
       && this.globalStateStamp !== globalStateStamp;
-    this.globalStateStamp = globalStateStamp;
 
-    let state = null;
-    try {
-      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
-    } catch {}
+    let state = this.globalStateSnapshot;
+    if (this.globalStateStamp !== globalStateStamp) {
+      state = null;
+      try {
+        state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      } catch {}
+      this.globalStateSnapshot = state;
+      this.globalStateStamp = globalStateStamp;
+    }
 
     const previousPinnedThreadIds = this.pinnedThreadIds;
     if (state && typeof state === 'object' && !Array.isArray(state)) {
