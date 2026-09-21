@@ -14,6 +14,24 @@ const rawInlineScript = (() => {
 })();
 const inlineScript = rawInlineScript.replaceAll('\\\\', '\\');
 
+test('boot defers resume sync and flushes session changes after loading', async () => {
+  const start=serverSource.indexOf('async function boot(selectRecent=false)');
+  const end=serverSource.indexOf('async function bootContent(',start);
+  const source=serverSource.slice(start,end);
+  let complete;
+  const ready=new Promise(resolve=>{complete=resolve});
+  let syncs=0;
+  const factory=new Function('bootContent','scheduleChangedNativeSessionSync',
+    'let pageBootPending=false;const nativeSyncChangedIds=new Set(["changed"]);let historyRefreshPending=false;const syncHistoryCompletionReadFromServer=()=>{};'+source+';return {boot,pending:()=>pageBootPending};');
+  const state=factory(()=>ready,()=>{syncs++});
+  const loading=state.boot(true);
+  assert.equal(state.pending(),true);
+  assert.equal(syncs,0);
+  complete();await loading;
+  assert.equal(state.pending(),false);
+  assert.equal(syncs,1);
+});
+
 function sourceBetween(start, end) {
   const source = inlineScript.match(new RegExp(`(${start}[\\s\\S]*?)(?=${end})`))?.[1];
   assert.ok(source, `missing helper source: ${start}`);
@@ -186,6 +204,15 @@ test('opening the unread popover does not mark a completion as read', () => {
   );
 });
 
+test('unread popover exposes a mark-all-read action', () => {
+  assert.match(unreadPopoverSource, /markAll\.className='historyUnreadMarkAll'/);
+  assert.match(unreadPopoverSource, /markAll\.textContent='全部已读'/);
+  assert.match(unreadPopoverSource, /markAll\.disabled=unread\.length===0/);
+  assert.match(unreadPopoverSource, /markAllHistoryCompletionRead\(unread\)/);
+  assert.match(inlineScript, /function markAllHistoryCompletionRead\(items=historyUnreadItems\(\)\)/);
+  assert.match(uiStyles, /\.historyUnreadMarkAll\s*\{/);
+});
+
 test('Codex App read sync requires an unread-to-read transition', () => {
   assert.ok(removedCodexAppUnreadSource);
   assert.ok(syncCodexAppUnreadSource);
@@ -228,6 +255,21 @@ test('Codex App read sync requires an unread-to-read transition', () => {
   assert.equal(writes.length, 1);
 });
 
+test('App read snapshot repairs missed transitions without clearing newer completions', () => {
+  const unread = new Set(['still-unread']);
+  unread.snapshotAt = Date.parse('2026-09-07T10:00:00Z');
+  const api = new Function('readCodexAppUnreadThreadIds','nativeSessionSummaries','cleanNativeThreadId','serverHistoryCompletionVersion','selectServerHistoryCompletionReadVersion','writeHistoryCompletionReadFile',
+    `let lastCodexAppUnreadThreadIds=new Set();let serverHistoryCompletionRead={};${removedCodexAppUnreadSource}\n${syncCodexAppUnreadSource}\nreturn {syncServerHistoryCompletionReadFromCodexApp,read:()=>serverHistoryCompletionRead};`)(
+    ()=>unread,
+    ()=>[
+      {id:'already-read',status:'done',updatedAt:'2026-09-07T09:00:00Z'},
+      {id:'still-unread',status:'done',updatedAt:'2026-09-07T09:00:00Z'},
+      {id:'just-completed',status:'done',updatedAt:'2026-09-07T10:01:00Z'},
+    ],String,item=>item.status+'|'+item.updatedAt,(_old,next)=>next,()=>{});
+  assert.equal(api.syncServerHistoryCompletionReadFromCodexApp(),true);
+  assert.deepEqual(Object.keys(api.read()),['codex:already-read']);
+});
+
 test('a stale server sync cannot revive a completion dot after it was clicked', async () => {
   const storage = new Map();
   const localStorage = {
@@ -267,6 +309,7 @@ test('a stale server sync cannot revive a completion dot after it was clicked', 
      let historyCompletionPushTimer=null;
      let historyCompletionSyncTimer=null;
      let historyCompletionSyncInFlight=null;
+     let historyCompletionSyncQueued=false;
      ${completionStateSource}
      return {
        trackHistoryCompletionState,
@@ -535,9 +578,10 @@ test('session events coalesce native sync and avoid completion sound playback', 
 
 test('history completion read sync is single-flight and delayed during session churn', () => {
   assert.match(inlineScript, /let historyCompletionSyncInFlight=null/);
-  assert.match(completionStateSource, /if\(historyCompletionSyncInFlight\)return historyCompletionSyncInFlight/);
+  assert.match(completionStateSource, /if\(historyCompletionSyncInFlight\)\{historyCompletionSyncQueued=true;return historyCompletionSyncInFlight\}/);
   assert.match(completionStateSource, /function scheduleHistoryCompletionReadSync\(delay=HISTORY_COMPLETION_SYNC_DELAY_MS\)/);
-  assert.match(completionStateSource, /if\(historyCompletionSyncTimer\|\|historyCompletionSyncInFlight\)return/);
+  assert.match(completionStateSource, /if\(historyCompletionSyncInFlight\)\{historyCompletionSyncQueued=true;return\}/);
+  assert.match(completionStateSource, /if\(historyCompletionSyncQueued\)scheduleHistoryCompletionReadSync\(0\)/);
 });
 
 test('project headers can start a new task in the current project path', () => {

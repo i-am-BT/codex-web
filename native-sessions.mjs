@@ -13,6 +13,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { estimateTokenCost } from './cycle-usage.mjs';
 
 const SESSION_UUID_SOURCE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const SESSION_ID_PATTERN = new RegExp(`(${SESSION_UUID_SOURCE})\\.jsonl$`, 'i');
@@ -27,7 +28,7 @@ const DEFAULT_TURN_START_SCAN_BYTES = 32 * 1024 * 1024;
 const TURN_START_RECORD_LIMIT_BYTES = 256 * 1024;
 const DEFAULT_MAX_MESSAGES = 0;
 const DEFAULT_MAX_SESSIONS = 100;
-const DEFAULT_POLL_INTERVAL_MS = 1000;
+const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_RUNNING_WINDOW_MS = 6 * 60 * 60 * 1000;
 const HISTORY_PAGE_TURN_HINT_COUNT = 2;
 const HISTORY_PAGE_TURN_TAIL_LIMIT = 60;
@@ -38,6 +39,8 @@ const TOOL_FILE_CHANGE_LIMIT = 200;
 const TOOL_FILE_PATH_LIMIT = 2048;
 const APP_THREAD_SOURCES = new Set(['vscode', 'appServer', 'app_server']);
 const TURN_TERMINAL_PROCESS_KINDS = new Set(['task_complete', 'task_error', 'turn_aborted', 'error']);
+const CAPACITY_ERROR_RE = /selected model is at capacity/i;
+const TRANSIENT_PROVIDER_LIMIT_RE = /usage limit|quota exceeded|insufficient quota|too many requests|rate limit|high demand|selected model is at capacity|(^|\D)429(\D|$)/i;
 
 export class NativeSessionStore extends EventEmitter {
   constructor(codexHome, options = {}) {
@@ -76,6 +79,7 @@ export class NativeSessionStore extends EventEmitter {
     this.sessionMetadataCache = new Map();
     this.indexStamp = '';
     this.globalStateStamp = null;
+    this.globalStateSnapshot = null;
     this.workspaceStateAvailable = false;
     this.projectlessThreadIds = new Set();
     this.projectThreadIds = new Set();
@@ -104,16 +108,16 @@ export class NativeSessionStore extends EventEmitter {
       try {
         this.watcher = watch(this.codexHome, { recursive: true }, (_eventType, filename) => {
           const relative = String(filename || '').replace(/\\/g, '/');
+          // SQLite shared-memory files churn during ordinary reads/writes and do not
+          // represent durable state changes. Watching the database and WAL is enough.
           if (
             relative
             && relative !== '.codex-global-state.json'
             && relative !== 'session_index.jsonl'
             && relative !== 'state_5.sqlite'
             && relative !== 'state_5.sqlite-wal'
-            && relative !== 'state_5.sqlite-shm'
             && relative !== 'goals_1.sqlite'
             && relative !== 'goals_1.sqlite-wal'
-            && relative !== 'goals_1.sqlite-shm'
             && !relative.startsWith('sessions/')
           ) return;
           this.scheduleRefresh();
@@ -208,12 +212,16 @@ export class NativeSessionStore extends EventEmitter {
     } catch {}
     const completionReadStateChanged = this.globalStateStamp !== null
       && this.globalStateStamp !== globalStateStamp;
-    this.globalStateStamp = globalStateStamp;
 
-    let state = null;
-    try {
-      state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
-    } catch {}
+    let state = this.globalStateSnapshot;
+    if (this.globalStateStamp !== globalStateStamp) {
+      state = null;
+      try {
+        state = JSON.parse(readFileSync(this.globalStateFile, 'utf8'));
+      } catch {}
+      this.globalStateSnapshot = state;
+      this.globalStateStamp = globalStateStamp;
+    }
 
     const previousPinnedThreadIds = this.pinnedThreadIds;
     if (state && typeof state === 'object' && !Array.isArray(state)) {
@@ -1618,6 +1626,16 @@ function applyMetadataRecord(cache, record) {
   }
 }
 
+function collapsePreviousCapacityErrors(cache) {
+  const before = cache.messages.length;
+  cache.messages = cache.messages.filter((message) => !(
+    message?.role === 'process'
+    && ['task_error', 'error', 'turn_aborted'].includes(String(message?.kind || ''))
+    && CAPACITY_ERROR_RE.test(String(message?.content || ''))
+  ));
+  if (cache.messages.length !== before) cache.contentMutated = true;
+}
+
 function applyEventRecord(cache, record, payload, maxMessages, store = null) {
   const turnId = String(payload.turn_id || payload.turnId || '');
   if (turnId) cache.latestTurnId = turnId;
@@ -1625,6 +1643,7 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
     cache.activeTaskTurnId = turnId;
     updateNativeTurnId(cache, turnId, true);
     cache.currentTurnTokenUsage = null;
+    cache.currentTurnTokenUsageDetails = null;
     cache.currentTurnTokenUsageBaseline = tokenUsageBaseline(cache.latestTotalTokenUsage);
     cache.currentTurnFallbackTokenUsage = null;
     const contextWindowTokens = normalizeContextTokenCount(payload.model_context_window);
@@ -1684,11 +1703,13 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
     case 'task_complete': {
       const errorMessage = nativeEventErrorMessage(payload.error);
       if (errorMessage) {
-        const pauseLike = /usage limit|quota exceeded|insufficient quota|too many requests|rate limit|high demand|(^|\D)429(\D|$)/i.test(errorMessage);
+        const pauseLike = TRANSIENT_PROVIDER_LIMIT_RE.test(errorMessage);
         cache.status = pauseLike ? 'interrupted' : 'error';
         restoreRolledBackRetryAssistant(cache, maxMessages);
+        if (CAPACITY_ERROR_RE.test(errorMessage)) collapsePreviousCapacityErrors(cache);
         appendNativeMessage(cache, 'process', errorMessage, record, maxMessages, pauseLike ? 'turn_aborted' : 'task_error', {
           ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+          ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
         });
         break;
       }
@@ -1701,15 +1722,31 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
       const content = Number.isFinite(duration) ? `任务完成，耗时 ${(duration / 1000).toFixed(1)}s` : '任务完成';
       appendNativeMessage(cache, 'process', content, record, maxMessages, payload.type, {
         ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+        ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
       });
       break;
     }
     case 'token_count': {
+      const previousDetails = cache.currentTurnTokenUsageDetails;
       updateCurrentTurnTokenUsage(
         cache,
         payload.info?.last_token_usage,
         payload.info?.total_token_usage,
       );
+      const snapshot = normalizeTurnTokenUsageSnapshot(payload.info?.total_token_usage)
+        || normalizeTurnTokenUsageSnapshot(payload.info?.last_token_usage);
+      if (snapshot && cache.currentTurnTokenUsage) {
+        const models = [...new Set([...(previousDetails?.models || []), String(cache.metadata?.model || '')])];
+        const fields = [...snapshot.fields].filter(field => !previousDetails || previousDetails.fields.includes(field));
+        const value = field => fields.includes(field) ? cache.currentTurnTokenUsage[field] : null;
+        const input = value('inputTokens'), cached = value('cachedInputTokens'), output = value('outputTokens');
+        cache.currentTurnTokenUsageDetails = {
+          models, fields, inputTokens: input, outputTokens: output, cachedInputTokens: cached,
+          cacheHitPercent: input > 0 && cached !== null && cached <= input ? cached / input * 100 : null,
+          estimatedUsd: models.length === 1 ? estimateTokenCost(models[0], input, cached, output) : null,
+          pricingBasis: '标准短上下文 API 等价估算，非实际扣费；不含加速、长上下文、缓存写入及工具附加费用',
+        };
+      }
       const contextUsedTokens = normalizeContextUsedTokens(payload.info?.last_token_usage);
       if (contextUsedTokens !== null) cache.contextUsedTokens = contextUsedTokens;
       const contextWindowTokens = normalizeContextTokenCount(
@@ -1728,14 +1765,19 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
         record,
         maxMessages,
         payload.type,
+        {
+          ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+          ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
+        },
       );
       break;
     case 'task_error':
     case 'error': {
       const errorMessage = payload.message || nativeEventErrorMessage(payload.error, '任务中断');
-      const pauseLike = /usage limit|quota exceeded|insufficient quota|too many requests|rate limit|high demand|(^|\D)429(\D|$)/i.test(String(errorMessage || ''));
+      const pauseLike = TRANSIENT_PROVIDER_LIMIT_RE.test(String(errorMessage || ''));
       cache.status = pauseLike ? 'interrupted' : 'error';
       restoreRolledBackRetryAssistant(cache, maxMessages);
+      if (CAPACITY_ERROR_RE.test(String(errorMessage || ''))) collapsePreviousCapacityErrors(cache);
       appendNativeMessage(
         cache,
         'process',
@@ -1743,6 +1785,10 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
         record,
         maxMessages,
         pauseLike ? 'turn_aborted' : payload.type,
+        {
+          ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
+          ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
+        },
       );
       break;
     }
@@ -2891,6 +2937,7 @@ function updateNativeTurnId(cache, value, force = false) {
   cache.currentTurnId = turnId;
   cache.currentTurnStartedAt = '';
   cache.currentTurnTokenUsage = null;
+  cache.currentTurnTokenUsageDetails = null;
   cache.turnStartScanComplete = false;
   cache.displayUserMessagesInTurn = 0;
 }

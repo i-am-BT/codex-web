@@ -47,6 +47,13 @@ test('quota settings keep multi-key controls horizontally bounded', () => {
   assert.doesNotMatch(serverSource, /if\(!builtin\)\{\s*const manualFields=document\.createElement\('div'\)/);
   assert.match(serverSource, /setIconLabel\(addKeyButton,'plus','添加 Key',false\)/);
   assert.match(serverSource, /row\.className='subQuotaCredentialRow'/);
+  assert.match(serverSource, /moveUp\.className='subQuotaCredentialMove subQuotaCredentialMoveUp'/);
+  assert.match(serverSource, /moveDown\.className='subQuotaCredentialMove subQuotaCredentialMoveDown'/);
+  assert.match(serverSource, /moveUp\.addEventListener\('click',\(\)=>moveCredentialRow\(row,-1\)\)/);
+  assert.match(serverSource, /moveDown\.addEventListener\('click',\(\)=>moveCredentialRow\(row,1\)\)/);
+  assert.match(serverSource, /if\(moveUp\)moveUp\.disabled=index===0/);
+  assert.match(serverSource, /if\(moveDown\)moveDown\.disabled=index===rows\.length-1/);
+  assert.match(serverSource, /rowActions\.append\(moveUp,moveDown,removeKeyButton\)/);
   assert.match(serverSource, /removeKeyButton\.setAttribute\('aria-label','移除 '\+credentialLabel\)/);
   assert.match(serverSource, /setIconLabel\(removeKeyButton,'x','移除此 Key',false\)/);
   assert.match(
@@ -67,7 +74,11 @@ test('quota settings keep multi-key controls horizontally bounded', () => {
   );
   assert.match(
     uiStyles,
-    /@media \(max-width: 820px\)[\s\S]*?\.subQuotaCredentialRow\s*\{[^}]*grid-template-columns:\s*46px minmax\(0, 1fr\) 40px/s,
+    /\.subQuotaCredentialActions\s*\{(?=[^}]*display:\s*inline-flex)(?=[^}]*gap:\s*3px)[^}]*\}/s,
+  );
+  assert.match(
+    uiStyles,
+    /@media \(max-width: 820px\)[\s\S]*?\.subQuotaCredentialRow\s*\{[^}]*grid-template-columns:\s*46px minmax\(0, 1fr\) auto/s,
   );
 });
 
@@ -306,6 +317,11 @@ test('composer context window uses real session data with an accessible progress
     uiStyles,
     /\.composerContextRing::after\s*\{[^}]*inset:\s*2px;/s,
   );
+  assert.match(
+    uiStyles,
+    /\.composerContextToggle\.running \.composerContextRing\s*\{[^}]*background:\s*conic-gradient\([^}]*currentColor 28%,[^}]*animation:\s*spin 900ms linear infinite/s,
+  );
+  assert.doesNotMatch(uiStyles, /\.composerModelToggle\.running \.composerModelState/);
   assert.match(
     uiStyles,
     /body \.composerContextPanel\s*\{[^}]*width:\s*min\(176px,[^}]*border-radius:\s*11px;[^}]*text-align:\s*center/s,

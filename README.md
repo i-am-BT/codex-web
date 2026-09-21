@@ -12,6 +12,8 @@
 - 通过持久 `codex app-server` 实现 Web 与 Codex App 双向同步
 - 只显示 Codex App 中未归档的普通用户会话，不显示自动化任务
 - 最近会话按工作目录分组，显示项目名与完整路径
+- 内置官方账号用量分析：直接读取 ChatGPT analytics，展示 Credits、Tokens、缓存命中、每日明细和折算金额，无需 Codex Meter 扩展或快照同步
+- 官方分析需要服务端 Codex 登录凭据；凭据不会返回浏览器。数据按日汇总（起始日整日计入），Credits 按 $0.04 折算，推算周期价值不是实际消费账单；依赖私有接口，失败时不以本机统计冒充官方结果
 - 支持会话改名、归档和历史记录管理
 - 支持从历史用户消息创建原生会话分支，恢复原消息后修改并重新发送
 - 支持流式显示助手回复与思考摘要；历史思考和工具调用默认折叠
@@ -192,8 +194,11 @@ cp .env.example .env
 | `CODEX_HOME` | Codex 配置、索引和原生会话目录，默认 `$HOME/.codex` |
 | `CODEX_WEB_CWD_MIGRATIONS_FILE` | 可选的工作目录迁移 TSV；仅在显式设置时启用，运行时将旧 `cwd` 映射到新目录 |
 | `CODEX_WEB_LOCAL_IMAGE_ROOTS` | 可选的绝对图片根目录白名单，多个目录用英文逗号分隔；用于显示助手消息中来自其他项目的本地图片 |
+| `CODEX_WEB_LOCAL_FILE_ROOTS` | 可选的绝对文件或目录白名单；白名单内 Markdown 本机文件链接会以已登录的纯文本页面打开 |
 | `APP_SERVER_REQUEST_TIMEOUT_MS` | `codex app-server` 单次协议请求超时，默认 30000 毫秒 |
+| `CODEX_APP_SERVER_PROXY` | 可选的 Codex App Server 网络代理；会同时传递大小写 `HTTP(S)_PROXY` 与 `ALL_PROXY` |
 | `CODEX_DESKTOP_IPC_ENABLED` | macOS/Windows 默认开启；续聊优先交给当前打开任务的 Codex App 窗口 |
+| `CODEX_EXISTING_THREAD_APP_SERVER_FALLBACK` | 找不到 Codex App owner 时是否允许 Web 接管既有会话；桌面 IPC 开启时默认关闭，容器模式默认开启 |
 | `CODEX_DESKTOP_IPC_TIMEOUT_MS` | Codex App 桌面 IPC 请求超时，默认 20000 毫秒 |
 | `CODEX_DESKTOP_IPC_SOCKET` | 可选的桌面 IPC socket/pipe 覆盖路径，通常留空自动发现 |
 | `NATIVE_SESSION_POLL_MS` | 原生会话文件监听的轮询兜底间隔 |
@@ -202,6 +207,8 @@ cp .env.example .env
 | `DEFAULT_CWD` | 新会话默认工作目录 |
 | `DEFAULT_SANDBOX` | Codex 默认沙箱模式 |
 | `DEFAULT_APPROVAL` | Codex 默认审批模式 |
+
+当 Codex App 的回合已经进入明确终态、但 App Server 仍留下该线程的 writer lock 时，Web 会在续聊或修改会话设置前先隔离这枚残留锁并重试。仍处于运行中的 App 回合不会被 Web 抢占，以避免双写。
 
 ### 工作目录迁移
 

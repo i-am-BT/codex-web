@@ -3480,6 +3480,71 @@ test('automation heartbeat messages are not classified as steering', { timeout: 
   }
 });
 
+test('capacity task_complete becomes resumable and collapses repeated capacity errors', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-capacity-retry-'));
+  const id = '019fd72e-8f11-7a42-b7de-a4e81f74c666';
+  const sessionDir = path.join(temporary, 'sessions', '2026', '08', '08');
+  const sessionFile = path.join(sessionDir, 'rollout-2026-08-08T14-00-00-' + id + '.jsonl');
+  const errorMessage = 'Selected model is at capacity. Please try a different model.';
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-08-08T14:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: temporary, source: 'appServer' },
+      },
+      {
+        timestamp: '2026-08-08T14:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-capacity-1' },
+      },
+      {
+        timestamp: '2026-08-08T14:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'turn-capacity-1',
+          error: { message: errorMessage, codex_error_info: 'serverOverloaded' },
+        },
+      },
+      {
+        timestamp: '2026-08-08T14:00:03.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-capacity-2' },
+      },
+      {
+        timestamp: '2026-08-08T14:00:04.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'turn-capacity-2',
+          error: { message: errorMessage, codex_error_info: 'serverOverloaded' },
+        },
+      },
+    ]));
+
+    store = new NativeSessionStore(temporary, { watchChanges: false, maxMessages: 100 });
+    const conversation = store.get(id);
+    const capacityMessages = conversation.messages.filter((message) => (
+      message.role === 'process'
+      && message.kind === 'turn_aborted'
+      && message.content === errorMessage
+    ));
+
+    assert.equal(conversation.status, 'interrupted');
+    assert.equal(conversation.latestTurnId, 'turn-capacity-2');
+    assert.equal(capacityMessages.length, 1);
+    assert.equal(capacityMessages[0].turnId, 'turn-capacity-2');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+
 test('task_complete with an error stays failed and exposes the complete upstream message', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-task-complete-error-'));
   const id = '019fd72e-8f11-7a42-b7de-a4e81f74b405';

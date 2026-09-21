@@ -326,6 +326,237 @@ body .history::-webkit-scrollbar {
   display: none;
 }
 
+.chatgptSidebarSection {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  margin: 0 0 8px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+}
+
+.chatgptSidebarEntry {
+  appearance: none;
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  grid-template-columns: 28px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: var(--surface-subtle);
+  color: var(--text);
+  padding: 8px 10px;
+  font: inherit;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+  transition: border-color 140ms var(--ease), background 140ms var(--ease), color 140ms var(--ease);
+}
+
+.chatgptSidebarEntry:hover,
+.chatgptSidebarEntry:focus-visible {
+  border-color: var(--primary-line);
+  background: var(--surface-hover);
+  color: var(--text);
+  outline: none;
+}
+
+.chatgptSidebarEntry:focus-visible {
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+.chatgptSidebarEntryIcon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.chatgptSidebarEntryIcon .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.chatgptSidebarEntryCopy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.chatgptSidebarEntryCopy strong,
+.chatgptSidebarEntryCopy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chatgptSidebarEntryCopy strong {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chatgptSidebarEntryCopy small {
+  width: max-content;
+  max-width: 100%;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  padding: 1px 6px;
+}
+
+.chatgptSidebarEntryChevron {
+  display: grid;
+  place-items: center;
+  color: var(--text-subtle);
+  transition: color 140ms var(--ease);
+}
+
+.chatgptSidebarEntryChevron .lucide {
+  width: 14px;
+  height: 14px;
+}
+
+.chatgptSidebarConversations {
+  display: grid;
+  max-height: min(260px, 34vh);
+  gap: 1px;
+  overflow-y: auto;
+  padding: 2px 2px 6px 10px;
+  scrollbar-width: thin;
+}
+
+/* Keep the local conversation list flat; do not draw a tree connector line. */
+.chatgptSidebarConversations::before {
+  display: none;
+  content: none;
+}
+
+.chatgptSidebarConversations[hidden] {
+  display: none;
+}
+
+.chatgptSidebarConversation {
+  display: grid;
+  appearance: none;
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 6px 8px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms var(--ease), border-color 140ms var(--ease), color 140ms var(--ease);
+}
+
+.chatgptSidebarConversation:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.chatgptSidebarConversation:focus-visible {
+  border-color: var(--primary-line);
+  outline: none;
+  box-shadow: 0 0 0 2px var(--primary-soft);
+}
+
+.chatgptSidebarConversation.active {
+  border-color: var(--primary-line);
+  background: var(--primary-soft);
+  color: var(--text);
+}
+
+.chatgptSidebarConversation.active .chatgptSidebarConversationTitle {
+  font-weight: 700;
+}
+
+.chatgptSidebarConversationIcon {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  color: var(--text-subtle);
+  transition: color 140ms var(--ease);
+}
+
+.chatgptSidebarConversationIcon .lucide {
+  width: 14px;
+  height: 14px;
+}
+
+.chatgptSidebarConversation.active .chatgptSidebarConversationIcon,
+.chatgptSidebarConversation:hover .chatgptSidebarConversationIcon {
+  color: var(--primary);
+}
+
+.chatgptSidebarConversationTitle {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chatgptSidebarState {
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-subtle);
+  padding: 7px 8px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: left;
+}
+
+.chatgptSidebarRetry {
+  cursor: pointer;
+}
+
+.chatgptSidebarRetry:hover,
+.chatgptSidebarRetry:focus-visible {
+  color: var(--primary);
+  outline: none;
+}
+
+@container sidebar (max-width: 280px) {
+  .chatgptSidebarEntry {
+    min-height: 44px;
+    grid-template-columns: 26px minmax(0, 1fr) 16px;
+    gap: 8px;
+    padding: 7px 8px;
+  }
+
+  .chatgptSidebarEntryIcon {
+    width: 26px;
+    height: 26px;
+  }
+
+  .chatgptSidebarConversations {
+    padding-left: 8px;
+  }
+
+  .chatgptSidebarConversation {
+    padding: 5px 6px;
+  }
+}
+
 .sideBrand {
   display: grid;
   gap: 9px;
@@ -529,6 +760,41 @@ body[data-theme="light"] .themeToggle {
   color: var(--text-muted);
   font-size: 10px;
   font-weight: 680;
+}
+
+.historyUnreadHeadActions {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.historyUnreadMarkAll {
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--primary);
+  padding: 2px 3px;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.historyUnreadMarkAll:hover,
+.historyUnreadMarkAll:focus-visible {
+  background: var(--primary-soft);
+  outline: none;
+}
+
+.historyUnreadMarkAll:disabled {
+  color: var(--text-subtle);
+  cursor: default;
+  opacity: .65;
+}
+
+.historyUnreadMarkAll:disabled:hover {
+  background: transparent;
 }
 
 .historyUnreadList {
@@ -853,7 +1119,56 @@ body .subQuotaClose:hover {
   display: grid;
   min-width: 0;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  row-gap: 8px;
 }
+
+.subQuotaCycleUsage { grid-column: 1 / -1; margin-top: 8px; }
+.subQuotaCycleUsage strong { white-space: normal; overflow-wrap: anywhere; }
+.subQuotaAnalyticsDaily { grid-column: 1 / -1; overflow: auto; font-size: 12px; }
+.subQuotaAnalyticsDaily summary { cursor: pointer; padding: 8px 0; }
+.subQuotaCodexUsage:has(.codexMeter) { display: block; min-width: 0; max-width: 100%; border: 0; padding: 0; }
+.codexMeter, .codexMeterDaily, .codexMeterTableScroll { min-width: 0; max-width: 100%; }
+.subQuotaSettingsBuiltinSource:has(.codexMeter) { grid-template-columns: minmax(0, 1fr); }
+.codexMeter { --meter-card: #282828; --meter-border: #353535; --meter-text: #f5f5f5; --meter-muted: #ababab; background: #212121; color: var(--meter-text); padding: 12px; border-radius: 12px; }
+body[data-theme="light"] .codexMeter { --meter-card: #f6f6f6; --meter-border: #e5e5e5; --meter-text: #202020; --meter-muted: #666; background: #fff; }
+.codexMeter .codexMeterTitle { color: var(--meter-text); font-size: 18px; font-weight: 600; margin: 0 0 12px; }
+.codexMeterGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.codexMeterCard { min-width: 0; background: var(--meter-card); border: 1px solid var(--meter-border); border-radius: 12px; padding: 12px; }
+.codexMeterCardTitle { display: flex; align-items: center; gap: 6px; color: var(--meter-muted); font-size: 12px; font-weight: 600; line-height: 1.5; }
+.codexMeterCardTitle .lucide { width: 15px; height: 15px; flex: 0 0 15px; }
+.codexMeterValue { display: block; font-size: 24px; font-weight: 650; line-height: 1.2; margin: 10px 0 8px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.codexMeterCard p { color: var(--meter-muted); font-size: 11px; line-height: 1.45; margin: 0; }
+.codexMeterDaily { margin-top: 16px; }
+.codexMeterDailyHead { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; color: var(--meter-muted); margin-bottom: 8px; }
+.codexMeterDailyHead h4 { margin: 0; font-size: 14px; font-weight: 600; }
+.codexMeterDailyHead span { font-size: 12px; }
+.codexMeterTableScroll { overflow-x: auto; }
+.codexMeter table { width: 100%; border-collapse: collapse; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; }
+.codexMeter th, .codexMeter td { padding: 7px 5px; text-align: left; border-bottom: 1px solid var(--meter-border); }
+.codexMeter th { color: var(--meter-muted); font-weight: 500; }
+.codexMeter tfoot { font-weight: 650; }
+.codexMeterActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.codexMeterActions button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; border-radius: 999px; border: 1px solid var(--meter-border); background: transparent; color: var(--meter-text); padding: 6px 12px; font-size: 12px; }
+.codexMeterActions button .lucide { width: 15px; height: 15px; }
+.codexMeterActions .codexMeterRefresh { background: var(--meter-text); color: #212121; }
+body[data-theme="light"] .codexMeterActions .codexMeterRefresh { color: #fff; }
+.codexMeterActions button:focus-visible { outline: 2px solid var(--meter-text); outline-offset: 3px; }
+.codexMeterActions button:disabled { opacity: .5; cursor: wait; }
+@media(max-width: 480px) {
+  .codexMeter { padding: 8px; }
+  .codexMeterCard { padding: 10px; border-radius: 12px; }
+  .codexMeterCardTitle { font-size: 12px; gap: 6px; align-items: flex-start; }
+  .codexMeterCardTitle .lucide { margin-top: 2px; }
+  .codexMeterValue { font-size: 22px; }
+  .codexMeterDailyHead { align-items: flex-start; flex-direction: column; }
+  .codexMeterTableScroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .codexMeter table { min-width: 390px; }
+  .codexMeterActions { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; }
+  .codexMeterActions button { min-width: 0; min-height: 44px; padding: 8px 6px; }
+}
+@media(max-width: 360px) { .codexMeterGrid { grid-template-columns: minmax(0,1fr); } }
+.subQuotaAnalyticsDaily table { width: 100%; border-collapse: collapse; }
+.subQuotaAnalyticsDaily th, .subQuotaAnalyticsDaily td { padding: 6px; text-align: left; border-bottom: 1px solid var(--border); }
 
 .subQuotaCredits {
   display: grid;
@@ -867,6 +1182,12 @@ body .subQuotaClose:hover {
   border-left: 1px solid var(--border);
   padding: 2px 0 2px 12px;
   text-align: right;
+}
+
+.subQuotaCreditsGrid > .subQuotaCredits:nth-child(2n+3) {
+  border-left: 0;
+  padding: 2px 12px 2px 0;
+  text-align: left;
 }
 
 .subQuotaCredits > span {
@@ -1626,6 +1947,7 @@ body .grok2ApiConsoleIconButton:disabled {
 }
 
 .subQuotaCredentialAdd,
+.subQuotaCredentialMove,
 .subQuotaCredentialRemove {
   display: inline-grid;
   width: 28px;
@@ -1640,6 +1962,7 @@ body .grok2ApiConsoleIconButton:disabled {
 }
 
 .subQuotaCredentialAdd:hover:not(:disabled),
+.subQuotaCredentialMove:hover:not(:disabled),
 .subQuotaCredentialRemove:hover:not(:disabled) {
   border-color: var(--border-strong);
   background: var(--surface-hover);
@@ -1651,18 +1974,21 @@ body .grok2ApiConsoleIconButton:disabled {
   color: var(--danger);
 }
 
-.subQuotaCredentialAdd:disabled {
+.subQuotaCredentialAdd:disabled,
+.subQuotaCredentialMove:disabled {
   opacity: 0.4;
   cursor: default;
 }
 
 .subQuotaCredentialAdd:focus-visible,
+.subQuotaCredentialMove:focus-visible,
 .subQuotaCredentialRemove:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
 
 .subQuotaCredentialAdd .lucide,
+.subQuotaCredentialMove .lucide,
 .subQuotaCredentialRemove .lucide {
   width: 14px;
   height: 14px;
@@ -1680,6 +2006,13 @@ body .grok2ApiConsoleIconButton:disabled {
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
+}
+
+.subQuotaCredentialActions {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
 }
 
 .subQuotaCredentialRowLabel {
@@ -1833,6 +2166,18 @@ body .grok2ApiConsoleIconButton:disabled {
   border-top: 1px solid var(--border);
   padding-top: 12px;
 }
+
+.subQuotaCodexUsage {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.subQuotaCodexUsage .subQuotaCodexBalance { border: 0; padding: 0; }
+.subQuotaCodexUsage .subQuotaCodexBalance > strong { white-space: normal; overflow-wrap: anywhere; }
+.subQuotaCodexUsage > small { grid-column: 1 / -1; color: var(--text-muted); }
 
 .subQuotaCodexBalances {
   display: grid;
@@ -3404,6 +3749,174 @@ body.modalOpen {
   background: rgba(20, 24, 31, 0.42);
   padding: 20px;
   backdrop-filter: blur(5px);
+}
+
+.newTaskModeOverlay {
+  position: fixed;
+  z-index: 95;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: color-mix(in srgb, var(--canvas) 86%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.newTaskModeDialog {
+  width: min(520px, calc(100vw - 32px));
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  color: var(--text);
+  padding: 22px;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.36);
+}
+
+.newTaskModeHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.newTaskModeHeader h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 760;
+}
+
+.newTaskModeHeader p {
+  margin: 5px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.newTaskModeClose {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.newTaskModeClose:hover,
+.newTaskModeClose:focus-visible {
+  border-color: var(--primary);
+  color: var(--text);
+}
+
+.newTaskModeTabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  margin-top: 22px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-raised);
+}
+
+.newTaskModeTab {
+  min-height: 40px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.newTaskModeTab[aria-selected="true"] {
+  background: var(--surface-active);
+  color: var(--text);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+
+.newTaskModeTab:hover,
+.newTaskModeTab:focus-visible {
+  color: var(--text);
+}
+
+.newTaskModePreview {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 92px;
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 15px;
+  background: color-mix(in srgb, var(--surface-raised) 84%, transparent);
+}
+
+.newTaskModeIcon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.newTaskModeIcon .lucide {
+  width: 20px;
+  height: 20px;
+}
+
+.newTaskModePreview strong {
+  display: block;
+  font-size: 14px;
+}
+
+.newTaskModePreview p {
+  margin: 5px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.newTaskModeActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.newTaskModeCancel,
+.newTaskModeConfirm {
+  min-height: 38px;
+  padding: 0 16px;
+  border-radius: 10px;
+  font-weight: 700;
+}
+
+.newTaskModeCancel {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.newTaskModeConfirm {
+  border: 1px solid var(--primary);
+  background: var(--primary);
+  color: var(--primary-contrast, #fff);
+}
+
+.newTaskModeCancel:hover,
+.newTaskModeCancel:focus-visible {
+  color: var(--text);
+}
+
+.newTaskModeConfirm:hover,
+.newTaskModeConfirm:focus-visible {
+  background: var(--primary-hover);
 }
 
 .archiveConfirmDialog {
@@ -5603,6 +6116,7 @@ body .chat .conversationRestorePlaceholder {
   gap: 8px;
   width: max-content;
   max-width: min(360px, calc(100vw - 36px));
+  min-width: 0;
   margin: 0;
   padding: 10px 14px;
   transform: translate(-50%, -50%);
@@ -5613,6 +6127,7 @@ body .chat .conversationRestorePlaceholder {
   backdrop-filter: blur(14px);
   pointer-events: none;
   opacity: 1;
+  overflow: hidden;
   white-space: nowrap;
 }
 
@@ -5629,16 +6144,23 @@ body .chat .conversationRestorePlaceholder::before {
 
 body .chat .conversationRestorePlaceholder b,
 body .chat .conversationRestorePlaceholder span {
-  display: inline;
+  display: block;
   margin: 0;
   line-height: 1.25;
 }
 
 body .chat .conversationRestorePlaceholder b {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 13px;
 }
 
 body .chat .conversationRestorePlaceholder span {
+  flex: 0 0 auto;
+  white-space: nowrap;
   font-size: 12px;
 }
 
@@ -7373,6 +7895,7 @@ body .msg.process.completionSummary {
 .completionSummary > summary,
 .completionSummary > .completionRow {
   display: flex;
+  flex-wrap: wrap;
   min-height: 40px;
   width: 100%;
   max-width: 100%;
@@ -7415,8 +7938,11 @@ body .msg.process.completionSummary {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
+
+.completionUsageDetails { font-size: 12px; line-height: 1.7; padding-bottom: 12px; overflow-wrap: anywhere; }
 
 .completionSummary > summary .completionTokenUsage.hidden,
 .completionSummary > .completionRow .completionTokenUsage.hidden {
@@ -10344,6 +10870,27 @@ body[data-theme] .box .attachBtn {
   content: "";
 }
 
+/* The context ring doubles as the live-turn spinner, so the composer keeps
+   one status circle that remains clickable while a task is running. */
+.composerContextToggle.running {
+  cursor: pointer;
+  color: var(--primary);
+}
+
+.composerContextToggle.running .composerContextRing {
+  background: conic-gradient(
+    currentColor 28%,
+    color-mix(in srgb, currentColor 24%, transparent) 0
+  );
+  animation: spin 900ms linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composerContextToggle.running .composerContextRing {
+    animation: none;
+  }
+}
+
 body .composerContextPanel {
   right: 84px;
   width: min(176px, calc(100vw - 32px));
@@ -10434,23 +10981,6 @@ body .composerContextPanel {
 .composerModelToggle.running:not(:disabled) {
   cursor: pointer;
   background: transparent;
-}
-
-.composerModelState {
-  display: none;
-  width: 18px;
-  height: 18px;
-  flex: 0 0 18px;
-  border: 2px solid var(--border-strong);
-  border-top-color: var(--text-muted);
-  border-radius: 50%;
-}
-
-.composerModelToggle.running .composerModelState {
-  display: block;
-  border-color: var(--text-muted);
-  border-right-color: transparent;
-  animation: spin 900ms linear infinite;
 }
 
 .composerModelName {
@@ -12489,12 +13019,6 @@ body .composer > .box:focus-within {
     height: 30px;
   }
 
-  body .composer:has(> .composerProjectPicker.hidden) .composerModelToggle.running .composerModelState {
-    width: 14px;
-    height: 14px;
-    flex-basis: 14px;
-  }
-
   body[data-theme="light"] .composer:has(> .composerProjectPicker.hidden) > .box {
     border-color: #e1e3e6;
     background: #ffffff;
@@ -13144,6 +13668,17 @@ body .composer > .box:focus-within {
     padding: 8px;
   }
 
+  .newTaskModeOverlay {
+    place-items: end center;
+    padding: 8px;
+  }
+
+  .newTaskModeDialog {
+    width: 100%;
+    padding: 18px 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+    border-radius: 20px;
+  }
+
   .archiveConfirmDialog {
     width: 100%;
     padding: 18px 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
@@ -13201,11 +13736,17 @@ body .composer > .box:focus-within {
     flex-wrap: wrap;
   }
 
-  .subQuotaAddSourceType,
-  .subQuotaSourceTypeSelect {
+  .subQuotaAddSourceType {
     min-width: 0;
     min-height: 40px;
     flex: 1 1 160px;
+  }
+
+  .subQuotaSourceTypeSelect {
+    min-width: 0;
+    height: 40px;
+    min-height: 40px;
+    flex: 0 0 auto;
   }
 
   .subQuotaAddSourceButton {
@@ -13218,6 +13759,7 @@ body .composer > .box:focus-within {
   .subQuotaSourceRemoveButton,
   .subQuotaRemoveButton,
   .subQuotaCredentialAdd,
+  .subQuotaCredentialMove,
   .subQuotaCredentialRemove {
     width: 40px;
     height: 40px;
@@ -13264,7 +13806,7 @@ body .composer > .box:focus-within {
   }
 
   .subQuotaCredentialRow {
-    grid-template-columns: 46px minmax(0, 1fr) 40px;
+    grid-template-columns: 46px minmax(0, 1fr) auto;
     gap: 6px;
   }
 
@@ -13486,12 +14028,6 @@ body .composer > .box:focus-within {
     gap: 4px;
     padding-inline: 3px;
     font-size: 12px;
-  }
-
-  .composerModelState {
-    width: 15px;
-    height: 15px;
-    flex-basis: 15px;
   }
 
   .composerModelToggle .lucide {

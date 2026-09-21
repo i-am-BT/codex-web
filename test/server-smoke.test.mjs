@@ -111,6 +111,34 @@ test('app-server terminal errors broadcast full detail before closing the turn',
   ]);
 });
 
+
+test('capacity errors stop after the 50th native empty-input retry', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const delayStart = serverSource.indexOf('const CAPACITY_AUTO_RETRY_DELAYS_MS');
+  const delayEnd = serverSource.indexOf('\nconst HOMEPAGE_API_TOKEN', delayStart);
+  assert.ok(delayStart >= 0 && delayEnd > delayStart);
+  const { capacityAutoRetryDelayMs, CAPACITY_AUTO_RETRY_MAX_ATTEMPTS } = new Function(
+    serverSource.slice(delayStart, delayEnd) + '; return { capacityAutoRetryDelayMs, CAPACITY_AUTO_RETRY_MAX_ATTEMPTS };',
+  )();
+
+  assert.equal(CAPACITY_AUTO_RETRY_MAX_ATTEMPTS, 50);
+  assert.deepEqual(
+    Array.from({ length: 12 }, (_, index) => capacityAutoRetryDelayMs(index + 1)),
+    [0, 1000, 2000, 5000, 10000, 20000, 30000, 45000, 60000, 60000, 60000, 60000],
+  );
+  assert.equal(capacityAutoRetryDelayMs(49), 60000);
+  assert.equal(capacityAutoRetryDelayMs(50), 60000);
+  assert.match(serverSource, /attempt > CAPACITY_AUTO_RETRY_MAX_ATTEMPTS/);
+  assert.match(serverSource, /status:\s*'stopped'/);
+  assert.match(serverSource, /第50次重试失败后停止/);
+  assert.ok(serverSource.includes("attempt+'/'+maxAttempts"));
+  assert.match(serverSource, /input:\s*\[\],[\s\S]{0,500}turnTrigger:\s*'capacity_retry_automatic'/);
+  assert.match(serverSource, /turnTrigger:\s*turn\.turnTrigger/);
+  assert.match(serverSource, /native-sessions\/:id\/interrupt[\s\S]{0,450}clearCapacityAutoRetryState\(threadId, \{ clearPause: true \}\)/);
+  assert.match(serverSource, /prompt-queues\/:threadId\/resume-interrupted[\s\S]{0,450}clearCapacityAutoRetryState\(threadId, \{ clearPause: true \}\)/);
+  assert.match(serverSource, /app\.delete\('\/api\/native-sessions\/:id'[\s\S]{0,450}clearCapacityAutoRetryState\(threadId, \{ clearPause: true \}\)/);
+});
+
 test('Homepage stats expose current and concurrent running task names', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('function homepageTaskName');
@@ -211,6 +239,273 @@ test('Codex App quota card omits provider status metadata', async () => {
   assert.doesNotMatch(branch, /appendSubQuotaMeta\(meta,'状态 /);
 });
 
+test('isolated Codex App quota waits for its app-server process to stop', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function requestIsolatedCodexAppCredits');
+  const helperEnd = serverSource.indexOf('\nfunction codexAppQuotaErrorLabel', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  let resolveClose;
+  let closeCalled = false;
+  const closePromise = new Promise((resolve) => {
+    resolveClose = resolve;
+  });
+  class FakeAppServerClient {
+    close() {
+      closeCalled = true;
+      return closePromise;
+    }
+  }
+  const requestIsolatedCodexAppCredits = new Function(
+    'CodexAppServerClient',
+    'CODEX_BIN',
+    'CODEX_PROCESS_HOME',
+    'buildCodexProcessEnvironment',
+    'APP_NAME',
+    'APP_SERVER_REQUEST_TIMEOUT_MS',
+    'requestCodexAppCredits',
+    `${serverSource.slice(helperStart, helperEnd)}; return requestIsolatedCodexAppCredits;`,
+  )(
+    FakeAppServerClient,
+    'codex',
+    '/tmp',
+    () => ({}),
+    'Codex Web Test',
+    30000,
+    async () => ({ rateLimits: { planType: 'plus' } }),
+  );
+
+  let settled = false;
+  const resultPromise = requestIsolatedCodexAppCredits().then((result) => {
+    settled = true;
+    return result;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeCalled, true);
+  assert.equal(settled, false);
+
+  resolveClose();
+  assert.deepEqual(await resultPromise, { rateLimits: { planType: 'plus' } });
+});
+
+test('Codex App quota environment uses the dedicated proxy and isolates provider credentials', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function normalizeCodexProviderEnvironmentKey');
+  const helperEnd = serverSource.indexOf('\nasync function readNativeModelCapabilities', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const buildCodexProcessEnvironment = new Function(
+    'process',
+    'CODEX_PROCESS_HOME',
+    'CODEX_HOME',
+    'readProviderDetails',
+    'readCodexDefaults',
+    'providerCredential',
+    'DEFAULT_PROVIDER',
+    `${serverSource.slice(helperStart, helperEnd)}; return buildCodexProcessEnvironment;`,
+  )(
+    {
+      env: {
+        CODEX_APP_SERVER_PROXY: 'http://192.168.31.213:7890',
+        HTTPS_PROXY: 'http://stale-proxy:7890',
+        OPENAI_BASE_URL: 'https://custom-provider.example',
+        OPENAI_API_KEY: 'provider-secret',
+        NO_PROXY: 'localhost,127.0.0.1',
+      },
+    },
+    '/tmp/codex-process-home',
+    '/tmp/codex-home',
+    () => [{ name: 'custom', envKey: 'CUSTOM_API_KEY' }],
+    () => ({ provider: 'custom' }),
+    () => 'custom-secret',
+    'custom',
+  );
+
+  const normal = buildCodexProcessEnvironment();
+  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']) {
+    assert.equal(normal[key], 'http://192.168.31.213:7890');
+  }
+  assert.equal(normal.OPENAI_BASE_URL, 'https://custom-provider.example');
+  assert.equal(normal.OPENAI_API_KEY, 'provider-secret');
+  assert.equal(normal.NO_PROXY, 'localhost,127.0.0.1');
+  assert.equal(normal.no_proxy, 'localhost,127.0.0.1');
+
+  const isolated = buildCodexProcessEnvironment({ includeProviderCredentials: false });
+  assert.equal(isolated.OPENAI_BASE_URL, undefined);
+  assert.equal(isolated.OPENAI_API_KEY, undefined);
+  assert.equal(isolated.CUSTOM_API_KEY, undefined);
+  assert.equal(isolated.custom_api_key, undefined);
+  assert.equal(isolated.HTTP_PROXY, 'http://192.168.31.213:7890');
+});
+
+test('Codex App quota retries transient failures and preserves the last good result', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const extractFunction = (signature) => {
+    const start = serverSource.indexOf(signature);
+    const bodyMarker = serverSource.indexOf(') {', start);
+    const braceStart = bodyMarker + 2;
+    assert.ok(start >= 0 && braceStart > start, `missing ${signature}`);
+    let depth = 0;
+    for (let index = braceStart; index < serverSource.length; index += 1) {
+      if (serverSource[index] === '{') depth += 1;
+      else if (serverSource[index] === '}') {
+        depth -= 1;
+        if (depth === 0) return serverSource.slice(start, index + 1);
+      }
+    }
+    throw new Error(`unterminated ${signature}`);
+  };
+  const readCodexAppCreditsFactory = new Function(
+    'codexAppQuotaCache',
+    'CODEX_APP_QUOTA_PROVIDER',
+    'CODEX_APP_QUOTA_RETRY_DELAYS_MS',
+    'requestCodexAppCredits',
+    'requestIsolatedCodexAppCredits',
+    'normalizeCodexAppCredits',
+    'codexAppQuotaCacheMs',
+    'console',
+    [
+      extractFunction('function codexAppQuotaStaleMaxMs'),
+      extractFunction('async function retryCodexAppQuotaRequest'),
+      extractFunction('function codexAppQuotaErrorLabel'),
+      extractFunction('async function readCodexAppCredits'),
+      'return readCodexAppCredits;',
+    ].join('\n'),
+  );
+  const cache = {
+    value: null,
+    expiresAt: 0,
+    pending: null,
+    lastGood: null,
+    lastGoodAt: 0,
+  };
+  let mode = 'success';
+  let primaryCalls = 0;
+  let isolatedCalls = 0;
+  const logs = [];
+  const readCodexAppCredits = readCodexAppCreditsFactory(
+    cache,
+    'codex-app',
+    [0, 0, 0],
+    async () => {
+      primaryCalls += 1;
+      if (mode === 'success') return { channel: 'primary' };
+      throw new Error('ECONNRESET');
+    },
+    async () => {
+      isolatedCalls += 1;
+      throw new Error('proxy unavailable');
+    },
+    (result) => ({
+      valid: true,
+      available: true,
+      balance: result.channel === 'primary' ? 42 : 0,
+      fetchedAt: '2026-09-01T00:00:00.000Z',
+    }),
+    () => 1000,
+    { warn: (message) => logs.push(message) },
+  );
+
+  const first = await readCodexAppCredits({ refresh: true });
+  assert.equal(first.balance, 42);
+  assert.equal(first.stale, undefined);
+  assert.equal(primaryCalls, 1);
+  assert.equal(isolatedCalls, 0);
+  const lastGoodAt = cache.lastGoodAt;
+
+  mode = 'failure';
+  const stale = await readCodexAppCredits({ refresh: true });
+  assert.equal(stale.valid, true);
+  assert.equal(stale.stale, true);
+  assert.equal(stale.balance, 42);
+  assert.equal(stale.message, '最近一次成功结果，当前检测暂时失败');
+  assert.equal(stale.warning, 'proxy unavailable');
+  assert.equal(primaryCalls, 4);
+  assert.equal(isolatedCalls, 3);
+  assert.equal(cache.lastGoodAt, lastGoodAt);
+  assert.equal(logs.length, 1);
+
+  cache.lastGoodAt = Date.now() - 301000;
+  const expired = await readCodexAppCredits({ refresh: true });
+  assert.equal(expired.valid, false);
+  assert.equal(expired.error, '无法从本机 Codex 登录态读取额度');
+  assert.equal(expired.stale, undefined);
+});
+
+test('server shutdown waits for the Web app-server owner to exit', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function shutdown(signal)');
+  const helperEnd = serverSource.indexOf('\nfunction requireAuth', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  let resolveAppServerClose;
+  const appServerClosePromise = new Promise((resolve) => {
+    resolveAppServerClose = resolve;
+  });
+  const calls = [];
+  const shutdown = new Function(
+    'shuttingDown',
+    'activeProcess',
+    'terminateProcess',
+    'APP_NAME',
+    'unsubscribeAllAppServerThreads',
+    'CODEX_WEB_SHUTDOWN_GRACE_MS',
+    'desktopIpcClient',
+    'appServerClient',
+    'nativeSessions',
+    'imagePromptLibrary',
+    'stopAppQueueSync',
+    'sessionEventClients',
+    'server',
+    'unlinkSync',
+    'PID_FILE',
+    'process',
+    'console',
+    'setTimeout',
+    `${serverSource.slice(helperStart, helperEnd)}; return shutdown;`,
+  )(
+    false,
+    null,
+    () => {},
+    'Codex Web Test',
+    async () => {},
+    120000,
+    { close: () => calls.push('desktop-close') },
+    {
+      close: () => {
+        calls.push('app-server-close-start');
+        return appServerClosePromise.then(() => calls.push('app-server-close-done'));
+      },
+    },
+    { stop: () => calls.push('native-stop') },
+    { stop: () => calls.push('image-stop') },
+    () => calls.push('queue-stop'),
+    new Set([{ end: () => calls.push('event-end') }]),
+    { close: (callback) => { calls.push('http-close'); callback(); } },
+    () => calls.push('pid-unlink'),
+    '/tmp/codex-web-test.pid',
+    { exit: (code) => calls.push(`exit:${code}`) },
+    { log() {} },
+    () => ({ unref() {} }),
+  );
+
+  const shutdownPromise = shutdown('SIGTERM');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ['desktop-close', 'app-server-close-start']);
+
+  resolveAppServerClose();
+  await shutdownPromise;
+  assert.ok(calls.indexOf('app-server-close-done') < calls.indexOf('http-close'));
+  assert.deepEqual(calls.slice(calls.indexOf('native-stop')), [
+    'native-stop',
+    'image-stop',
+    'queue-stop',
+    'event-end',
+    'http-close',
+    'pid-unlink',
+    'exit:0',
+  ]);
+});
+
 test('quota display labels hide account email addresses', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('function isSubQuotaEmailLabel');
@@ -286,10 +581,49 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
   assert.ok(completionStart >= 0 && completionEnd > completionStart);
   assert.doesNotMatch(serverSource.slice(notificationStart, notificationEnd), /thread\/status\/changed/);
 
+  const notificationLoads = [];
+  const notificationTurns = [];
+  const notificationStarts = [];
+  const notificationApi = new Function(
+    'cleanNativeThreadId',
+    'markAppServerThreadLoaded',
+    'markAppServerThreadTurn',
+    'recordNativeTurnStarted',
+    'appServerClient',
+    'nativeSessions',
+    `${serverSource.slice(notificationStart, notificationEnd)}; return { handleAppServerNotification };`,
+  )(
+    (value) => String(value || '').trim(),
+    (...args) => notificationLoads.push(args),
+    (...args) => notificationTurns.push(args),
+    (...args) => notificationStarts.push(args),
+    { child: { id: 'web-app-server' } },
+    { scheduleRefresh() {} },
+  );
+  notificationApi.handleAppServerNotification({
+    method: 'thread/started',
+    params: { thread: { id: 'thread-notified' } },
+  });
+  notificationApi.handleAppServerNotification({
+    method: 'turn/started',
+    params: {
+      threadId: 'thread-notified',
+      turn: { id: 'turn-notified', status: 'inProgress' },
+    },
+  });
+  assert.deepEqual(
+    notificationLoads.map(([threadId]) => threadId),
+    ['thread-notified', 'thread-notified'],
+    'late thread and turn notifications must register the Web-owned subscription',
+  );
+  assert.deepEqual(notificationTurns, [['thread-notified', 'turn-notified']]);
+  assert.equal(notificationStarts.length, 1);
+
   const activeNativeTurns = new Map([['thread-a', { turnId: 'turn-current', status: 'running' }]]);
   const updates = [];
   const timers = [];
   const dispatches = [];
+  const releases = [];
   const api = new Function(
     'activeNativeTurns',
     'cleanNativeThreadId',
@@ -309,7 +643,10 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
       activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state });
     },
     () => false,
-    () => Promise.resolve(false),
+    (...args) => {
+      releases.push(args);
+      return Promise.resolve(true);
+    },
     (...args) => dispatches.push(args),
     (callback) => { timers.push(callback); return { unref() {} }; },
   );
@@ -320,6 +657,7 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
   assert.equal(updates.length, 0);
   assert.equal(api.recordNativeTurnCompletion('thread-a', { id: 'turn-current', status: 'completed' }), true);
   assert.deepEqual(updates, [{ threadId: 'thread-a', state: { turnId: 'turn-current', status: 'done' } }]);
+  assert.deepEqual(releases, [['thread-a', 'turn-current', { reason: 'turn-completed' }]]);
   assert.deepEqual(dispatches, [['thread-a', 160]], 'a durable server worker takes over the next queued prompt');
   assert.equal(timers.length, 0, 'terminal state remains until the matching persisted turn record is observed');
 });
@@ -813,7 +1151,7 @@ test('native session terminal state clears a stale in-memory running turn', asyn
   assert.equal(activeNativeTurns.has('thread-stale-jsonl'), true, 'an older JSONL running state must not undo a newer pause');
 });
 
-test('app-server latest turn status repairs stale JSONL running state after restart', async () => {
+test('Web-owned app-server latest turn status repairs stale JSONL running state', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('function appServerTurnStartedAt');
   const helperEnd = serverSource.indexOf('\nfunction requestDesktopThreadSnapshot', helperStart);
@@ -823,6 +1161,10 @@ test('app-server latest turn status repairs stale JSONL running state after rest
   const updates = [];
   const dispatches = [];
   const requests = [];
+  const connection = {};
+  const appServerLoadedThreads = new Map([
+    ['thread-paused', { connection, turnId: 'turn-paused', loadedAt: Date.now() }],
+  ]);
   const api = new Function(
     'activeNativeTurns',
     'cleanNativeThreadId',
@@ -834,6 +1176,7 @@ test('app-server latest turn status repairs stale JSONL running state after rest
     'nativeTurnStatusSyncTimes',
     'NATIVE_TURN_STATUS_SYNC_INTERVAL_MS',
     'NATIVE_TURN_STATUS_ACTIVITY_GRACE_MS',
+    'appServerLoadedThreads',
     'appServerClient',
     'NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS',
     'releaseAppServerThreadAfterTurn',
@@ -861,7 +1204,10 @@ test('app-server latest turn status repairs stale JSONL running state after rest
     new Map(),
     1500,
     5 * 60 * 1000,
+    appServerLoadedThreads,
     {
+      child: connection,
+      initialized: true,
       request: async (method, params, options) => {
         requests.push({ method, params, options });
         return {
@@ -903,6 +1249,30 @@ test('app-server latest turn status repairs stale JSONL running state after rest
   }]);
   assert.deepEqual(dispatches, [['thread-paused', 160]]);
 
+  const desktopProbeCount = requests.length;
+  assert.equal(
+    await api.reconcileNativeTurnStatusFromAppServer('desktop-owned-thread', {
+      status: 'running',
+      latestTurnId: 'desktop-turn',
+      latestTurnStartedAt: new Date().toISOString(),
+    }),
+    false,
+  );
+  assert.equal(
+    await api.reconcileNativeTurnStatusFromAppServer('desktop-owned-thread', {
+      status: 'running',
+      latestTurnId: 'desktop-turn',
+      latestTurnStartedAt: new Date().toISOString(),
+    }, { force: true }),
+    false,
+    'force must not let Web probe a thread that it did not explicitly load',
+  );
+  assert.equal(
+    requests.length,
+    desktopProbeCount,
+    'opening or recovering a Desktop-owned thread must not send app-server turns/list',
+  );
+
   const updateCountBeforeLiveTurn = updates.length;
   assert.equal(api.applyAppServerTurnStatus('thread-live', {
     id: 'turn-live',
@@ -928,28 +1298,193 @@ test('app-server latest turn status repairs stale JSONL running state after rest
   }), false, 'an older persisted terminal state must not stop a newer live turn');
 });
 
-test('stale app-server unsubscribe cleanup cannot suppress a later reload on the same connection', async () => {
+test('opening a running Desktop-owned session stays passive to Web app-server', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-web-passive-desktop-session-'));
+  const runtime = path.join(temporary, 'runtime');
+  const codexHome = path.join(temporary, 'codex-home');
+  const fakeCodex = path.join(temporary, 'fake-codex.mjs');
+  const traceFile = path.join(temporary, 'codex-trace.json');
+  const appServerTraceFile = path.join(temporary, 'app-server-trace.jsonl');
+  const threadId = '019f4f84-ea9f-73c2-b997-deba7b4aa739';
+  let child;
+  let desktopIpc;
+
+  try {
+    const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '30');
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(appServerTraceFile, '');
+    await writeFile(
+      path.join(sessionDir, `rollout-2026-08-30T00-00-00-${threadId}.jsonl`),
+      [
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: threadId,
+            cwd: temporary,
+            originator: 'Codex Desktop',
+            cli_version: 'test',
+          },
+        }),
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_id: 'desktop-passive-turn' },
+        }),
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Desktop-owned running fixture' }],
+          },
+        }),
+        '',
+      ].join('\n'),
+    );
+    await writeFile(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+if (process.argv[2] !== 'app-server') process.exit(2);
+const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  const lines = buffer.split('\\n');
+  buffer = lines.pop() || '';
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    appendFileSync(process.env.FAKE_APP_SERVER_TRACE, JSON.stringify(message) + '\\n');
+    if (message.method === 'initialize') {
+      send({ id: message.id, result: { userAgent: 'passive-desktop-session-fixture' } });
+    } else if (Object.hasOwn(message, 'id')) {
+      send({ id: message.id, error: { code: -32601, message: 'unsupported fake method' } });
+    }
+  }
+});
+`);
+    await chmod(fakeCodex, 0o755);
+    desktopIpc = await createDesktopIpcFixture(temporary);
+    child = await startServer({
+      temporary,
+      runtime,
+      codexHome,
+      fakeCodex,
+      traceFile,
+      appServerTraceFile,
+      desktopIpcEnabled: 'true',
+      desktopIpcSocket: desktopIpc.socketPath,
+    });
+    const port = await waitForServer(child, runtime);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const login = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'test-password' }),
+    });
+    assert.equal(login.status, 200);
+    const cookie = login.headers.get('set-cookie').split(';', 1)[0];
+
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const response = await fetch(`${baseUrl}/api/native-sessions/${threadId}`, {
+        headers: { Cookie: cookie },
+      });
+      if (response.status === 200) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (attempt === 79) assert.fail('Desktop-owned fixture session was not indexed');
+    }
+
+    const firstRead = await fetch(
+      `${baseUrl}/api/native-sessions/${threadId}?history=page&latest=complete&limit=3`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(firstRead.status, 200);
+    assert.equal((await firstRead.json()).conversation.status, 'running');
+
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      if (desktopIpc.messages.some((message) => (
+        message.method === 'thread-follower-load-complete-history'
+        && message.params?.conversationId === threadId
+      ))) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (attempt === 79) assert.fail('Desktop history follower was not used');
+    }
+    const secondRead = await fetch(
+      `${baseUrl}/api/native-sessions/${threadId}?history=page&latest=complete&limit=3`,
+      { headers: { Cookie: cookie } },
+    );
+    assert.equal(secondRead.status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const historyLoads = desktopIpc.messages.filter((message) => (
+      message.method === 'thread-follower-load-complete-history'
+      && message.params?.conversationId === threadId
+    ));
+    assert.equal(historyLoads.length, 1);
+    assert.equal(historyLoads[0].targetClientId, 'desktop-owner');
+    assert.equal(
+      desktopIpc.messages.some((message) => (
+        message.params?.conversationId === threadId
+        && [
+          'thread-follower-start-turn',
+          'thread-follower-steer-turn',
+          'thread-follower-interrupt-turn',
+        ].includes(message.method)
+      )),
+      false,
+    );
+
+    const passiveTrace = await readAppServerTrace(appServerTraceFile);
+    const forbiddenMethods = new Set([
+      'thread/resume',
+      'thread/start',
+      'thread/fork',
+      'thread/turns/list',
+      'thread/unsubscribe',
+      'turn/start',
+      'turn/steer',
+      'turn/interrupt',
+    ]);
+    assert.deepEqual(
+      passiveTrace.filter((message) => (
+        forbiddenMethods.has(message.method)
+        && message.params?.threadId === threadId
+      )),
+      [],
+      'opening a Desktop-owned session must not make Web touch its app-server thread',
+    );
+  } finally {
+    if (child) await stopServer(child);
+    if (desktopIpc) await desktopIpc.close();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('stale app-server unsubscribe cleanup cannot suppress a later reload on a replacement client', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('function isAppServerThreadAlreadyUnsubscribedError');
-  const helperEnd = serverSource.indexOf('\nfunction releaseAppServerThreadAfterTurn', helperStart);
+  const helperEnd = serverSource.indexOf('\nasync function releaseAppServerThreadAfterTurn', helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart);
 
-  const connection = {};
-  const appServerLoadedThreads = new Map([
-    ['thread-a', { connection, turnId: '', loadedAt: 0 }],
-  ]);
+  const globalClient = { child: null, initialized: false };
+  const oldConnection = {};
+  const newConnection = {};
   const appServerUnsubscribeRequests = new Map();
   const appServerThreadIdleReleaseTimers = new Map();
   const appServerThreadIdleReleaseAttempts = new Map();
   const requests = [];
   const scheduled = [];
+  const closes = [];
   let holdUnsubscribe = false;
   let resolveHeldUnsubscribe = null;
-  const appServerClient = {
+  const createClient = (name, connection) => ({
+    name,
     child: connection,
-    initialized: false,
+    initialized: true,
     requestWithConnection: async (method, params, options) => {
-      requests.push({ method, params, options });
+      requests.push({ client: name, method, params, options });
       if (method === 'thread/unsubscribe' && holdUnsubscribe) {
         return new Promise((resolve) => {
           resolveHeldUnsubscribe = () => resolve({
@@ -960,13 +1495,24 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
       }
       return { result: { status: 'unsubscribed' }, child: connection };
     },
+  });
+  const oldClient = createClient('old', oldConnection);
+  const newClient = createClient('new', newConnection);
+  const initialRecord = {
+    client: oldClient,
+    connection: oldConnection,
+    turnId: '',
+    loadedAt: 0,
   };
+  const appServerLoadedThreads = new Map([['thread-a', initialRecord]]);
   const api = new Function(
     'cleanNativeThreadId',
     'appServerLoadedThreads',
     'appServerUnsubscribeRequests',
     'activeNativeTurns',
     'appServerClient',
+    'appServerClientForRecord',
+    'closeThreadAppServerClient',
     'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
     'appServerThreadIdleReleaseTimers',
     'appServerThreadIdleReleaseAttempts',
@@ -990,7 +1536,12 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
     appServerLoadedThreads,
     appServerUnsubscribeRequests,
     new Map(),
-    appServerClient,
+    globalClient,
+    (record) => record?.client || globalClient,
+    async (client, reason) => {
+      closes.push({ client: client.name, reason });
+      return true;
+    },
     5000,
     appServerThreadIdleReleaseTimers,
     appServerThreadIdleReleaseAttempts,
@@ -1001,6 +1552,7 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
     { warn() {} },
   );
 
+  oldClient.initialized = false;
   assert.equal(await api.unsubscribeAppServerThread('thread-a'), true);
   assert.equal(appServerLoadedThreads.has('thread-a'), false);
   assert.equal(
@@ -1008,21 +1560,33 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
     0,
     'an already-closed connection must not leave a resolved unsubscribe entry behind',
   );
+  assert.deepEqual(closes.map(({ client }) => client), ['old']);
 
-  appServerClient.initialized = true;
-  const oldRecord = { connection, turnId: 'turn-old', loadedAt: 1 };
+  oldClient.initialized = true;
+  const oldRecord = {
+    client: oldClient,
+    connection: oldConnection,
+    turnId: 'turn-old',
+    loadedAt: 1,
+  };
   appServerLoadedThreads.set('thread-a', oldRecord);
   holdUnsubscribe = true;
   const oldRelease = api.unsubscribeAppServerThread('thread-a');
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(requests.length, 1);
   assert.deepEqual(requests[0], {
+    client: 'old',
     method: 'thread/unsubscribe',
     params: { threadId: 'thread-a' },
     options: { timeoutMs: 5000 },
   });
 
-  const reloadedRecord = { connection, turnId: 'turn-new', loadedAt: 2 };
+  const reloadedRecord = {
+    client: newClient,
+    connection: newConnection,
+    turnId: 'turn-new',
+    loadedAt: 2,
+  };
   appServerLoadedThreads.set('thread-a', reloadedRecord);
   assert.equal(typeof resolveHeldUnsubscribe, 'function');
   resolveHeldUnsubscribe();
@@ -1034,13 +1598,16 @@ test('stale app-server unsubscribe cleanup cannot suppress a later reload on the
   );
   assert.equal(appServerUnsubscribeRequests.size, 0);
   assert.equal(scheduled.length, 0);
+  assert.deepEqual(closes.map(({ client }) => client), ['old', 'old']);
 
   holdUnsubscribe = false;
   assert.equal(await api.unsubscribeAppServerThread('thread-a'), true);
   assert.equal(appServerLoadedThreads.has('thread-a'), false);
   assert.equal(requests.length, 2);
+  assert.equal(requests[1].client, 'new');
   assert.equal(requests[1].method, 'thread/unsubscribe');
   assert.equal(scheduled.length, 0);
+  assert.deepEqual(closes.map(({ client }) => client), ['old', 'old', 'new']);
 });
 
 test('app-server unsubscribe failures retain ownership and turn mismatches do not unsubscribe', async () => {
@@ -1308,7 +1875,40 @@ test('ambiguous app-server turns reconcile terminal, running, and idle states wi
   requests.length = 0;
   updates.length = 0;
   probeResponse = { data: [] };
+  result = await api.reconcileUnconfirmedAppServerThread(threadId, 'turn-running', {
+    retryDelays: [0],
+    reason: 'test-interrupt-ack-still-pending',
+    allowProbeWhileBusy: true,
+    requireTerminalTurn: true,
+  });
+  assert.equal(result.released, false);
+  assert.equal(result.state, 'pending-terminal');
+  assert.equal(result.turnId, 'turn-running');
+  assert.equal(appServerLoadedThreads.has(threadId), true);
+  assert.equal(activeNativeTurns.get(threadId)?.status, 'running');
+  assert.deepEqual(requests.map((request) => request.method), ['thread/turns/list']);
+  assert.equal(updates.length, 0);
+
+  requests.length = 0;
+  probeResponse = { data: [{ id: 'turn-running', status: 'interrupted' }] };
+  result = await api.reconcileUnconfirmedAppServerThread(threadId, 'turn-running', {
+    retryDelays: [0],
+    reason: 'test-interrupt-terminal-confirmed',
+    allowProbeWhileBusy: true,
+    requireTerminalTurn: true,
+  });
+  assert.equal(result.released, true);
+  assert.equal(result.state, 'terminal');
+  assert.equal(result.turnId, 'turn-running');
+  assert.equal(appServerLoadedThreads.has(threadId), false);
+  assert.notEqual(activeNativeTurns.get(threadId)?.status, 'running');
+  assert.deepEqual(requests.map((request) => request.method), ['thread/turns/list', 'thread/unsubscribe']);
+
+  requests.length = 0;
+  updates.length = 0;
+  probeResponse = { data: [] };
   activeNativeTurns.clear();
+  appServerLoadedThreads.set(threadId, { connection, turnId: '', loadedAt: 0 });
   conversations.set(threadId, { status: 'done', messages: [] });
   result = await api.reconcileUnconfirmedAppServerThread(threadId, '', {
     retryDelays: [0],
@@ -1938,7 +2538,13 @@ test('a pending new-session turn/start keeps its Web subscription reserved', asy
     nativeTurnReservations,
     serverPromptQueueDispatchingThreads,
     activeNativeTurns,
-    { get: () => null },
+    {
+      get: () => ({
+        status: 'running',
+        latestTurnId: 'turn-slow',
+        latestTurnStartedAt: '2026-08-30T14:40:03.000Z',
+      }),
+    },
     appServerClient,
     2500,
     [0],
@@ -2006,10 +2612,11 @@ test('a pending new-session turn/start keeps its Web subscription reserved', asy
   assert.deepEqual(requests.map((request) => request.method), []);
   assert.equal(appServerUnsubscribeRequests.size, 0);
 
-  // This mirrors the route finally block after turn/start has settled. Once
-  // the running marker is gone, the same timer chain may clean up normally.
+  // This mirrors the route finally block after turn/start has settled while
+  // both the in-memory and JSONL running markers are stale. The idle timer
+  // must ignore only those stale status hints, probe app-server, and release
+  // the now-idle writer without waiting for another local terminal event.
   nativeTurnReservations.delete(threadId);
-  activeNativeTurns.delete(threadId);
   const retryTimer = appServerThreadIdleReleaseTimers.get(threadId)?.timer;
   assert.ok(retryTimer);
   retryTimer.callback();
@@ -2020,6 +2627,7 @@ test('a pending new-session turn/start keeps its Web subscription reserved', asy
     ['thread/turns/list', 'thread/unsubscribe'],
   );
   assert.equal(appServerLoadedThreads.has(threadId), false);
+  assert.notEqual(activeNativeTurns.get(threadId)?.status, 'running');
 });
 
 test('ambiguous steer and interrupt cleanup retain the record loaded by their resume', async () => {
@@ -2036,7 +2644,12 @@ test('ambiguous steer and interrupt cleanup retain the record loaded by their re
       startMarker: 'async function steerNativeTurn',
       endMarker: '\nasync function waitForNativeSteerEcho',
       rpc: 'turn/steer',
-      invoke: (api) => api.steerNativeTurn(threadId, { input: [{ type: 'text', text: 'steer' }] }, ''),
+      invoke: (api) => api.steerNativeTurn(
+        threadId,
+        { input: [{ type: 'text', text: 'steer' }] },
+        '',
+        { allowAppServerFallback: true },
+      ),
       client: {
         steerTurn: async () => { throw desktopUnavailable; },
       },
@@ -2046,7 +2659,11 @@ test('ambiguous steer and interrupt cleanup retain the record loaded by their re
       startMarker: 'async function interruptNativeTurn',
       endMarker: '\nasync function stopNativeTurnForArchive',
       rpc: 'turn/interrupt',
-      invoke: (api) => api.interruptNativeTurn(threadId, ''),
+      invoke: (api) => api.interruptNativeTurn(
+        threadId,
+        '',
+        { allowAppServerFallback: true },
+      ),
       client: {
         interruptTurn: async () => { throw desktopUnavailable; },
       },
@@ -2135,6 +2752,140 @@ test('ambiguous steer and interrupt cleanup retain the record loaded by their re
   }
 });
 
+test('app-server interrupt ACK keeps ownership until the matching turn is terminal', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function interruptNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function stopNativeTurnForArchive', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const threadId = '019edad7-8eda-7622-bf2f-7c0bf4fdd063';
+  const turnId = 'turn-interrupt';
+  const connection = {};
+  const record = { connection, turnId, loadedAt: 1 };
+  const appServerLoadedThreads = new Map([[threadId, record]]);
+  const activeNativeTurns = new Map([[
+    threadId,
+    { turnId, status: 'running', transport: 'app-server' },
+  ]]);
+  const requests = [];
+  const reconciles = [];
+  const releases = [];
+  let reconciliationResult = { released: false, state: 'running', turnId };
+  const desktopUnavailable = Object.assign(new Error('Desktop owner unavailable'), {
+    code: 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+  });
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'desktopIpcClient',
+    'CODEX_DESKTOP_IPC_INTERRUPT_TIMEOUT_MS',
+    'isCodexDesktopIpcUnavailableError',
+    'nativeAppHandoffRequiredError',
+    'appServerLoadedThreads',
+    'requestLoadedAppServerThread',
+    'findInProgressTurnId',
+    'releaseAppServerThreadAfterTurn',
+    'appServerClient',
+    'APP_SERVER_INTERRUPT_TIMEOUT_MS',
+    'isAmbiguousAppServerRequestError',
+    'reconcileUnconfirmedAppServerThread',
+    'activeNativeTurns',
+    'nativeTurnHasPersistedTerminal',
+    `${serverSource.slice(helperStart, helperEnd)}; return { interruptNativeTurn };`,
+  )(
+    { get: () => ({ status: 'running', messages: [] }) },
+    new Map(),
+    { interruptTurn: async () => { throw desktopUnavailable; } },
+    100,
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    () => new Error('unexpected handoff rejection'),
+    appServerLoadedThreads,
+    async () => { throw new Error('loaded Web thread must not resume again'); },
+    () => '',
+    async (...args) => { releases.push(args); return true; },
+    {
+      request: async (method, params, options) => {
+        requests.push({ method, params, options });
+        return { ok: true };
+      },
+    },
+    100,
+    () => false,
+    async (...args) => {
+      reconciles.push(args);
+      return reconciliationResult;
+    },
+    activeNativeTurns,
+    () => false,
+  );
+
+  let result = await api.interruptNativeTurn(
+    threadId,
+    turnId,
+    { allowAppServerFallback: true },
+  );
+  assert.equal(result.terminalConfirmed, false);
+  assert.equal(activeNativeTurns.get(threadId)?.status, 'running');
+  assert.equal(appServerLoadedThreads.get(threadId), record);
+  assert.equal(releases.length, 0);
+  assert.deepEqual(requests.map((request) => request.method), ['turn/interrupt']);
+  assert.equal(reconciles.length, 1);
+  assert.equal(reconciles[0][0], threadId);
+  assert.equal(reconciles[0][1], turnId);
+  assert.equal(reconciles[0][2].record, record);
+  assert.equal(reconciles[0][2].requireTerminalTurn, true);
+
+  reconciliationResult = { released: true, state: 'terminal', turnId };
+  result = await api.interruptNativeTurn(
+    threadId,
+    turnId,
+    { allowAppServerFallback: true },
+  );
+  assert.equal(result.terminalConfirmed, true);
+  assert.equal(releases.length, 0);
+});
+
+test('archive waits when app-server interrupt has not reached a terminal turn', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function stopNativeTurnForArchive');
+  const helperEnd = serverSource.indexOf('\nasync function notifyDesktopThreadArchived', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const states = [];
+  const releases = [];
+  const terminalMarks = [];
+  const api = new Function(
+    'currentNativeTurnId',
+    'interruptNativeTurn',
+    'appServerThreadIsLoadedByWeb',
+    'setNativeTurnState',
+    'releaseAppServerThreadAfterTurn',
+    'nativeSessions',
+    `${serverSource.slice(helperStart, helperEnd)}; return { stopNativeTurnForArchive };`,
+  )(
+    () => 'turn-pending',
+    async () => ({
+      interruptedTurnId: 'turn-pending',
+      transport: 'app-server',
+      terminalConfirmed: false,
+    }),
+    () => true,
+    (...args) => states.push(args),
+    async (...args) => { releases.push(args); return true; },
+    {
+      markTurnTerminal: (...args) => terminalMarks.push(args),
+    },
+  );
+
+  await assert.rejects(
+    api.stopNativeTurnForArchive('thread-pending'),
+    (error) => error?.statusCode === 409 && /等待 Codex 确认结束/.test(error.message),
+  );
+  assert.equal(states.length, 0);
+  assert.equal(releases.length, 0);
+  assert.equal(terminalMarks.length, 0);
+});
+
 test('Desktop snapshots and patches synchronize live and terminal turn state', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const handlerStart = serverSource.indexOf('function handleDesktopIpcBroadcast');
@@ -2153,6 +2904,7 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
   ]);
   const updates = [];
   const dispatches = [];
+  const pauses = [];
   const requestedSnapshots = [];
   const api = new Function(
     'desktopThreadStates',
@@ -2163,6 +2915,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
     'nativeSessions',
     'setNativeTurnState',
     'scheduleServerPromptQueueDispatch',
+    'isPromptQueuePaused',
+    'setPromptQueuePause',
     `${serverSource.slice(handlerStart, handlerEnd)}; return { handleDesktopIpcBroadcast };`,
   )(
     new Map(),
@@ -2176,6 +2930,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
       activeNativeTurns.set(threadId, { ...activeNativeTurns.get(threadId), ...state });
     },
     (...args) => dispatches.push(args),
+    () => false,
+    (...args) => pauses.push(args),
   );
 
   api.handleDesktopIpcBroadcast({
@@ -2251,7 +3007,8 @@ test('Desktop snapshots and patches synchronize live and terminal turn state', a
       state: { turnId: 'turn-c', status: 'running', transport: 'desktop-ipc' },
     },
   ]);
-  assert.deepEqual(dispatches, [['thread-a', 160], ['thread-b', 160]]);
+  assert.deepEqual(dispatches, [['thread-b', 160]]);
+  assert.deepEqual(pauses, [['thread-a', { reason: 'app-paused', message: 'Codex App 已暂停，等待手动继续' }]]);
 
   api.handleDesktopIpcBroadcast({
     method: 'thread-stream-state-changed',
@@ -2428,6 +3185,74 @@ test('active-writer conflicts are classified without matching generic active sta
   assert.doesNotMatch(friendly.message, /active writer|thread-store/i);
 });
 
+test('terminal App writer locks are quarantined before Web settings takeover', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function requestLoadedAppServerThreadWithIdleWriterTakeover');
+  const helperEnd = serverSource.indexOf('\nasync function resumeNativeTurnWithIdleWriterTakeover', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const calls = [];
+  const repair = { lockPath: '/tmp/thread.lock', backupPath: '/tmp/thread.lock.web-takeover' };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'quarantineIdleNativeThreadWriterLock',
+    'requestLoadedAppServerThread',
+    'discardQuarantinedNativeThreadWriterLock',
+    'restoreQuarantinedNativeThreadWriterLock',
+    `${serverSource.slice(helperStart, helperEnd)}; return { requestLoadedAppServerThreadWithIdleWriterTakeover };`,
+  )(
+    (value) => String(value || '').trim(),
+    (threadId) => { calls.push(['quarantine', threadId]); return repair; },
+    async (method, params) => {
+      calls.push(['request', method, params]);
+      return { thread: { id: params.threadId } };
+    },
+    (value) => calls.push(['discard', value]),
+    (value) => calls.push(['restore', value]),
+  );
+
+  const result = await api.requestLoadedAppServerThreadWithIdleWriterTakeover(
+    'thread/resume',
+    { threadId: 'thread-a', excludeTurns: true },
+    new Error('active writer'),
+  );
+  assert.deepEqual(result, { thread: { id: 'thread-a' } });
+  assert.deepEqual(calls, [
+    ['quarantine', 'thread-a'],
+    ['request', 'thread/resume', { threadId: 'thread-a', excludeTurns: true }],
+    ['discard', repair],
+  ]);
+
+  calls.length = 0;
+  const requestError = new Error('resume failed');
+  const failingApi = new Function(
+    'cleanNativeThreadId',
+    'quarantineIdleNativeThreadWriterLock',
+    'requestLoadedAppServerThread',
+    'discardQuarantinedNativeThreadWriterLock',
+    'restoreQuarantinedNativeThreadWriterLock',
+    `${serverSource.slice(helperStart, helperEnd)}; return { requestLoadedAppServerThreadWithIdleWriterTakeover };`,
+  )(
+    (value) => String(value || '').trim(),
+    (threadId) => { calls.push(['quarantine', threadId]); return repair; },
+    async () => { throw requestError; },
+    (value) => calls.push(['discard', value]),
+    (value) => calls.push(['restore', value]),
+  );
+  await assert.rejects(
+    failingApi.requestLoadedAppServerThreadWithIdleWriterTakeover(
+      'thread/resume',
+      { threadId: 'thread-a' },
+      new Error('active writer'),
+    ),
+    (error) => error === requestError,
+  );
+  assert.deepEqual(calls, [
+    ['quarantine', 'thread-a'],
+    ['restore', repair],
+  ]);
+});
+
 test('Desktop handoff stops when Web subscription release is not confirmed', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('async function continueNativeTurn');
@@ -2497,7 +3322,7 @@ test('active-writer archive fallback requires an explicit latest-turn terminal r
   };
   const storageCalls = [];
   const api = new Function(
-    'appServerClient',
+    'requestThreadAppServer',
     'nativeSessions',
     'nativeActiveTurnFor',
     'nativeTurnReservations',
@@ -2508,7 +3333,7 @@ test('active-writer archive fallback requires an explicit latest-turn terminal r
       nativeConversationHasExplicitTerminal,
     };`,
   )(
-    { request: async () => { throw activeWriterConflict; } },
+    async () => { throw activeWriterConflict; },
     { get: () => conversation },
     () => null,
     new Set(),
@@ -2621,6 +3446,56 @@ test('active-writer Desktop retry preserves non-availability failures', async ()
   assert.equal(releaseCalls, 1);
   assert.equal(resumeCalls, 1);
   assert.equal(desktopCalls, 2);
+});
+
+test('terminal Desktop active-writer conflict falls back to Web takeover', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const activeWriterConflict = new Error(
+    'Codex Desktop IPC 请求失败: thread-store conflict: thread 019edad7-8eda-7622-bf2f-7c0bf4fdd063 already has an active writer',
+  );
+  let desktopCalls = 0;
+  let takeoverCalls = 0;
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'resumeNativeTurnWithIdleWriterTakeover',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => { throw new Error('must not call plain Web resume'); },
+    async () => {
+      takeoverCalls += 1;
+      return { turnId: 'turn-web-takeover' };
+    },
+    (error) => error === activeWriterConflict,
+    ({ cause } = {}) => Object.assign(new Error('friendly active-writer conflict', { cause }), {
+      code: 'CODEX_NATIVE_ACTIVE_WRITER',
+      statusCode: 409,
+    }),
+    async () => {},
+    async () => {
+      desktopCalls += 1;
+      throw activeWriterConflict;
+    },
+  );
+
+  const result = await api.continueNativeTurn(
+    '019edad7-8eda-7622-bf2f-7c0bf4fdd063',
+    { provider: 'fake' },
+  );
+  assert.deepEqual(result, { turnId: 'turn-web-takeover' });
+  assert.equal(desktopCalls, 1);
+  assert.equal(takeoverCalls, 1);
 });
 
 test('active-writer recovery waits for a temporarily unavailable Desktop owner', async () => {
@@ -2741,6 +3616,79 @@ test('disabled Desktop IPC falls back to app-server when continuing a thread', a
   assert.equal(result.turnId, 'app-server-turn');
   assert.equal(desktopCalls, 1);
   assert.equal(resumeCalls, 1);
+});
+
+test('Desktop-exclusive continuations never claim an existing App thread through app-server', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function continueNativeTurn');
+  const helperEnd = serverSource.indexOf('\nasync function startDesktopNativeTurn', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const unavailable = Object.assign(new Error('Desktop owner unavailable'), {
+    code: 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    reason: 'no-client-found',
+  });
+  let desktopCalls = 0;
+  let resumeCalls = 0;
+  const api = new Function(
+    'nativeSessions',
+    'desktopThreadStates',
+    'resumeNativeTurn',
+    'isNativeActiveWriterConflict',
+    'nativeActiveWriterConflictError',
+    'nativeAppHandoffRequiredError',
+    'releaseAppServerThreadAfterTurn',
+    'startDesktopNativeTurn',
+    'isCodexDesktopIpcUnavailableError',
+    'isAmbiguousDesktopTurnStartError',
+    'CODEX_DESKTOP_ACTIVE_WRITER_RETRY_DELAYS_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_OWNER_DISCOVERY_TIMEOUT_MS',
+    'CODEX_DESKTOP_ACTIVE_WRITER_START_TIMEOUT_MS',
+    `${serverSource.slice(helperStart, helperEnd)}; return { continueNativeTurn };`,
+  )(
+    { get: () => ({ metadata: { modelProvider: 'fake' } }) },
+    new Map(),
+    async () => {
+      resumeCalls += 1;
+      throw new Error('exclusive Desktop mode must not resume through app-server');
+    },
+    () => false,
+    () => new Error('unexpected active writer'),
+    ({ providerChanged = false, cause } = {}) => Object.assign(
+      new Error(providerChanged ? 'switch provider in App' : 'open the thread in App', { cause }),
+      { code: 'CODEX_DESKTOP_OWNER_REQUIRED', statusCode: 409 },
+    ),
+    async () => true,
+    async () => {
+      desktopCalls += 1;
+      throw unavailable;
+    },
+    (error) => error?.code === 'CODEX_DESKTOP_IPC_UNAVAILABLE',
+    () => false,
+    [0, 0],
+    25,
+    40,
+  );
+
+  await assert.rejects(
+    api.continueNativeTurn('019edad7-8eda-7622-bf2f-7c0bf4fdd063', {
+      provider: 'fake',
+      allowAppServerFallback: false,
+    }),
+    (error) => error?.code === 'CODEX_DESKTOP_OWNER_REQUIRED' && error.statusCode === 409,
+  );
+  assert.equal(desktopCalls, 3, 'Desktop owner discovery should receive bounded retries');
+  assert.equal(resumeCalls, 0, 'Web must never call thread/resume in Desktop-exclusive mode');
+
+  await assert.rejects(
+    api.continueNativeTurn('019edad7-8eda-7622-bf2f-7c0bf4fdd063', {
+      provider: 'other-provider',
+      allowAppServerFallback: false,
+    }),
+    (error) => error?.code === 'CODEX_DESKTOP_OWNER_REQUIRED' && /provider/i.test(error.message),
+  );
+  assert.equal(desktopCalls, 3, 'provider changes must fail before trying to claim the App thread');
+  assert.equal(resumeCalls, 0);
 });
 
 test('active-writer recovery retries only an owner-discovery timeout', async () => {
@@ -3115,21 +4063,158 @@ test('playground proxy maps an external host alias only to a matching loopback p
   ), false);
 });
 
-test('provider config reload guard preserves running app-server turns', async () => {
+test('failed thread RPC still schedules the app-server writer for release', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('async function requestThreadAppServer');
+  const helperEnd = serverSource.indexOf('\nasync function requestLoadedAppServerThread', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const marked = [];
+  const scheduled = [];
+  const appServerClient = {
+    child: null,
+    initialized: false,
+    async requestWithConnection() {
+      this.child = connection;
+      this.initialized = true;
+      throw new Error('Codex app-server 请求超时: thread/archive');
+    },
+  };
+  const requestThreadAppServer = new Function(
+    'appServerClient',
+    'markAppServerWriterConnection',
+    'scheduleAppServerWriterIdleStop',
+    `${serverSource.slice(helperStart, helperEnd)}; return requestThreadAppServer;`,
+  )(
+    appServerClient,
+    (child) => marked.push(child),
+    (reason, options) => scheduled.push({ reason, options }),
+  );
+
+  await assert.rejects(
+    requestThreadAppServer('thread/archive', { threadId: 'thread-a' }),
+    /请求超时/,
+  );
+  assert.deepEqual(marked, [connection]);
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].reason, 'thread-rpc:thread/archive');
+  assert.equal(scheduled[0].options.connection, connection);
+});
+
+test('writer handoff ignores only its own reservation, never live app-server work', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function appServerWriterHasBlockingWork');
+  const helperEnd = serverSource.indexOf('\nfunction stopAppServerWriterIfIdle', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const connection = {};
+  const activeNativeTurns = new Map();
+  const pendingNativeRequests = new Map();
+  const nativeTurnReservations = new Set();
+  const serverPromptQueueDispatchingThreads = new Set();
+  const appServerThreadReconcileRequests = new Map();
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    operationCount: 0,
+    pending: new Map(),
+    startPromise: null,
+    restartPromise: null,
+  };
+  const appServerWriterHasBlockingWork = new Function(
+    'appServerClient',
+    'cleanNativeThreadId',
+    'appServerLoadedThreads',
+    'appServerUnsubscribeRequests',
+    'appServerThreadReconcileRequests',
+    'activeNativeTurns',
+    'pendingNativeRequests',
+    'nativeTurnReservations',
+    'serverPromptQueueDispatchingThreads',
+    `${serverSource.slice(helperStart, helperEnd)}; return appServerWriterHasBlockingWork;`,
+  )(
+    appServerClient,
+    (value) => String(value || '').trim(),
+    new Map(),
+    new Map(),
+    appServerThreadReconcileRequests,
+    activeNativeTurns,
+    pendingNativeRequests,
+    nativeTurnReservations,
+    serverPromptQueueDispatchingThreads,
+  );
+
+  nativeTurnReservations.add('thread-a');
+  activeNativeTurns.set('thread-a', {
+    turnId: 'turn-a',
+    status: 'running',
+    transport: 'app-server',
+  });
+  assert.equal(
+    appServerWriterHasBlockingWork(connection, { ignoreReservationThreadId: 'thread-a' }),
+    true,
+    'handoff must not ignore a real running Web turn on the reserved thread',
+  );
+
+  activeNativeTurns.set('thread-a', {
+    turnId: 'turn-a',
+    status: 'running',
+    transport: 'desktop-ipc',
+  });
+  assert.equal(
+    appServerWriterHasBlockingWork(connection, { ignoreReservationThreadId: 'thread-a' }),
+    false,
+    'only the matching reservation is ignored when no Web work is active',
+  );
+
+  appServerClient.operationCount = 1;
+  assert.equal(
+    appServerWriterHasBlockingWork(connection, { ignoreReservationThreadId: 'thread-a' }),
+    true,
+    'an operation lease must block writer shutdown before its RPC enters the pending map',
+  );
+  appServerClient.operationCount = 0;
+
+  pendingNativeRequests.set('approval-a', { threadId: 'thread-a', transport: 'app-server' });
+  assert.equal(
+    appServerWriterHasBlockingWork(connection, { ignoreReservationThreadId: 'thread-a' }),
+    true,
+  );
+  pendingNativeRequests.clear();
+  appServerThreadReconcileRequests.set('thread-a', Promise.resolve());
+  assert.equal(
+    appServerWriterHasBlockingWork(connection, { ignoreReservationThreadId: 'thread-a' }),
+    true,
+  );
+  appServerThreadReconcileRequests.clear();
+  nativeTurnReservations.add('thread-b');
+  assert.equal(
+    appServerWriterHasBlockingWork(connection, { ignoreReservationThreadId: 'thread-a' }),
+    true,
+  );
+});
+
+test('provider config reload guard preserves all blocking app-server work', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('function assertAppServerConfigChangeAllowed');
   const helperEnd = serverSource.indexOf('\nasync function restartAppServerForConfigChange', helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart);
   const helperSource = serverSource.slice(helperStart, helperEnd);
-  const buildGuard = (turns) => new Function(
-    'activeNativeTurns',
+  const buildGuard = ({ child = {}, initialized = true, blocking = false } = {}) => new Function(
+    'appServerClient',
+    'appServerWriterHasBlockingWork',
     `${helperSource}; return assertAppServerConfigChangeAllowed;`,
-  )(new Map(turns));
+  )(
+    { child, initialized },
+    (connection) => connection === child && blocking,
+  );
 
-  assert.doesNotThrow(buildGuard([]));
-  assert.doesNotThrow(buildGuard([['desktop', { status: 'running', transport: 'desktop-ipc' }]]));
+  assert.doesNotThrow(buildGuard({ blocking: false }));
+  assert.doesNotThrow(buildGuard({ child: null, blocking: true }));
+  assert.doesNotThrow(buildGuard({ initialized: false, blocking: true }));
   assert.throws(
-    buildGuard([['local', { status: 'running', transport: 'app-server' }]]),
+    buildGuard({ blocking: true }),
     (error) => error.statusCode === 409 && /任务正在运行/.test(error.message),
   );
 });
@@ -3326,6 +4411,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
   const invalidSvgImagePath = path.join(temporary, 'not-really-svg.svg');
   let externalImageRoot = '';
   let externalImagePath = '';
+  let localFilePath = '';
+  let rejectedLocalFilePath = '';
   const nativeSessionId = '019f4f84-ea9f-73c2-b997-deba7b4aa729';
   const nativeFirstTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa780';
   const nativeSecondTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa781';
@@ -3610,6 +4697,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     await mkdir(codexHome, { recursive: true });
     externalImageRoot = await mkdtemp(path.join(tmpdir(), 'codex-web-image-root-'));
     externalImagePath = path.join(externalImageRoot, 'gallery-preview.png');
+    localFilePath = path.join(externalImageRoot, 'AGENTS.md');
+    rejectedLocalFilePath = path.join(temporary, 'private-notes.md');
     await writeFile(appServerControlFile, '{}');
     await writeFile(
       toolImagePath,
@@ -3618,6 +4707,8 @@ test('login, read-only config, CLI arguments, and session restart', { timeout: 3
     await writeFile(svgImagePath, '<?xml version="1.0"?>\n<!-- Grok SVG -->\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8"/></svg>');
     await writeFile(invalidSvgImagePath, '<html><body>not an SVG image</body></html>');
     await writeFile(externalImagePath, await readFile(toolImagePath));
+    await writeFile(localFilePath, '# AGENTS.md\n\nAllowed fixture file.\n');
+    await writeFile(rejectedLocalFilePath, 'Not in the configured root.\n');
     await writeFile(imagePromptFetchFixture, `
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (input, options) => {
@@ -4030,6 +5121,7 @@ if (args[0] === 'app-server') {
     }
   } catch {}
   const archiveListCounters = new Map();
+  const latestTurnsByThread = new Map();
   let threadGoal = null;
   let clientName = '';
   const archiveControl = () => {
@@ -4152,6 +5244,10 @@ if (args[0] === 'app-server') {
       else if (message.method === 'thread/unsubscribe') {
         send({ id: message.id, result: { status: 'unsubscribed' } });
       }
+      else if (message.method === 'thread/turns/list') {
+        const latestTurn = latestTurnsByThread.get(String(message.params.threadId || ''));
+        send({ id: message.id, result: { data: latestTurn ? [latestTurn] : [] } });
+      }
       else if (message.method === 'turn/start') {
         const turnId = '019f4f84-ea9f-73c2-b997-deba7b4aa798';
         const text = (message.params.input || []).find((item) => item.type === 'text')?.text || '';
@@ -4161,14 +5257,17 @@ if (args[0] === 'app-server') {
           continue;
         }
         const respond = () => {
-          send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [] } } });
-          send({ method: 'turn/started', params: { threadId: message.params.threadId, turn: { id: turnId, status: 'inProgress', items: [] } } });
+          const threadId = String(message.params.threadId || '');
+          const turn = { id: turnId, status: 'inProgress', items: [] };
+          latestTurnsByThread.set(threadId, turn);
+          send({ id: message.id, result: { turn } });
+          send({ method: 'turn/started', params: { threadId, turn } });
           send({
             method: 'error',
             params: {
               error: { message: 'Reconnecting... 1/5' },
               willRetry: true,
-              threadId: message.params.threadId,
+              threadId,
               turnId
             }
           });
@@ -4249,7 +5348,16 @@ if (args[0] === 'app-server') {
         send({ id: message.id, result: { cleared } });
         send({ method: 'thread/goal/cleared', params: { threadId: message.params.threadId } });
       }
-      else if (['thread/name/set', 'thread/settings/update', 'turn/interrupt'].includes(message.method)) {
+      else if (message.method === 'turn/interrupt') {
+        const threadId = String(message.params.threadId || '');
+        const turnId = String(message.params.turnId || '');
+        const latestTurn = latestTurnsByThread.get(threadId);
+        if (latestTurn?.id === turnId) {
+          latestTurnsByThread.set(threadId, { ...latestTurn, status: 'interrupted' });
+        }
+        send({ id: message.id, result: {} });
+      }
+      else if (['thread/name/set', 'thread/settings/update'].includes(message.method)) {
         send({ id: message.id, result: {} });
       }
       else send({ id: message.id, error: { code: -32601, message: 'unsupported fake method' } });
@@ -4297,6 +5405,7 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
       desktopIpcTimeoutMs: '5000',
       playgroundProxyAllowedOrigins: customProviderBaseUrl,
       localImageRoots: externalImageRoot,
+      localFileRoots: externalImageRoot,
       sub2ApiBaseUrl: providerBaseUrl,
       sub2ApiKey: 'test-sub-key',
     });
@@ -4373,7 +5482,8 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.match(uiStyles, /\.promptQueueRow/);
     assert.match(uiStyles, /\.box\.runActive/);
     assert.match(uiStyles, /\.composerModelToggle\.running:not\(:disabled\)\s*\{[^}]*cursor:\s*pointer/s);
-    assert.match(uiStyles, /\.composerModelToggle\.running \.composerModelState\s*\{[^}]*border-right-color:\s*transparent;[^}]*animation:\s*spin/s);
+    assert.match(uiStyles, /\.composerContextToggle\.running \.composerContextRing\s*\{[^}]*background:\s*conic-gradient\([^}]*currentColor 28%,[^}]*animation:\s*spin/s);
+    assert.doesNotMatch(uiStyles, /\.composerModelToggle\.running \.composerModelState/);
     assert.match(uiStyles, /\.composerModelPanel\s*\{[^}]*width:\s*min\(260px,[^}]*border-radius:\s*18px/s);
     assert.match(uiStyles, /\.composerModelMenuRow\s*\{[^}]*min-height:\s*44px;[^}]*grid-template-columns:/s);
     assert.match(uiStyles, /\.composerModelMenuRow\.active\s*\{[^}]*background:\s*var\(--surface-hover\)/s);
@@ -4865,18 +5975,22 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
     assert.match(codexAppCredits.headers.get('cache-control'), /private, no-store/);
     const codexAppCreditsPayload = await codexAppCredits.json();
     assert.match(codexAppCreditsPayload.fetchedAt, /^\d{4}-\d{2}-\d{2}T/);
-    const { fetchedAt: _codexAppCreditsFetchedAt, ...codexAppCreditsStable } = codexAppCreditsPayload;
+    assert.equal(codexAppCreditsPayload.usage, undefined);
+    assert.deepEqual(codexAppCreditsPayload.cycleUsage, { available: false, loading: false });
+    const { fetchedAt: _codexAppCreditsFetchedAt, cycleUsage: _cycleUsage, ...codexAppCreditsStable } = codexAppCreditsPayload;
     assert.deepEqual(codexAppCreditsStable, {
       provider: 'codex-app',
       providerLabel: 'Codex App',
       name: 'Codex App',
       mode: 'codex_app_credits',
+      windows: [],
       valid: true,
       available: true,
       planType: 'plus',
       planName: 'Plus',
       unit: 'credits',
       balance: 1705.928725,
+      creditsVisible: true,
       pointsBalance: 1705.928725,
       pointsLimit: 2500,
       usdBalance: 68.2,
@@ -5416,7 +6530,7 @@ updated_at = 1784422800000
     assert.equal(page.includes('\0'), false, 'rendered HTML must not contain NUL bytes');
     assert.match(page, /src="\/vendor\/marked\.js"/);
     assert.match(page, /src="\/vendor\/purify\.js"/);
-    assert.match(page, /href="\/ui\.css\?v=sync-quota-preview-20260827a"/);
+    assert.match(page, /href="\/ui\.css\?v=subquota-key-order-20260830a"/);
     assert.match(page, /href="\/image-prompt\.css\?v=top-context-padding-20260801b"/);
     assert.match(page, /src="\/image-prompt\.js\?v=image-prompt-main-20260803a"/);
     assert.match(page, /\['dream-skin','Dream Skin'\]/);
@@ -5759,7 +6873,7 @@ updated_at = 1784422800000
     assert.match(page, /async function renameConversation\(id,title,source='codex'\)\{[\s\S]*?currentConversationId===id[\s\S]*?setCurrentConversationTitle\(clean\)/);
     assert.match(page, /function newChat\(\)\{[^\n]*setCurrentConversationTitle\('新任务'\)/);
     assert.match(page, /async function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?setCurrentConversationTitle\(conversation\.title\|\|'Chat','Chat'\)/);
-    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId=''\}=\{\}\)\{[\s\S]*?const sourceThreadId=String\(requestedThreadId\|\|currentConversationId\|\|''\)[\s\S]*?loadConversation\(data\.threadId,'codex',\{conversation:data\.conversation,skipPromptQueueSync:true\}\)[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
+    assert.match(page, /async function forkNativeConversation\(messageSeq,\{continueAfter=false,trigger=null,sourceThreadId:requestedThreadId='',turnId='',role=''\}=\{\}\)\{[\s\S]*?const sourceThreadId=String\(requestedThreadId\|\|currentConversationId\|\|''\)[\s\S]*?loadConversation\(data\.threadId,'codex',\{conversation:data\.conversation,skipPromptQueueSync:true\}\)[\s\S]*?setCurrentConversationTitle\(data\.conversation\?\.title\|\|'新分支','新分支'\)/);
     assert.doesNotMatch(page, /forkNativeConversation[\s\S]{0,500}confirm\(/);
     assert.match(page, /input\.focus\(\);\s*refreshHistory\(\)\.catch\(\(\)=>\{\}\)/);
     assert.match(page, /currentConversationSource==='codex'&&!options\.skipPromptQueueSync\)await pullPromptQueueFromServer/);
@@ -6012,14 +7126,25 @@ updated_at = 1784422800000
     assert.equal(isHandoffSummaryText('已完成 Context checkpoint 显示修复。'), false);
     const markdownFileIconHelper = inlineScript.match(/(function markdownLocalFileIcon[\s\S]*?)(?=function decorateMarkdownLink)/)?.[1];
     assert.ok(markdownFileIconHelper);
-    const markdownLocalFileIcon = new Function(
-      markdownFileIconHelper + '; return markdownLocalFileIcon;',
-    )();
+    const markdownFileHelpers = new Function(
+      'window',
+      markdownFileIconHelper + '; return { markdownLocalFileIcon, markdownLocalFileProxyUrl };',
+    )({ location: { origin: 'https://web.xazz.top' } });
+    const { markdownLocalFileIcon, markdownLocalFileProxyUrl } = markdownFileHelpers;
     assert.equal(markdownLocalFileIcon('/Volumes/ikirito/docker/codex-web/server.mjs:11980'), 'file-code-2');
     assert.equal(markdownLocalFileIcon('/Volumes/ikirito/docker/codex-web/ui.css'), 'hash');
     assert.equal(markdownLocalFileIcon('/Users/ikirito/Documents/notes.md'), 'file-text');
     assert.equal(markdownLocalFileIcon('https://example.com/app.js'), '');
     assert.equal(markdownLocalFileIcon('/playground/index.html'), '');
+    assert.equal(
+      markdownLocalFileProxyUrl('/Users/ikirito/Documents/ChatGPT/docker/AGENTS.md:2'),
+      '/?f=JTJGVXNlcnMlMkZpa2lyaXRvJTJGRG9jdW1lbnRzJTJGQ2hhdEdQVCUyRmRvY2tlciUyRkFHRU5UUy5tZCUzQTI',
+    );
+    assert.equal(
+      markdownLocalFileProxyUrl('https://web.xazz.top/Users/ikirito/Documents/ChatGPT/docker/AGENTS.md'),
+      '/?f=JTJGVXNlcnMlMkZpa2lyaXRvJTJGRG9jdW1lbnRzJTJGQ2hhdEdQVCUyRmRvY2tlciUyRkFHRU5UUy5tZA',
+    );
+    assert.equal(markdownLocalFileProxyUrl('https://example.com/Users/ikirito/notes.md'), '');
     assert.match(inlineScript, /link\.prepend\(icon\)/);
     assert.match(uiStyles, /\.markdownBody a\.markdownFileLink\s*\{[^}]*display:\s*inline-flex;[^}]*gap:\s*3px/s);
     assert.match(uiStyles, /\.markdownFileLinkIcon\s*\{[^}]*width:\s*12px;[^}]*height:\s*12px/s);
@@ -6113,7 +7238,7 @@ updated_at = 1784422800000
       'loadSubQuota',
       'startSubQuotaCountdowns',
       'stopSubQuotaCountdowns',
-      subQuotaPreviewHelpers + '; return { showSubQuotaPreview, hideSubQuotaPreview };',
+      'let lastSubQuotaHoverRefreshAt=-Infinity;' + subQuotaPreviewHelpers + '; return { showSubQuotaPreview, hideSubQuotaPreview };',
     )(
       previewPopover,
       previewToggle,
@@ -6134,7 +7259,7 @@ updated_at = 1784422800000
     assert.equal(previewAttributes.get('aria-expanded'), 'false');
     assert.equal(previewToggle.dataset.previewOpen, undefined);
     subQuotaPreviewApi.showSubQuotaPreview();
-    assert.equal(subQuotaLoads, 2);
+    assert.equal(subQuotaLoads, 1);
     const renderSubQuotaHelper = inlineScript.match(/(function renderSubQuota\(data\)[\s\S]*?)(?=function subQuotaProgressPercent)/)?.[1];
     assert.ok(renderSubQuotaHelper);
     const newApiQuotaHelpers = inlineScript.match(/(function isSubQuotaNewApi\(quota\)[\s\S]*?)(?=function renderSubQuota)/)?.[1];
@@ -8060,7 +9185,7 @@ updated_at = 1784422800000
       Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
     );
     try {
-      const outOfScopeLocalImage = await fetch(
+    const outOfScopeLocalImage = await fetch(
         `${baseUrl}/api/local-image?${new URLSearchParams({ path: outOfScopeImagePath, cwd: temporary })}`,
         { headers: { Cookie: cookie } },
       );
@@ -8068,6 +9193,33 @@ updated_at = 1784422800000
     } finally {
       await rm(outOfScopeImagePath, { force: true });
     }
+
+    const localFileUrl = new URL(localFilePath, baseUrl);
+    const unauthorizedLocalFile = await fetch(localFileUrl);
+    assert.equal(unauthorizedLocalFile.status, 401);
+    const localFile = await fetch(localFileUrl, { headers: { Cookie: cookie } });
+    assert.equal(localFile.status, 200);
+    assert.match(localFile.headers.get('content-type') || '', /^text\/plain/);
+    assert.equal(localFile.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(localFile.headers.get('content-security-policy'), "default-src 'none'");
+    assert.equal(await localFile.text(), '# AGENTS.md\n\nAllowed fixture file.\n');
+    const localFileToken = Buffer.from(encodeURIComponent(localFilePath), 'utf8').toString('base64url');
+    const localFileProxyUrl = `${baseUrl}/?${new URLSearchParams({ f: localFileToken })}`;
+    const unauthorizedLocalFileProxy = await fetch(localFileProxyUrl);
+    assert.equal(unauthorizedLocalFileProxy.status, 401);
+    const localFileProxy = await fetch(localFileProxyUrl, { headers: { Cookie: cookie } });
+    assert.equal(localFileProxy.status, 200);
+    assert.match(localFileProxy.headers.get('content-type') || '', /^text\/html/);
+    assert.equal(localFileProxy.headers.get('content-security-policy'), "default-src 'none'");
+    assert.match(await localFileProxy.text(), /<pre[^>]*># AGENTS\.md\n\nAllowed fixture file\.\n<\/pre>/);
+    const malformedLocalFileProxy = await fetch(`${baseUrl}/?f=not%20a%20token`, { headers: { Cookie: cookie } });
+    assert.equal(malformedLocalFileProxy.status, 400);
+    const localFileAtLine = await fetch(new URL(`${localFilePath}:2`, baseUrl), { headers: { Cookie: cookie } });
+    assert.equal(localFileAtLine.status, 200);
+    const rejectedLocalFile = await fetch(new URL(rejectedLocalFilePath, baseUrl), {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(rejectedLocalFile.status, 404);
 
     const falseToolImageMessage = nativeConversation.messages.find((message) => (
       message.role === 'tool' && message.content.includes('not-a-real-image.png')
@@ -8471,11 +9623,11 @@ updated_at = 1784422800000
       desktopIpc.interruptMode = 'respond';
     }
     const timeoutInterruptedPayload = await timeoutInterrupted.json();
-    assert.equal(timeoutInterrupted.status, 200, timeoutInterruptedPayload.error);
-    assert.equal(timeoutInterruptedPayload.turnId, echoedContinuationPayload.turnId);
+    assert.equal(timeoutInterrupted.status, 409);
+    assert.match(timeoutInterruptedPayload.error, /避免 Web 接管|避免 Web 占用/);
     assert.ok(
       Date.now() - timeoutInterruptStartedAt < 2500,
-      'desktop interrupt timeout did not fall back promptly',
+      'desktop interrupt timeout did not fail closed promptly',
     );
     const timeoutDesktopInterrupts = desktopIpc.messages
       .filter((message) => message.method === 'thread-follower-interrupt-turn')
@@ -8489,8 +9641,37 @@ updated_at = 1784422800000
       .filter(Boolean)
       .map((line) => JSON.parse(line))
       .filter((message) => message.method === 'turn/interrupt');
-    assert.equal(appInterruptsAfterDesktopTimeout.length, appInterruptsBeforeDesktopTimeout.length + 1);
-    assert.deepEqual(appInterruptsAfterDesktopTimeout.at(-1).params, {
+    assert.equal(appInterruptsAfterDesktopTimeout.length, appInterruptsBeforeDesktopTimeout.length);
+
+    desktopIpc.interruptMode = 'timeout';
+    let takeoverInterrupted;
+    try {
+      takeoverInterrupted = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/interrupt`, {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          turnId: echoedContinuationPayload.turnId,
+          allowWebTakeover: true,
+        }),
+      });
+    } finally {
+      desktopIpc.interruptMode = 'respond';
+    }
+    const takeoverInterruptedPayload = await takeoverInterrupted.json();
+    assert.equal(takeoverInterrupted.status, 202, takeoverInterruptedPayload.error);
+    assert.equal(takeoverInterruptedPayload.turnId, echoedContinuationPayload.turnId);
+    assert.equal(takeoverInterruptedPayload.pending, true);
+    const appInterruptsAfterExplicitTakeover = (await readFile(appServerTraceFile, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === 'turn/interrupt');
+    assert.equal(
+      appInterruptsAfterExplicitTakeover.length,
+      appInterruptsBeforeDesktopTimeout.length + 1,
+    );
+    assert.deepEqual(appInterruptsAfterExplicitTakeover.at(-1).params, {
       threadId: nativeSessionId,
       turnId: echoedContinuationPayload.turnId,
     });
@@ -8784,8 +9965,8 @@ updated_at = 1784422800000
     });
     const blockedActiveWriterPayload = await blockedActiveWriter.json();
     assert.equal(blockedActiveWriter.status, 409);
-    assert.match(blockedActiveWriterPayload.error, /Codex App 持有/);
-    assert.match(blockedActiveWriterPayload.error, /稍后重试|App 中继续/);
+    assert.match(blockedActiveWriterPayload.error, /未找到可接管.*Codex App.*为避免 Web 占用/);
+    assert.match(blockedActiveWriterPayload.error, /App 中打开后重试/);
     assert.doesNotMatch(blockedActiveWriterPayload.error, /active writer|thread-store/i);
     const activeWriterTraceAfterFailure = await readAppServerTrace(appServerTraceFile);
     assert.equal(
@@ -8816,7 +9997,7 @@ updated_at = 1784422800000
     });
     const blockedProviderSwitchPayload = await blockedProviderSwitch.json();
     assert.equal(blockedProviderSwitch.status, 409);
-    assert.match(blockedProviderSwitchPayload.error, /无法在 Web 中切换渠道/);
+    assert.match(blockedProviderSwitchPayload.error, /避免 Web 占用.*App 中修改模型与运行设置/);
     assert.doesNotMatch(blockedProviderSwitchPayload.error, /active writer|thread-store/i);
     assert.equal(
       desktopIpc.messages.filter((message) => message.method === 'thread-follower-start-turn').length,
@@ -8825,7 +10006,8 @@ updated_at = 1784422800000
     );
     await writeFile(appServerControlFile, '{}');
 
-    await writeFile(appServerControlFile, JSON.stringify({ turnStartDelayMs: 120 }));
+    desktopIpc.ownerAvailable = true;
+    desktopIpc.startTurnDelayMs = 120;
     const concurrentTurnPayload = {
       message: 'concurrent reservation test',
       provider: 'fake',
@@ -8857,7 +10039,7 @@ updated_at = 1784422800000
       body: JSON.stringify({ turnId: acceptedConcurrentPayload.turnId }),
     });
     assert.equal(interruptedConcurrentTurn.status, 200);
-    await writeFile(appServerControlFile, '{}');
+    desktopIpc.startTurnDelayMs = 0;
 
     const nonRetryErrorThreadId = '019f4f84-ea9f-73c2-b997-deba7b4aa742';
     const wrongNonRetryErrorTurnId = '019f4f84-ea9f-73c2-b997-deba7b4aa743';
@@ -9386,6 +10568,16 @@ updated_at = 1784422800000
       headers: { Cookie: cookie },
     });
     assert.deepEqual((await queueAfterAppQueueSideChat.json()).items, []);
+    const interruptedAppQueueSideChat = await fetch(
+      `${baseUrl}/api/native-sessions/${appQueueSideChatPayload.threadId}/interrupt`,
+      {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ turnId: appQueueSideChatPayload.turnId }),
+      },
+    );
+    const interruptedAppQueueSideChatPayload = await interruptedAppQueueSideChat.json();
+    assert.equal(interruptedAppQueueSideChat.status, 200, interruptedAppQueueSideChatPayload.error);
     const appQueueTraceBeforeRemoval = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
@@ -9641,6 +10833,7 @@ updated_at = 1784422800000
     assert.deepEqual(mergedQueuePayload.items.map((item) => item.id), [queueItemB.id, queueItemA.id]);
     assert.deepEqual(mergedQueuePayload.items.map((item) => item.serviceTier), [null, 'priority']);
 
+    desktopIpc.ownerAvailable = true;
     const queueTurn = await fetch(`${baseUrl}/api/native-sessions/${nativeSessionId}/turns`, {
       method: 'POST',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -9651,8 +10844,8 @@ updated_at = 1784422800000
         queueItemId: queueItemA.id,
       }),
     });
-    assert.equal(queueTurn.status, 202);
     const queueTurnPayload = await queueTurn.json();
+    assert.equal(queueTurn.status, 202, queueTurnPayload.error || JSON.stringify(queueTurnPayload));
     assert.deepEqual(queueTurnPayload.queue.items.map((item) => item.id), [queueItemB.id]);
     const queueAfterTurn = await fetch(`${baseUrl}/api/prompt-queues/${nativeSessionId}`, {
       headers: { Cookie: cookie },
@@ -9733,6 +10926,7 @@ updated_at = 1784422800000
       body: JSON.stringify({ turnId: queueTurnPayload.turnId }),
     });
     assert.equal(interruptedQueueTurn.status, 200);
+    desktopIpc.ownerAvailable = false;
     const turnStartsBeforeDuplicateQueue = (await readFile(appServerTraceFile, 'utf8'))
       .trim()
       .split('\n')
@@ -9999,7 +11193,12 @@ updated_at = 1784422800000
     const updatedThreadSettings = await fetch(`${baseUrl}/api/native-sessions/${createdNativeSessionId}`, {
       method: 'PATCH',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: 'switchtest', model: 'switch-model', reasoningEffort: 'xhigh' }),
+      body: JSON.stringify({
+        provider: 'switchtest',
+        model: 'switch-model',
+        reasoningEffort: 'xhigh',
+        allowWebTakeover: true,
+      }),
     });
     assert.equal(updatedThreadSettings.status, 200);
     const updatedThreadSettingsPayload = await updatedThreadSettings.json();
@@ -10046,7 +11245,11 @@ updated_at = 1784422800000
     const sameProviderSettings = await fetch(`${baseUrl}/api/native-sessions/${createdNativeSessionId}`, {
       method: 'PATCH',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider: 'switchtest', model: 'switch-model' }),
+      body: JSON.stringify({
+        provider: 'switchtest',
+        model: 'switch-model',
+        allowWebTakeover: true,
+      }),
     });
     assert.equal(sameProviderSettings.status, 200);
     const sameProviderProtocol = (await readFile(appServerTraceFile, 'utf8'))
@@ -10088,6 +11291,7 @@ updated_at = 1784422800000
         cwd: temporary,
         sandbox: 'read-only',
         approval: 'on-request',
+        allowWebTakeover: true,
       }),
     });
     assert.equal(continued.status, 202);
@@ -10156,6 +11360,7 @@ updated_at = 1784422800000
         cwd: temporary,
         sandbox: 'read-only',
         approval: 'on-request',
+        allowWebTakeover: true,
       }),
     });
     assert.equal(mismatchedProvider.status, 202);
@@ -10308,8 +11513,8 @@ updated_at = 1784422800000
         .length,
       createdDeleteCountBeforeBulkRace,
     );
-    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 10);
-    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 10);
+    assert.equal(protocolMessages.filter((message) => message.method === 'thread/resume').length, 5);
+    assert.equal(protocolMessages.filter((message) => message.method === 'turn/start').length, 7);
     const switchedProviderResume = protocolMessages.find((message) => (
       message.method === 'thread/resume'
       && message.params.modelProvider === 'custom'
@@ -10355,12 +11560,19 @@ updated_at = 1784422800000
     assert.equal(switchedProviderTurnStart.params.model, 'custom-model');
     assert.equal(switchedProviderTurnStart.params.effort, 'max');
     assert.equal(switchedProviderTurnStart.params.serviceTier, 'priority');
-    const queuedFastTurnStart = turnStartMessages.find((message) => (
+    const queuedFastAppServerStart = turnStartMessages.find((message) => (
       message.params.threadId === nativeSessionId
       && turnStartText(message) === queueItemA.message
       && message.params.serviceTier === 'priority'
     ));
-    assert.ok(queuedFastTurnStart);
+    assert.equal(queuedFastAppServerStart, undefined);
+    const queuedFastDesktopStart = desktopIpc.messages.find((message) => (
+      message.method === 'thread-follower-start-turn'
+      && message.params?.conversationId === nativeSessionId
+      && message.params?.turnStart?.request?.input?.some((item) => item.text === queueItemA.message)
+    ));
+    assert.ok(queuedFastDesktopStart);
+    assert.equal(queuedFastDesktopStart.params.turnStart.request.serviceTier, 'priority');
     const standardSideChatTurnStart = turnStartMessages.find((message) => (
       message.params.threadId === runningSideChatId
       && turnStartText(message) === queueItemB.message
@@ -10674,6 +11886,7 @@ function startServer({
   desktopIpcTimeoutMs = '',
   playgroundProxyAllowedOrigins = '',
   localImageRoots = '',
+  localFileRoots = '',
   fetchFixture = '',
   dockerBin = '',
   sub2ApiBaseUrl,
@@ -10704,6 +11917,7 @@ function startServer({
     CODEX_DESKTOP_IPC_SOCKET: desktopIpcSocket,
     PLAYGROUND_PROXY_ALLOWED_ORIGINS: playgroundProxyAllowedOrigins,
     CODEX_WEB_LOCAL_IMAGE_ROOTS: localImageRoots,
+    CODEX_WEB_LOCAL_FILE_ROOTS: localFileRoots,
     PLAYGROUND_PROXY_HEARTBEAT_MS: '20',
     HOMEPAGE_API_TOKEN: '',
     CODEX_WEB_QUOTA_MONITOR_TOKEN: quotaMonitorToken,
@@ -10794,7 +12008,8 @@ async function waitForAppServerTrace(file, predicate, errorMessage) {
     if (predicate(messages)) return messages;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  throw new Error(errorMessage);
+  const messages = await readAppServerTrace(file);
+  throw new Error(`${errorMessage}: ${JSON.stringify(messages.slice(-12))}`);
 }
 
 async function createDesktopIpcFixture(temporary) {
@@ -10807,6 +12022,7 @@ async function createDesktopIpcFixture(temporary) {
     messages: [],
     ownerAvailable: true,
     startTurnMode: 'respond',
+    startTurnDelayMs: 0,
     acceptedStartTurnCount: 0,
     onStartTurn: null,
     steerMode: 'respond',
@@ -10973,7 +12189,7 @@ async function createDesktopIpcFixture(temporary) {
           : message.method.includes('approval') || message.method.includes('submit-')
             ? { ok: true }
             : {};
-      writeDesktopFrame(socket, {
+      const respond = () => writeDesktopFrame(socket, {
         type: 'response',
         requestId: message.requestId,
         resultType: 'success',
@@ -10981,6 +12197,14 @@ async function createDesktopIpcFixture(temporary) {
         handledByClientId: 'desktop-owner',
         result: { result },
       });
+      const responseDelayMs = message.method === 'thread-follower-start-turn'
+        ? Number(fixture.startTurnDelayMs || 0)
+        : 0;
+      if (Number.isFinite(responseDelayMs) && responseDelayMs > 0) {
+        setTimeout(respond, responseDelayMs);
+      } else {
+        respond();
+      }
     });
   });
   await new Promise((resolve, reject) => {
