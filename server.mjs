@@ -38,6 +38,12 @@ import {
 import { normalizeSubQuotaBaseUrl, SubQuotaService } from './sub-quota.mjs';
 import { listCodexSkills } from './skills-catalog.mjs';
 import { listCodexPlugins } from './plugins-catalog.mjs';
+import {
+  listLocalChatGPTConversations,
+  readLocalChatGPTConversation,
+  sanitizeChatGPTConversationPayload,
+  sendLocalChatGPTMessage,
+} from './chatgpt-conversations.mjs';
 import { PlaygroundUpdater } from './playground-updater.mjs';
 import {
   loadCwdMigrations,
@@ -170,6 +176,7 @@ const NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS = Math.min(APP_SERVER_REQUEST_TIMEOUT_M
 const NATIVE_TURN_STATUS_SYNC_INTERVAL_MS = 1500;
 const NATIVE_TURN_STATUS_ACTIVITY_GRACE_MS = Math.max(NATIVE_SESSION_POLL_MS * 4, 5 * 60 * 1000);
 const NATIVE_MODEL_CAPABILITIES_CACHE_MS = 5 * 60 * 1000;
+const CHATGPT_CONVERSATIONS_CACHE_MS = 30 * 1000;
 const APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS = Math.min(
   Number.isFinite(APP_SERVER_REQUEST_TIMEOUT_MS) && APP_SERVER_REQUEST_TIMEOUT_MS > 0
     ? APP_SERVER_REQUEST_TIMEOUT_MS
@@ -387,6 +394,7 @@ let activeProcess = null;
 let activeConversationId = '';
 let homepageModelCache = { provider: '', count: 0, expiresAt: 0 };
 let nativeModelCapabilitiesCache = { models: [], expiresAt: 0 };
+let chatGPTConversationsCache = { value: null, expiresAt: 0, pending: null };
 
 nativeSessions.on('change', handleNativeSessionChange);
 nativeSessions.start();
@@ -732,6 +740,77 @@ app.get('/api/config', requireAuth, (req, res) => {
     },
     desktopConnected: desktopIpcClient.connected,
   });
+});
+
+app.get('/api/chatgpt-conversations', requireAuth, async (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const now = Date.now();
+    if (chatGPTConversationsCache.value && chatGPTConversationsCache.expiresAt > now) {
+      return res.json({ ok: true, ...chatGPTConversationsCache.value, cached: true });
+    }
+    if (!chatGPTConversationsCache.pending) {
+      const contextThread = nativeSessionSummaries().find((item) => cleanNativeThreadId(item?.id));
+      if (!contextThread) return res.status(503).json({ error: '本机暂无可用的 Codex 任务上下文' });
+      chatGPTConversationsCache.pending = listLocalChatGPTConversations({
+        threadId: contextThread.id,
+        limit: 30,
+        codexBin: CODEX_BIN,
+      }).then((value) => {
+        chatGPTConversationsCache.value = value;
+        chatGPTConversationsCache.expiresAt = Date.now() + CHATGPT_CONVERSATIONS_CACHE_MS;
+        return value;
+      }).finally(() => {
+        chatGPTConversationsCache.pending = null;
+      });
+    }
+    const value = await chatGPTConversationsCache.pending;
+    return res.json({ ok: true, ...value, cached: false });
+  } catch (error) {
+    console.warn(`读取本机 ChatGPT 会话失败: ${error?.message || error}`);
+    return res.status(503).json({ error: '本机 ChatGPT 会话暂时不可用，请确认 Codex App 已打开' });
+  }
+});
+
+app.get('/api/chatgpt-conversations/:id', requireAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const chatGPTId = String(req.params.id || '').trim();
+    const contextThread = nativeSessionSummaries().find((item) => cleanNativeThreadId(item?.id));
+    if (!contextThread) return res.status(503).json({ error: '本机暂无可用的 Codex 任务上下文' });
+    const raw = await readLocalChatGPTConversation({
+      threadId: contextThread.id,
+      chatGPTId,
+      cursor: String(req.query.cursor || '').trim().slice(0, 240),
+      limit: Math.min(10, Math.max(1, Number(req.query.limit) || 10)),
+      codexBin: CODEX_BIN,
+    });
+    const conversation = sanitizeChatGPTConversationPayload(raw, { chatGPTId });
+    return res.json({ ok: true, conversation });
+  } catch (error) {
+    console.warn(`读取本机 ChatGPT 会话失败: ${error?.message || error}`);
+    return res.status(503).json({ error: '本机 ChatGPT 会话暂时不可用，请确认 Codex App 已打开' });
+  }
+});
+
+app.post('/api/chatgpt-conversations/:id/messages', requireAuth, async (req, res) => {
+  try {
+    const prompt = String(req.body?.prompt ?? req.body?.message ?? '').trim();
+    if (!prompt) return res.status(400).json({ error: '消息不能为空' });
+    if (prompt.length > 50_000) return res.status(413).json({ error: '消息过长' });
+    const contextThread = nativeSessionSummaries().find((item) => cleanNativeThreadId(item?.id));
+    if (!contextThread) return res.status(503).json({ error: '本机暂无可用的 Codex 任务上下文' });
+    await sendLocalChatGPTMessage({
+      threadId: contextThread.id,
+      chatGPTId: String(req.params.id || '').trim(),
+      prompt,
+      codexBin: CODEX_BIN,
+    });
+    return res.json({ ok: true, accepted: true });
+  } catch (error) {
+    console.warn(`发送本机 ChatGPT 消息失败: ${error?.message || error}`);
+    return res.status(503).json({ error: error?.message || '发送到本机 ChatGPT 失败' });
+  }
 });
 
 app.get('/api/native-model-capabilities', requireAuth, async (_req, res) => {
@@ -10922,6 +11001,10 @@ const titleEl = document.querySelector('.top .title');
 let currentConversationId = '';
 let currentConversationSource = 'codex';
 let currentConversationTitle = '新任务';
+let chatGPTConversationCursor = '';
+let chatGPTConversationHasMore = false;
+let chatGPTSendInFlight = false;
+let chatGPTRefreshTimer = null;
 let currentNativeWorkspaceKind = '';
 let defaultComposerCwd = '';
 let activeMainView = 'chat';
@@ -11323,6 +11406,8 @@ let historyCompletionPushTimer=null;
 let historyCompletionSyncTimer=null;
 let historyCompletionSyncInFlight=null;
 let historyCompletionSyncQueued=false;
+let chatGPTSidebarLoadPromise=null;
+let chatGPTSidebarLoadedAt=0;
 let composerModelValueBeforeChange='';
 let activeHistoryProjectMenu=null;
 const HISTORY_SESSION_REFRESH_DELAY_MS=700;
@@ -19370,6 +19455,7 @@ function enhanceInterface(){
     search.appendChild(historyFilter);
     historyTitle.after(search);
   }
+  ensureChatGPTSidebarEntry();
   history?.addEventListener('scroll',()=>hideHistoryProjectPreview(),{passive:true});
   window.addEventListener('resize',()=>{hideHistoryProjectPreview();renderSidebarWidth();renderSideChatWidth()},{passive:true});
   desktopSidebarMedia.addEventListener('change',()=>hideHistoryProjectPreview());
@@ -19606,7 +19692,7 @@ async function boot(selectRecent=false){
     if(historyRefreshPending)void refreshHistory();
   }
 }
-async function bootContent(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();refreshDesktopQueueAvailability(data);modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelLoadWarnings.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();const conversations=Array.isArray(data.conversations)?data.conversations:[];const saved=selectRecent?readActiveConversationPreference():null;const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===saved.source):null;const target=selectRecent&&conversations.length?(match||conversations[0]):null;if(target){if(saved?.title||target.title)setCurrentConversationTitle(saved?.title||target.title,'Chat');setTopStatusText('同步中',{running:false});chat?.classList?.add('conversationRestoring');}const modelsReady=loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(target)await loadConversation(target.id,target.source||'codex',{historyPageLimit:NATIVE_HISTORY_PAGE_SIZE*2});await modelsReady;await restoreSideChatIfNeeded()}
+async function bootContent(selectRecent=false){const res=await fetch('/api/config');if(!res.ok)return;const data=await res.json();refreshDesktopQueueAvailability(data);modelLoadRevision++;modelLoadInFlight=null;modelListCache.clear();modelLoadWarnings.clear();modelOptionsProvider=null;dreamSkinConcepts=Array.isArray(data.dreamSkinConcepts)?data.dreamSkinConcepts:[];appearance=data.appearance||appearance;const activeDream=findDreamSkinConcept(appearance.chatBackground);if(activeDream)dreamSkinSelectedConcept=activeDream.id;if(!dreamSkinConcepts.some((concept)=>concept.id===dreamSkinSelectedConcept))dreamSkinSelectedConcept=dreamSkinConcepts[0]?.id||'';applyAppearance();renderDreamSkinConcepts();forceFullAccess=Boolean(data.capabilities?.forceFullAccess);defaultComposerCwd=String(data.defaults.cwd||'');if(!currentConversationId)cwd.value='';sandbox.value=forceFullAccess?'danger-full-access':data.defaults.sandbox;approval.value=forceFullAccess?'never':data.defaults.approval;composerPermissionMode=forceFullAccess?'full':composerPermissionModeFromValues(sandbox.value,approval.value);reasoningEffort.value=data.defaults.reasoningEffort||'';defaultComposerServiceTier=normalizeComposerServiceTier(data.defaults.serviceTier);composerServiceTier=defaultComposerServiceTier;const canManage=Boolean(data.capabilities?.manageProviders);providerManager?.classList.toggle('hidden',!canManage);saveDefault?.classList.toggle('hidden',!canManage);deleteProviderButton?.classList.toggle('hidden',!canManage);provider.innerHTML='<option value="">默认</option>';for(const p of data.providers){const opt=document.createElement('option');opt.value=p;opt.textContent=p;provider.appendChild(opt)}provider.value=data.defaults.provider||'';pinnedThreadIds=Array.isArray(data.pinnedThreadIds)?data.pinnedThreadIds:[];renderHistory(data.conversations);updateSafetyHint();applyConversationMode();connectSessionEvents();refreshNativeRequests();const conversations=Array.isArray(data.conversations)?data.conversations:[];const saved=selectRecent?readActiveConversationPreference():null;const savedSource=saved?.source==='chatgpt'?'chatgpt':saved?.source==='web'?'web':'codex';const match=saved?conversations.find((item)=>String(item.id)===String(saved.id)&&(item.source==='web'?'web':'codex')===savedSource):null;const target=selectRecent&&conversations.length?(match||conversations[0]):null;if(saved?.source==='chatgpt'&&saved.id){setCurrentConversationTitle(saved.title||'Chat','Chat');setTopStatusText('同步中',{running:false});chat?.classList?.add('conversationRestoring');}else if(target){if(saved?.title||target.title)setCurrentConversationTitle(saved?.title||target.title,'Chat');setTopStatusText('同步中',{running:false});chat?.classList?.add('conversationRestoring');}const modelsReady=loadModels(provider.value,data.defaults.model);void loadNativeModelCapabilities();if(saved?.source==='chatgpt'&&saved.id)await loadChatGPTConversation(saved.id);else if(target)await loadConversation(target.id,target.source||'codex',{historyPageLimit:NATIVE_HISTORY_PAGE_SIZE*2});await modelsReady;await restoreSideChatIfNeeded()}
 function historyRefreshBlocked(){return historyRefreshPointerId!==null||activeHistoryProjectMenu||historyProjectPreviewAnchor||historyRenameActive||history.querySelector('.hist.renaming,.histRenameInput')}
 function beginHistoryRefreshPointerLock(event){
   if(event.button!==0||event.isPrimary===false||!event.target.closest?.('.hist'))return;
@@ -19765,7 +19851,7 @@ async function saveDefaultModel(){defaultMsg.textContent='保存中...';const re
 async function deleteSelectedProvider(){const name=provider.value;if(!name){defaultMsg.textContent='请选择要删除的具体服务商';return}if(!confirm('删除服务商 '+name+'？该操作会移除对应配置和 API Key。'))return;defaultMsg.textContent='删除中...';const res=await fetch('/api/providers/'+encodeURIComponent(name),{method:'DELETE'});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'删除失败';return}defaultMsg.textContent='已删除服务商 '+name;await boot();if(data.provider){provider.value=data.provider;await loadModels(data.provider,data.model)}statusEl.textContent='Provider deleted'}
 async function requestModels(payload){try{const res=await fetch('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();return res.ok?data:{error:data.error||'获取模型失败'}}catch(e){return{error:e.message}}}
 function fillSelect(select,items,selected){select.innerHTML='';const list=[...new Set((items||[]).filter(Boolean))];if(!list.length)list.push(selected||'gpt-5.5');for(const item of list){const opt=document.createElement('option');opt.value=item;opt.textContent=item;select.appendChild(opt)}select.value=list.includes(selected)?selected:list[0];syncComposerChrome()}
-function conversationKey(source,id){return (source==='codex'?'codex':'web')+':'+id}
+function conversationKey(source,id){return (source==='codex'?'codex':source==='chatgpt'?'chatgpt':'web')+':'+id}
 function historyProjectKey(value){return normalizeProjectPath(value)||'__unknown__'}
 function normalizeProjectPath(value){const raw=String(value||'').trim();if(!raw)return'';if(raw==='/'||/^[A-Za-z]:[\\\\/]?$/.test(raw))return raw;return raw.replace(/[\\\\/]+$/,'')}
 function projectNameFromPath(value){const clean=String(value||'').replace(/\\\\/g,'/').replace(/\\/+$/,'');const parts=clean.split('/').filter(Boolean);return parts.length?parts[parts.length-1]:'未指定项目'}
@@ -20681,7 +20767,7 @@ function syncTaskCompleteSoundButton(button){
   button.appendChild(icon);
   refreshIcons(button);
 }
-function historyCompletionKey(item){return conversationKey(item?.source==='codex'?'codex':'web',item?.id)}
+function historyCompletionKey(item){return conversationKey(item?.source==='codex'?'codex':item?.source==='chatgpt'?'chatgpt':'web',item?.id)}
 function historyCompletionVersion(item){return String(item?.status||'')+'|'+String(item?.updatedAt||item?.recencyAt||item?.createdAt||'')}
 function historyCompletionReadVersionTimestamp(version){
   const value=String(version||'');
@@ -21455,6 +21541,133 @@ function appendStandaloneHistoryTasks(items,{query=false}={}){
     storeHistoryTasksCollapsed();
   });
 }
+function ensureChatGPTSidebarEntry(){
+  if(!history?.parentElement||document.getElementById('chatgptSidebarSection'))return;
+  const section=document.createElement('section');
+  section.id='chatgptSidebarSection';
+  section.className='chatgptSidebarSection';
+  const entry=document.createElement('button');
+  entry.type='button';
+  entry.id='chatgptSidebarEntry';
+  entry.className='chatgptSidebarEntry';
+  entry.title='展开或收起本机 ChatGPT 聊天';
+  entry.setAttribute('aria-label','展开或收起本机 ChatGPT 聊天');
+  entry.setAttribute('aria-controls','chatgptSidebarConversations');
+  entry.setAttribute('aria-expanded','true');
+
+  const icon=document.createElement('span');
+  icon.className='chatgptSidebarEntryIcon';
+  setIconLabel(icon,'message-circle','',false);
+  const copy=document.createElement('span');
+  copy.className='chatgptSidebarEntryCopy';
+  const name=document.createElement('strong');
+  name.textContent='ChatGPT';
+  const detail=document.createElement('small');
+  detail.className='chatgptSidebarEntryDetail';
+  detail.textContent='读取本地聊天…';
+  copy.append(name,detail);
+  const chevron=document.createElement('span');
+  chevron.className='chatgptSidebarEntryChevron';
+  setIconLabel(chevron,'chevron-down','',false);
+  entry.append(icon,copy,chevron);
+
+  const conversations=document.createElement('div');
+  conversations.id='chatgptSidebarConversations';
+  conversations.className='chatgptSidebarConversations';
+  conversations.setAttribute('aria-live','polite');
+  const initial=document.createElement('div');
+  initial.className='chatgptSidebarState';
+  initial.textContent='正在读取本机聊天…';
+  conversations.appendChild(initial);
+  section.append(entry,conversations);
+  history.parentElement.insertBefore(section,history);
+  entry.addEventListener('click',()=>{
+    const expanded=entry.getAttribute('aria-expanded')==='true';
+    entry.setAttribute('aria-expanded',String(!expanded));
+    conversations.hidden=expanded;
+    setIconLabel(chevron,expanded?'chevron-right':'chevron-down','',false);
+    if(!expanded)void loadChatGPTSidebarConversations();
+  });
+  refreshIcons(section);
+  void loadChatGPTSidebarConversations();
+}
+async function loadChatGPTSidebarConversations(options={}){
+  const conversations=document.getElementById('chatgptSidebarConversations');
+  const detail=document.querySelector('.chatgptSidebarEntryDetail');
+  if(!conversations)return;
+  if(chatGPTSidebarLoadPromise)return chatGPTSidebarLoadPromise;
+  if(!options.force&&conversations.dataset.loaded==='true'&&Date.now()-chatGPTSidebarLoadedAt<30000)return;
+  conversations.dataset.loading='true';
+  if(!conversations.dataset.loaded){
+    conversations.replaceChildren();
+    const loading=document.createElement('div');
+    loading.className='chatgptSidebarState';
+    loading.textContent='正在读取本机聊天…';
+    conversations.appendChild(loading);
+  }
+  chatGPTSidebarLoadPromise=(async()=>{
+    try{
+      const response=await fetch('/api/chatgpt-conversations',{cache:'no-store'});
+      const body=await response.json().catch(()=>({}));
+      if(!response.ok)throw new Error(body.error||'读取失败');
+      const items=Array.isArray(body.conversations)?body.conversations:[];
+      conversations.replaceChildren();
+      if(!items.length){
+        const empty=document.createElement('div');
+        empty.className='chatgptSidebarState';
+        empty.textContent='暂无本机 ChatGPT 聊天';
+        conversations.appendChild(empty);
+      }else{
+        for(const item of items){
+          const row=document.createElement('button');
+          row.type='button';
+          row.className='chatgptSidebarConversation';
+          row.dataset.conversationId=String(item.id||'');
+          row.dataset.conversationSource='chatgpt';
+          row.title=String(item.title||'未命名聊天');
+          row.setAttribute('aria-label','打开 ChatGPT 会话 '+String(item.title||'未命名聊天'));
+          row.addEventListener('click',()=>void loadChatGPTConversation(String(item.id||'')));
+          const rowIcon=document.createElement('span');
+          rowIcon.className='chatgptSidebarConversationIcon';
+          setIconLabel(rowIcon,item.pinned?'pin':'message-square','',false);
+          const title=document.createElement('span');
+          title.className='chatgptSidebarConversationTitle';
+          title.textContent=String(item.title||'未命名聊天');
+          row.append(rowIcon,title);
+          conversations.appendChild(row);
+        }
+      }
+      conversations.dataset.loaded='true';
+      chatGPTSidebarLoadedAt=Date.now();
+      if(detail)detail.textContent=items.length?items.length+' 个本地聊天':'本地聊天';
+      refreshChatGPTSidebarSelection();
+      refreshIcons(conversations);
+    }catch(error){
+      conversations.replaceChildren();
+      const failed=document.createElement('button');
+      failed.type='button';
+      failed.className='chatgptSidebarState chatgptSidebarRetry';
+      failed.textContent=(error?.message||'读取失败')+'，点击重试';
+      failed.addEventListener('click',()=>void loadChatGPTSidebarConversations({force:true}));
+      conversations.appendChild(failed);
+      if(detail)detail.textContent='本地聊天暂不可用';
+    }finally{
+      delete conversations.dataset.loading;
+    }
+  })().finally(()=>{chatGPTSidebarLoadPromise=null});
+  return chatGPTSidebarLoadPromise;
+}
+
+function refreshChatGPTSidebarSelection(){
+  const active=currentConversationSource==='chatgpt'?String(currentConversationId||''):'';
+  document.querySelectorAll('#chatgptSidebarConversations .chatgptSidebarConversation').forEach((row)=>{
+    const selected=Boolean(active&&row.dataset.conversationId===active);
+    row.classList.toggle('active',selected);
+    if(selected)row.setAttribute('aria-current','page');
+    else row.removeAttribute('aria-current');
+  });
+}
+
 function renderHistory(items){
   if(Array.isArray(items))historyItems=items.filter((item)=>!item?.sideChat && String(item?.workspaceKind||'')!=='sidechat');
   trackHistoryCompletionState(historyItems);
@@ -22062,10 +22275,11 @@ async function startLimitPauseContinuation(threadId,payload){
 }
 function syncComposerSubmitControl(){
   const native=currentConversationSource==='codex';
-  const legacyLocked=webRunActive&&!native;
+  const chatGPT=currentConversationSource==='chatgpt';
+  const legacyLocked=webRunActive&&!native&&!chatGPT;
   const queueStarting=native&&Boolean(currentConversationId)&&queueDispatchingThreads.has(currentConversationId);
   const cancelPending=nativeCancelPendingMatches();
-  const blocked=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending;
+  const blocked=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||chatGPTSendInFlight;
   const hasPayload=Boolean(input.value.trim()||pendingAttachments.length);
   const resumeInterrupted=canResumeInterruptedNativeTask()&&!hasPayload;
   const action=webRunActive&&native?'queue':resumeInterrupted?'resume':'send';
@@ -22085,20 +22299,21 @@ function syncComposerInputState(){
 }
 function applyConversationMode(){
   const native=currentConversationSource==='codex';
-  const legacyLocked=webRunActive&&!native;
+  const chatGPT=currentConversationSource==='chatgpt';
+  const legacyLocked=webRunActive&&!native&&!chatGPT;
   const queueStarting=native&&Boolean(currentConversationId)&&queueDispatchingThreads.has(currentConversationId);
   const cancelPending=nativeCancelPendingMatches();
-  input.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending;
-  attachFile.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending;
-  fileInput.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending;
+  input.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||chatGPTSendInFlight;
+  attachFile.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||chatGPT;
+  fileInput.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||chatGPT;
   syncComposerSubmitControl();
-  for(const control of [provider,model,reasoningEffort])control.disabled=legacyLocked;
-  sandbox.disabled=legacyLocked||forceFullAccess;
-  approval.disabled=legacyLocked||forceFullAccess;
-  setNativeNoticeText(nativeNotice?.textContent||'Codex App 会话 · 双向同步',{visible:native});
-  if(activeMainView==='chat')setModeLabelState(native);
+  for(const control of [provider,model,reasoningEffort])control.disabled=legacyLocked||chatGPT;
+  sandbox.disabled=legacyLocked||chatGPT||forceFullAccess;
+  approval.disabled=legacyLocked||chatGPT||forceFullAccess;
+  setNativeNoticeText(chatGPT?'ChatGPT 本地会话 · 可继续发送':nativeNotice?.textContent||'Codex App 会话 · 双向同步',{visible:native||chatGPT});
+  if(activeMainView==='chat')setModeLabelState(native,chatGPT);
   if(activeMainView==='chat')statusEl.classList.toggle('running',webRunActive);
-  input.placeholder=queueStarting?'正在发送队列消息...':steerSubmitting?'正在发送引导...':cancelPending?'正在停止当前任务...':webRunActive&&native?'排队消息':'向 Codex 提问';
+  input.placeholder=queueStarting?'正在发送队列消息...':steerSubmitting?'正在发送引导...':cancelPending?'正在停止当前任务...':chatGPT?'向 ChatGPT 提问':webRunActive&&native?'排队消息':'向 Codex 提问';
   cancelBtn.classList.toggle('hidden',!webRunActive||!native);
   cancelBtn.disabled=!webRunActive||cancelPending;
   cancelBtn.title=cancelPending?'正在停止':'停止';
@@ -22109,6 +22324,7 @@ function applyConversationMode(){
   syncComposerChrome();
   renderPromptQueue();
   renderThreadGoalBar();
+  refreshChatGPTSidebarSelection();
   if(activeMainView==='archive'){
     statusEl.classList.remove('running');
     statusEl.textContent=archiveNotice||'Codex App · '+archivedItems.length+' 个已归档任务';
@@ -22188,7 +22404,7 @@ function readActiveConversationPreference(){
     if(!parsed||typeof parsed!=='object')return null;
     const id=String(parsed.id||'').trim();
     if(!id)return null;
-    const source=parsed.source==='web'?'web':'codex';
+    const source=parsed.source==='chatgpt'?'chatgpt':parsed.source==='web'?'web':'codex';
     const title=normalizeConversationTitle(parsed.title||'','');
     return{id,source,title};
   }catch(e){return null}
@@ -22202,7 +22418,7 @@ function persistActiveConversation(id=currentConversationId,source=currentConver
     }
     localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY,JSON.stringify({
       id:cleanId,
-      source:source==='web'?'web':'codex',
+      source:source==='chatgpt'?'chatgpt':source==='web'?'web':'codex',
       title:normalizeConversationTitle(title||currentConversationTitle||'','Chat'),
       at:Date.now(),
     }));
@@ -22212,11 +22428,11 @@ function restoreBootConversationChrome(){
   const saved=readActiveConversationPreference();
   if(!saved?.id)return null;
   currentConversationId=saved.id;
-  currentConversationSource=saved.source==='web'?'web':'codex';
+  currentConversationSource=saved.source==='chatgpt'?'chatgpt':saved.source==='web'?'web':'codex';
   if(saved.title)setCurrentConversationTitle(saved.title,'Chat');
   else setCurrentConversationTitle('Chat','Chat');
-  setNativeNoticeText('Codex App 会话 · 双向同步',{visible:currentConversationSource==='codex'});
-  if(activeMainView==='chat')setModeLabelState(currentConversationSource==='codex');
+  setNativeNoticeText(currentConversationSource==='chatgpt'?'ChatGPT 本地会话 · 可继续发送':'Codex App 会话 · 双向同步',{visible:currentConversationSource==='codex'||currentConversationSource==='chatgpt'});
+  if(activeMainView==='chat')setModeLabelState(currentConversationSource==='codex',currentConversationSource==='chatgpt');
   const empty=chat?.querySelector?.('.empty')||document.querySelector('.empty');
   if(empty){
     empty.classList.add('conversationRestoring');
@@ -22451,7 +22667,154 @@ async function loadEarlierNativeHistoryPage(options={}){
     if(sameConversation&&syncDeferred)scheduleDeferredNativeHistorySync(id);
   }
 }
+async function loadChatGPTConversation(id, options = {}) {
+  const chatGPTId = String(id || '').trim();
+  if (!chatGPTId) return false;
+  const conversationChanged = chatGPTId !== currentConversationId || currentConversationSource !== 'chatgpt';
+  const seq = ++conversationLoadSeq;
+  const restoreRevision = ++conversationRestoreRevision;
+  clearNativeCompletionSync();
+  clearNativeCancelPending();
+  clearNativeComposerOverride();
+  clearNativeLiveItems();
+  clearNativeHistoryDeferredSync();
+  clearSubagentTraceStates();
+  responseAnnotationsByTurn = new Map();
+  nativeOptimisticElements = [];
+  nativeOptimisticSteering = new Map();
+  nativeRunningElement = null;
+  latestToolElement = null;
+  latestAssistantElement = null;
+  latestFinalAssistantElement = null;
+  latestUserElement = null;
+  resetTurnProcessCollection();
+  webRunActive = false;
+  steerSubmitting = false;
+  activeNativeTurnId = '';
+  currentNativeRunStatus = '';
+  currentConversationId = chatGPTId;
+  currentConversationSource = 'chatgpt';
+  chatGPTConversationCursor = '';
+  chatGPTConversationHasMore = false;
+  setThreadGoal(null);
+  updateActiveHistory();
+  applyConversationMode();
+  if (conversationChanged || !options.keepRestoring) beginConversationRestoring();
+  try {
+    const query = new URLSearchParams();
+    if (options.cursor) query.set('cursor', String(options.cursor));
+    if (options.limit) query.set('limit', String(options.limit));
+    const suffix = query.toString() ? '?' + query.toString() : '';
+    const res = await fetch('/api/chatgpt-conversations/' + encodeURIComponent(chatGPTId) + suffix, { cache: 'no-store' });
+    const body = await res.json().catch(() => ({}));
+    if (seq !== conversationLoadSeq) return false;
+    if (!res.ok) throw new Error(body.error || '读取 ChatGPT 会话失败');
+    const conversation = body.conversation;
+    if (!conversation || String(conversation.id) !== chatGPTId) throw new Error('ChatGPT 会话返回不一致');
+    currentConversationId = String(conversation.id);
+    currentConversationSource = 'chatgpt';
+    currentNativeRunStatus = String(conversation.status || '');
+    chatGPTConversationCursor = String(conversation.cursor || '');
+    chatGPTConversationHasMore = Boolean(conversation.hasMore);
+    setCurrentConversationTitle(conversation.title || 'ChatGPT', 'ChatGPT');
+    chat.replaceChildren();
+    const messages = Array.isArray(conversation.messages) ? conversation.messages : [];
+    for (const message of messages) {
+      const role = message?.role === 'user' ? 'user' : 'assistant';
+      const text = String(message?.content || '').trim();
+      if (!text) continue;
+      addMsg(role, text, {
+        kind: 'message',
+        at: message?.at || '',
+        turnId: message?.turnId || '',
+        autoScroll: false,
+        hydrating: true,
+      });
+    }
+    if (!messages.length) chat.innerHTML = '<div class="empty"><b>空会话</b><span>该 ChatGPT 会话暂无可显示消息。</span></div>';
+    updateConversationStatus(conversation);
+    applyConversationMode();
+    updateActiveHistory();
+    persistActiveConversation(currentConversationId, 'chatgpt', currentConversationTitle);
+    scrollChatToLatest({ force: true });
+    alignChatToBottomStable(12, seq);
+    clearConversationRestoring({ restoreRevision, id: currentConversationId, source: 'chatgpt' });
+    return true;
+  } catch (error) {
+    if (seq !== conversationLoadSeq) return false;
+    chat.replaceChildren();
+    const failed = document.createElement('div');
+    failed.className = 'empty';
+    failed.innerHTML = '<b>加载失败</b>';
+    const detail = document.createElement('span');
+    detail.textContent = error?.message || '读取 ChatGPT 会话失败';
+    failed.appendChild(detail);
+    chat.appendChild(failed);
+    setTopStatusText('ChatGPT · 加载失败', { running: false });
+    clearConversationRestoring({ restoreRevision, id: chatGPTId, source: 'chatgpt' });
+    return false;
+  }
+}
+
+async function sendChatGPTMessage(message) {
+  if (currentConversationSource !== 'chatgpt' || !currentConversationId || chatGPTSendInFlight) return false;
+  const text = String(message || '').trim();
+  if (!text) return false;
+  chatGPTSendInFlight = true;
+  const id = currentConversationId;
+  const seq = conversationLoadSeq;
+  input.value = '';
+  input.style.height = 'auto';
+  clearPendingAttachments();
+  appendConversationElement(createConversationMessageElement('user', text, {
+    kind: 'message', at: new Date().toISOString(),
+  }), 'user');
+  scrollChatToLatest({ force: true });
+  setTopStatusText('ChatGPT · 发送中…', { running: true });
+  applyConversationMode();
+  try {
+    const res = await fetch('/api/chatgpt-conversations/' + encodeURIComponent(id) + '/messages', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: text }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || '发送到 ChatGPT 失败');
+    setTopStatusText('ChatGPT · 已发送，等待回复…', { running: true });
+    scheduleChatGPTRefresh(id, seq);
+    return true;
+  } catch (error) {
+    if (seq === conversationLoadSeq && currentConversationSource === 'chatgpt' && currentConversationId === id) {
+      setTopStatusText('ChatGPT · 发送失败', { running: false });
+      const failed = createConversationMessageElement('assistant', '错误: ' + (error?.message || '发送失败'), {
+        kind: 'error', at: new Date().toISOString(),
+      });
+      appendConversationElement(failed, 'assistant');
+      input.value = text;
+      input.style.height = Math.min(input.scrollHeight, 180) + 'px';
+    }
+    return false;
+  } finally {
+    chatGPTSendInFlight = false;
+    applyConversationMode();
+  }
+}
+
+function scheduleChatGPTRefresh(id, seq) {
+  if (chatGPTRefreshTimer) clearTimeout(chatGPTRefreshTimer);
+  const startedAt = Date.now();
+  const refresh = async () => {
+    if (currentConversationSource !== 'chatgpt' || currentConversationId !== id) return;
+    const loaded = await loadChatGPTConversation(id, { keepRestoring: true });
+    if (!loaded || currentConversationSource !== 'chatgpt' || currentConversationId !== id) return;
+    if (Date.now() - startedAt < 90_000 && currentNativeRunStatus === 'running') {
+      chatGPTRefreshTimer = setTimeout(refresh, 1200);
+    }
+  };
+  chatGPTRefreshTimer = setTimeout(refresh, 700);
+}
+
 async function loadConversation(id,source='web',options={}){
+  if (source === 'chatgpt') return loadChatGPTConversation(id, options);
   if(webRunActive&&currentConversationSource==='web'&&(id!==currentConversationId||source!==currentConversationSource)){statusEl.textContent='旧版任务运行中，暂不能切换会话';return false}
   const nextConversationSource=source==='codex'?'codex':'web';
   const conversationChanged=id!==currentConversationId||nextConversationSource!==currentConversationSource;
@@ -22669,9 +23032,9 @@ function setNativeNoticeText(text,{visible=null}={}){
   const hide=!visible;
   if(nativeNotice.classList.contains('hidden')!==hide)nativeNotice.classList.toggle('hidden',hide);
 }
-function setModeLabelState(native){
-  const label=native?'Codex App':'Web';
-  const icon=native?'app-window':'globe-2';
+function setModeLabelState(native,chatGPT=false){
+  const label=native?'Codex App':chatGPT?'ChatGPT':'Web';
+  const icon=native?'app-window':chatGPT?'message-circle':'globe-2';
   if(modeLabel?.dataset.mode===label)return;
   modeLabel.dataset.mode=label;
   setIconLabel(modeLabel,icon,label);
@@ -22682,7 +23045,7 @@ let conversationStatusLoadSeq=0;
 function conversationRestoreOwnerMatches(revision,id,source){
   return revision===conversationRestoreRevision
     &&String(currentConversationId)===String(id||'')
-    &&currentConversationSource===(source==='codex'?'codex':'web');
+    &&currentConversationSource===(source==='codex'?'codex':source==='chatgpt'?'chatgpt':'web');
 }
 
 function beginConversationRestoring(){
@@ -22764,6 +23127,10 @@ function updateConversationStatus(conversation){
       setTopStatusText('Codex App · '+stateLabel+(stamp?' · '+stamp:''),{running:false});
     }
     setNativeNoticeText('Codex App 会话 · 双向同步'+(conversation.truncated?' · 仅显示最近记录':''),{visible:true});
+  }else if(conversation.source==='chatgpt'){
+    const state=conversation.status==='running'?'处理中':'已同步';
+    setTopStatusText('ChatGPT · '+state+(stamp?' · '+stamp:''),{running:conversation.status==='running'});
+    setNativeNoticeText('ChatGPT 本地会话 · 可继续发送',{visible:true});
   }else{
     setTopStatusText('Loaded '+stamp,{running:false});
     setNativeNoticeText(nativeNotice?.textContent||'',{visible:false});
@@ -28325,6 +28692,11 @@ async function send(){
   const sendConversationId=currentConversationId;
   const sendConversationSource=currentConversationSource;
   const sendContextMatches=()=>sendLoadSeq===conversationLoadSeq&&sendConversationId===currentConversationId&&sendConversationSource===currentConversationSource;
+  if(sendConversationSource==='chatgpt'){
+    if(attachments.length){statusEl.textContent='本地 ChatGPT 会话暂不支持附件发送';return}
+    await sendChatGPTMessage(message);
+    return;
+  }
   const providerReady=await waitForLatestComposerProviderChange();
   await waitForLatestComposerModelLoad();
   await nativeComposerSettingsQueue.catch(()=>false);
