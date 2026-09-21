@@ -34,5 +34,6 @@ test('sidebar expands local ChatGPT conversations without opening the external s
   assert.match(css, /\.chatgptSidebarEntry\s*\{/);
   assert.match(css, /\.chatgptSidebarEntry:focus-visible\s*\{/);
   assert.match(css, /\.chatgptSidebarConversations\s*\{/);
+  assert.doesNotMatch(css, /\.chatgptSidebarConversations::before\s*\{/);
   assert.match(css, /\.chatgptSidebarConversation\s*\{/);
 });
