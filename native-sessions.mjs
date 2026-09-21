@@ -821,6 +821,30 @@ export class NativeSessionStore extends EventEmitter {
     return this.getConversationFromEntries(id, options, false);
   }
 
+  getVisibleConversation(id, options = {}) {
+    const threadId = String(id || '').trim().toLowerCase();
+    const conversation = this.get(threadId, options);
+    if (conversation) return conversation;
+    let entry = this.subagentEntries.get(threadId);
+    if (!entry) {
+      this.refresh();
+      entry = this.subagentEntries.get(threadId);
+    }
+    if (!entry) return null;
+    return this.getSubagent(entry.parentThreadId, entry.id, options);
+  }
+
+  getThreadSource(id) {
+    if (this.subagentThreads.has(id) || this.subagentEntries.has(id)) return 'subagent';
+    const entry = this.entries.get(id);
+    const metadata = entry
+      ? cachedSessionMetadata(this.sessionMetadataCache, id, entry.filePath, entry.ino)
+      : null;
+    // Use just the cached session header. Classifying a completion must not
+    // refresh the store or emit nested change/queue events.
+    return metadata?.sessionSource || (this.appThreads?.has(id) ? 'appServer' : '');
+  }
+
   getSubagent(parentId, agentRef, options = {}) {
     let entry = findSubagentEntry(this.subagentEntries, parentId, agentRef);
     if (!entry) {
@@ -1233,6 +1257,7 @@ function sessionMetadataFromFirstRecord(record) {
   return {
     cwd: String(record.payload.cwd || '').trim(),
     originator: String(record.payload.originator || '').trim(),
+    sessionSource: record.payload.source || '',
   };
 }
 

@@ -23,6 +23,14 @@ const nativeUiProtocolSource = sourceBetween(
   'function nativeUiProtocolLine',
   'function automationHeartbeatDisplayText',
 );
+const nativeMessageMediaContextStub = `
+function setNativeMessageMediaContext(element, threadId, generation) {
+  if (!element?.dataset) return false;
+  element.dataset.messageMediaThreadId = String(threadId || '');
+  element.dataset.messageMediaGeneration = String(generation || '');
+  return true;
+}
+`;
 
 const referencePlan = [
   { step: '对照 参考图', status: 'completed' },
@@ -293,12 +301,12 @@ test('response annotations render as hover details and touch toggles', () => {
   assert.match(inlineScript, /function enhanceResponseAnnotationDirectives\(body,annotations\)\{[\s\S]*?querySelectorAll\('code'\)[\s\S]*?responseAnnotationReplacementFragment\(source,items\)[\s\S]*?createTreeWalker\(body,NodeFilter\.SHOW_TEXT\)[\s\S]*?responseAnnotationReplacementFragment\(node\.nodeValue,items\)/s);
   assert.match(inlineScript, /function removeEmptyResponseAnnotationWrappers\(node,body\)\{[\s\S]*?current\.remove\(\)/s);
   assert.doesNotMatch(inlineScript, /function enhanceResponseAnnotationDirectives\(body,annotations\)\{\s*if\(!body\|\|!Array\.isArray\(annotations\)\|\|!annotations\.length\)return/);
-  assert.match(inlineScript, /function renderAssistantMarkdown\(body,text,turnId=''\)\{[\s\S]*?const messageTurnId=String\(turnId\|\|body\?\.closest\?\.\('\.msg'\)\?\.dataset\?\.turnId\|\|''\);[\s\S]*?enhanceResponseAnnotationDirectives\(body,responseAnnotationsForTurn\(messageTurnId\)\);/s);
+  assert.match(inlineScript, /function renderAssistantMarkdown\(body,text,turnId='',messageMedia=null\)\{[\s\S]*?const messageTurnId=String\(turnId\|\|body\?\.closest\?\.\('\.msg'\)\?\.dataset\?\.turnId\|\|''\);[\s\S]*?enhanceResponseAnnotationDirectives\(body,responseAnnotationsForTurn\(messageTurnId\)\);/s);
   assert.match(inlineScript, /function addMsg\(role,text,options=\{\}\)\{[\s\S]*?if\(role==='user'\)rememberResponseAnnotations\(options\.turnId,text\);[\s\S]*?if\(options\.responseAnnotations\)rememberResponseAnnotationItems\(options\.turnId,options\.responseAnnotations\);/s);
-  assert.match(inlineScript, /function reconcileNativeResetMessage\(message\)\{[\s\S]*?if\(message\.role==='user'\)rememberResponseAnnotations\(message\.turnId,text\);[\s\S]*?if\(message\.responseAnnotations\)rememberResponseAnnotationItems\(message\.turnId,message\.responseAnnotations\);/s);
+  assert.match(inlineScript, /function reconcileNativeResetMessage\(message,conversation=null\)\{[\s\S]*?if\(message\.role==='user'\)rememberResponseAnnotations\(message\.turnId,text\);[\s\S]*?if\(message\.responseAnnotations\)rememberResponseAnnotationItems\(message\.turnId,message\.responseAnnotations\);/s);
   assert.equal((inlineScript.match(/responseAnnotations:msg\.responseAnnotations/g) || []).length, 2);
   assert.match(inlineScript, /responseAnnotations:message\.responseAnnotations/);
-  assert.match(inlineScript, /function adoptRuntimeLiveForSnapshotMessage\(message\)\{[\s\S]*?rememberResponseAnnotationItems\(pausedTurnId,message\.responseAnnotations\)/s);
+  assert.match(inlineScript, /function adoptRuntimeLiveForSnapshotMessage\(message,conversation=null\)\{[\s\S]*?rememberResponseAnnotationItems\(pausedTurnId,message\.responseAnnotations\)/s);
   assert.match(inlineScript, /function ensureNativeRuntimeLiveElement\(live\)\{[\s\S]*?addMsg\('assistant','',\{streaming:true,kind:'live_progress',turnId:live\.turnId,autoScroll:false\}\)/s);
   assert.match(inlineScript, /function newChat\(\)[\s\S]*?responseAnnotationsByTurn=new Map\(\)/);
   assert.match(inlineScript, /function loadConversation\(id,source='web',options=\{\}\)\{[\s\S]*?clearNativeLiveItems\(\);\s*responseAnnotationsByTurn=new Map\(\);/s);
@@ -1362,6 +1370,7 @@ test('persisted active commentary renders progressively and deduplicates by sequ
       let activeNativeTurnId = 'turn-active';
       function nativeCancelPendingMatches() { return false; }
       ${nativeUiProtocolSource}
+      ${nativeMessageMediaContextStub}
       ${liveSource}
       return {
         shouldStream: isNativeSnapshotStreamingMessage,
@@ -1637,6 +1646,7 @@ test('runtime stream and snapshot message adopt into one assistant bubble', () =
       function activateTurnProcessElement() {}
       function removeNativeRunningElement() {}
       ${nativeUiProtocolSource}
+      ${nativeMessageMediaContextStub}
       ${liveSource}
       return {
         updateDelta: updateNativeLiveDelta,
@@ -1750,6 +1760,7 @@ test('late runtime delta adopts an already rendered snapshot bubble', () => {
       function turnProcessElapsedMatches() { return true; }
       function activateTurnProcessElement() {}
       function removeNativeRunningElement() {}
+      ${nativeMessageMediaContextStub}
       ${liveSource}
       return {
         updateDelta: updateNativeLiveDelta,
@@ -2535,7 +2546,7 @@ test('composerCollapsed defaults to a capsule input', () => {
   assert.match(inlineScript, /setComposerExpanded\(!prefersCollapsedComposer\(\)\|\|composerShouldStayExpanded\(\)\,\{force:true\}\)/);
   assert.match(inlineScript, /composerMicBtn/);
   assert.match(inlineScript, /function composerPopoverOpen\(\)\{/);
-  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':cancelPending\?'正在停止当前任务\.\.\.':webRunActive&&native\?'排队消息':'向 Codex 提问'/);
+  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':cancelPending\?'正在停止当前任务\.\.\.':chatGPT\?'向 ChatGPT 提问':webRunActive&&native\?'排队消息':'向 Codex 提问'/);
   assert.doesNotMatch(sourceBetween('function composerShouldStayExpanded', 'function setComposerExpanded'), /threadGoalBar/);
   assert.match(inlineScript, /向 Codex 提问/);
   assert.match(uiStyles, /body \.box\.composerCollapsed/);
@@ -2575,7 +2586,7 @@ test('assistant message kind is treated as turn process progress', () => {
 test('generation resets reconcile live messages without rebuilding the conversation', () => {
   const syncSource = sourceBetween('async function syncCurrentNativeConversationOnce', 'function nativeTerminalPersisted');
   assert.match(inlineScript, /function nativeResetMessagesForIncrementalSync\(conversation\)/);
-  assert.match(inlineScript, /function reconcileNativeResetMessage\(message\)/);
+  assert.match(inlineScript, /function reconcileNativeResetMessage\(message,conversation=null\)/);
   assert.match(inlineScript, /function refreshNativeResetImage\(message\)/);
   assert.match(syncSource, /let syncMessages=conversation\.messages\|\|\[\]/);
   assert.match(syncSource, /const renderSnapshotImmediately=nativeLiveDocumentHidden\(\)\|\|nativeSnapshotResumeCatchup/);
@@ -2598,7 +2609,7 @@ test('boot restores the last conversation chrome before content paints', () => {
   assert.match(inlineScript, /title:normalizeConversationTitle\(title\|\|currentConversationTitle\|\|'',\'Chat'\)/);
   assert.match(inlineScript, /if\(!restoreBootConversationChrome\(\)\)setCurrentConversationTitle\('新任务'\)/);
   assert.match(inlineScript, /const modelsReady=loadModels\(provider\.value,data\.defaults\.model\)/);
-  assert.match(inlineScript, /if\(target\)await loadConversation\(target\.id,target\.source\|\|'codex'\);await modelsReady/);
+  assert.match(inlineScript, /if\(target\)await loadConversation\(target\.id,target\.source\|\|'codex',\{historyPageLimit:NATIVE_HISTORY_PAGE_SIZE\*2\}\);await modelsReady/);
   assert.match(inlineScript, /root\.classList\.add\('conversationRestoring'\)/);
   assert.match(inlineScript, /chat\.replaceChildren\(\)/);
   assert.match(inlineScript, /function beginConversationRestoring/);
@@ -2715,7 +2726,7 @@ test('same-conversation refresh keeps the visible status instead of flashing Loa
   assert.doesNotMatch(loadConversation, /statusEl\.textContent='Loading\.\.\.'/);
   assert.match(inlineScript, /function scheduleConversationStatusLoading\(seq\)/);
   assert.match(inlineScript, /Keep the previous status visible for quick switches/);
-  assert.match(inlineScript, /function setModeLabelState\(native\)/);
+  assert.match(inlineScript, /function setModeLabelState\(native,chatGPT=false\)/);
   assert.match(inlineScript, /if\(modeLabel\?\.dataset\.mode===label\)return;/);
 });
 

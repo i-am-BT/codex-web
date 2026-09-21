@@ -50,6 +50,14 @@ import {
   remapMigratedCwd,
   resolveCwdMigrationsFile,
 } from './cwd-migrations.mjs';
+import {
+  MessageMediaError,
+  closeVerifiedMp4,
+  createVerifiedMp4Stream,
+  extractVisibleAssistantMp4Links,
+  openVerifiedMp4,
+  planMp4Response,
+} from './message-media.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ENV_FILE = path.join(ROOT, '.env');
@@ -83,6 +91,7 @@ const IMAGE_DIR = path.join(RUNTIME_DIR, 'images');
 const FILE_DIR = path.join(RUNTIME_DIR, 'files');
 const BACKGROUND_DIR = path.join(RUNTIME_DIR, 'backgrounds');
 const IMAGE_PROMPT_CACHE_DIR = path.join(RUNTIME_DIR, 'image-prompts');
+const PROVIDER_MODELS_FILE = path.join(RUNTIME_DIR, 'provider-models.json');
 const SUB_QUOTA_DEFAULT_ORDER = ['cpa-codex', 'sub2api', 'grok2api', 'deepseek'];
 const SUB_QUOTA_SUPPORTED_PROVIDERS = [...SUB_QUOTA_DEFAULT_ORDER, 'openai-compatible'];
 const SUB_QUOTA_BUILTIN_IDS = new Set(['cpa-codex', 'sub2api', 'grok2api', 'deepseek']);
@@ -1556,6 +1565,82 @@ app.get('/api/native-sessions/:id/tool-images/:seq/:index', requireAuth, (req, r
   }
 });
 
+app.get('/api/native-sessions/:id/messages/:seq/videos/:index', requireAuth, (req, res) => {
+  let video = null;
+  try {
+    const threadId = cleanNativeThreadId(req.params.id);
+    const sequence = Number(req.params.seq);
+    const linkIndex = Number(req.params.index);
+    const generation = Number(req.query.generation);
+    if (
+      !threadId
+      || !Number.isSafeInteger(sequence)
+      || sequence < 1
+      || !Number.isSafeInteger(linkIndex)
+      || linkIndex < 1
+      || !Number.isSafeInteger(generation)
+      || generation < 1
+    ) {
+      return res.status(400).json({ error: '消息视频参数无效' });
+    }
+    if (Object.hasOwn(req.query, 'path') || Object.hasOwn(req.query, 'p')) {
+      return res.status(400).json({ error: '消息视频接口不接受文件路径' });
+    }
+
+    const conversation = nativeSessions.getVisibleConversation(threadId);
+    if (!conversation) return res.status(404).json({ error: 'Codex App 会话不存在' });
+    if (generation !== conversation.generation) {
+      return res.status(404).json({ error: '消息视频记录已更新' });
+    }
+    const message = conversation.messages.find((item) => item.seq === sequence);
+    if (!message || message.role !== 'assistant') {
+      return res.status(404).json({ error: '消息视频不存在或未获授权' });
+    }
+    const filePath = extractVisibleAssistantMp4Links(message.content)[linkIndex - 1];
+    if (!filePath) return res.status(404).json({ error: '消息视频不存在或未获授权' });
+
+    video = openVerifiedMp4(filePath, { maxBytes: MESSAGE_MEDIA_MAX_BYTES });
+    const headRequest = req.method === 'HEAD';
+    const response = planMp4Response(headRequest ? null : req.headers.range, video.size);
+    res.set({
+      ...response.headers,
+      'Cache-Control': 'private, no-store',
+      'Content-Type': 'video/mp4',
+      'Cross-Origin-Resource-Policy': 'same-origin',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.status(response.statusCode);
+    if (response.statusCode === 416 || headRequest) {
+      closeVerifiedMp4(video);
+      video = null;
+      return res.end();
+    }
+
+    const stream = createVerifiedMp4Stream(video, response);
+    video = null;
+    res.setTimeout(MESSAGE_MEDIA_IDLE_TIMEOUT_MS, () => res.destroy());
+    stream.once('error', (error) => {
+      if (!res.headersSent && !res.destroyed) {
+        for (const header of ['Accept-Ranges', 'Content-Length', 'Content-Range', 'Content-Type']) {
+          res.removeHeader(header);
+        }
+        res.status(500).json({ error: '读取消息视频失败' });
+      }
+      else res.destroy(error);
+    });
+    res.once('close', () => stream.destroy());
+    stream.pipe(res);
+  } catch (err) {
+    if (video) {
+      try { closeVerifiedMp4(video); } catch {}
+    }
+    const status = err instanceof MessageMediaError ? err.statusCode : 500;
+    res.status(status).json({
+      error: status === 404 ? '消息视频不存在或未获授权' : '读取消息视频失败',
+    });
+  }
+});
+
 app.get('/api/local-image', requireAuth, (req, res) => {
   try {
     const rawPath = String(req.query.path || req.query.p || '').trim();
@@ -2626,10 +2711,15 @@ app.post('/api/models', requireAuth, async (req, res) => {
   if (!isHttpUrl(baseUrl)) return res.status(400).json({ error: 'Base URL 无效' });
   if (!apiKey) return res.status(400).json({ error: 'API Key 不能为空' });
 
+  const savedModels = providerName ? getProviderModels(providerName) : [];
   try {
-    const models = await fetchModels(baseUrl, apiKey);
+    const remoteModels = await fetchModels(baseUrl, apiKey);
+    const models = mergeProviderModels(savedModels, remoteModels);
     res.json({ ok: true, models });
   } catch (err) {
+    if (savedModels.length) {
+      return res.json({ ok: true, models: savedModels, warning: err.message });
+    }
     res.status(502).json({ error: err.message });
   }
 });
@@ -2638,27 +2728,51 @@ app.post('/api/providers', requireAuth, requireConfigWrite, async (req, res) => 
   const name = cleanProviderName(req.body?.name);
   const baseUrl = String(req.body?.baseUrl || '').trim().replace(/\/+$/, '');
   const apiKey = String(req.body?.apiKey || '').trim();
-  const model = cleanValue(req.body?.model) || DEFAULT_MODEL;
+  const models = normalizeProviderModels(req.body?.models, req.body?.model);
+  const model = models[0] || '';
   const wireApi = ['responses', 'chat'].includes(req.body?.wireApi) ? req.body.wireApi : 'responses';
 
   if (!name) return res.status(400).json({ error: '服务商名称只能包含字母、数字、下划线和短横线' });
   if (!isHttpUrl(baseUrl)) return res.status(400).json({ error: 'Base URL 必须是 http/https URL' });
   if (!apiKey) return res.status(400).json({ error: 'API Key 不能为空' });
+  if (!model) return res.status(400).json({ error: '请至少填写一个模型' });
 
+  const envKey = `${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`;
+  let configurationSnapshot = null;
+  let mutationStarted = false;
+  let restartAttempted = false;
   try {
     assertAppServerConfigChangeAllowed();
-    const envKey = `${name.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`;
+    const providerModelsStore = readProviderModelsStore({ strict: true });
+    configurationSnapshot = captureConfigurationState(
+      [CODEX_CONFIG_FILE, PROVIDER_MODELS_FILE, CODEX_ENV_FILE, ENV_FILE],
+      [envKey, 'DEFAULT_PROVIDER', 'DEFAULT_MODEL'],
+    );
+    mutationStarted = true;
     upsertProvider({ name, baseUrl, envKey, wireApi, model });
+    saveProviderModels(name, models, providerModelsStore);
     updateEnvVar(CODEX_ENV_FILE, envKey, apiKey);
     updateEnvVar(ENV_FILE, 'DEFAULT_PROVIDER', name);
     updateEnvVar(ENV_FILE, 'DEFAULT_MODEL', model);
     process.env[envKey] = apiKey;
     process.env.DEFAULT_PROVIDER = name;
     process.env.DEFAULT_MODEL = model;
+    restartAttempted = true;
     await restartAppServerForConfigChange(`provider:${name}`);
-    res.json({ ok: true, provider: name, model, providers: readProviders() });
+    res.json({ ok: true, provider: name, model, models, providers: readProviders() });
   } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message });
+    let responseError = err;
+    if (configurationSnapshot && mutationStarted) {
+      const rollbackErrors = await rollbackConfigurationChange(configurationSnapshot, {
+        restartAppServer: restartAttempted,
+        reason: `rollback-provider:${name}`,
+      });
+      if (rollbackErrors.length) {
+        responseError = new Error(`${err.message}; 配置回滚失败: ${rollbackErrors.join('; ')}`);
+        responseError.statusCode = err.statusCode;
+      }
+    }
+    res.status(responseError.statusCode || 500).json({ error: responseError.message });
   }
 });
 
@@ -2666,20 +2780,52 @@ app.delete('/api/providers/:name', requireAuth, requireConfigWrite, async (req, 
   const name = cleanProviderName(req.params.name);
   if (!name) return res.status(400).json({ error: '服务商名称无效' });
 
+  let configurationSnapshot = null;
+  let mutationStarted = false;
+  let restartAttempted = false;
   try {
     assertAppServerConfigChangeAllowed();
-    const result = deleteProvider(name);
+    const providers = readProviderDetails();
+    const target = providers.find((provider) => provider.name === name);
+    if (!target) {
+      const error = new Error('服务商不存在');
+      error.statusCode = 404;
+      throw error;
+    }
+    if (providers.length <= 1) {
+      const error = new Error('至少保留一个服务商');
+      error.statusCode = 400;
+      throw error;
+    }
+    const providerModelsStore = readProviderModelsStore({ strict: true });
+    configurationSnapshot = captureConfigurationState(
+      [CODEX_CONFIG_FILE, PROVIDER_MODELS_FILE, CODEX_ENV_FILE, ENV_FILE],
+      [...providers.map((provider) => provider.envKey), 'DEFAULT_PROVIDER', 'DEFAULT_MODEL'],
+    );
+    mutationStarted = true;
+    const result = deleteProvider(name, providerModelsStore);
+    restartAttempted = true;
     await restartAppServerForConfigChange(`delete-provider:${name}`);
     res.json({ ok: true, ...result, providers: readProviders() });
   } catch (err) {
-    const status = err.statusCode || 500;
-    res.status(status).json({ error: err.message });
+    let responseError = err;
+    if (configurationSnapshot && mutationStarted) {
+      const rollbackErrors = await rollbackConfigurationChange(configurationSnapshot, {
+        restartAppServer: restartAttempted,
+        reason: `rollback-delete-provider:${name}`,
+      });
+      if (rollbackErrors.length) {
+        responseError = new Error(`${err.message}; 配置回滚失败: ${rollbackErrors.join('; ')}`);
+        responseError.statusCode = err.statusCode;
+      }
+    }
+    res.status(responseError.statusCode || 500).json({ error: responseError.message });
   }
 });
 
 app.post('/api/defaults', requireAuth, requireConfigWrite, async (req, res) => {
   const provider = cleanProviderName(req.body?.provider || '');
-  const model = cleanValue(req.body?.model) || '';
+  const model = cleanModelValue(req.body?.model) || '';
   let reasoningEffort;
   try {
     reasoningEffort = cleanReasoningEffort(req.body?.reasoningEffort);
@@ -2713,7 +2859,7 @@ app.post('/api/chat', requireAuth, (req, res) => {
   const message = String(req.body?.message || '').trim();
   const uploadedAttachments = normalizeUploadedAttachments(req.body?.attachments, req.body?.images);
   const promptMessage = appendAttachmentPrompt(message, uploadedAttachments);
-  const model = cleanValue(req.body?.model) || DEFAULT_MODEL;
+  const model = cleanModelValue(req.body?.model) || DEFAULT_MODEL;
   const provider = cleanValue(req.body?.provider) || DEFAULT_PROVIDER;
   const cwd = normalizeCwd(req.body?.cwd || DEFAULT_CWD);
   const { permissionMode, sandbox, approval } = permissionSettingsFromRequest(req.body || {});
@@ -6252,6 +6398,19 @@ function buildNativeRequestResponse(request, body) {
   }
 }
 
+function isTaskCompleteSoundThread(threadId) {
+  try {
+    const source = nativeSessions.getThreadSource(threadId);
+    // A task started/resumed by Web can finish before its rollout is indexed.
+    // This map records explicit Web subscriptions, not global child events.
+    if (!source) return appServerLoadedThreads.has(threadId);
+    return typeof source === 'string'
+      && ['cli', 'vscode', 'appServer', 'app_server', 'exec'].includes(source);
+  } catch {
+    return false;
+  }
+}
+
 function setNativeTurnState(threadId, state) {
   const cleanId = cleanNativeThreadId(threadId);
   if (!cleanId) return;
@@ -6275,7 +6434,10 @@ function setNativeTurnState(threadId, state) {
   else if (Object.hasOwn(current || {}, 'serviceTier')) next.serviceTier = current.serviceTier;
   activeNativeTurns.set(cleanId, next);
   if (next.transport === 'desktop-ipc' && next.status === 'running') requestDesktopThreadSnapshot(cleanId);
-  broadcastNativeRuntime({ type: 'turn', threadId: cleanId, ...next });
+  broadcastNativeRuntime({
+    type: 'turn', threadId: cleanId, ...next,
+    completionSoundEligible: status === 'done' && isTaskCompleteSoundThread(cleanId),
+  });
   nativeSessions.scheduleRefresh();
 }
 
@@ -7588,7 +7750,7 @@ function parseNativeThreadSettings(body, options = {}) {
     ? createProjectlessWorkspace(body)
     : normalizeCwd(requestedCwd || DEFAULT_CWD);
   if (!cwd) throw new Error(projectless ? '无法创建无项目工作目录' : '工作目录不存在');
-  const model = cleanValue(body.model) || DEFAULT_MODEL;
+  const model = cleanModelValue(body.model) || DEFAULT_MODEL;
   const provider = cleanValue(body.provider) || DEFAULT_PROVIDER;
   const permissions = permissionSettingsFromRequest(body);
   const reasoningEffort = cleanReasoningEffort(body.reasoningEffort);
@@ -7946,6 +8108,85 @@ function sessionCookie(token, maxAge) {
 function cleanValue(value) {
   const text = String(value || '').trim();
   return /^[A-Za-z0-9._:-]+$/.test(text) ? text : '';
+}
+
+function cleanModelValue(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  if (!text || text.length > 256 || /[\u0000-\u001f\u007f]/.test(text)) return '';
+  return text;
+}
+
+function normalizeProviderModels(models, fallbackModel = '') {
+  const values = Array.isArray(models) ? models : [];
+  const cleaned = [];
+  for (const item of [fallbackModel, ...values]) {
+    const model = cleanModelValue(item);
+    if (model && !cleaned.includes(model)) cleaned.push(model);
+  }
+  return cleaned.slice(0, 50);
+}
+
+function mergeProviderModels(...lists) {
+  const merged = [];
+  for (const item of lists.flat()) {
+    const model = cleanModelValue(item);
+    if (model && !merged.includes(model)) merged.push(model);
+  }
+  return merged;
+}
+
+function readProviderModelsStore({ strict = false } = {}) {
+  try {
+    if (!existsSync(PROVIDER_MODELS_FILE)) return {};
+    const raw = JSON.parse(readFileSync(PROVIDER_MODELS_FILE, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('根节点必须是对象');
+    }
+    const store = {};
+    for (const [name, models] of Object.entries(raw)) {
+      const provider = cleanProviderName(name);
+      if (!provider || !Array.isArray(models) || models.some((model) => !cleanModelValue(model))) {
+        if (strict) throw new Error(`服务商 ${name} 的模型列表无效`);
+        continue;
+      }
+      const list = normalizeProviderModels(models);
+      if (list.length) store[provider] = list;
+    }
+    return store;
+  } catch (error) {
+    if (strict) throw new Error(`手动模型配置读取失败: ${error.message}`);
+    return {};
+  }
+}
+
+function writeProviderModelsStore(store) {
+  atomicWriteFile(PROVIDER_MODELS_FILE, `${JSON.stringify(store, null, 2)}\n`);
+}
+
+function getProviderModels(name) {
+  const provider = cleanProviderName(name);
+  return provider ? readProviderModelsStore()[provider] || [] : [];
+}
+
+function saveProviderModels(name, models, currentStore = null) {
+  const provider = cleanProviderName(name);
+  if (!provider) return [];
+  const list = normalizeProviderModels(models);
+  const store = currentStore || readProviderModelsStore({ strict: true });
+  if (list.length) store[provider] = list;
+  else delete store[provider];
+  writeProviderModelsStore(store);
+  return list;
+}
+
+function deleteProviderModels(name, currentStore = null) {
+  const provider = cleanProviderName(name);
+  if (!provider) return;
+  const store = currentStore || readProviderModelsStore({ strict: true });
+  if (!Object.hasOwn(store, provider)) return;
+  delete store[provider];
+  writeProviderModelsStore(store);
 }
 
 function cleanProviderName(value) {
@@ -9243,10 +9484,10 @@ function readCodexDefaults() {
   if (!existsSync(CODEX_CONFIG_FILE)) return {};
   const content = readFileSync(CODEX_CONFIG_FILE, 'utf8');
   return {
-    provider: content.match(/^model_provider\s*=\s*"([^"]+)"/m)?.[1] || '',
-    model: content.match(/^model\s*=\s*"([^"]+)"/m)?.[1] || '',
-    reasoningEffort: content.match(/^model_reasoning_effort\s*=\s*"([^"]+)"/m)?.[1] || '',
-    serviceTier: String(content.match(/^service_tier\s*=\s*"([^"]+)"/m)?.[1] || '').trim().toLowerCase() === 'priority'
+    provider: readTopLevelTomlString(content, 'model_provider'),
+    model: readTopLevelTomlString(content, 'model'),
+    reasoningEffort: readTopLevelTomlString(content, 'model_reasoning_effort'),
+    serviceTier: String(readTopLevelTomlString(content, 'service_tier')).trim().toLowerCase() === 'priority'
       ? 'priority'
       : null,
   };
@@ -9262,12 +9503,12 @@ function readProviderDetails() {
     const block = content.slice(range.start, range.end);
     details.push({
       name,
-      displayName: block.match(/^name\s*=\s*"([^"]+)"/m)?.[1] || name,
-      baseUrl: block.match(/^base_url\s*=\s*"([^"]+)"/m)?.[1] || '',
-      envKey: block.match(/^env_key\s*=\s*"([^"]+)"/m)?.[1] || `${name.toUpperCase()}_API_KEY`,
-      wireApi: block.match(/^wire_api\s*=\s*"([^"]+)"/m)?.[1] || 'responses',
+      displayName: readTomlString(block, 'name') || name,
+      baseUrl: readTomlString(block, 'base_url'),
+      envKey: readTomlString(block, 'env_key') || `${name.toUpperCase()}_API_KEY`,
+      wireApi: readTomlString(block, 'wire_api') || 'responses',
       requiresOpenAIAuth: block.match(/^requires_openai_auth\s*=\s*(true|false)/m)?.[1] === 'true',
-      bearerToken: block.match(/^experimental_bearer_token\s*=\s*"([^"]+)"/m)?.[1] || '',
+      bearerToken: readTomlString(block, 'experimental_bearer_token'),
     });
   }
   return details;
@@ -9352,7 +9593,7 @@ function validateCodexConfigText(content) {
   }
 }
 
-function deleteProvider(name) {
+function deleteProvider(name, currentModelsStore = null) {
   if (!existsSync(CODEX_CONFIG_FILE)) throw new Error('Codex config 不存在');
   const providers = readProviderDetails();
   const target = providers.find((provider) => provider.name === name);
@@ -9372,10 +9613,16 @@ function deleteProvider(name) {
   const defaults = readCodexDefaults();
   const deletedDefault = defaults.provider === name || process.env.DEFAULT_PROVIDER === name;
   const nextProvider = deletedDefault ? fallbackProvider : defaults.provider;
-  const nextModel = defaults.model || DEFAULT_MODEL;
+  const providerModelsStore = currentModelsStore || readProviderModelsStore({ strict: true });
+  const fallbackModel = providerModelsStore[fallbackProvider]?.[0] || 'gpt-5.5';
+  const nextModel = deletedDefault ? fallbackModel : defaults.model || DEFAULT_MODEL;
   if (deletedDefault && fallbackProvider) {
-    updateEnvVar(ENV_FILE, 'DEFAULT_PROVIDER', fallbackProvider);
+    updateEnvVars(ENV_FILE, {
+      DEFAULT_PROVIDER: fallbackProvider,
+      DEFAULT_MODEL: nextModel,
+    });
     process.env.DEFAULT_PROVIDER = fallbackProvider;
+    process.env.DEFAULT_MODEL = nextModel;
   }
 
   let content = readFileSync(CODEX_CONFIG_FILE, 'utf8');
@@ -9384,6 +9631,7 @@ function deleteProvider(name) {
   content = replaceTopLevelTomlValue(content, 'model', nextModel);
   content = replaceTopLevelTomlValue(content, 'review_model', nextModel);
   writeCodexConfig(content);
+  deleteProviderModels(name, providerModelsStore);
   deleteEnvVar(CODEX_ENV_FILE, target.envKey);
   delete process.env[target.envKey];
   return { deleted: name, provider: nextProvider, model: nextModel };
@@ -9425,14 +9673,20 @@ function cleanServiceTier(value) {
 }
 
 function replaceTopLevelTomlValue(content, key, value) {
+  const source = String(content || '');
   const line = `${key} = "${tomlEscape(value)}"`;
-  const pattern = new RegExp(`^${key}\\s*=\\s*"[^"]*"`, 'm');
-  if (pattern.test(content)) return content.replace(pattern, line);
-  return `${line}\n${content}`;
+  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"(?:\\\\.|[^"\\\\])*"`, 'm');
+  const topLevelEnd = findTopLevelTomlEnd(source);
+  const topLevel = source.slice(0, topLevelEnd);
+  if (pattern.test(topLevel)) return `${topLevel.replace(pattern, line)}${source.slice(topLevelEnd)}`;
+  return `${line}\n${source}`;
 }
 
 function removeTopLevelTomlValue(content, key) {
-  return content.replace(new RegExp(`^${key}\\s*=.*(?:\\r?\\n|$)`, 'm'), '');
+  const source = String(content || '');
+  const topLevelEnd = findTopLevelTomlEnd(source);
+  const topLevel = source.slice(0, topLevelEnd);
+  return `${topLevel.replace(new RegExp(`^${escapeRegExp(key)}\\s*=.*(?:\\r?\\n|$)`, 'm'), '')}${source.slice(topLevelEnd)}`;
 }
 
 function updateEnvVars(file, values) {
@@ -9466,15 +9720,102 @@ function deleteEnvVar(file, key) {
   atomicWriteFile(file, next.filter((line, index, arr) => line || index < arr.length - 1).join('\n') + '\n');
 }
 
-function atomicWriteFile(file, content) {
+function captureConfigurationState(files, environmentKeys = []) {
+  const fileStates = [];
+  for (const file of [...new Set(files)]) {
+    try {
+      const stats = statSync(file);
+      if (!stats.isFile()) throw new Error(`${path.basename(file)} 不是普通文件`);
+      fileStates.push({ file, exists: true, content: readFileSync(file), mode: stats.mode & 0o777 });
+    } catch (error) {
+      if (error.code === 'ENOENT') fileStates.push({ file, exists: false });
+      else throw error;
+    }
+  }
+  const environment = [...new Set(environmentKeys)].map((key) => ({
+    key,
+    exists: Object.hasOwn(process.env, key),
+    value: process.env[key],
+  }));
+  return { fileStates, environment };
+}
+
+function restoreConfigurationState(snapshot) {
+  const errors = [];
+  for (const state of [...(snapshot?.fileStates || [])].reverse()) {
+    try {
+      if (state.exists) {
+        atomicWriteFile(state.file, state.content, state.mode);
+      } else {
+        try {
+          const stats = statSync(state.file);
+          if (!stats.isFile()) throw new Error(`${path.basename(state.file)} 不是普通文件`);
+          unlinkSync(state.file);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      }
+    } catch (error) {
+      errors.push(`${path.basename(state.file)}: ${error.message}`);
+    }
+  }
+  for (const state of snapshot?.environment || []) {
+    if (state.exists) process.env[state.key] = state.value;
+    else delete process.env[state.key];
+  }
+  return errors;
+}
+
+async function rollbackConfigurationChange(snapshot, { restartAppServer = false, reason = 'configuration-rollback' } = {}) {
+  const errors = restoreConfigurationState(snapshot);
+  if (restartAppServer && !errors.length) {
+    try {
+      await restartAppServerForConfigChange(reason);
+    } catch (error) {
+      errors.push(`app-server: ${error.message}`);
+    }
+  }
+  return errors;
+}
+
+function atomicWriteFile(file, content, mode = 0o600) {
   mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
-  writeFileSync(temporary, content, { mode: 0o600 });
-  renameSync(temporary, file);
+  try {
+    writeFileSync(temporary, content, { mode });
+    renameSync(temporary, file);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {}
+    throw error;
+  }
 }
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function readTomlString(content, key) {
+  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"((?:\\\\.|[^"\\\\])*)"`, 'm');
+  const raw = pattern.exec(String(content || ''))?.[1];
+  if (raw === undefined) return '';
+  try {
+    return JSON.parse(`"${raw}"`);
+  } catch {
+    return raw.replace(/\\(["\\])/g, '$1');
+  }
+}
+
+function readTopLevelTomlString(content, key) {
+  const source = String(content || '');
+  return readTomlString(source.slice(0, findTopLevelTomlEnd(source)), key);
+}
+
+function findTopLevelTomlEnd(content) {
+  const source = String(content || '');
+  const firstTable = /^\s*(?:\[[^\]\r\n]+\]|\[\[[^\]\r\n]+\]\])\s*(?:#.*)?$/m.exec(source);
+  return firstTable ? firstTable.index : source.length;
 }
 
 function tomlEscape(value) {
@@ -11784,6 +12125,8 @@ jumpToLatest.appendChild(jumpToLatestDots);
 composer?.before(jumpToLatest);
 const dropZone = document.getElementById('dropZone'), attachFile = document.getElementById('attachFile'), fileInput = document.getElementById('fileInput'), attachmentTray = document.getElementById('attachmentTray');
 const provider = document.getElementById('provider'), model = document.getElementById('model'), reasoningEffort = document.getElementById('reasoningEffort'), cwd = document.getElementById('cwd'), sandbox = document.getElementById('sandbox'), approval = document.getElementById('approval'), history = document.getElementById('history'), providerForm = document.getElementById('providerForm'), providerMsg = document.getElementById('providerMsg'), newProviderModel = document.getElementById('newProviderModel'), defaultMsg = document.getElementById('defaultMsg'), safetyHint = document.getElementById('safetyHint');
+let newProviderModelRows = null, addProviderModelButton = null;
+let newProviderModelSuggestions = [], activeProviderModelPicker = null, providerModelPickerSequence = 0;
 const settingsToggle = document.getElementById('settingsToggle'), settingsPanel = document.getElementById('settingsPanel');
 const archiveToggle = document.getElementById('archiveToggle'), archiveView = document.getElementById('archiveView'), archiveList = document.getElementById('archiveList'), archiveSearch = document.getElementById('archiveSearch'), archiveProjectFilter = document.getElementById('archiveProjectFilter'), archiveRefresh = document.getElementById('archiveRefresh'), archiveDeleteAll = document.getElementById('archiveDeleteAll'), archiveStatus = document.getElementById('archiveStatus');
 const automationToggle = document.getElementById('automationToggle'), automationView = document.getElementById('automationView'), automationList = document.getElementById('automationList'), automationSearch = document.getElementById('automationSearch'), automationFilter = document.getElementById('automationFilter'), automationRefresh = document.getElementById('automationRefresh'), automationCreate = document.getElementById('automationCreate'), automationStatus = document.getElementById('automationStatus'), automationEditor = document.getElementById('automationEditor'), automationForm = document.getElementById('automationForm'), automationFormMessage = document.getElementById('automationFormMessage'), automationFrequency = document.getElementById('automationFrequency');
@@ -12011,6 +12354,7 @@ let nativeComposerSettingsWriteId = 0;
 let modelLoadRevision = 0;
 let modelOptionsProvider = null;
 let modelListCache = new Map();
+let modelLoadWarnings = new Map();
 let modelLoadInFlight = null;
 let composerModelLoadPromise = Promise.resolve(true);
 let composerProviderChangePromise = Promise.resolve(true);
@@ -12184,6 +12528,8 @@ const HIDDEN_HISTORY_PROJECTS_STORAGE_KEY='codexWeb.historyProjectsHidden';
 const HISTORY_PROJECT_NAMES_STORAGE_KEY='codexWeb.historyProjectNames.v1';
 const HISTORY_COMPLETION_READ_STORAGE_KEY='codexWeb.historyCompletionRead.v2';
 const HISTORY_COMPLETION_SEEN_STORAGE_KEY='codexWeb.historyCompletionSeen.v2';
+const TASK_COMPLETE_SOUND_STORAGE_KEY='codexWeb.taskCompleteSoundEnabled.v1';
+const TASK_COMPLETE_SOUND_DEDUPE_LIMIT=256;
 const PROMPT_QUEUE_STORAGE_KEY='codexWeb.promptQueue.v1';
 const SIDE_CHAT_STORAGE_KEY='codexWeb.sideChat.v1';
 const SIDE_CHAT_WIDTH_STORAGE_KEY='codexWeb.sideChatWidth.v1';
@@ -12208,6 +12554,9 @@ let hiddenHistoryProjects=readHiddenHistoryProjects();
 let renamedHistoryProjects=readRenamedHistoryProjects();
 let historyCompletionRead=readHistoryCompletionState(HISTORY_COMPLETION_READ_STORAGE_KEY);
 let historyCompletionSeen=readHistoryCompletionState(HISTORY_COMPLETION_SEEN_STORAGE_KEY);
+let taskCompleteSoundEnabled=readTaskCompleteSoundEnabled();
+const taskCompleteSoundTurnKeys=new Set();
+let completeAudioCtx=null;
 let historyCompletionPushTimer=null;
 let historyCompletionSyncTimer=null;
 let historyCompletionSyncInFlight=null;
@@ -12452,6 +12801,18 @@ async function loadNativeModelCapabilities(){
     nativeModelCapabilitiesLoaded=false;
     nativeModelDisplayNames=new Map();
     nativeModelCatalogIds=[];
+    const providerName=String(modelOptionsProvider!==null
+      ?modelOptionsProvider
+      :(typeof provider!=='undefined'?provider?.value||'':''));
+    const cached=modelListCache.get(providerName);
+    const cachedItems=Array.isArray(cached)?cached:[];
+    const currentModel=String(model.value||'').trim();
+    // A capability probe is independent of provider model discovery. If it
+    // fails before that discovery has populated a cache, keep the current
+    // selection instead of replacing a manual model with the generic default.
+    const selected=currentModel||cachedItems[0]||'';
+    if(typeof applyComposerModels==='function'&&(cachedItems.length||selected))applyComposerModels(providerName,cachedItems,selected);
+    else if(typeof syncComposerChrome==='function')syncComposerChrome();
     renderComposerFastToggle();
   }
 }
@@ -12584,6 +12945,9 @@ function renderComposerReasoningSlider(source,target=composerModelSubmenuOptions
   return range;
 }
 function openComposerModelSubmenu(kind){
+  const focus=arguments[1]?.focus!==false;
+  const preserveFocus=!focus&&typeof document!=='undefined'
+    &&composerModelSubmenuOptions?.contains?.(document.activeElement);
   const source=composerModelMenuSource(kind);
   if(!source||source.disabled||!composerModelSubmenuOptions)return;
   composerModelMainMenu?.classList.add('hidden');
@@ -12593,7 +12957,11 @@ function openComposerModelSubmenu(kind){
   composerModelSubmenuTitle.textContent=kind==='model'?'模型':kind==='reasoning'?'推理强度':'高级';
   composerModelSubmenuOptions.replaceChildren();
   if(kind==='reasoning'){
-    renderComposerReasoningSlider(source);
+    if(focus)renderComposerReasoningSlider(source);
+    else{
+      const range=renderComposerReasoningSlider(source,composerModelSubmenuOptions,{focus:false});
+      if(preserveFocus)range?.focus();
+    }
     return;
   }
   for(const option of source.options){
@@ -12626,9 +12994,11 @@ function openComposerModelSubmenu(kind){
     composerModelSubmenuOptions.appendChild(button);
   }
   refreshIcons(composerModelSubmenu);
-  const selected=composerModelSubmenuOptions.querySelector('[aria-selected="true"]');
-  selected?.scrollIntoView({block:'nearest'});
-  selected?.focus();
+  if(focus||preserveFocus){
+    const selected=composerModelSubmenuOptions.querySelector('[aria-selected="true"]');
+    selected?.scrollIntoView({block:'nearest'});
+    selected?.focus();
+  }
 }
 function createTrailingSingleFlight(task){
   let active=null;
@@ -13944,6 +14314,7 @@ function renderSideChatMessages(messages,context={}){
   }
   const renderContext={
     threadId:String(context.threadId||sideChatThreadId||''),
+    generation:Number(context.generation)||0,
     activeTurnId:String(context.activeTurnId||''),
     running:Boolean(context.running),
     startedAt:String(context.startedAt||''),
@@ -13992,6 +14363,8 @@ function renderSideChatMessages(messages,context={}){
           at:message.at,
           turnId,
           nativeMessageSeq:Number.isInteger(Number(message.seq))&&Number(message.seq)>0?Number(message.seq):undefined,
+          messageMediaThreadId:renderContext.threadId,
+          messageMediaGeneration:renderContext.generation,
           browserTarget:message.browserTarget,
           actionThreadId:renderContext.threadId,
           scrollContainer:sideChatMessages,
@@ -14016,6 +14389,8 @@ function renderSideChatMessages(messages,context={}){
           at:message.at,
           turnId,
           nativeMessageSeq:Number.isInteger(Number(message.seq))&&Number(message.seq)>0?Number(message.seq):undefined,
+          messageMediaThreadId:renderContext.threadId,
+          messageMediaGeneration:renderContext.generation,
           streaming,
           actionThreadId:renderContext.threadId,
           scrollContainer:sideChatMessages,
@@ -14128,6 +14503,7 @@ async function syncSideChatConversation(options={}){
     sideChatActiveTurnId=String(conversation.activeTurnId||'');
     await renderSideChatMessages(messages,{
       threadId:syncId,
+      generation:conversation.generation,
       activeTurnId:sideChatActiveTurnId,
       running:sideChatRunning,
       startedAt:conversation.activeTurnStartedAt||conversation.updatedAt||'',
@@ -15909,7 +16285,17 @@ function syncComposerChrome(){
     composerModelToggle.title=webRunActive&&currentConversationSource==='codex'?modelSummary+' · 修改将用于下一条消息':modelSummary;
     composerModelToggle.setAttribute('aria-label',composerModelToggle.title);
   }
-  renderComposerModelMenuState();
+  const activeSubmenu=composerModelPanel&&!composerModelPanel.classList.contains('hidden')
+    ?String(composerModelPanel.dataset.submenu||'')
+    :'';
+  const activeSubmenuSource=activeSubmenu?composerModelMenuSource(activeSubmenu):null;
+  if(activeSubmenu&&activeSubmenuSource&&!activeSubmenuSource.disabled){
+    openComposerModelSubmenu(activeSubmenu,{focus:false});
+  }else if(activeSubmenu){
+    showComposerModelMainMenu({focus:false});
+  }else{
+    renderComposerModelMenuState();
+  }
   const mode=composerPermissionDisplayMode();
   if(composerPermissionToggle){
     const profile=COMPOSER_PERMISSION_PROFILES[mode]||{label:'当前配置',icon:'sliders-horizontal'};
@@ -18672,6 +19058,7 @@ function openSettings({returnFocus=settingsToggle,focusTarget=settingsClose}={})
 }
 function closeSettings(){
   if(!settingsOverlay||settingsOverlay.classList.contains('hidden'))return;
+  closeNewProviderModelPicker();
   settingsOverlay.classList.add('hidden');
   syncModalOpenState();
   settingsToggle.setAttribute('aria-expanded','false');
@@ -20016,6 +20403,204 @@ function renderSubQuotaEmpty(message,status=''){
   delete subQuotaStatus.dataset.state;
   subQuotaStatus.textContent=status;
 }
+function closeNewProviderModelPicker(){
+  activeProviderModelPicker?.close();
+  activeProviderModelPicker=null;
+}
+function createNewProviderModelPicker(field){
+  const wrapper=document.createElement('div');
+  wrapper.className='providerModelPicker';
+  const toggle=document.createElement('button');
+  toggle.type='button';
+  toggle.className='providerModelToggle';
+  toggle.title='显示全部已获取模型';
+  toggle.setAttribute('aria-label','显示全部已获取模型');
+  toggle.setAttribute('aria-haspopup','listbox');
+  const list=document.createElement('div');
+  list.id='provider-model-options-'+(++providerModelPickerSequence);
+  list.className='providerModelOptions';
+  list.setAttribute('role','listbox');
+  list.setAttribute('aria-label','已获取模型');
+  list.hidden=true;
+  field.setAttribute('role','combobox');
+  field.setAttribute('aria-autocomplete','list');
+  field.setAttribute('aria-controls',list.id);
+  toggle.setAttribute('aria-controls',list.id);
+  let visible=[],activeIndex=-1,query='';
+  const setActive=(index)=>{
+    activeIndex=index;
+    [...list.querySelectorAll('[role="option"]')].forEach((option,i)=>option.classList.toggle('active',i===index));
+    const option=list.children[index];
+    if(option&&visible[index]!==undefined){
+      field.setAttribute('aria-activedescendant',option.id);
+      option.scrollIntoView({block:'nearest'});
+    }else field.removeAttribute('aria-activedescendant');
+  };
+  const close=()=>{
+    list.hidden=true;
+    field.setAttribute('aria-expanded','false');
+    toggle.setAttribute('aria-expanded','false');
+    field.removeAttribute('aria-activedescendant');
+    activeIndex=-1;
+  };
+  const choose=(value)=>{
+    field.value=value;
+    closeNewProviderModelPicker();
+    field.focus();
+    field.dispatchEvent(new Event('change',{bubbles:true}));
+  };
+  const render=()=>{
+    visible=newProviderModelSuggestions.filter((value)=>value.toLowerCase().includes(query));
+    list.replaceChildren();
+    for(const [index,value] of visible.entries()){
+      const option=document.createElement('div');
+      option.id=list.id+'-'+index;
+      option.className='providerModelOption';
+      option.setAttribute('role','option');
+      option.setAttribute('aria-selected',String(value===field.value));
+      option.textContent=value;
+      option.addEventListener('click',()=>choose(value));
+      list.appendChild(option);
+    }
+    if(!visible.length){
+      const empty=document.createElement('div');
+      empty.className='providerModelEmpty';
+      empty.setAttribute('role','status');
+      empty.textContent=newProviderModelSuggestions.length?'无匹配模型，可直接使用手动输入的名称':'暂无候选模型，请先获取模型或手动输入';
+      list.appendChild(empty);
+    }
+    setActive(-1);
+  };
+  const picker={close,refresh:()=>{if(!list.hidden)render()}};
+  const open=(filter='')=>{
+    if(activeProviderModelPicker!==picker)closeNewProviderModelPicker();
+    activeProviderModelPicker=picker;
+    query=String(filter).toLowerCase();
+    render();
+    list.hidden=false;
+    field.setAttribute('aria-expanded','true');
+    toggle.setAttribute('aria-expanded','true');
+  };
+  toggle.addEventListener('click',()=>{
+    const closeOnly=!list.hidden&&query==='';
+    field.focus();
+    if(closeOnly)closeNewProviderModelPicker();else open();
+  });
+  field.addEventListener('input',()=>open(field.value.trim()));
+  field.addEventListener('click',()=>open());
+  wrapper.addEventListener('keydown',(event)=>{
+    if(event.isComposing)return;
+    if(event.key==='Escape'&&!list.hidden){
+      event.preventDefault();event.stopPropagation();closeNewProviderModelPicker();return;
+    }
+    if(event.key==='Tab'){if(activeProviderModelPicker===picker)closeNewProviderModelPicker();return}
+    if(event.target!==field)return;
+    if(event.key==='ArrowDown'||event.key==='ArrowUp'){
+      event.preventDefault();
+      if(list.hidden)open();
+      if(visible.length)setActive(activeIndex<0?(event.key==='ArrowDown'?0:visible.length-1):(activeIndex+(event.key==='ArrowDown'?1:-1)+visible.length)%visible.length);
+    }else if(event.key==='Enter'&&!list.hidden){
+      event.preventDefault();
+      if(activeIndex>=0)choose(visible[activeIndex]);else closeNewProviderModelPicker();
+    }
+  });
+  // Keep input focus while selecting with a mouse; touch scrolling stays native.
+  list.addEventListener('mousedown',(event)=>event.preventDefault());
+  wrapper.append(field,toggle,list);
+  setIconLabel(toggle,'chevron-down','',false);
+  close();
+  return wrapper;
+}
+function syncNewProviderModelRowLabels(){
+  const rows=[...(newProviderModelRows?.querySelectorAll('.providerModelRow')||[])];
+  rows.forEach((row,index)=>{
+    row.querySelector('.newProviderModelInput')?.setAttribute('aria-label','模型 '+(index+1));
+    const remove=row.querySelector('.providerModelRemove');
+    if(remove){remove.setAttribute('aria-label','删除模型 '+(index+1));remove.title='删除模型 '+(index+1)}
+  });
+}
+function collectNewProviderModels(){
+  const values=[...(newProviderModelRows?.querySelectorAll('.newProviderModelInput')||[])]
+    .map((field)=>String(field.value||'').trim())
+    .filter(Boolean);
+  return [...new Set(values)].slice(0,50);
+}
+function addNewProviderModelRow(value=''){
+  if(!newProviderModelRows)return null;
+  if(newProviderModelRows.querySelectorAll('.providerModelRow').length>=50){
+    providerMsg.textContent='最多添加 50 个模型';
+    return null;
+  }
+  const row=document.createElement('div');
+  row.className='providerModelRow';
+  const field=document.createElement('input');
+  field.className='newProviderModelInput';
+  field.placeholder='例如 gpt-5.6-sol';
+  field.autocomplete='off';
+  field.spellcheck=false;
+  field.maxLength=256;
+  field.value=String(value||'');
+  const remove=document.createElement('button');
+  remove.type='button';
+  remove.className='miniDanger providerModelRemove';
+  remove.addEventListener('click',()=>{
+    closeNewProviderModelPicker();
+    const rows=newProviderModelRows.querySelectorAll('.providerModelRow');
+    if(rows.length<=1){field.value='';field.focus();return}
+    row.remove();
+    syncNewProviderModelRowLabels();
+  });
+  row.append(createNewProviderModelPicker(field),remove);
+  newProviderModelRows.appendChild(row);
+  setIconLabel(remove,'x','删除模型',false);
+  syncNewProviderModelRowLabels();
+  return field;
+}
+function setNewProviderModels(models){
+  if(!newProviderModelRows)return;
+  closeNewProviderModelPicker();
+  const values=[...new Set((models||[]).map((item)=>String(item||'').trim()).filter(Boolean))].slice(0,50);
+  newProviderModelRows.replaceChildren();
+  if(!values.length)addNewProviderModelRow('');
+  else for(const value of values)addNewProviderModelRow(value);
+}
+function setNewProviderModelSuggestions(models){
+  newProviderModelSuggestions=[...new Set((models||[]).map((item)=>String(item||'').trim()).filter(Boolean))];
+  activeProviderModelPicker?.refresh();
+}
+function resetNewProviderModelRows(){
+  setNewProviderModels([]);
+  setNewProviderModelSuggestions([]);
+}
+function enhanceProviderModelEditor(){
+  if(newProviderModelRows||!newProviderModel)return;
+  const field=newProviderModel.closest('.field');
+  if(!field)return;
+  field.classList.add('providerModelField');
+  const rows=document.createElement('div');
+  rows.id='newProviderModelRows';
+  rows.className='providerModelRows';
+  const actions=document.createElement('div');
+  actions.className='providerModelActions';
+  const add=document.createElement('button');
+  add.id='addProviderModel';
+  add.type='button';
+  add.className='miniSecondary providerModelAdd';
+  const fetchButton=document.getElementById('fetchNewModels');
+  newProviderModel.replaceWith(rows);
+  actions.appendChild(add);
+  if(fetchButton)actions.appendChild(fetchButton);
+  field.append(actions);
+  newProviderModelRows=rows;
+  addProviderModelButton=add;
+  addProviderModelButton.addEventListener('click',()=>addNewProviderModelRow('')?.focus());
+  setIconLabel(addProviderModelButton,'plus','添加模型');
+  resetNewProviderModelRows();
+  // Closing on pointerdown/blur can move the clicked control before pointerup.
+  document.addEventListener('click',(event)=>{
+    if(!event.target.closest?.('.providerModelPicker'))closeNewProviderModelPicker();
+  });
+}
 function enhanceInterface(){
   const sideBrand=document.querySelector('.side > div:first-child');
   sideBrand?.classList.add('sideBrand');
@@ -20039,6 +20624,7 @@ function enhanceInterface(){
   enhanceSubQuota(sideActions);
   if(sideActions&&settingsToggle)sideActions.appendChild(settingsToggle);
   enhanceSettingsModal();
+  enhanceProviderModelEditor();
   setIconLabel(document.getElementById('newChat'),'plus','新建任务');
   setIconLabel(archiveToggle,'archive','已归档任务',false);
   archiveToggle?.setAttribute('title','已归档任务');
@@ -20381,34 +20967,31 @@ async function refreshHistory(){
   return historyRefreshInFlight;
 }
 function nativeRuntimeNeedsHistoryRefresh(type){return ['turn','turn-cleared','connection-error'].includes(String(type||''))}
+function uniqueComposerModelItems(items){return [...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))]}
 function composerModelItems(items,selected){
-  const providerItems=[...new Set((items||[]).map((item)=>String(item||'').trim()).filter(Boolean))];
+  const providerItems=uniqueComposerModelItems(items);
+  const catalog=uniqueComposerModelItems(nativeModelCatalogIds);
+  const list=providerItems.length?[...providerItems]:catalog;
   const selectedModel=String(selected||'').trim();
-  const providerSet=new Set(providerItems.map((item)=>item.toLowerCase()));
-  const catalog=(nativeModelCatalogIds||[]).map((item)=>String(item||'').trim()).filter(Boolean);
-  let list;
-  if(catalog.length){
-    // Prefer Codex model catalog order/labels for the picker, keep provider-only extras after it.
-    const catalogVisible=catalog.filter((item)=>!providerSet.size || providerSet.has(item.toLowerCase()) || item===selectedModel);
-    const extras=providerItems.filter((item)=>!catalog.some((entry)=>entry.toLowerCase()===item.toLowerCase()));
-    list=[...catalogVisible,...extras];
-  }else{
-    list=providerItems;
-  }
-  if(selectedModel&&!list.some((item)=>item===selectedModel))list.push(selectedModel);
-  return [...new Set(list)];
+  if(selectedModel&&!list.includes(selectedModel))list.push(selectedModel);
+  return list;
 }
 function selectComposerModel(selected){const selectedModel=String(selected||'').trim();if(!selectedModel)return false;if(![...model.options].some((option)=>option.value===selectedModel)){const option=document.createElement('option');option.value=selectedModel;option.textContent=selectedModel;model.appendChild(option)}model.value=selectedModel;return true}
 function applyComposerModels(providerName,items,selected){const list=composerModelItems(items,selected);fillSelect(model,list,selected||list[0]||'');modelOptionsProvider=String(providerName||'')}
+function providerModelFallbackMessage(warning,count){const detail=String(warning||'').trim();const prefix='远端模型获取失败，已使用 '+Number(count||0)+' 个手动模型';return detail?prefix+'：'+detail:prefix}
 function loadModels(providerName,selected,{force=false}={}){
   const requestedProvider=String(providerName||'');
   const selectedModel=String(selected||'').trim();
   if(!force&&modelLoadInFlight?.provider===requestedProvider){
-    const joined=modelLoadInFlight.promise.then((loaded)=>{if(String(provider.value||'')===requestedProvider)selectComposerModel(selectedModel);return loaded});
+    const joinedRevision=modelLoadRevision;
+    const joined=modelLoadInFlight.promise.then((loaded)=>{
+      if(String(provider.value||'')===requestedProvider&&modelLoadRevision===joinedRevision)selectComposerModel(selectedModel);
+      return loaded;
+    });
     composerModelLoadPromise=joined.catch(()=>false);
     return joined;
   }
-  if(!force&&modelListCache.has(requestedProvider)){
+  if(!force&&modelListCache.has(requestedProvider)&&!modelLoadWarnings.has(requestedProvider)){
     applyComposerModels(requestedProvider,modelListCache.get(requestedProvider),selectedModel);
     composerModelLoadPromise=Promise.resolve(true);
     return composerModelLoadPromise;
@@ -20416,13 +20999,30 @@ function loadModels(providerName,selected,{force=false}={}){
   const revision=++modelLoadRevision;
   modelOptionsProvider=requestedProvider;
   model.innerHTML='<option value="">获取模型中...</option>';
+  if(typeof syncComposerChrome==='function')syncComposerChrome();
   let pending;
   pending=(async()=>{
     const data=await requestModels({provider:requestedProvider});
-    if(revision!==modelLoadRevision||String(provider.value||'')!==requestedProvider)return false;
-    if(data.error){applyComposerModels(requestedProvider,[],selectedModel||'gpt-5.5');statusEl.textContent=data.error;return false}
-    const items=composerModelItems(data.models,'');
+    if(revision!==modelLoadRevision||String(provider.value||'')!==requestedProvider){
+      if(String(provider.value||'')===requestedProvider&&revision!==modelLoadRevision){
+        const latest=modelLoadInFlight;
+        if(latest?.provider===requestedProvider&&latest.promise!==pending)return latest.promise.catch(()=>false);
+      }
+      return false;
+    }
+    if(data.error){modelListCache.delete(requestedProvider);modelLoadWarnings.delete(requestedProvider);applyComposerModels(requestedProvider,[],selectedModel||'gpt-5.5');statusEl.textContent=data.error;return false}
+    const items=uniqueComposerModelItems(data.models);
+    const warning=String(data.warning||'').trim();
+    const previousWarning=modelLoadWarnings.get(requestedProvider);
     modelListCache.set(requestedProvider,items);
+    if(warning){
+      modelLoadWarnings.set(requestedProvider,{message:warning,count:items.length});
+      statusEl.textContent=providerModelFallbackMessage(warning,items.length);
+    }else{
+      modelLoadWarnings.delete(requestedProvider);
+      const previousStatus=previousWarning&&providerModelFallbackMessage(previousWarning.message,previousWarning.count);
+      if(previousStatus&&statusEl.textContent===previousStatus)statusEl.textContent='';
+    }
     applyComposerModels(requestedProvider,items,selectedModel||items[0]||'');
     return true;
   })().finally(()=>{if(modelLoadInFlight?.promise===pending)modelLoadInFlight=null});
@@ -20449,7 +21049,7 @@ async function changeComposerProvider(nextProvider){
   return settingsReady;
 }
 function requestComposerProviderChange(nextProvider){const pending=changeComposerProvider(nextProvider);composerProviderChangePromise=pending.catch(()=>false);return pending}
-async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const loaded=await loadModels(providerName,selected,{force:true});if(!loaded){defaultMsg.textContent='模型列表更新失败';return}const count=modelListCache.get(String(providerName||''))?.length||0;defaultMsg.textContent=count?'模型列表已更新，共 '+count+' 个':'没有返回模型'}
+async function refreshProviderModels(){const providerName=provider.value;if(!providerName){defaultMsg.textContent='请选择要更新模型的服务商';return}const selected=model.value;defaultMsg.textContent='更新模型中...';const loaded=await loadModels(providerName,selected,{force:true});if(!loaded){defaultMsg.textContent='模型列表更新失败';return}const fallback=modelLoadWarnings.get(String(providerName||''));if(fallback){defaultMsg.textContent=providerModelFallbackMessage(fallback.message,fallback.count);return}const count=modelListCache.get(String(providerName||''))?.length||0;defaultMsg.textContent=count?'模型列表已更新，共 '+count+' 个':'没有返回模型'}
 async function saveDefaultModel(){defaultMsg.textContent='保存中...';const res=await fetch('/api/defaults',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:provider.value,model:model.value,reasoningEffort:reasoningEffort.value})});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'保存失败';return}defaultMsg.textContent='默认设置已保存：'+data.model+' / '+(data.reasoningEffort||'默认');statusEl.textContent='Default: '+data.provider+' / '+data.model+' / '+(data.reasoningEffort||'default')}
 async function deleteSelectedProvider(){const name=provider.value;if(!name){defaultMsg.textContent='请选择要删除的具体服务商';return}if(!confirm('删除服务商 '+name+'？该操作会移除对应配置和 API Key。'))return;defaultMsg.textContent='删除中...';const res=await fetch('/api/providers/'+encodeURIComponent(name),{method:'DELETE'});const data=await res.json();if(!res.ok){defaultMsg.textContent=data.error||'删除失败';return}defaultMsg.textContent='已删除服务商 '+name;await boot();if(data.provider){provider.value=data.provider;await loadModels(data.provider,data.model)}statusEl.textContent='Provider deleted'}
 async function requestModels(payload){try{const res=await fetch('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();return res.ok?data:{error:data.error||'获取模型失败'}}catch(e){return{error:e.message}}}
@@ -21292,6 +21892,61 @@ async function deleteAllArchivedTasks(){
 }
 function readRenamedHistoryProjects(){try{const saved=JSON.parse(localStorage.getItem(HISTORY_PROJECT_NAMES_STORAGE_KEY)||'{}');if(!saved||Array.isArray(saved)||typeof saved!=='object')return new Map();return new Map(Object.entries(saved).filter(([key,value])=>key&&typeof value==='string'&&value.trim()).map(([key,value])=>[key,value.trim().replace(/\\s+/g,' ').slice(0,80)]))}catch{return new Map()}}
 function storeRenamedHistoryProjects(){try{localStorage.setItem(HISTORY_PROJECT_NAMES_STORAGE_KEY,JSON.stringify(Object.fromEntries([...renamedHistoryProjects.entries()].sort(([left],[right])=>left.localeCompare(right)))))}catch{}}
+function readTaskCompleteSoundEnabled(){
+  try{return localStorage.getItem(TASK_COMPLETE_SOUND_STORAGE_KEY)==='1'}catch{return false}
+}
+function setTaskCompleteSoundEnabled(enabled){
+  taskCompleteSoundEnabled=Boolean(enabled);
+  try{localStorage.setItem(TASK_COMPLETE_SOUND_STORAGE_KEY,taskCompleteSoundEnabled?'1':'0')}catch{}
+}
+function taskCompleteSoundTurnKey(threadId,turnId){
+  const thread=String(threadId||'').trim();
+  const turn=String(turnId||'').trim();
+  return thread&&turn?JSON.stringify([thread,turn]):'';
+}
+function rememberTaskCompleteSoundTurn(threadId,turnId){
+  const key=taskCompleteSoundTurnKey(threadId,turnId);
+  if(!key||taskCompleteSoundTurnKeys.has(key))return false;
+  taskCompleteSoundTurnKeys.add(key);
+  while(taskCompleteSoundTurnKeys.size>TASK_COMPLETE_SOUND_DEDUPE_LIMIT){
+    taskCompleteSoundTurnKeys.delete(taskCompleteSoundTurnKeys.values().next().value);
+  }
+  return true;
+}
+async function playTaskCompleteSound(){
+  try{
+    const AudioContextClass=window.AudioContext||window.webkitAudioContext;
+    if(!AudioContextClass)return false;
+    if(!completeAudioCtx)completeAudioCtx=new AudioContextClass();
+    if(completeAudioCtx.state==='suspended'&&completeAudioCtx.resume)await completeAudioCtx.resume();
+    const now=completeAudioCtx.currentTime;
+    const master=completeAudioCtx.createGain();
+    master.gain.setValueAtTime(.85,now);
+    master.connect(completeAudioCtx.destination);
+    [[660,0,.12],[880,.13,.22]].forEach(([frequency,offset,duration])=>{
+      const oscillator=completeAudioCtx.createOscillator();
+      const gain=completeAudioCtx.createGain();
+      oscillator.type='triangle';
+      oscillator.frequency.value=frequency;
+      gain.gain.setValueAtTime(.0001,now+offset);
+      gain.gain.exponentialRampToValueAtTime(.32,now+offset+.006);
+      gain.gain.exponentialRampToValueAtTime(.0001,now+offset+duration);
+      oscillator.connect(gain);
+      gain.connect(master);
+      oscillator.start(now+offset);
+      oscillator.stop(now+offset+duration+.02);
+    });
+    return true;
+  }catch{return false}
+}
+function maybePlayTaskCompleteSound(runtime){
+  if(runtime?.type!=='turn'||String(runtime?.status||'').toLowerCase()!=='done')return false;
+  if(runtime.completionSoundEligible!==true)return false;
+  if(!rememberTaskCompleteSoundTurn(runtime.threadId,runtime.turnId))return false;
+  if(!taskCompleteSoundEnabled)return false;
+  void playTaskCompleteSound();
+  return true;
+}
 function readHistoryCompletionState(key){
   try{
     const saved=JSON.parse(localStorage.getItem(key)||'{}');
@@ -21403,6 +22058,8 @@ function renderHistoryUnreadPopover(){
   historyUnreadPopover.replaceChildren();
   const head=document.createElement('header');
   head.className='historyUnreadHead';
+  const summary=document.createElement('div');
+  summary.className='historyUnreadSummary';
   const title=document.createElement('strong');
   title.textContent='已完成';
   const actions=document.createElement('span');
@@ -22831,7 +23488,8 @@ async function startLimitPauseContinuation(threadId,payload){
 }
 function syncComposerSubmitControl(){
   const native=currentConversationSource==='codex';
-  const legacyLocked=webRunActive&&!native;
+  const chatGPT=currentConversationSource==='chatgpt';
+  const legacyLocked=webRunActive&&!native&&!chatGPT;
   const queueStarting=native&&Boolean(currentConversationId)&&queueDispatchingThreads.has(currentConversationId);
   const cancelPending=nativeCancelPendingMatches();
   const blocked=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||chatGPTSendInFlight;
@@ -22859,9 +23517,9 @@ function applyConversationMode(){
   const legacyLocked=webRunActive&&!native&&!chatGPT;
   const queueStarting=native&&Boolean(currentConversationId)&&queueDispatchingThreads.has(currentConversationId);
   const cancelPending=nativeCancelPendingMatches();
-  input.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending;
-  attachFile.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending;
-  fileInput.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending;
+  input.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||chatGPTSendInFlight;
+  attachFile.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||chatGPT;
+  fileInput.disabled=legacyLocked||steerSubmitting||queueStarting||appQueueEditSaving||cancelPending||chatGPT;
   syncComposerSubmitControl();
   for(const control of [provider,model,reasoningEffort])control.disabled=legacyLocked||chatGPT;
   sandbox.disabled=legacyLocked||chatGPT||forceFullAccess;
@@ -22998,8 +23656,8 @@ function restoreBootConversationChrome(){
   currentConversationSource=saved.source==='chatgpt'?'chatgpt':saved.source==='web'?'web':'codex';
   if(saved.title)setCurrentConversationTitle(saved.title,'Chat');
   else setCurrentConversationTitle('Chat','Chat');
-  setNativeNoticeText('Codex App 会话 · 双向同步',{visible:currentConversationSource==='codex'});
-  if(activeMainView==='chat')setModeLabelState(currentConversationSource==='codex');
+  setNativeNoticeText(currentConversationSource==='chatgpt'?'ChatGPT 本地会话 · 可继续发送':'Codex App 会话 · 双向同步',{visible:currentConversationSource==='codex'||currentConversationSource==='chatgpt'});
+  if(activeMainView==='chat')setModeLabelState(currentConversationSource==='codex',currentConversationSource==='chatgpt');
   const empty=chat?.querySelector?.('.empty')||document.querySelector('.empty');
   if(empty){
     empty.classList.add('conversationRestoring');
@@ -23824,17 +24482,24 @@ async function applyNativeConversationMetadata(metadata,{preserveProviderModel=f
     const effort=String(metadata.reasoningEffort||'').trim();
     if(['','low','medium','high','xhigh','max','ultra'].includes(effort))reasoningEffort.value=effort;
   }
+  let modelProviderMetadataHandled=false;
   if(!preserveProviderModel&&Object.hasOwn(metadata,'modelProvider')){
     const modelProvider=String(metadata.modelProvider||'').trim();
     if([...provider.options].some((opt)=>opt.value===modelProvider)){
+      modelProviderMetadataHandled=true;
       provider.value=modelProvider;
       const selectedModel=String(metadata.model||'').trim();
-      if(modelOptionsProvider!==modelProvider||modelLoadInFlight?.provider===modelProvider)await loadModels(modelProvider,selectedModel);
+      let modelLoadRevisionAtApply=modelLoadRevision;
+      if(modelOptionsProvider!==modelProvider||modelLoadInFlight?.provider===modelProvider){
+        const modelLoad=loadModels(modelProvider,selectedModel);
+        modelLoadRevisionAtApply=modelLoadRevision;
+        await modelLoad;
+      }
       if(String(provider.value||'')!==modelProvider)return false;
-      selectComposerModel(selectedModel);
+      if(modelLoadRevision===modelLoadRevisionAtApply&&Object.hasOwn(metadata,'model'))selectComposerModel(selectedModel);
     }
   }
-  if(!preserveProviderModel&&Object.hasOwn(metadata,'model')){
+  if(!preserveProviderModel&&Object.hasOwn(metadata,'model')&&!Object.hasOwn(metadata,'modelProvider')&&!modelProviderMetadataHandled){
     const selectedModel=String(metadata.model||'').trim();
     selectComposerModel(selectedModel);
   }
@@ -23999,6 +24664,7 @@ function connectSessionEvents(){
     // Text deltas can arrive many times per second. Their persisted snapshot is already
     // coalesced by the sessions listener, so only refresh the sidebar for lifecycle changes.
     if(nativeRuntimeNeedsHistoryRefresh(runtime.type))scheduleHistoryRefreshFromSession();
+    if(runtime.type==='turn')maybePlayTaskCompleteSound(runtime);
     if(runtime.threadId!==currentConversationId||currentConversationSource!=='codex')return;
     if(isCompletedNativeRuntimeTurn(runtime.turnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
     if(webRunActive&&activeNativeTurnId&&runtime.turnId&&String(runtime.turnId)!==String(activeNativeTurnId)&&['delta','item-completed','connection-error','turn'].includes(runtime.type))return;
@@ -24100,7 +24766,7 @@ function refreshNativeResetImage(message){
   if(image.getAttribute('src')!==source)image.setAttribute('src',source);
   return true;
 }
-function reconcileNativeResetMessage(message){
+function reconcileNativeResetMessage(message,conversation=null){
   if(message?.role==='image')return refreshNativeResetImage(message);
   const existing=nativeMessageElementBySequence(message?.seq);
   if(!existing)return false;
@@ -24115,11 +24781,14 @@ function reconcileNativeResetMessage(message){
   if(message.responseAnnotations)rememberResponseAnnotationItems(message.turnId,message.responseAnnotations);
   const before=normalizeAssistantDedupeText(existing.dataset.messageText||'');
   const after=normalizeAssistantDedupeText(text);
+  const mediaContextChanged=message.role==='assistant'
+    ?setNativeMessageMediaContext(existing,conversation?.id||currentConversationId,conversation?.generation||nativeGeneration)
+    :false;
   existing.dataset.messageText=text;
   existing.dataset.messageKind=String(message.kind||'');
   existing.dataset.turnId=String(message.turnId||'');
   if(message.at)existing.dataset.messageAt=String(message.at);
-  if(existing._messageBody&&before!==after){
+  if(existing._messageBody&&(before!==after||mediaContextChanged)){
     if(message.role==='assistant')renderAssistantMarkdown(existing._messageBody,text);
     else if(message.role==='user'&&existing.classList.contains('browserCommentSteering'))renderBrowserCommentMessageBody(existing._messageBody,text);
     else if(message.role==='user')renderMessageMarkdown(existing._messageBody,automationInstructionDisplayText(text));
@@ -24150,7 +24819,7 @@ function nativeResetMessagesForIncrementalSync(conversation){
   for(const message of messages){
     const sequence=Number(message.seq);
     if(Number.isInteger(sequence)&&sequence>previousCursor){pending.push(message);continue}
-    if(reconcileNativeResetMessage(message))continue;
+    if(reconcileNativeResetMessage(message,conversation))continue;
     if(['assistant','user'].includes(message.role))pending.push(message);
   }
   return pending;
@@ -24227,7 +24896,7 @@ async function syncCurrentNativeConversationOnce(){
       upsertNativeSnapshotLiveMessage(msg,conversation,{renderImmediately:renderSnapshotImmediately});
       continue;
     }
-    if(role==='assistant'&&adoptRuntimeLiveForSnapshotMessage(msg)){
+    if(role==='assistant'&&adoptRuntimeLiveForSnapshotMessage(msg,conversation)){
       continue;
     }
     addMsg(role,msg.content,{nativeMessageSeq:msg.seq,turnId:msg.turnId,autoTrackAgent:conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg)})
@@ -24630,7 +25299,7 @@ function enhanceMarkdownImages(body){
   }
   flushRun(run);
 }
-function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
+function renderMessageMarkdown(body,text,{assistantArtifacts=false,messageMedia=null}={}){
   const rawSource=String(text||'');
   const memoryParsed=assistantArtifacts?extractMemoryCitations(rawSource):{markdown:rawSource,citations:[]};
   const parsed=assistantArtifacts?extractCodeComments(memoryParsed.markdown):{markdown:memoryParsed.markdown,comments:[]};
@@ -24657,6 +25326,7 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false}={}){
   // Keep markdown HTML even if link/code enhancements fail.
   try{enhanceMarkdownLinks(body)}catch(e){}
   try{enhanceMarkdownImages(body)}catch(e){}
+  try{if(assistantArtifacts)enhanceMarkdownVideos(body,messageMedia,rawSource)}catch(e){}
   try{if(assistantArtifacts)enhanceMarkdownCodeBlocks(body)}catch(e){}
   if(inboxParsed.items.length)renderInboxItems(body,inboxParsed.items);
   if(parsed.comments.length)renderReviewComments(body,parsed.comments);
@@ -25094,9 +25764,9 @@ function automationInstructionDisplayText(text){
     return instructionText;
   }catch(e){return original}
 }
-function renderAssistantMarkdown(body,text,turnId=''){
+function renderAssistantMarkdown(body,text,turnId='',messageMedia=null){
   const displayText=stripNativeUiProtocolLines(automationHeartbeatDisplayText(text));
-  renderMessageMarkdown(body,displayText,{assistantArtifacts:true});
+  renderMessageMarkdown(body,displayText,{assistantArtifacts:true,messageMedia});
   const messageTurnId=String(turnId||body?.closest?.('.msg')?.dataset?.turnId||'');
   enhanceResponseAnnotationDirectives(body,responseAnnotationsForTurn(messageTurnId));
 }
@@ -25237,8 +25907,119 @@ function enhanceMarkdownLinks(body){
     decorateMarkdownLink(link, href.startsWith('http')?href:normalizeMarkdownUrl(href)||href);
   }
 }
+function normalizeMarkdownLocalVideoTarget(value){
+  const raw=String(value||'').trim();
+  if(!raw||markdownUtf8ByteLength(raw)>12288||!raw.startsWith('/')||raw.startsWith('//')||[0,10,13].some((code)=>raw.includes(String.fromCharCode(code)))||raw.includes('?')||raw.includes('#'))return'';
+  let decoded='';
+  try{decoded=decodeURIComponent(raw)}catch(e){return''}
+  if(!decoded.startsWith('/')||[0,10,13].some((code)=>decoded.includes(String.fromCharCode(code)))||decoded.includes('?')||decoded.includes('#')||markdownUtf8ByteLength(decoded)>4096)return'';
+  const segments=[];
+  for(const segment of decoded.split('/')){
+    if(!segment||segment==='.')continue;
+    if(segment==='..'){segments.pop();continue}
+    segments.push(segment);
+  }
+  const lexicalPath='/'+segments.join('/');
+  if(markdownUtf8ByteLength(lexicalPath)>4096)return'';
+  const basename=String(segments.at(-1)||'').toLowerCase();
+  return basename!=='.mp4'&&basename.endsWith('.mp4')?lexicalPath:'';
+}
+function markdownUtf8ByteLength(value){
+  let bytes=0;
+  for(const char of String(value||'')){
+    const code=char.codePointAt(0);
+    bytes+=code<=127?1:code<=2047?2:code<=65535?3:4;
+  }
+  return bytes;
+}
+function markdownLocalVideoTargets(source){
+  if(!window.marked?.lexer||!window.marked?.walkTokens)return[];
+  try{
+    const targets=[];
+    const tokens=window.marked.lexer(String(source||''));
+    window.marked.walkTokens(tokens,(token)=>{
+      if(token?.type!=='link')return;
+      const target=normalizeMarkdownLocalVideoTarget(token.href);
+      if(target)targets.push(target);
+    });
+    return targets;
+  }catch(e){return[]}
+}
+function setNativeMessageMediaContext(element,threadId,generation){
+  if(!element?.dataset)return false;
+  const cleanThreadId=String(threadId||'').trim();
+  const cleanGeneration=Number(generation);
+  const beforeThread=String(element.dataset.messageMediaThreadId||'');
+  const beforeGeneration=String(element.dataset.messageMediaGeneration||'');
+  if(cleanThreadId)element.dataset.messageMediaThreadId=cleanThreadId;
+  else delete element.dataset.messageMediaThreadId;
+  if(Number.isSafeInteger(cleanGeneration)&&cleanGeneration>0)element.dataset.messageMediaGeneration=String(cleanGeneration);
+  else delete element.dataset.messageMediaGeneration;
+  return beforeThread!==String(element.dataset.messageMediaThreadId||'')
+    ||beforeGeneration!==String(element.dataset.messageMediaGeneration||'');
+}
+function nativeMessageMediaContext(body,provided=null){
+  const message=body?.closest?.('.msg')||null;
+  const threadId=String(provided?.threadId||message?.dataset?.messageMediaThreadId||'').trim();
+  const sequence=Number(provided?.messageSeq??message?.dataset?.nativeMessageSeq);
+  const generation=Number(provided?.generation??message?.dataset?.messageMediaGeneration);
+  if(!threadId||!Number.isSafeInteger(sequence)||sequence<1||!Number.isSafeInteger(generation)||generation<1)return null;
+  return{threadId,messageSeq:sequence,generation};
+}
+function nativeMessageVideoUrl(context,linkIndex){
+  const clean=nativeMessageMediaContext(null,context);
+  const index=Number(linkIndex);
+  if(!clean||!Number.isSafeInteger(index)||index<1)return'';
+  return '/api/native-sessions/'+encodeURIComponent(clean.threadId)
+    +'/messages/'+clean.messageSeq+'/videos/'+index
+    +'?generation='+clean.generation;
+}
+function enhanceMarkdownVideos(body,providedContext=null,source=''){
+  if(!body)return;
+  const context=nativeMessageMediaContext(body,providedContext);
+  if(!context)return;
+  const targets=markdownLocalVideoTargets(source);
+  if(!targets.length)return;
+  const links=[...body.querySelectorAll('a[data-link-url]')];
+  let searchFrom=0;
+  targets.forEach((target,targetIndex)=>{
+    let link=null;
+    for(let index=searchFrom;index<links.length;index+=1){
+      if(normalizeMarkdownLocalVideoTarget(links[index].dataset.linkUrl)!==target)continue;
+      link=links[index];
+      searchFrom=index+1;
+      break;
+    }
+    if(!link)return;
+    const mediaUrl=nativeMessageVideoUrl(context,targetIndex+1);
+    if(!mediaUrl)return;
+    link.href=mediaUrl;
+    link.dataset.messageMediaUrl=mediaUrl;
+    link.classList.add('markdownLocalVideoLink');
+    link.removeAttribute('download');
+    const existing=link.nextElementSibling;
+    if(existing?.classList?.contains('markdownLocalVideo')){
+      const existingVideo=existing.querySelector(':scope > video');
+      if(existingVideo&&existingVideo.getAttribute('src')!==mediaUrl)existingVideo.src=mediaUrl;
+      return;
+    }
+    const wrap=document.createElement('span');
+    wrap.className='markdownLocalVideo';
+    const video=document.createElement('video');
+    video.controls=true;
+    video.playsInline=true;
+    video.setAttribute('playsinline','');
+    video.preload='metadata';
+    video.src=mediaUrl;
+    video.setAttribute('aria-label','播放 '+(String(link.textContent||'').trim()||'本地 MP4 视频'));
+    video.addEventListener('error',()=>wrap.classList.add('unavailable'));
+    wrap.appendChild(video);
+    link.after(wrap);
+  });
+}
 let chatLinkMenu=null;
 let chatLinkMenuUrl='';
+let chatLinkMenuOpenUrl='';
 function ensureChatLinkMenu(){
   if(chatLinkMenu)return chatLinkMenu;
   chatLinkMenu=document.createElement('div');
@@ -25280,10 +26061,12 @@ function hideChatLinkMenu(){
   if(!chatLinkMenu)return;
   chatLinkMenu.classList.add('hidden');
   chatLinkMenuUrl='';
+  chatLinkMenuOpenUrl='';
 }
-function showChatLinkMenu(clientX,clientY,url){
+function showChatLinkMenu(clientX,clientY,url,openUrl=''){
   const menu=ensureChatLinkMenu();
   chatLinkMenuUrl=String(url||'').trim();
+  chatLinkMenuOpenUrl=String(openUrl||'').trim();
   if(!chatLinkMenuUrl){hideChatLinkMenu();return}
   menu.classList.remove('hidden');
   const pad=8;
@@ -25314,6 +26097,7 @@ function insertTextIntoComposer(text){
 }
 async function handleChatLinkMenuAction(action){
   const url=chatLinkMenuUrl;
+  const openUrl=chatLinkMenuOpenUrl;
   hideChatLinkMenu();
   if(!url)return;
   if(action==='add'){
@@ -25337,10 +26121,11 @@ function bindChatLinkContextMenu(){
     const link=event.target?.closest?.('a.markdownLink, .markdownBody a[href]');
     if(link&&chat.contains(link)){
       const href=String(link.dataset.linkUrl||link.getAttribute('href')||'').trim();
+      const openUrl=String(link.dataset.messageMediaUrl||'').trim();
       if(href&&!href.startsWith('#')&&!href.startsWith('javascript:')){
         event.preventDefault();
         event.stopPropagation();
-        showChatLinkMenu(event.clientX,event.clientY,href);
+        showChatLinkMenu(event.clientX,event.clientY,href,openUrl);
         return;
       }
     }
@@ -26257,7 +27042,11 @@ function appendSubagentTraceMessage(state,message,conversation){
     }
     const body=document.createElement('div');
     body.className='subagentTraceMarkdown';
-    renderAssistantMarkdown(body,message.content);
+    renderAssistantMarkdown(body,message.content,message.turnId,{
+      threadId:conversation.id,
+      messageSeq:Number(message.seq),
+      generation:Number(conversation.generation),
+    });
     node.appendChild(head);
     node.appendChild(body);
     node._subagentTraceLabel=label;
@@ -28097,6 +28886,7 @@ function createConversationMessageElement(role,text,options={}){
   el.dataset.messageAt=String(options.at||'');
   el.dataset.turnId=String(options.turnId||'');
   if(Number.isInteger(options.nativeMessageSeq))el.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+  if(role==='assistant')setNativeMessageMediaContext(el,options.messageMediaThreadId,options.messageMediaGeneration);
   if(browserCommentUser){el.classList.add('browserCommentSteering');el.dataset.browserTarget=String(options.browserTarget||'')}
   if(steeringUser){
     el.classList.add('steeringUser');
@@ -28139,7 +28929,11 @@ function createConversationMessageElement(role,text,options={}){
     const body=document.createElement('div');
     body.className='msgBody';
     if(browserCommentUser)renderBrowserCommentMessageBody(body,text);
-    else if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text,options.turnId);
+    else if(role==='assistant'||role==='thinking')renderAssistantMarkdown(body,text,options.turnId,{
+      threadId:options.messageMediaThreadId,
+      messageSeq:options.nativeMessageSeq,
+      generation:options.messageMediaGeneration,
+    });
     else if(role==='user')renderMessageMarkdown(body,automationInstructionDisplayText(text));
     else body.textContent=terminalError?terminalErrorDisplayText(text):text;
     const actions=document.createElement('div');
@@ -28482,13 +29276,14 @@ function addMsg(role,text,options={}){
     const duplicate=findDuplicateAssistantBubble(text,options);
     if(duplicate){
       const targetText=String(text||'');
-      if(targetText&&normalizeAssistantDedupeText(duplicate.dataset.messageText||'')!==normalizeAssistantDedupeText(targetText)){
-        duplicate.dataset.messageText=targetText;
-        if(duplicate._messageBody)renderAssistantMarkdown(duplicate._messageBody,targetText);
-      }
+      const textChanged=Boolean(targetText&&normalizeAssistantDedupeText(duplicate.dataset.messageText||'')!==normalizeAssistantDedupeText(targetText));
       if(options.kind)duplicate.dataset.messageKind=String(options.kind);
       if(options.turnId)duplicate.dataset.turnId=String(options.turnId);
       if(Number.isInteger(options.nativeMessageSeq))duplicate.dataset.nativeMessageSeq=String(options.nativeMessageSeq);
+      const mediaContextChanged=setNativeMessageMediaContext(duplicate,options.messageMediaThreadId,options.messageMediaGeneration);
+      if(textChanged)duplicate.dataset.messageText=targetText;
+      const renderText=textChanged?targetText:String(duplicate.dataset.messageText||'');
+      if((textChanged||mediaContextChanged)&&duplicate._messageBody)renderAssistantMarkdown(duplicate._messageBody,renderText,options.turnId);
       if(options.at)duplicate.dataset.messageAt=String(options.at);
       if(options.kind==='final_answer'){
         duplicate.classList.remove('progressCommentary');
@@ -28714,7 +29509,7 @@ function findRuntimeLiveForSnapshotMessage(message){
   }
   return null;
 }
-function adoptRuntimeLiveForSnapshotMessage(message){
+function adoptRuntimeLiveForSnapshotMessage(message,conversation=null){
   const live=findRuntimeLiveForSnapshotMessage(message);
   if(!live?.element)return null;
   const targetText=nativeLiveDisplayText(message.content||'');
@@ -28733,6 +29528,7 @@ function adoptRuntimeLiveForSnapshotMessage(message){
     live.element.dataset.turnId=pausedTurnId;
     if(message.responseAnnotations)rememberResponseAnnotationItems(pausedTurnId,message.responseAnnotations);
     if(Number.isInteger(message.seq))live.element.dataset.nativeMessageSeq=String(message.seq);
+    setNativeMessageMediaContext(live.element,conversation?.id||currentConversationId,conversation?.generation||nativeGeneration);
     if(message.at)live.element.dataset.messageAt=String(message.at);
     return live.element;
   }
@@ -28744,6 +29540,7 @@ function adoptRuntimeLiveForSnapshotMessage(message){
   delete live.element.dataset.nativeLiveSource;
   if(message.responseAnnotations)rememberResponseAnnotationItems(pausedTurnId,message.responseAnnotations);
   if(Number.isInteger(message.seq))live.element.dataset.nativeMessageSeq=String(message.seq);
+  setNativeMessageMediaContext(live.element,conversation?.id||currentConversationId,conversation?.generation||nativeGeneration);
   if(message.at)live.element.dataset.messageAt=String(message.at);
   if(live.element._messageBody)renderAssistantMarkdown(live.element._messageBody,targetText);
   moveAssistantBubbleToMainChat(live.element,message.kind,targetText);
@@ -28817,7 +29614,7 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
   if(!targetText)return null;
   const cancelPending=nativeCancelPendingMatches(currentConversationId,message.turnId);
   // Prefer adopting the runtime stream bubble so live deltas and history never create twins.
-  const adopted=adoptRuntimeLiveForSnapshotMessage(message);
+  const adopted=adoptRuntimeLiveForSnapshotMessage(message,conversation);
   if(adopted){
     nativeRenderedMessageKeys.add(key);
     return null;
@@ -28848,7 +29645,7 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
   if(!live){
     if(nativeRenderedMessageKeys.has(key))return null;
     const followBottom=captureNativeLiveFollowBottom();
-    const element=addMsg('assistant','',{nativeMessageSeq:message.seq,turnId:message.turnId,autoTrackAgent:true,autoScroll:false,streaming:true,kind:message.kind,at:message.at,annotationCount:message.annotationCount,browserTarget:message.browserTarget,responseAnnotations:message.responseAnnotations,fileChanges:message.fileChanges});
+    const element=addMsg('assistant','',{nativeMessageSeq:message.seq,messageMediaThreadId:conversation.id,messageMediaGeneration:conversation.generation,turnId:message.turnId,autoTrackAgent:true,autoScroll:false,streaming:true,kind:message.kind,at:message.at,annotationCount:message.annotationCount,browserTarget:message.browserTarget,responseAnnotations:message.responseAnnotations,fileChanges:message.fileChanges});
     if(!element)return null;
     live={key,source:'snapshot',turnId:String(message.turnId||''),messageSeq:message.seq,role:'assistant',element,text:'',targetText:'',complete:true,renderTimer:null,followBottom};
     nativeLiveItems.set(key,live);
@@ -28857,6 +29654,7 @@ function upsertNativeSnapshotLiveMessage(message,conversation,{renderImmediately
   live.targetText=targetText;
   live.complete=true;
   if(Number.isInteger(message.seq))live.element.dataset.nativeMessageSeq=String(message.seq);
+  setNativeMessageMediaContext(live.element,conversation.id,conversation.generation);
   if(renderImmediately||!nativeLiveTypewriterEnabled())renderNativeLiveItemImmediately(live);
   else if(live.text.length<live.targetText.length)scheduleNativeLiveRender(live);else settleNativeLiveItem(live);
   return live;

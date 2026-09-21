@@ -31,7 +31,7 @@ test('side chat queue menu and pane helpers are present', () => {
     'isSideChatThread',
     'async function steerQueuedPrompt',
     'applyServerPromptQueue(threadId,data.queue)',
-    'renderAssistantMarkdown(body,text,options.turnId)',
+    'renderAssistantMarkdown(body,text,options.turnId,{',
     'toolActivityPresentations',
     'createActivityBatch',
     'createActivityCluster',

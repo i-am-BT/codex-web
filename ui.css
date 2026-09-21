@@ -752,8 +752,15 @@ body[data-theme="light"] .themeToggle {
   color: var(--text-subtle);
   font-size: 10px;
   font-weight: 620;
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
   text-transform: none;
+}
+
+.historyUnreadSummary {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
 }
 
 .historyUnreadHead strong {
@@ -4987,6 +4994,136 @@ body[data-theme="light"] .settingsDialog .passwordSettings.settingsCard {
   align-self: end;
   width: 100%;
   min-height: 42px;
+  border-radius: 12px;
+}
+
+.settingsDialog .providerModelField {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 8px;
+}
+
+.settingsDialog .providerModelRows {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settingsDialog .providerModelRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  align-items: start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settingsDialog .providerModelRow .newProviderModelInput {
+  width: 100%;
+  min-width: 0;
+  padding-right: 44px;
+  grid-area: 1 / 1;
+}
+
+.settingsDialog .providerModelPicker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+
+.settingsDialog .providerModelToggle {
+  grid-area: 1 / 1;
+  justify-self: end;
+  align-self: stretch;
+  z-index: 1;
+  width: 42px;
+  min-height: 42px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.settingsDialog .providerModelToggle:hover,
+.settingsDialog .providerModelToggle:focus-visible {
+  background: var(--surface-hover);
+}
+
+.settingsDialog .providerModelToggle .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.settingsDialog .providerModelOptions {
+  max-height: 220px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin-top: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.settingsDialog .providerModelOptions[hidden] {
+  display: none;
+}
+
+.settingsDialog .providerModelOption,
+.settingsDialog .providerModelEmpty {
+  padding: 10px;
+  min-height: 40px;
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.settingsDialog .providerModelOption {
+  cursor: pointer;
+}
+
+.settingsDialog .providerModelOption:hover,
+.settingsDialog .providerModelOption.active {
+  background: var(--surface-hover);
+}
+
+.settingsDialog .providerModelOption[aria-selected="true"] {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.settingsDialog .providerModelEmpty {
+  color: var(--text-muted);
+}
+
+.settingsDialog .providerModelRemove {
+  width: 42px;
+  min-width: 42px;
+  min-height: 42px;
+  padding: 0;
+  border-radius: 12px;
+}
+
+.settingsDialog .providerModelRemove .lucide {
+  width: 16px;
+  height: 16px;
+}
+
+.settingsDialog .providerModelActions {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.settingsDialog .providerModelActions .miniSecondary {
+  width: auto;
+  min-width: 0;
+  min-height: 42px;
+  flex: 1 1 0;
   border-radius: 12px;
 }
 
@@ -15177,6 +15314,34 @@ body[data-chat-bg="skin"] .sideChatSend {
   aspect-ratio: auto;
   object-fit: cover;
   object-position: center top;
+}
+
+.markdownBody .markdownLocalVideo,
+.msgBody.markdownBody .markdownLocalVideo,
+.subagentTraceMarkdown .markdownLocalVideo {
+  display: block;
+  width: min(720px, 100%);
+  margin: 10px 0 14px;
+}
+.markdownBody .markdownLocalVideo video,
+.msgBody.markdownBody .markdownLocalVideo video,
+.subagentTraceMarkdown .markdownLocalVideo video {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+  border-radius: 8px;
+  background: #000;
+  object-fit: contain;
+}
+.markdownBody .markdownLocalVideo.unavailable::after,
+.subagentTraceMarkdown .markdownLocalVideo.unavailable::after {
+  content: '视频暂时无法加载，可点击上方链接重试';
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 /* Standalone image messages also use compact thumbs; click still opens preview */
