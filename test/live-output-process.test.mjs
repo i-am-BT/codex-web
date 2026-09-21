@@ -2543,7 +2543,7 @@ test('composerCollapsed defaults to a capsule input', () => {
   assert.match(inlineScript, /setComposerExpanded\(!prefersCollapsedComposer\(\)\|\|composerShouldStayExpanded\(\)\,\{force:true\}\)/);
   assert.match(inlineScript, /composerMicBtn/);
   assert.match(inlineScript, /function composerPopoverOpen\(\)\{/);
-  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':cancelPending\?'正在停止当前任务\.\.\.':webRunActive&&native\?'排队消息':'向 Codex 提问'/);
+  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':cancelPending\?'正在停止当前任务\.\.\.':chatGPT\?'向 ChatGPT 提问':webRunActive&&native\?'排队消息':'向 Codex 提问'/);
   assert.doesNotMatch(sourceBetween('function composerShouldStayExpanded', 'function setComposerExpanded'), /threadGoalBar/);
   assert.match(inlineScript, /向 Codex 提问/);
   assert.match(uiStyles, /body \.box\.composerCollapsed/);
@@ -2723,7 +2723,7 @@ test('same-conversation refresh keeps the visible status instead of flashing Loa
   assert.doesNotMatch(loadConversation, /statusEl\.textContent='Loading\.\.\.'/);
   assert.match(inlineScript, /function scheduleConversationStatusLoading\(seq\)/);
   assert.match(inlineScript, /Keep the previous status visible for quick switches/);
-  assert.match(inlineScript, /function setModeLabelState\(native\)/);
+  assert.match(inlineScript, /function setModeLabelState\(native,chatGPT=false\)/);
   assert.match(inlineScript, /if\(modeLabel\?\.dataset\.mode===label\)return;/);
 });
 
