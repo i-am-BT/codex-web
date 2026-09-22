@@ -1873,7 +1873,7 @@ test('native session store applies projectless state without a state database an
   }
 });
 
-test('native session store treats unassigned generated task workspaces as projectless', async () => {
+test('native session store treats generated task workspaces as projectless even with stale assignments', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-generated-projectless-'));
   const codexHome = path.join(temporary, '.codex');
   const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '21');
@@ -1882,7 +1882,7 @@ test('native session store treats unassigned generated task workspaces as projec
   const legacyProjectId = '01a02017-a578-7b50-9358-fc426c9830da';
   const generatedRoot = path.join(temporary, 'Documents', 'Codex');
   const generatedCwd = path.join(generatedRoot, '2026-08-14', 'new-task');
-  const explicitProjectCwd = path.join(generatedRoot, '2026-08-14', 'saved-project');
+  const explicitProjectCwd = path.join(temporary, 'workspace', 'saved-project');
   const legacyProjectCwd = path.join(temporary, 'workspace', 'legacy-project');
   let store;
 

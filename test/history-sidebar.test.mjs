@@ -214,6 +214,17 @@ test('unread popover exposes a mark-all-read action', () => {
   assert.match(uiStyles, /\.historyUnreadMarkAll\s*\{/);
 });
 
+test('unread popover stays inside narrow desktop and mobile sidebars', () => {
+  assert.match(
+    uiStyles,
+    /\.historyUnreadPopover\s*\{[\s\S]*?width:\s*min\(248px, calc\(100vw - 28px\), calc\(var\(--sidebar-width, 316px\) - 24px\)\)/,
+  );
+  assert.match(
+    uiStyles,
+    /@media \(max-width: 820px\)\s*\{[\s\S]*?\.historyUnreadPopover\s*\{[\s\S]*?calc\(86vw - 24px\)/,
+  );
+});
+
 test('Codex App read sync requires an unread-to-read transition', () => {
   assert.ok(removedCodexAppUnreadSource);
   assert.ok(syncCodexAppUnreadSource);

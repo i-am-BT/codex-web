@@ -434,9 +434,12 @@ export class NativeSessionStore extends EventEmitter {
   workspaceKindForThread(id, cwd = '') {
     const threadId = String(id || '').trim().toLowerCase();
     if (!this.workspaceStateAvailable || !SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return '';
-    if (this.projectThreadIds.has(threadId)) return 'project';
     if (this.projectlessThreadIds.has(threadId)) return 'projectless';
+    // Codex creates standalone tasks below Documents/Codex/YYYY-MM-DD/<task>.
+    // A stale project assignment can remain after the task is created, but the
+    // generated workspace is still a task and belongs in the Tasks section.
     if (isGeneratedProjectlessWorkspace(cwd, this.projectlessWorkspaceRoot)) return 'projectless';
+    if (this.projectThreadIds.has(threadId)) return 'project';
     return 'project';
   }
 

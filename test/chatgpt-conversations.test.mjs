@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  extractPipePathsFromProcessList,
   resolveCodexAppToolsCwd,
   resolveCodexMcpNodePath,
   sanitizeChatGPTConversationPayload,
@@ -48,6 +49,17 @@ test('resolves explicitly configured Codex bridge paths', () => {
   );
 });
 
+test('extracts active Codex App tool pipes from process environments', () => {
+  assert.deepEqual(
+    extractPipePathsFromProcessList([
+      'node server.mjs CODEX_APP_TOOLS_PIPE_PATH=/tmp/codex-browser-use/active.sock',
+      'node server.mjs CODEX_APP_TOOLS_PIPE_PATH=/tmp/codex-browser-use/active.sock',
+      'unrelated CODEX_APP_TOOLS_PIPE_PATH=/tmp/ignored.txt',
+    ].join('\n')),
+    ['/tmp/codex-browser-use/active.sock'],
+  );
+});
+
 test('normalizes read_thread content into chronological chat messages', () => {
   const result = sanitizeChatGPTConversationPayload({
     success: true,
@@ -79,4 +91,23 @@ test('normalizes read_thread content into chronological chat messages', () => {
     { role: 'user', content: '问题' },
     { role: 'assistant', content: '答复' },
   ]);
+});
+
+test('preserves ChatGPT model metadata for composer mapping', () => {
+  const result = sanitizeChatGPTConversationPayload({
+    contentItems: [{
+      type: 'inputText',
+      text: JSON.stringify({
+        thread: {
+          id: '6aa9483a-5480-83ea-9fee-9dd8790a09db',
+          title: '本地聊天',
+          model: { id: 'gpt-6-pro', displayName: '6 Pro' },
+        },
+        turns: [],
+      }),
+    }],
+  });
+
+  assert.equal(result.model, 'gpt-6-pro');
+  assert.equal(result.modelDisplayName, '6 Pro');
 });
