@@ -776,6 +776,37 @@ body[data-theme="light"] .themeToggle {
   gap: 6px;
 }
 
+.historyUnreadSoundToggle {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-subtle);
+  padding: 0;
+  cursor: pointer;
+}
+
+.historyUnreadSoundToggle:hover,
+.historyUnreadSoundToggle:focus-visible {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text);
+  outline: none;
+}
+
+.historyUnreadSoundToggle[aria-pressed="true"] {
+  color: var(--primary);
+}
+
+.historyUnreadSoundToggle .lucide {
+  width: 14px;
+  height: 14px;
+}
+
 .historyUnreadMarkAll {
   border: 0;
   border-radius: 5px;

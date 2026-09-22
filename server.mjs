@@ -21957,6 +21957,19 @@ function readHistoryCompletionState(key){
 function storeHistoryCompletionState(key,state){
   try{localStorage.setItem(key,JSON.stringify(Object.fromEntries([...state.entries()].slice(-1000))))}catch{}
 }
+function syncTaskCompleteSoundButton(button){
+  if(!button)return;
+  const label=taskCompleteSoundEnabled?'关闭任务完成提示音':'开启任务完成提示音';
+  button.title=label;
+  button.setAttribute('aria-label',label);
+  button.setAttribute('aria-pressed',taskCompleteSoundEnabled?'true':'false');
+  button.replaceChildren();
+  const icon=document.createElement('i');
+  icon.setAttribute('data-lucide',taskCompleteSoundEnabled?'volume-2':'volume-x');
+  icon.setAttribute('aria-hidden','true');
+  button.appendChild(icon);
+  refreshIcons(button);
+}
 function historyCompletionKey(item){return conversationKey(item?.source==='codex'?'codex':item?.source==='chatgpt'?'chatgpt':'web',item?.id)}
 function historyCompletionVersion(item){return String(item?.status||'')+'|'+String(item?.updatedAt||item?.recencyAt||item?.createdAt||'')}
 function historyCompletionReadVersionTimestamp(version){
@@ -22066,6 +22079,16 @@ function renderHistoryUnreadPopover(){
   actions.className='historyUnreadHeadActions';
   const count=document.createElement('span');
   count.textContent=unread.length+' 个未读';
+  const soundToggle=document.createElement('button');
+  soundToggle.type='button';
+  soundToggle.className='historyUnreadSoundToggle';
+  syncTaskCompleteSoundButton(soundToggle);
+  soundToggle.addEventListener('click',(event)=>{
+    event.preventDefault();
+    event.stopPropagation();
+    setTaskCompleteSoundEnabled(!taskCompleteSoundEnabled);
+    syncTaskCompleteSoundButton(soundToggle);
+  });
   const markAll=document.createElement('button');
   markAll.type='button';
   markAll.className='historyUnreadMarkAll';
@@ -22078,7 +22101,7 @@ function renderHistoryUnreadPopover(){
     event.stopPropagation();
     markAllHistoryCompletionRead(unread);
   });
-  actions.append(count,markAll);
+  actions.append(count,soundToggle,markAll);
   head.appendChild(title);
   head.appendChild(actions);
   historyUnreadPopover.appendChild(head);
@@ -26111,7 +26134,7 @@ async function handleChatLinkMenuAction(action){
     return;
   }
   if(action==='open'){
-    window.open(markdownLocalFileProxyUrl(url)||url,'_blank','noopener,noreferrer');
+    window.open(openUrl||markdownLocalFileProxyUrl(url)||url,'_blank','noopener,noreferrer');
   }
 }
 function bindChatLinkContextMenu(){
