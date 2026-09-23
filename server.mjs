@@ -143,6 +143,12 @@ const LOCAL_FILE_ROOTS = String(process.env.CODEX_WEB_LOCAL_FILE_ROOTS || '')
   .filter(Boolean)
   .map((value) => resolveLocalPath(value, homedir()));
 const LOCAL_FILE_MAX_BYTES = 2 * 1024 * 1024;
+const MESSAGE_MEDIA_MAX_BYTES = (() => {
+  const megabytes = Number(process.env.CODEX_WEB_MESSAGE_MEDIA_MAX_MB || 1024);
+  if (!Number.isFinite(megabytes) || megabytes <= 0) return 1024 * 1024 * 1024;
+  return Math.max(1, Math.min(Math.floor(megabytes * 1024 * 1024), Number.MAX_SAFE_INTEGER));
+})();
+const MESSAGE_MEDIA_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
 
 loadEnv(CODEX_ENV_FILE, false);
 
@@ -4982,12 +4988,24 @@ function resetAppServerWriterConnection(expectedConnection = null) {
 
 function appServerWriterHasBlockingWork(connection, { ignoreReservationThreadId = '' } = {}) {
   if (!connection || connection !== appServerClient.child || !appServerClient.initialized) return false;
-  void ignoreReservationThreadId;
   if (Number(appServerClient.operationCount || 0) > 0) return true;
   if (Number(appServerClient.pending?.size || 0) > 0) return true;
   if (appServerClient.startPromise || appServerClient.restartPromise) return true;
   for (const request of pendingNativeRequests.values()) {
-    if (request?.sourceClient === appServerClient) return true;
+    if (request?.sourceClient === appServerClient || request?.transport === 'app-server') return true;
+  }
+  for (const [threadId, turn] of activeNativeTurns) {
+    if (
+      turn?.status === 'running'
+      && turn?.transport === 'app-server'
+    ) {
+      return true;
+    }
+  }
+  if (appServerThreadReconcileRequests.size > 0) return true;
+  if (serverPromptQueueDispatchingThreads.size > 0) return true;
+  for (const threadId of nativeTurnReservations) {
+    if (cleanNativeThreadId(threadId) !== cleanNativeThreadId(ignoreReservationThreadId)) return true;
   }
   return false;
 }
@@ -20824,8 +20842,35 @@ document.addEventListener('click',()=>closeHistoryProjectMenu());
 desktopSidebarMedia.addEventListener?.('change',()=>{finishSidebarResize();finishSideChatResize();app.classList.remove('menuOpen');renderSidebarWidth();renderSideChatWidth();syncMenuButton()});
 document.addEventListener('pointerdown',(event)=>{if(!promptQueueMenu||promptQueueMenu.classList.contains('hidden'))return;if(promptQueueMenu.contains(event.target)||event.target.closest?.('.promptQueueIconButton[aria-label="队列操作"]'))return;closePromptQueueMenu()});
 document.addEventListener('keydown',(event)=>{if(event.key!=='Escape')return;if(historyUnreadPopover&&!historyUnreadPopover.hidden){closeHistoryUnreadPopover({restoreFocus:true});return}if(promptQueueMenu&&!promptQueueMenu.classList.contains('hidden')){closePromptQueueMenu();return}if(activeHistoryProjectMenu){closeHistoryProjectMenu(true);return}if(codePreview&&!codePreview.classList.contains('hidden')){closeCodePreview();return}if(imagePreview&&!imagePreview.classList.contains('hidden')){closeImagePreview();return}if(grok2ApiConsoleOverlay&&!grok2ApiConsoleOverlay.classList.contains('hidden')){closeGrok2ApiConsole();return}if(projectRenameOverlay&&!projectRenameOverlay.classList.contains('hidden')){closeProjectRename();return}if(archiveConfirmOverlay&&!archiveConfirmOverlay.classList.contains('hidden')){closeArchiveConfirm();return}if(automationEditor&&!automationEditor.classList.contains('hidden')){closeAutomationEditor();return}if(subQuotaSettingsOverlay&&!subQuotaSettingsOverlay.classList.contains('hidden')){closeSubQuotaSettings();return}if(newTaskModeOverlay&&!newTaskModeOverlay.classList.contains('hidden')){closeNewTaskModePicker();return}if(settingsOverlay&&!settingsOverlay.classList.contains('hidden')){closeSettings();return}if(subQuotaPopover&&!subQuotaPopover.classList.contains('hidden')){hideSubQuotaPreview();subQuotaToggle?.focus();return}closeComposerPopovers();if(app.classList.contains('menuOpen'))closeMenu()});
-providerForm?.addEventListener('submit', async(e)=>{e.preventDefault();providerMsg.textContent='保存中...';const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:newProviderModel.value,wireApi:document.getElementById('newProviderWire').value};const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}providerMsg.textContent='已保存';document.getElementById('newProviderKey').value='';await boot();provider.value=data.provider;await loadModels(data.provider,data.model);});
-document.getElementById('fetchNewModels')?.addEventListener('click', async()=>{providerMsg.textContent='获取模型中...';const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});if(data.error){providerMsg.textContent=data.error;return}fillSelect(newProviderModel,data.models,data.models[0]||'');providerMsg.textContent=data.models.length?'已获取 '+data.models.length+' 个模型':'没有返回模型';});
+providerForm?.addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  const models=collectNewProviderModels();
+  if(!models.length){
+    providerMsg.textContent='请至少填写一个模型';
+    newProviderModelRows?.querySelector('.newProviderModelInput')?.focus();
+    return;
+  }
+  providerMsg.textContent='保存中...';
+  const payload={name:document.getElementById('newProviderName').value,baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value,model:models[0],models,wireApi:document.getElementById('newProviderWire').value};
+  const res=await fetch('/api/providers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data=await res.json();
+  if(!res.ok){providerMsg.textContent=data.error||'保存失败';return}
+  providerMsg.textContent='已保存';
+  document.getElementById('newProviderKey').value='';
+  resetNewProviderModelRows();
+  await boot();
+  provider.value=data.provider;
+  await loadModels(data.provider,data.model);
+});
+document.getElementById('fetchNewModels')?.addEventListener('click',async()=>{
+  providerMsg.textContent='获取模型中...';
+  const data=await requestModels({baseUrl:document.getElementById('newProviderUrl').value,apiKey:document.getElementById('newProviderKey').value});
+  if(data.error){providerMsg.textContent=data.error;return}
+  const models=[...new Set((data.models||[]).map((item)=>String(item||'').trim()).filter(Boolean))];
+  setNewProviderModelSuggestions(models);
+  if(!collectNewProviderModels().length&&models[0])setNewProviderModels([models[0]]);
+  providerMsg.textContent=models.length?'已获取 '+models.length+' 个模型':'没有返回模型，请手动填写模型名称';
+});
 provider?.addEventListener('change',()=>{void requestComposerProviderChange(provider.value)});
 model?.addEventListener('focus',()=>{composerModelValueBeforeChange=model.value});
 model?.addEventListener('change',()=>{

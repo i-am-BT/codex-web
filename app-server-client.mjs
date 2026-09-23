@@ -306,7 +306,6 @@ export class CodexAppServerClient extends EventEmitter {
         forceWaitTimer = setTimeout(() => {
           finish(stopError('进程已退出但未收到 close'));
         }, forceWaitMs);
-        forceWaitTimer.unref?.();
         return;
       }
       if (!signalChild('SIGTERM') || settled) return;
@@ -322,9 +321,7 @@ export class CodexAppServerClient extends EventEmitter {
         forceWaitTimer = setTimeout(() => {
           finish(stopError('SIGKILL 后未收到 close'));
         }, forceWaitMs);
-        forceWaitTimer.unref?.();
       }, this.stopTimeoutMs);
-      forceTimer.unref?.();
     });
   }
 

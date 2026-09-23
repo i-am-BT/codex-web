@@ -54,6 +54,9 @@ test('app-server terminal errors broadcast full detail before closing the turn',
   const detail = `unexpected status 405 Method Not Allowed: ${'x'.repeat(520)}, url: http://127.0.0.1:8090/v1/responses`;
   const handleAppServerError = new Function(
     'activeNativeTurns',
+    'appServerLoadedThreads',
+    'appServerClient',
+    'appServerClientForRecord',
     'cleanNativeThreadId',
     'setNativeTurnState',
     'recordNativeTurnCompletion',
@@ -64,6 +67,9 @@ test('app-server terminal errors broadcast full detail before closing the turn',
     `${serverSource.slice(start, end)}; return handleAppServerError;`,
   )(
     new Map([['thread-a', { turnId: 'turn-a', status: 'running' }]]),
+    new Map(),
+    {},
+    () => ({}),
     (value) => String(value || '').trim(),
     (...args) => calls.push({ type: 'state', args }),
     (...args) => calls.push({ type: 'complete', args }),
@@ -86,7 +92,7 @@ test('app-server terminal errors broadcast full detail before closing the turn',
   assert.deepEqual(calls[1].args, [
     'thread-a',
     { id: 'turn-a', status: 'failed' },
-    { skipQueueDispatch: false },
+    { expectedRecord: undefined, skipQueueDispatch: false },
   ]);
 
   const rateLimitDetail = 'exceeded retry limit, last status: 429 Too Many Requests';
@@ -107,7 +113,7 @@ test('app-server terminal errors broadcast full detail before closing the turn',
   assert.deepEqual(calls[4].args, [
     'thread-a',
     { id: 'turn-a', status: 'interrupted' },
-    { skipQueueDispatch: true },
+    { expectedRecord: undefined, skipQueueDispatch: true },
   ]);
 });
 
@@ -505,6 +511,7 @@ test('server shutdown waits for the Web app-server owner to exit', async () => {
     'imagePromptLibrary',
     'stopAppQueueSync',
     'sessionEventClients',
+    'appServerThreadClients',
     'server',
     'unlinkSync',
     'PID_FILE',
@@ -530,6 +537,7 @@ test('server shutdown waits for the Web app-server owner to exit', async () => {
     { stop: () => calls.push('image-stop') },
     () => calls.push('queue-stop'),
     new Set([{ end: () => calls.push('event-end') }]),
+    new Set(),
     { close: (callback) => { calls.push('http-close'); callback(); } },
     () => calls.push('pid-unlink'),
     '/tmp/codex-web-test.pid',
@@ -634,20 +642,36 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
   const notificationLoads = [];
   const notificationTurns = [];
   const notificationStarts = [];
+  const appServerLoadedThreads = new Map();
   const notificationApi = new Function(
     'cleanNativeThreadId',
     'markAppServerThreadLoaded',
     'markAppServerThreadTurn',
     'recordNativeTurnStarted',
     'appServerClient',
+    'appServerClientKey',
+    'appServerLoadedThreads',
+    'appServerClientForRecord',
+    'appServerPendingKey',
     'nativeSessions',
     `${serverSource.slice(notificationStart, notificationEnd)}; return { handleAppServerNotification };`,
   )(
     (value) => String(value || '').trim(),
-    (...args) => notificationLoads.push(args),
-    (...args) => notificationTurns.push(args),
+    (threadId, child, client) => {
+      notificationLoads.push([threadId, child, client]);
+      appServerLoadedThreads.set(threadId, { connection: child, client });
+      return true;
+    },
+    (threadId, turnId) => {
+      notificationTurns.push([threadId, turnId]);
+      return true;
+    },
     (...args) => notificationStarts.push(args),
     { child: { id: 'web-app-server' } },
+    () => 'global',
+    appServerLoadedThreads,
+    (record) => record?.client || null,
+    (clientKey, requestId) => `app-server:${clientKey}:${requestId}`,
     { scheduleRefresh() {} },
   );
   notificationApi.handleAppServerNotification({
@@ -707,7 +731,11 @@ test('native queue turns ignore unscoped idle status and stale completions', asy
   assert.equal(updates.length, 0);
   assert.equal(api.recordNativeTurnCompletion('thread-a', { id: 'turn-current', status: 'completed' }), true);
   assert.deepEqual(updates, [{ threadId: 'thread-a', state: { turnId: 'turn-current', status: 'done' } }]);
-  assert.deepEqual(releases, [['thread-a', 'turn-current', { reason: 'turn-completed' }]]);
+  assert.deepEqual(
+    releases,
+    [['thread-a', 'turn-current', { expectedRecord: null, reason: 'turn-completed' }]],
+    'the terminal release must stay scoped to the record that owned the turn',
+  );
   assert.deepEqual(dispatches, [['thread-a', 160]], 'a durable server worker takes over the next queued prompt');
   assert.equal(timers.length, 0, 'terminal state remains until the matching persisted turn record is observed');
 });
@@ -1215,6 +1243,20 @@ test('Web-owned app-server latest turn status repairs stale JSONL running state'
   const appServerLoadedThreads = new Map([
     ['thread-paused', { connection, turnId: 'turn-paused', loadedAt: Date.now() }],
   ]);
+  const appServerClient = {
+    child: connection,
+    initialized: true,
+    request: async (method, params, options) => {
+      requests.push({ method, params, options });
+      return {
+        data: [{
+          id: 'turn-paused',
+          status: 'interrupted',
+          startedAt: Date.parse('2026-08-07T09:34:46.000Z') / 1000,
+        }],
+      };
+    },
+  };
   const api = new Function(
     'activeNativeTurns',
     'cleanNativeThreadId',
@@ -1228,6 +1270,7 @@ test('Web-owned app-server latest turn status repairs stale JSONL running state'
     'NATIVE_TURN_STATUS_ACTIVITY_GRACE_MS',
     'appServerLoadedThreads',
     'appServerClient',
+    'appServerClientForRecord',
     'NATIVE_TURN_STATUS_SYNC_TIMEOUT_MS',
     'releaseAppServerThreadAfterTurn',
     `${serverSource.slice(helperStart, helperEnd)}; return {
@@ -1255,20 +1298,8 @@ test('Web-owned app-server latest turn status repairs stale JSONL running state'
     1500,
     5 * 60 * 1000,
     appServerLoadedThreads,
-    {
-      child: connection,
-      initialized: true,
-      request: async (method, params, options) => {
-        requests.push({ method, params, options });
-        return {
-          data: [{
-            id: 'turn-paused',
-            status: 'interrupted',
-            startedAt: Date.parse('2026-08-07T09:34:46.000Z') / 1000,
-          }],
-        };
-      },
-    },
+    appServerClient,
+    (record) => record?.client || appServerClient,
     4000,
     () => Promise.resolve(false),
   );
@@ -1692,6 +1723,7 @@ test('app-server unsubscribe failures retain ownership and turn mismatches do no
     'appServerUnsubscribeRequests',
     'activeNativeTurns',
     'appServerClient',
+    'appServerClientForRecord',
     'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
     'appServerThreadIdleReleaseTimers',
     'appServerThreadIdleReleaseAttempts',
@@ -1716,6 +1748,7 @@ test('app-server unsubscribe failures retain ownership and turn mismatches do no
     appServerUnsubscribeRequests,
     new Map(),
     appServerClient,
+    (record) => record?.client || appServerClient,
     5000,
     appServerThreadIdleReleaseTimers,
     appServerThreadIdleReleaseAttempts,
@@ -1811,6 +1844,7 @@ test('ambiguous app-server turns reconcile terminal, running, and idle states wi
     'activeNativeTurns',
     'nativeSessions',
     'appServerClient',
+    'appServerClientForRecord',
     'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
     'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
     'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
@@ -1857,6 +1891,7 @@ test('ambiguous app-server turns reconcile terminal, running, and idle states wi
     activeNativeTurns,
     { get: (threadId) => conversations.get(threadId) || null },
     appServerClient,
+    (record) => record?.client || appServerClient,
     2500,
     [0],
     2500,
@@ -2047,6 +2082,7 @@ test('ambiguous app-server probe retries are bounded and never start another tur
     'activeNativeTurns',
     'nativeSessions',
     'appServerClient',
+    'appServerClientForRecord',
     'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
     'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
     'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
@@ -2089,6 +2125,8 @@ test('ambiguous app-server probe retries are bounded and never start another tur
     new Map(),
     { get: () => ({ status: 'done', messages: [] }) },
     appServerClient,
+    (record) => record?.client || appServerClient,
+    (record) => Boolean(record?.connection === appServerClient.child && appServerClient.initialized),
     2500,
     [0, 0, 0],
     2500,
@@ -2165,6 +2203,7 @@ test('malformed app-server latest-turn probes never release a Web subscription',
     'activeNativeTurns',
     'nativeSessions',
     'appServerClient',
+    'appServerClientForRecord',
     'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
     'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
     'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
@@ -2207,6 +2246,7 @@ test('malformed app-server latest-turn probes never release a Web subscription',
     new Map(),
     { get: () => ({ status: 'done', messages: [] }) },
     appServerClient,
+    (record) => record?.client || appServerClient,
     2500,
     [0],
     2500,
@@ -2293,6 +2333,8 @@ test('an in-flight app-server probe cannot clean up a replacement record', async
     'activeNativeTurns',
     'nativeSessions',
     'appServerClient',
+    'appServerClientForRecord',
+    'appServerThreadRecordIsConnected',
     'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
     'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
     'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
@@ -2335,6 +2377,8 @@ test('an in-flight app-server probe cannot clean up a replacement record', async
     new Map(),
     { get: () => ({ status: 'done', messages: [] }) },
     appServerClient,
+    (record) => record?.client || appServerClient,
+    (record) => Boolean(record?.connection === appServerClient.child && appServerClient.initialized),
     2500,
     [0],
     2500,
@@ -2426,6 +2470,12 @@ test('ambiguous thread loading only reconciles resume, never the source of a for
   const api = new Function(
     'cleanNativeThreadId',
     'appServerClient',
+    'appServerClientForRecord',
+    'appServerThreadRecordIsConnected',
+    'createThreadAppServerClient',
+    'closeThreadAppServerClient',
+    'clearAppServerThreadIdleReleaseTimer',
+    'appServerThreadIdleReleaseAttempts',
     'waitForAppServerThreadUnsubscribe',
     'markAppServerThreadLoaded',
     'appServerLoadedThreads',
@@ -2435,6 +2485,12 @@ test('ambiguous thread loading only reconciles resume, never the source of a for
   )(
     (value) => String(value || '').trim(),
     appServerClient,
+    (record) => record?.client || appServerClient,
+    (record) => Boolean(record?.connection === appServerClient.child && appServerClient.initialized),
+    () => appServerClient,
+    async () => true,
+    () => {},
+    new Map(),
     async () => true,
     (threadId, child) => {
       marks.push({ threadId, child });
@@ -2534,6 +2590,10 @@ test('a pending new-session turn/start keeps its Web subscription reserved', asy
   const fakeClearTimeout = (timer) => {
     if (timer) timer.cleared = true;
   };
+  const requestThreadAppServer = async (method) => {
+    if (method !== 'turn/start') throw new Error(`unexpected app-server method: ${method}`);
+    return appServerClient.request(method);
+  };
   const api = new Function(
     'cleanNativeThreadId',
     'appServerLoadedThreads',
@@ -2545,6 +2605,9 @@ test('a pending new-session turn/start keeps its Web subscription reserved', asy
     'activeNativeTurns',
     'nativeSessions',
     'appServerClient',
+    'appServerClientForRecord',
+    'appServerThreadRecordIsConnected',
+    'requestThreadAppServer',
     'APP_SERVER_THREAD_RECONCILE_TIMEOUT_MS',
     'APP_SERVER_THREAD_RECONCILE_RETRY_DELAYS_MS',
     'APP_SERVER_THREAD_UNSUBSCRIBE_TIMEOUT_MS',
@@ -2596,6 +2659,9 @@ test('a pending new-session turn/start keeps its Web subscription reserved', asy
       }),
     },
     appServerClient,
+    (record) => record?.client || appServerClient,
+    (record) => Boolean(record?.connection === appServerClient.child && appServerClient.initialized),
+    requestThreadAppServer,
     2500,
     [0],
     2500,
@@ -2749,6 +2815,7 @@ test('ambiguous steer and interrupt cleanup retain the record loaded by their re
       'isCodexDesktopIpcUnavailableError',
       'isNativeThreadNotFoundError',
       'requestLoadedAppServerThread',
+      'requestThreadAppServer',
       'findInProgressTurnId',
       'appServerClient',
       'isAmbiguousAppServerRequestError',
@@ -2776,6 +2843,11 @@ test('ambiguous steer and interrupt cleanup retain the record loaded by their re
       async () => {
         appServerLoadedThreads.set(threadId, oldRecord);
         return { thread: { turns: [{ id: 'turn-a', status: 'inProgress' }] } };
+      },
+      async () => {
+        // A concurrent Web reload can replace the loaded record mid-RPC.
+        appServerLoadedThreads.set(threadId, replacementRecord);
+        throw ambiguous;
       },
       () => 'turn-a',
       appServerClient,
@@ -2833,6 +2905,7 @@ test('app-server interrupt ACK keeps ownership until the matching turn is termin
     'nativeAppHandoffRequiredError',
     'appServerLoadedThreads',
     'requestLoadedAppServerThread',
+    'requestThreadAppServer',
     'findInProgressTurnId',
     'releaseAppServerThreadAfterTurn',
     'appServerClient',
@@ -2851,14 +2924,13 @@ test('app-server interrupt ACK keeps ownership until the matching turn is termin
     () => new Error('unexpected handoff rejection'),
     appServerLoadedThreads,
     async () => { throw new Error('loaded Web thread must not resume again'); },
+    async (method, params, options) => {
+      requests.push({ method, params, options });
+      return { ok: true };
+    },
     () => '',
     async (...args) => { releases.push(args); return true; },
-    {
-      request: async (method, params, options) => {
-        requests.push({ method, params, options });
-        return { ok: true };
-      },
-    },
+    {},
     100,
     () => false,
     async (...args) => {
@@ -4061,15 +4133,21 @@ test('playground refresh preserves browser streaming preferences and completed A
   assert.match(playgroundV072PatchSource, /imageProfile,\s*\n\+\s*params: imageParams/);
   assert.match(playgroundV072PatchSource, /normalizeParamsForSettings\(imageParams, imageRequestSettings/);
   assert.match(playgroundV073PatchSource, /normalizeParamsForSettings\(imageParams, imageRequestSettings/);
-  assert.match(playgroundAssetScript, /streamImages:typeof\(w==null\?void 0:w\.streamImages\)=="boolean"\?w\.streamImages:I\.streamImages/);
-  assert.match(playgroundAssetScript, /streamPartialImages:typeof\(w==null\?void 0:w\.streamPartialImages\)=="number"\?w\.streamPartialImages:I\.streamPartialImages/);
   assert.match(
     playgroundAssetScript,
-    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const k of a\.inputImageIds\)[A-Za-z_$][\w$]*\(k\)\}/,
+    /streamImages:typeof [A-Za-z_$][\w$]*\.streamImages=="boolean"\?[A-Za-z_$][\w$]*\.streamImages:[A-Za-z_$][\w$]*\.streamImages/,
+  );
+  assert.match(
+    playgroundAssetScript,
+    /streamPartialImages:(?:typeof\(w==null\?void 0:w\.streamPartialImages\)=="number"\?w\.streamPartialImages:I\.streamPartialImages|[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\.streamPartialImages,[A-Za-z_$][\w$]*\.streamPartialImages\))/,
+  );
+  assert.match(
+    playgroundAssetScript,
+    /\.getState\(\)\.setDetailTaskId\(e\)\}\}finally\{for\(const [A-Za-z_$][\w$]* of a\.inputImageIds\)[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\)\}/,
   );
   assert.doesNotMatch(
     playgroundAssetScript,
-    /R\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for\(const k of a\.inputImageIds\)[A-Za-z_$][\w$]*\(k\)\}/,
+    /\.getState\(\)\.setDetailTaskId\(e\)\}\}\}finally\{for/,
   );
   await new Promise((resolve, reject) => {
     execFile('node', ['--check', path.join(ROOT, 'vendor', 'gpt-image-playground', 'app', playgroundAssetPath)], (error, stdout, stderr) => {
@@ -4135,11 +4213,25 @@ test('failed thread RPC still schedules the app-server writer for release', asyn
   };
   const requestThreadAppServer = new Function(
     'appServerClient',
+    'cleanNativeThreadId',
+    'appServerUnsubscribeRequests',
+    'waitForAppServerThreadUnsubscribe',
+    'appServerLoadedThreads',
+    'appServerThreadRecordIsConnected',
+    'closeThreadAppServerClient',
+    'appServerClientForRecord',
     'markAppServerWriterConnection',
     'scheduleAppServerWriterIdleStop',
     `${serverSource.slice(helperStart, helperEnd)}; return requestThreadAppServer;`,
   )(
     appServerClient,
+    (value) => String(value || '').trim(),
+    new Map(),
+    async () => true,
+    new Map(),
+    () => false,
+    async () => true,
+    (record) => record?.client || appServerClient,
     (child) => marked.push(child),
     (reason, options) => scheduled.push({ reason, options }),
   );
@@ -9284,7 +9376,9 @@ updated_at = 1784422800000
     });
     assert.equal(heartbeatResult.status, 200);
     assert.equal(JSON.parse(heartbeatResult.body).data.length, 1);
-    assert.ok(heartbeatStatuses.includes(102));
+    // Buffered JSON requests must not emit 102 responses. Nginx can forward
+    // them as the final HTTP/2 status, causing browsers to report Failed to fetch.
+    assert.deepEqual(heartbeatStatuses, []);
     const playgroundProxyFallback = await fetch(
       `${baseUrl}/api-proxy/images/generations?codex_upstream=${encodeURIComponent(`${providerBaseUrl}/v1`)}`,
       {
@@ -11661,7 +11755,15 @@ updated_at = 1784422800000
       .filter(Boolean)
       .map((line) => JSON.parse(line))
       .slice(protocolBeforeSameProviderUpdate.length);
-    assert.equal(sameProviderProtocol.some((message) => message.type === 'process_env'), false);
+    // A thread-scoped Web client may spawn for the resume below, but a
+    // same-provider update must never restart the shared Web app-server writer.
+    assert.equal(
+      sameProviderProtocol.some((message) => (
+        message.method === 'initialize' && message.params?.clientInfo?.name === 'codex-web'
+      )),
+      false,
+      'a same-provider settings update must not restart the shared Web app-server',
+    );
 
     const archived = await fetch(`${baseUrl}/api/native-sessions/${createdNativeSessionId}`, {
       method: 'DELETE',
