@@ -25419,12 +25419,31 @@ function enhanceMarkdownImages(body){
   }
   flushRun(run);
 }
+function enhanceCodexFileCitations(source){
+  const rawSource=String(source||'');
+  const citationPattern=/::codex-file-citation\{([^{}\n]*)\}/g;
+  return rawSource.replace(citationPattern,(raw,body)=>{
+    const attributes={};
+    const attributePattern=/([A-Za-z][A-Za-z0-9_-]*)=(?:"((?:\\.|[^"])*)"|'((?:\\.|[^'])*)'|([^\s]+))/g;
+    let match;
+    while((match=attributePattern.exec(body))){
+      const value=match[2]??match[3]??match[4]??'';
+      attributes[match[1]]=value.replace(/\\([\\"'])/g,'$1');
+    }
+    const filePath=String(attributes.path||'').trim();
+    if(!filePath.startsWith('/')||filePath.includes('\n')||filePath.includes('\r'))return raw;
+    const fileName=filePath.split(/[\\/]/).filter(Boolean).pop()||'下载文件';
+    const label=String(attributes.label||fileName).replace(/[\[\]]/g,'\\$&');
+    return '['+label+'](<'+filePath.replace(/[<>]/g,'')+'>)';
+  });
+}
 function renderMessageMarkdown(body,text,{assistantArtifacts=false,messageMedia=null}={}){
   const rawSource=String(text||'');
   const memoryParsed=assistantArtifacts?extractMemoryCitations(rawSource):{markdown:rawSource,citations:[]};
   const parsed=assistantArtifacts?extractCodeComments(memoryParsed.markdown):{markdown:memoryParsed.markdown,comments:[]};
   const inboxParsed=assistantArtifacts?extractInboxItems(parsed.markdown):{markdown:parsed.markdown,items:[]};
   const source=inboxParsed.markdown;
+  const markdownSource=assistantArtifacts?enhanceCodexFileCitations(source):source;
   if(!window.marked?.parse||!window.DOMPurify?.sanitize){
     body.textContent=source;
     if(inboxParsed.items.length)renderInboxItems(body,inboxParsed.items);
@@ -25433,7 +25452,7 @@ function renderMessageMarkdown(body,text,{assistantArtifacts=false,messageMedia=
     return;
   }
   try{
-    const html=window.marked.parse(source,{gfm:true,breaks:true});
+    const html=window.marked.parse(markdownSource,{gfm:true,breaks:true});
     body.classList.add('markdownBody');
     body.innerHTML=window.DOMPurify.sanitize(html,{ALLOWED_TAGS:MARKDOWN_ALLOWED_TAGS,ALLOWED_ATTR:MARKDOWN_ALLOWED_ATTRS});
   }catch(e){

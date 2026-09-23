@@ -462,6 +462,25 @@ test('Codex App quota preserves the available reset-card count', async () => {
   assert.equal(withoutCount.rateLimitResetCredits, null);
 });
 
+test('Codex file citations render as safe local-file Markdown links', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const start = serverSource.indexOf('function enhanceCodexFileCitations(source)');
+  const end = serverSource.indexOf('\nfunction renderMessageMarkdown', start);
+  assert.ok(start >= 0 && end > start);
+  const enhanceCodexFileCitations = new Function(
+    `${serverSource.slice(start, end)}; return enhanceCodexFileCitations;`,
+  )();
+  const citation = '::codex-file-citation{path="/Users/ikirito/Outputs/设备清单.xlsx" purpose="output"}';
+  assert.equal(
+    enhanceCodexFileCitations(`已生成 ${citation}`),
+    '已生成 [设备清单.xlsx](</Users/ikirito/Outputs/设备清单.xlsx>)',
+  );
+  assert.equal(
+    enhanceCodexFileCitations('::codex-file-citation{path="relative.xlsx"}'),
+    '::codex-file-citation{path="relative.xlsx"}',
+  );
+});
+
 test('server shutdown waits for the Web app-server owner to exit', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('async function shutdown(signal)');
