@@ -246,7 +246,7 @@ test('reasoning effort uses an accessible six-step slider and keeps select synch
   );
   assert.match(
     serverSource,
-    /composerEffortName\.classList\.toggle\('maximum',Boolean\(reasoningEffort\.value\)&&reasoningEffort\.value===composerMaximumEffortValue\(reasoningEffort\)\)/,
+    /composerEffortName\.classList\.toggle\('maximum',(?:!chatGPTConversation&&)?Boolean\(reasoningEffort\.value\)&&reasoningEffort\.value===composerMaximumEffortValue\(reasoningEffort\)\)/,
   );
   assert.match(
     uiStyles,

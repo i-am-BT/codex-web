@@ -473,8 +473,14 @@ test('Codex file citations render as safe local-file Markdown links', async () =
   const start = serverSource.indexOf('function enhanceCodexFileCitations(source)');
   const end = serverSource.indexOf('\nfunction renderMessageMarkdown', start);
   assert.ok(start >= 0 && end > start);
+  // This helper lives inside the served HTML template literal, so evaluate the
+  // fragment the same way the page does before exercising it.
+  const backtick = String.fromCharCode(96);
+  const servedSource = new Function(
+    `return ${backtick}${serverSource.slice(start, end)}${backtick};`,
+  )();
   const enhanceCodexFileCitations = new Function(
-    `${serverSource.slice(start, end)}; return enhanceCodexFileCitations;`,
+    `${servedSource}; return enhanceCodexFileCitations;`,
   )();
   const citation = '::codex-file-citation{path="/Users/ikirito/Outputs/设备清单.xlsx" purpose="output"}';
   assert.equal(
@@ -6176,6 +6182,7 @@ process.stderr.write('2026-08-07T08:00:03.000000000Z Authorization: Bearer fixtu
       planType: 'plus',
       planName: 'Plus',
       unit: 'credits',
+      rateLimitResetCredits: null,
       balance: 1705.928725,
       creditsVisible: true,
       pointsBalance: 1705.928725,
@@ -7126,7 +7133,7 @@ updated_at = 1784422800000
     assert.match(page, /const activeSubmenu=composerModelPanel&&![\s\S]*?openComposerModelSubmenu\(activeSubmenu,\{focus:false\}\)/);
     assert.match(page, /composerModelSelect\.addEventListener\('change',\(\)=>\{\s*const previous=model\.value;[\s\S]*?composerModelSwitchConfirm\(previous,model\.value\)[\s\S]*?syncComposerChrome\(\)\}\)/);
     assert.match(page, /model\?\.addEventListener\('change',\(\)=>\{\s*if\(!composerModelSwitchConfirm\(composerModelValueBeforeChange,model\.value\)\)return;[\s\S]*?syncComposerChrome\(\)\}\)/);
-    assert.match(page, /payload\.provider=String\(provider\.value\|\|''\)\.trim\(\)\|\|null/);
+    assert.match(page, /payload\.provider=String\(changes\.provider\|\|''\)\.trim\(\)\|\|null/);
     assert.match(page, /reasoningEffort\?\.addEventListener\('change',\(\)=>\{void syncNativeComposerSettings\(\{reasoningEffort:reasoningEffort\.value\}\);syncComposerChrome\(\)\}\)/);
     assert.match(page, /nativeComposerOverride=\{threadId:currentConversationId,provider:[^}]*pending:Boolean\(pending\),writeId:Number\(writeId\)\|\|0\}/);
     assert.match(page, /function nativeComposerOverrideApplies\(threadId\)\{return Boolean\(nativeComposerOverride\?\.pending/);
