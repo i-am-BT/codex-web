@@ -431,6 +431,37 @@ test('Codex App quota retries transient failures and preserves the last good res
   assert.equal(expired.stale, undefined);
 });
 
+test('Codex App quota preserves the available reset-card count', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const start = serverSource.indexOf('function normalizeCodexAppCredits(result)');
+  const end = serverSource.indexOf('\nfunction codexAppQuotaCacheMs()', start);
+  assert.ok(start >= 0 && end > start);
+  const normalizeCodexAppCredits = new Function(
+    'CODEX_APP_QUOTA_PROVIDER',
+    'CODEX_APP_USD_PER_CREDIT',
+    'CODEX_APP_CREDIT_LIMIT',
+    'codexAppPlanLabel',
+    `${serverSource.slice(start, end)}; return normalizeCodexAppCredits;`,
+  )('codex-app', 0.04, 2500, () => 'Pro');
+
+  const quota = normalizeCodexAppCredits({
+    rateLimits: {
+      planType: 'pro',
+      credits: { balance: '0', hasCredits: false, unlimited: false },
+    },
+    rateLimitResetCredits: { availableCount: 3 },
+  });
+  assert.equal(quota.rateLimitResetCredits, 3);
+
+  const withoutCount = normalizeCodexAppCredits({
+    rateLimits: {
+      planType: 'pro',
+      credits: { balance: '0', hasCredits: false, unlimited: false },
+    },
+  });
+  assert.equal(withoutCount.rateLimitResetCredits, null);
+});
+
 test('server shutdown waits for the Web app-server owner to exit', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('async function shutdown(signal)');

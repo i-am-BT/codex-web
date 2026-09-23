@@ -2078,9 +2078,12 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
 
   let provider;
   if (hasProvider) {
-    provider = cleanProviderName(body.provider || '');
+    const requestedProvider = String(body.provider || '').trim();
+    provider = requestedProvider
+      ? cleanProviderName(requestedProvider)
+      : cleanProviderName(readCodexDefaults().provider || DEFAULT_PROVIDER || 'openai');
     if (!provider) return res.status(400).json({ error: '服务商无效' });
-    if (!readProviders().includes(provider)) return res.status(404).json({ error: '服务商不存在' });
+    if (provider !== 'openai' && !readProviders().includes(provider)) return res.status(404).json({ error: '服务商不存在' });
     if (!hasModel) return res.status(400).json({ error: '切换服务商时必须同时指定模型' });
   }
 
@@ -2698,6 +2701,14 @@ app.post('/api/models', requireAuth, async (req, res) => {
   const providerName = cleanProviderName(req.body?.provider || '');
   const explicitBaseUrl = String(req.body?.baseUrl || '').trim().replace(/\/+$/, '');
   const explicitApiKey = String(req.body?.apiKey || '').trim();
+  if (!providerName && !explicitBaseUrl && !explicitApiKey) {
+    try {
+      const models = await readNativeModelCapabilities();
+      return res.json({ ok: true, models: models.map((item) => item.model || item.id).filter(Boolean) });
+    } catch (error) {
+      return res.status(503).json({ error: `读取 Codex 模型失败: ${error.message}` });
+    }
+  }
   let baseUrl = explicitBaseUrl;
   let apiKey = explicitApiKey;
 
@@ -6812,6 +6823,14 @@ function sendAllowedLocalFile(res, requestedPath, { html = false } = {}) {
   res.setHeader('Content-Security-Policy', "default-src 'none'");
   res.setHeader('X-Content-Type-Options', 'nosniff');
   if (html) {
+    if (/\.html?$/i.test(filePath)) {
+      // Run generated pages in an opaque origin, isolated from the Web session.
+      // Inline scripts/styles support self-contained artifacts without granting
+      // access to cookies, app APIs, forms, or arbitrary local files.
+      res.setHeader('Content-Security-Policy', "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'");
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      return res.type('html').send(readFileSync(filePath, 'utf8'));
+    }
     const content = escapeHtml(readFileSync(filePath, 'utf8'));
     return res.type('html').send(`<!doctype html><meta charset="utf-8"><title>${escapeHtml(path.basename(filePath))}</title><pre style="white-space:pre-wrap;word-break:break-word">${content}</pre>`);
   }
@@ -8287,6 +8306,7 @@ function codexAppPlanLabel(value) {
 
 function normalizeCodexAppCredits(result) {
   const fetchedAt = new Date().toISOString();
+  const resetCredits = result?.rateLimitResetCredits?.availableCount;
   const rateLimits = result?.rateLimits || result?.rateLimitsByLimitId?.codex
     || Object.values(result?.rateLimitsByLimitId || {})[0];
   const base = {
@@ -8295,6 +8315,7 @@ function normalizeCodexAppCredits(result) {
     name: 'Codex App',
     mode: 'codex_app_credits',
     fetchedAt,
+    rateLimitResetCredits: Number.isInteger(resetCredits) && resetCredits >= 0 ? resetCredits : null,
     windows: Object.entries(result?.rateLimitsByLimitId || { codex: rateLimits }).flatMap(([id, limits]) =>
       ['primary', 'secondary'].flatMap((key) => {
         const window = limits?.[key];
@@ -17581,7 +17602,7 @@ function enhanceComposer(){
       return;
     }
     reconcileComposerFastSupport();
-    void syncNativeComposerSettings({provider:provider.value,model:model.value});
+    void syncNativeComposerSettings({model:model.value});
     syncComposerChrome();
   });
   composerReasoningSelect.addEventListener('change',()=>{reasoningEffort.value=composerReasoningSelect.value;void syncNativeComposerSettings({reasoningEffort:reasoningEffort.value});syncComposerChrome()});
@@ -19955,6 +19976,18 @@ function renderSubQuota(data){
         detailCount+=1;
       }
       if(creditsGrid)source.appendChild(creditsGrid);
+      const resetCredits=quota.rateLimitResetCredits;
+      if(Number.isInteger(resetCredits)&&resetCredits>=0){
+        const resetRow=document.createElement('div');
+        resetRow.className='subQuotaWindowHead subQuotaResetCredits';
+        const resetLabel=document.createElement('span');
+        resetLabel.textContent='重置卡';
+        const resetCount=document.createElement('strong');
+        resetCount.textContent=resetCredits.toLocaleString('zh-CN')+' 张';
+        resetRow.append(resetLabel,resetCount);
+        source.appendChild(resetRow);
+        detailCount++;
+      }
       for(const window of quota.windows||[]){
         if(window.id==='codex_bengalfox'&&!(window.remainingPercent<100))continue;
         const minutes=window.windowDurationMins;
@@ -20798,7 +20831,7 @@ model?.addEventListener('focus',()=>{composerModelValueBeforeChange=model.value}
 model?.addEventListener('change',()=>{
   if(!composerModelSwitchConfirm(composerModelValueBeforeChange,model.value))return;
   composerModelValueBeforeChange=model.value;
-  void syncNativeComposerSettings({provider:provider.value,model:model.value});
+  void syncNativeComposerSettings({model:model.value});
   syncComposerChrome();
 });
 reasoningEffort?.addEventListener('change',()=>{void syncNativeComposerSettings({reasoningEffort:reasoningEffort.value});syncComposerChrome()});
@@ -23654,7 +23687,6 @@ function syncNativeComposerSettings(changes={}){
   if(Object.hasOwn(changes,'provider'))payload.provider=String(changes.provider||'').trim()||null;
   if(Object.hasOwn(changes,'model')){
     payload.model=String(changes.model||'').trim()||null;
-    if(!Object.hasOwn(payload,'provider'))payload.provider=String(provider.value||'').trim()||null;
   }
   if(Object.hasOwn(changes,'reasoningEffort'))payload.reasoningEffort=String(changes.reasoningEffort||'').trim()||null;
   if(!Object.keys(payload).length)return Promise.resolve(true);
@@ -24571,7 +24603,8 @@ async function applyNativeConversationMetadata(metadata,{preserveProviderModel=f
   }
   let modelProviderMetadataHandled=false;
   if(!preserveProviderModel&&Object.hasOwn(metadata,'modelProvider')){
-    const modelProvider=String(metadata.modelProvider||'').trim();
+    const persistedProvider=String(metadata.modelProvider||'').trim();
+    const modelProvider=persistedProvider==='openai'&&!([...provider.options].some((opt)=>opt.value==='openai'))?'':persistedProvider;
     if([...provider.options].some((opt)=>opt.value===modelProvider)){
       modelProviderMetadataHandled=true;
       provider.value=modelProvider;
