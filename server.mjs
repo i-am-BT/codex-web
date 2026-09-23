@@ -25466,19 +25466,19 @@ function enhanceMarkdownImages(body){
 }
 function enhanceCodexFileCitations(source){
   const rawSource=String(source||'');
-  const citationPattern=/::codex-file-citation\{([^{}\n]*)\}/g;
+  const citationPattern=/::codex-file-citation\\{([^{}\\n]*)\\}/g;
   return rawSource.replace(citationPattern,(raw,body)=>{
     const attributes={};
-    const attributePattern=/([A-Za-z][A-Za-z0-9_-]*)=(?:"((?:\\.|[^"])*)"|'((?:\\.|[^'])*)'|([^\s]+))/g;
+    const attributePattern=/([A-Za-z][A-Za-z0-9_-]*)=(?:"((?:\\\\.|[^"])*)"|'((?:\\\\.|[^'])*)'|([^\\s]+))/g;
     let match;
     while((match=attributePattern.exec(body))){
       const value=match[2]??match[3]??match[4]??'';
-      attributes[match[1]]=value.replace(/\\([\\"'])/g,'$1');
+      attributes[match[1]]=value.replace(/\\\\([\\\\"'])/g,'$1');
     }
     const filePath=String(attributes.path||'').trim();
-    if(!filePath.startsWith('/')||filePath.includes('\n')||filePath.includes('\r'))return raw;
-    const fileName=filePath.split(/[\\/]/).filter(Boolean).pop()||'下载文件';
-    const label=String(attributes.label||fileName).replace(/[\[\]]/g,'\\$&');
+    if(!filePath.startsWith('/')||filePath.includes('\\n')||filePath.includes('\\r'))return raw;
+    const fileName=filePath.split(/[\\\\/]/).filter(Boolean).pop()||'下载文件';
+    const label=String(attributes.label||fileName).replace(/[\\[\\]]/g,'\\\\$&');
     return '['+label+'](<'+filePath.replace(/[<>]/g,'')+'>)';
   });
 }
