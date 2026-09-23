@@ -1873,7 +1873,7 @@ test('native session store applies projectless state without a state database an
   }
 });
 
-test('native session store treats unassigned generated task workspaces as projectless', async () => {
+test('native session store treats generated task workspaces as projectless even with stale assignments', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-generated-projectless-'));
   const codexHome = path.join(temporary, '.codex');
   const sessionDir = path.join(codexHome, 'sessions', '2026', '08', '21');
@@ -1882,7 +1882,7 @@ test('native session store treats unassigned generated task workspaces as projec
   const legacyProjectId = '01a02017-a578-7b50-9358-fc426c9830da';
   const generatedRoot = path.join(temporary, 'Documents', 'Codex');
   const generatedCwd = path.join(generatedRoot, '2026-08-14', 'new-task');
-  const explicitProjectCwd = path.join(generatedRoot, '2026-08-14', 'saved-project');
+  const explicitProjectCwd = path.join(temporary, 'workspace', 'saved-project');
   const legacyProjectCwd = path.join(temporary, 'workspace', 'legacy-project');
   let store;
 
@@ -3498,6 +3498,71 @@ test('automation heartbeat messages are not classified as steering', { timeout: 
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+test('capacity task_complete becomes resumable and collapses repeated capacity errors', async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-capacity-retry-'));
+  const id = '019fd72e-8f11-7a42-b7de-a4e81f74c666';
+  const sessionDir = path.join(temporary, 'sessions', '2026', '08', '08');
+  const sessionFile = path.join(sessionDir, 'rollout-2026-08-08T14-00-00-' + id + '.jsonl');
+  const errorMessage = 'Selected model is at capacity. Please try a different model.';
+  let store;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(sessionFile, jsonl([
+      {
+        timestamp: '2026-08-08T14:00:00.000Z',
+        type: 'session_meta',
+        payload: { id, cwd: temporary, source: 'appServer' },
+      },
+      {
+        timestamp: '2026-08-08T14:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-capacity-1' },
+      },
+      {
+        timestamp: '2026-08-08T14:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'turn-capacity-1',
+          error: { message: errorMessage, codex_error_info: 'serverOverloaded' },
+        },
+      },
+      {
+        timestamp: '2026-08-08T14:00:03.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'turn-capacity-2' },
+      },
+      {
+        timestamp: '2026-08-08T14:00:04.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'turn-capacity-2',
+          error: { message: errorMessage, codex_error_info: 'serverOverloaded' },
+        },
+      },
+    ]));
+
+    store = new NativeSessionStore(temporary, { watchChanges: false, maxMessages: 100 });
+    const conversation = store.get(id);
+    const capacityMessages = conversation.messages.filter((message) => (
+      message.role === 'process'
+      && message.kind === 'turn_aborted'
+      && message.content === errorMessage
+    ));
+
+    assert.equal(conversation.status, 'interrupted');
+    assert.equal(conversation.latestTurnId, 'turn-capacity-2');
+    assert.equal(capacityMessages.length, 1);
+    assert.equal(capacityMessages[0].turnId, 'turn-capacity-2');
+  } finally {
+    store?.stop();
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 
 test('task_complete with an error stays failed and exposes the complete upstream message', async () => {
   const temporary = await mkdtemp(path.join(tmpdir(), 'codex-native-task-complete-error-'));

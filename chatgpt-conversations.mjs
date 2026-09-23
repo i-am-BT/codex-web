@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import {
   existsSync,
   readdirSync,
@@ -17,6 +17,7 @@ const CONNECT_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 12_000;
 const HELPER_TIMEOUT_MS = 16_000;
 const MAX_PIPE_CANDIDATES = 24;
+const PROCESS_LIST_TIMEOUT_MS = 800;
 
 export async function listLocalChatGPTConversations(options = {}) {
   const threadId = cleanThreadId(options.threadId);
@@ -161,6 +162,7 @@ export function sanitizeChatGPTConversationPayload(result, options = {}) {
   const thread = payload.thread && typeof payload.thread === 'object' ? payload.thread : {};
   const id = cleanThreadId(thread.id || options.chatGPTId);
   if (!id) throw new Error('ChatGPT 会话返回的 ID 无效');
+  const model = sanitizeChatGPTModel(thread) || sanitizeChatGPTModel(payload);
   const turns = Array.isArray(payload.turns) ? [...payload.turns].reverse() : [];
   const messages = [];
   for (const turn of turns) {
@@ -190,6 +192,8 @@ export function sanitizeChatGPTConversationPayload(result, options = {}) {
     kind: 'chatgpt',
     title: cleanText(thread.title || '未命名聊天').slice(0, 160) || '未命名聊天',
     preview: cleanText(thread.preview || '').slice(0, 240),
+    ...(model?.id ? { model: model.id } : {}),
+    ...(model?.displayName ? { modelDisplayName: model.displayName } : {}),
     createdAt: toIsoTimestamp(thread.createdAt),
     updatedAt: toIsoTimestamp(thread.updatedAt),
     status,
@@ -546,10 +550,38 @@ class NativeAppToolsClient {
   }
 }
 
+export function extractPipePathsFromProcessList(output) {
+  const paths = [];
+  const text = String(output || '');
+  for (const match of text.matchAll(/(?:^|\s)CODEX_APP_TOOLS_PIPE_PATH=([^\s]+)/g)) {
+    const pipePath = String(match[1] || '').trim();
+    if (pipePath.endsWith('.sock')) paths.push(pipePath);
+  }
+  return [...new Set(paths)];
+}
+
+function discoverProcessPipePaths() {
+  try {
+    const output = execFileSync('ps', ['eww', '-ax'], {
+      encoding: 'utf8',
+      timeout: PROCESS_LIST_TIMEOUT_MS,
+      maxBuffer: 8 * 1024 * 1024,
+      windowsHide: true,
+    });
+    return extractPipePathsFromProcessList(output);
+  } catch {
+    return [];
+  }
+}
+
 function discoverPipePaths() {
   const paths = [];
   const configured = String(process.env.CODEX_APP_TOOLS_PIPE_PATH || '').trim();
   if (configured) paths.push(configured);
+  // The web service is launched by launchd and does not inherit the pipe path
+  // that Codex App gives its MCP server. Read active app-tool processes first
+  // so a stale socket cannot win merely because it has a newer mtime.
+  paths.push(...discoverProcessPipePaths());
   const pipeDir = path.join(tmpdir(), 'codex-browser-use');
   try {
     const entries = readdirSync(pipeDir)
@@ -577,12 +609,40 @@ function sanitizeChatGPTConversation(item) {
     ? new Date(seconds * 1000).toISOString()
     : null;
   const pinnedIndex = item?.pinnedIndex == null ? NaN : Number(item.pinnedIndex);
+  const model = sanitizeChatGPTModel(item);
   return {
     id,
     title,
     updatedAt,
     pinned: Number.isFinite(pinnedIndex),
+    ...(model?.id ? { model: model.id } : {}),
+    ...(model?.displayName ? { modelDisplayName: model.displayName } : {}),
   };
+}
+
+function sanitizeChatGPTModel(value) {
+  if (!value || typeof value !== 'object') return null;
+  const raw = [
+    value.model,
+    value.modelId,
+    value.model_id,
+    value.modelName,
+    value.model_name,
+    value.modelSlug,
+    value.model_slug,
+  ].find((candidate) => candidate != null && candidate !== '');
+  if (raw && typeof raw === 'object') {
+    const id = String(raw.id || raw.model || raw.value || raw.slug || '').trim();
+    const displayName = String(raw.displayName || raw.display_name || raw.name || '').trim();
+    if (id || displayName) return { id, displayName };
+  }
+  if (typeof raw !== 'string') return null;
+  const id = raw.trim().slice(0, 160);
+  if (!id) return null;
+  const displayName = String(
+    value.modelDisplayName || value.model_display_name || value.modelLabel || value.model_label || '',
+  ).trim().slice(0, 160);
+  return { id, displayName };
 }
 
 function cleanThreadId(value) {

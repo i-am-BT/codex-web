@@ -180,7 +180,8 @@ test('playground proxy returns clean 502 for truncated JSON and streams SSE', as
     const streamBody = await stream.text();
     assert.match(streamBody, /image\.generation\.result|partial_image/);
 
-    // heartbeat 102 still works for slow buffered requests
+    // Buffered JSON requests must not emit 102 responses. Nginx can forward
+    // them as the final HTTP/2 status, causing browsers to report Failed to fetch.
     const heartbeatStatuses = [];
     const heartbeatResult = await new Promise((resolve, reject) => {
       const target = new URL(`${baseUrl}/api-proxy/images/generations?codex_upstream=${encodeURIComponent(providerBaseUrl)}`);
@@ -207,7 +208,7 @@ test('playground proxy returns clean 502 for truncated JSON and streams SSE', as
     });
     assert.equal(heartbeatResult.status, 200);
     assert.equal(JSON.parse(heartbeatResult.body).data.length, 1);
-    assert.ok(heartbeatStatuses.includes(102));
+    assert.deepEqual(heartbeatStatuses, []);
   } finally {
     child.kill('SIGTERM');
     providerServer.close();

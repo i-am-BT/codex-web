@@ -2099,7 +2099,10 @@ test('native histories load upward in real pages without an obstructive history 
   assert.match(inlineScript, /function captureHistoryScrollAnchor\(container\)/);
   assert.match(inlineScript, /function restoreHistoryScrollAnchor\(container,anchor\)/);
   assert.match(serverSource, /const earlierHistoryPage = req\.query\.history === 'page' && req\.query\.paging === 'earlier';/);
-  assert.match(serverSource, /if \(!earlierHistoryPage\) await reconcileNativeTurnStatusFromAppServer\(conversation\.id, conversation\);/);
+  assert.match(
+    serverSource,
+    /if \(!earlierHistoryPage\) await reconcileNativeTurnStatusWithBudget\(conversation\.id, conversation, NATIVE_TURN_RECONCILE_WAIT_MS\);/,
+  );
   let emptyGrowthBatches=0;
   let emptyGrowthRequests=0;
   while(emptyGrowthBatches<maxPageBatches){
@@ -2543,7 +2546,7 @@ test('composerCollapsed defaults to a capsule input', () => {
   assert.match(inlineScript, /setComposerExpanded\(!prefersCollapsedComposer\(\)\|\|composerShouldStayExpanded\(\)\,\{force:true\}\)/);
   assert.match(inlineScript, /composerMicBtn/);
   assert.match(inlineScript, /function composerPopoverOpen\(\)\{/);
-  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':cancelPending\?'正在停止当前任务\.\.\.':chatGPT\?'向 ChatGPT 提问':webRunActive&&native\?'排队消息':'向 Codex 提问'/);
+  assert.match(inlineScript, /input\.placeholder=queueStarting\?'正在发送队列消息\.\.\.':steerSubmitting\?'正在发送引导\.\.\.':cancelPending\?'正在停止当前任务\.\.\.':chatGPT\|\|legacyChat\?'向 ChatGPT 提问':webRunActive&&native\?'排队消息':'向 Codex 提问'/);
   assert.doesNotMatch(sourceBetween('function composerShouldStayExpanded', 'function setComposerExpanded'), /threadGoalBar/);
   assert.match(inlineScript, /向 Codex 提问/);
   assert.match(uiStyles, /body \.box\.composerCollapsed/);
@@ -2723,7 +2726,7 @@ test('same-conversation refresh keeps the visible status instead of flashing Loa
   assert.doesNotMatch(loadConversation, /statusEl\.textContent='Loading\.\.\.'/);
   assert.match(inlineScript, /function scheduleConversationStatusLoading\(seq\)/);
   assert.match(inlineScript, /Keep the previous status visible for quick switches/);
-  assert.match(inlineScript, /function setModeLabelState\(native,chatGPT=false\)/);
+  assert.match(inlineScript, /function setModeLabelState\(native,chatGPT=false,legacyChat=false\)/);
   assert.match(inlineScript, /if\(modeLabel\?\.dataset\.mode===label\)return;/);
 });
 
@@ -3165,8 +3168,8 @@ test('thread goal status bar exposes native edit, pause, resume, and clear contr
   assert.match(serverSource, /updateCurrentThreadGoal\(\s*\{objective,status:'active'\},\s*goal\.status==='active'\?'目标已更新':'目标已更新并恢复'/s);
   assert.match(serverSource, /threadGoalBar\.append\(lead,body,time,actions,mobile\)/);
   assert.match(serverSource, /\/api\/native-sessions\/'\+encodeURIComponent\(threadId\)\+'\/goal'/);
-  assert.match(serverSource, /appServerClient\.request\('thread\/goal\/set'/);
-  assert.match(serverSource, /appServerClient\.request\('thread\/goal\/clear'/);
+  assert.match(serverSource, /requestThreadAppServer\('thread\/goal\/set'/);
+  assert.match(serverSource, /requestThreadAppServer\('thread\/goal\/clear'/);
   assert.match(serverSource, /webRunActive&&native\?'排队消息':'向 Codex 提问'/);
   assert.match(uiStyles, /\.threadGoalBar\s*\{/);
   assert.match(uiStyles, /body \.composer > \.threadGoalBar/);

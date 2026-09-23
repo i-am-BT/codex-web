@@ -4,15 +4,15 @@ The production files in `app/` were built from:
 
 - Project: `CookSleep/gpt_image_playground`
 - Source: https://github.com/CookSleep/gpt_image_playground
-- Commit: `eb91e4fb335ffee61f6b9db46d62ac8244c13d53`
-- Version: `0.7.1`
+- Commit: `da4fda85b59ecacc51d6a1e2ef680e3abb9e29b8`
+- Version: `0.7.12`
 - License: MIT, reproduced in `LICENSE`
 
 Rebuild from a clean checkout of the pinned commit:
 
 ```text
 cp vendor/gpt-image-playground/package-lock.json <upstream-checkout>/package-lock.json
-git -C <upstream-checkout> apply <codex-web-checkout>/vendor/gpt-image-playground/patches/codex-web.patch
+git -C <upstream-checkout> apply <codex-web-checkout>/vendor/gpt-image-playground/patches/codex-web-v0.7.12.patch
 cd <upstream-checkout>
 npm ci
 VITE_API_PROXY_AVAILABLE=true npm run build

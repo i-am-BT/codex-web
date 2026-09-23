@@ -39,6 +39,8 @@ const TOOL_FILE_CHANGE_LIMIT = 200;
 const TOOL_FILE_PATH_LIMIT = 2048;
 const APP_THREAD_SOURCES = new Set(['vscode', 'appServer', 'app_server']);
 const TURN_TERMINAL_PROCESS_KINDS = new Set(['task_complete', 'task_error', 'turn_aborted', 'error']);
+const CAPACITY_ERROR_RE = /selected model is at capacity/i;
+const TRANSIENT_PROVIDER_LIMIT_RE = /usage limit|quota exceeded|insufficient quota|too many requests|rate limit|high demand|selected model is at capacity|(^|\D)429(\D|$)/i;
 
 export class NativeSessionStore extends EventEmitter {
   constructor(codexHome, options = {}) {
@@ -432,9 +434,12 @@ export class NativeSessionStore extends EventEmitter {
   workspaceKindForThread(id, cwd = '') {
     const threadId = String(id || '').trim().toLowerCase();
     if (!this.workspaceStateAvailable || !SESSION_ID_PATTERN.test(`${threadId}.jsonl`)) return '';
-    if (this.projectThreadIds.has(threadId)) return 'project';
     if (this.projectlessThreadIds.has(threadId)) return 'projectless';
+    // Codex creates standalone tasks below Documents/Codex/YYYY-MM-DD/<task>.
+    // A stale project assignment can remain after the task is created, but the
+    // generated workspace is still a task and belongs in the Tasks section.
     if (isGeneratedProjectlessWorkspace(cwd, this.projectlessWorkspaceRoot)) return 'projectless';
+    if (this.projectThreadIds.has(threadId)) return 'project';
     return 'project';
   }
 
@@ -1649,6 +1654,16 @@ function applyMetadataRecord(cache, record) {
   }
 }
 
+function collapsePreviousCapacityErrors(cache) {
+  const before = cache.messages.length;
+  cache.messages = cache.messages.filter((message) => !(
+    message?.role === 'process'
+    && ['task_error', 'error', 'turn_aborted'].includes(String(message?.kind || ''))
+    && CAPACITY_ERROR_RE.test(String(message?.content || ''))
+  ));
+  if (cache.messages.length !== before) cache.contentMutated = true;
+}
+
 function applyEventRecord(cache, record, payload, maxMessages, store = null) {
   const turnId = String(payload.turn_id || payload.turnId || '');
   if (turnId) cache.latestTurnId = turnId;
@@ -1716,9 +1731,10 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
     case 'task_complete': {
       const errorMessage = nativeEventErrorMessage(payload.error);
       if (errorMessage) {
-        const pauseLike = /usage limit|quota exceeded|insufficient quota|too many requests|rate limit|high demand|(^|\D)429(\D|$)/i.test(errorMessage);
+        const pauseLike = TRANSIENT_PROVIDER_LIMIT_RE.test(errorMessage);
         cache.status = pauseLike ? 'interrupted' : 'error';
         restoreRolledBackRetryAssistant(cache, maxMessages);
+        if (CAPACITY_ERROR_RE.test(errorMessage)) collapsePreviousCapacityErrors(cache);
         appendNativeMessage(cache, 'process', errorMessage, record, maxMessages, pauseLike ? 'turn_aborted' : 'task_error', {
           ...(cache.currentTurnTokenUsage ? { tokenUsage: { ...cache.currentTurnTokenUsage } } : {}),
           ...(cache.currentTurnTokenUsageDetails ? { tokenUsageDetails: { ...cache.currentTurnTokenUsageDetails } } : {}),
@@ -1786,9 +1802,10 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
     case 'task_error':
     case 'error': {
       const errorMessage = payload.message || nativeEventErrorMessage(payload.error, '任务中断');
-      const pauseLike = /usage limit|quota exceeded|insufficient quota|too many requests|rate limit|high demand|(^|\D)429(\D|$)/i.test(String(errorMessage || ''));
+      const pauseLike = TRANSIENT_PROVIDER_LIMIT_RE.test(String(errorMessage || ''));
       cache.status = pauseLike ? 'interrupted' : 'error';
       restoreRolledBackRetryAssistant(cache, maxMessages);
+      if (CAPACITY_ERROR_RE.test(String(errorMessage || ''))) collapsePreviousCapacityErrors(cache);
       appendNativeMessage(
         cache,
         'process',

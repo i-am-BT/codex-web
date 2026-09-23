@@ -22,7 +22,14 @@ test('sidebar expands local ChatGPT conversations without opening the external s
   assert.match(server, /res\.status\(503\)\.json\(\{ error: '本机 ChatGPT 会话暂时不可用/);
   assert.match(server, /entry\.type='button'/);
   assert.doesNotMatch(server, /entry\.href='https:\/\/chatgpt\.com\/'/);
-  assert.match(server, /entry\.setAttribute\('aria-expanded','true'\)/);
+  assert.match(server, /const CHATGPT_SIDEBAR_COLLAPSED_STORAGE_KEY='codexWeb\.chatgptSidebarCollapsed'/);
+  assert.match(server, /let chatGPTSidebarCollapsed=readChatGPTSidebarCollapsed\(\)/);
+  assert.match(server, /entry\.setAttribute\('aria-expanded',String\(!chatGPTSidebarCollapsed\)\)/);
+  assert.match(server, /conversations\.hidden=chatGPTSidebarCollapsed/);
+  assert.match(server, /chatGPTSidebarCollapsed=expanded/);
+  assert.match(server, /storeChatGPTSidebarCollapsed\(\)/);
+  assert.match(server, /function readChatGPTSidebarCollapsed\(\)/);
+  assert.match(server, /function storeChatGPTSidebarCollapsed\(\)/);
   assert.match(server, /fetch\('\/api\/chatgpt-conversations'/);
   assert.match(server, /history\.parentElement\.insertBefore\(section,history\)/);
   assert.match(server, /ensureChatGPTSidebarEntry\(\);/);
@@ -34,6 +41,7 @@ test('sidebar expands local ChatGPT conversations without opening the external s
   assert.match(css, /\.chatgptSidebarEntry\s*\{/);
   assert.match(css, /\.chatgptSidebarEntry:focus-visible\s*\{/);
   assert.match(css, /\.chatgptSidebarConversations\s*\{/);
-  assert.doesNotMatch(css, /\.chatgptSidebarConversations::before\s*\{/);
   assert.match(css, /\.chatgptSidebarConversation\s*\{/);
+  assert.match(css, /\.conversationRestorePlaceholder\s*\{[\s\S]*?overflow:\s*hidden;/);
+  assert.match(css, /\.conversationRestorePlaceholder b\s*\{[\s\S]*?text-overflow:\s*ellipsis;/);
 });

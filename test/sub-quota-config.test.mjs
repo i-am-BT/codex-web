@@ -685,12 +685,63 @@ if (process.argv[2] === 'app-server') {
     );
     assert.deepEqual(storedRetained.sources.find((source) => source.id === 'sub-empty').apiKeys, []);
 
-    const deleteBackup = await fetch(`${baseUrl}/api/sub-quota-config`, {
+    const originalSubMainCredentials = retainedPayload.sources.find((source) => (
+      source.id === 'sub-main'
+    )).credentials;
+    const reorderedSubMainCredentials = [...originalSubMainCredentials].reverse();
+    const reorderedSave = await fetch(`${baseUrl}/api/sub-quota-config`, {
       method: 'PUT',
       headers: { Cookie: cookie, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         codexAppVisible: false,
         sources: retainedPayload.sources.map((source) => ({
+          ...source,
+          apiKey: '',
+          ...(source.id === 'sub-main' ? {
+            // The settings UI keeps saved Key values blank. Its DOM order must
+            // still become the persisted credential order.
+            apiKeys: reorderedSubMainCredentials.map((credential) => ({
+              ...credential,
+              value: '',
+            })),
+          } : {}),
+        })),
+        order: ['compat-main', 'sub-empty', 'sub-main', 'sub_main'],
+      }),
+    });
+    assert.equal(reorderedSave.status, 200);
+    const reorderedPayload = await reorderedSave.json();
+    const reorderedPublicSubMain = reorderedPayload.sources.find((source) => source.id === 'sub-main');
+    assert.deepEqual(reorderedPublicSubMain.credentials, reorderedSubMainCredentials);
+    assert.doesNotMatch(
+      JSON.stringify(reorderedPayload),
+      /sub-main-secret|sub-main-alt-secret|sub-backup-secret|compat-secret/,
+    );
+    const storedReordered = JSON.parse(await readFile(sourcesFile, 'utf8'));
+    assert.deepEqual(
+      storedReordered.sources.find((source) => source.id === 'sub-main').apiKeys,
+      [
+        {
+          id: reorderedSubMainCredentials[0].id,
+          label: reorderedSubMainCredentials[0].label,
+          value: 'sub-main-alt-secret',
+        },
+        {
+          id: reorderedSubMainCredentials[1].id,
+          label: reorderedSubMainCredentials[1].label,
+          value: 'sub-main-secret',
+        },
+      ],
+    );
+    const persistedAfterReorder = await readFile(envFile, 'utf8');
+    assert.match(persistedAfterReorder, /^SUB2API_API_KEY="sub-main-alt-secret"$/m);
+
+    const deleteBackup = await fetch(`${baseUrl}/api/sub-quota-config`, {
+      method: 'PUT',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        codexAppVisible: false,
+        sources: reorderedPayload.sources.map((source) => ({
           ...source,
           apiKey: '',
           remove: source.id === 'sub_main',
@@ -712,6 +763,10 @@ if (process.argv[2] === 'app-server') {
     );
     const storedAfterDelete = JSON.parse(await readFile(sourcesFile, 'utf8'));
     assert.equal(storedAfterDelete.sources.some((source) => source.id === 'sub_main'), false);
+    assert.deepEqual(
+      storedAfterDelete.sources.find((source) => source.id === 'sub-main').apiKeys.map((credential) => credential.value),
+      ['sub-main-alt-secret', 'sub-main-secret'],
+    );
 
     await stopServer();
     await rm(path.join(runtime, 'port'), { force: true });
@@ -732,6 +787,10 @@ if (process.argv[2] === 'app-server') {
     assert.equal(restoredConfigPayload.sources.find((source) => source.id === 'compat-main').keyConfigured, true);
     assert.equal(restoredConfigPayload.sources.find((source) => source.id === 'sub-main').keyConfigured, true);
     assert.equal(restoredConfigPayload.sources.find((source) => source.id === 'sub-main').keyCount, 2);
+    assert.deepEqual(
+      restoredConfigPayload.sources.find((source) => source.id === 'sub-main').credentials,
+      reorderedSubMainCredentials,
+    );
     assert.equal(restoredConfigPayload.sources.find((source) => source.id === 'sub-empty').keyConfigured, false);
     assert.doesNotMatch(
       JSON.stringify(restoredConfigPayload),
@@ -749,6 +808,29 @@ if (process.argv[2] === 'app-server') {
       'sub-main',
       'sub-main',
     ]);
+    assert.deepEqual(
+      restoredQuotaPayload.quotas
+        .filter((quota) => quota.sourceId === 'sub-main')
+        .map((quota) => [quota.credentialId, quota.credentialLabel, quota.planName]),
+      [
+        [
+          reorderedSubMainCredentials[0].id,
+          reorderedSubMainCredentials[0].label,
+          'Main Sub Backup Plan',
+        ],
+        [
+          reorderedSubMainCredentials[1].id,
+          reorderedSubMainCredentials[1].label,
+          'Main Sub Plan',
+        ],
+      ],
+    );
+    assert.deepEqual(
+      providerRequests
+        .filter((request) => request.url === '/v1/usage')
+        .map((request) => request.authorization),
+      ['Bearer sub-main-alt-secret', 'Bearer sub-main-secret'],
+    );
     assert.equal(
       providerRequests.some((request) => request.authorization === 'Bearer sub-backup-secret'),
       false,
