@@ -28,6 +28,7 @@ import {
   ImagePromptLibrary,
 } from './image-prompt-library.mjs';
 import { NativeSessionStore } from './native-sessions.mjs';
+import { quarantineUnlockedWriterLock } from './native-writer-lock.mjs';
 import { createAccountAnalyticsReader } from './account-analytics.mjs';
 import { archiveInactiveNativeThread } from './native-thread-archive.mjs';
 import {
@@ -6953,11 +6954,19 @@ function quarantineIdleNativeThreadWriterLock(threadId) {
   if (!cleanId) return null;
   const conversation = nativeSessions.get(cleanId);
   const active = activeNativeTurns.get(cleanId);
+  const hasStartedTurn = Boolean(
+    String(conversation?.latestTurnId || '').trim()
+    || (conversation?.messages || []).some((message) => (
+      String(message?.turnId || '').trim()
+      || String(message?.kind || '') === 'task_started'
+    )),
+  );
   if (
     !conversation
     || conversation.status === 'running'
     || active?.status === 'running'
-    || !nativeConversationHasExplicitTerminal(conversation)
+    || (!hasStartedTurn && conversation.messagesTruncated)
+    || (hasStartedTurn && !nativeConversationHasExplicitTerminal(conversation))
   ) {
     return null;
   }
@@ -6983,17 +6992,18 @@ function quarantineIdleNativeThreadWriterLock(threadId) {
   if (
     !latest
     || latest.status === 'running'
+    || (!hasStartedTurn && latest.messagesTruncated)
     || activeNativeTurns.get(cleanId)?.status === 'running'
     || latest.latestTurnId !== conversation.latestTurnId
     || latest.revision !== conversation.revision
-    || !nativeConversationHasExplicitTerminal(latest)
+    || (hasStartedTurn && !nativeConversationHasExplicitTerminal(latest))
   ) {
     return null;
   }
 
   const backupPath = `${lockPath}.web-takeover-${process.pid}-${randomBytes(4).toString('hex')}`;
   try {
-    renameSync(lockPath, backupPath);
+    if (!quarantineUnlockedWriterLock(lockPath, backupPath, NATIVE_THREAD_WRITER_LOCK_TAKEOVER_MIN_AGE_MS)) return null;
     console.warn(`Codex Web 已隔离空闲会话的残留 writer lock (${cleanId})`);
     return { lockPath, backupPath };
   } catch (error) {

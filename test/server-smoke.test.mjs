@@ -3383,6 +3383,59 @@ test('terminal App writer locks are quarantined before Web settings takeover', a
   ]);
 });
 
+test('an empty fork may quarantine an old unlocked writer lock without a terminal event', async () => {
+  const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
+  const helperStart = serverSource.indexOf('function quarantineIdleNativeThreadWriterLock');
+  const helperEnd = serverSource.indexOf('\nfunction discardQuarantinedNativeThreadWriterLock', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+
+  const renames = [];
+  const conversation = {
+    status: 'done',
+    latestTurnId: '',
+    revision: 'empty-fork-revision',
+    messages: [],
+  };
+  const api = new Function(
+    'cleanNativeThreadId',
+    'nativeSessions',
+    'activeNativeTurns',
+    'nativeConversationHasExplicitTerminal',
+    'path',
+    'CODEX_HOME',
+    'statSync',
+    'NATIVE_THREAD_WRITER_LOCK_TAKEOVER_MIN_AGE_MS',
+    'randomBytes',
+    'quarantineUnlockedWriterLock',
+    `${serverSource.slice(helperStart, helperEnd)}; return { quarantineIdleNativeThreadWriterLock };`,
+  )(
+    (value) => String(value || '').trim(),
+    { get: () => conversation },
+    new Map(),
+    () => false,
+    path,
+    '/tmp/codex-home',
+    () => ({ isFile: () => true, size: 0, mtimeMs: Date.now() - 6000 }),
+    5000,
+    () => Buffer.from('1234'),
+    (source, target) => { renames.push([source, target]); return true; },
+  );
+
+  const repair = api.quarantineIdleNativeThreadWriterLock('empty-thread');
+  assert.ok(repair);
+  assert.equal(renames.length, 1);
+  assert.equal(renames[0][0], '/tmp/codex-home/thread-writer-locks/empty-thread.lock');
+  conversation.status = 'running';
+  assert.equal(api.quarantineIdleNativeThreadWriterLock('empty-thread'), null);
+  conversation.status = 'done';
+  conversation.messages = [{ kind: 'task_started' }];
+  assert.equal(api.quarantineIdleNativeThreadWriterLock('empty-thread'), null);
+  conversation.messages = [];
+  conversation.latestTurnId = 'unfinished-turn';
+  assert.equal(api.quarantineIdleNativeThreadWriterLock('empty-thread'), null);
+  assert.equal(renames.length, 1);
+});
+
 test('Desktop handoff stops when Web subscription release is not confirmed', async () => {
   const serverSource = await readFile(path.join(ROOT, 'server.mjs'), 'utf8');
   const helperStart = serverSource.indexOf('async function continueNativeTurn');
