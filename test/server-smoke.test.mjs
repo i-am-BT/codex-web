@@ -7993,8 +7993,13 @@ updated_at = 1784422800000
     assert.equal(composerLabels.composerModelLabel('gpt-5.6-sol'), '5.6 Sol');
     assert.equal(composerLabels.composerModelLabel('deepseek-v4-flash'), 'DeepSeek V4 Flash');
     assert.equal(composerLabels.composerModelLabel('grok-4.5'), 'Grok 4.5');
-    assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高');
-    assert.equal(composerLabels.composerEffortLabel('ultra'), '超高');
+    assert.equal(composerLabels.composerEffortLabel(''), '默认');
+    assert.equal(composerLabels.composerEffortLabel('low'), '轻度 (low)');
+    assert.equal(composerLabels.composerEffortLabel('medium'), '中 (medium)');
+    assert.equal(composerLabels.composerEffortLabel('high'), '高 (high)');
+    assert.equal(composerLabels.composerEffortLabel('xhigh'), '极高 (xhigh)');
+    assert.equal(composerLabels.composerEffortLabel('max'), '最高 (max)');
+    assert.equal(composerLabels.composerEffortLabel('ultra'), '超高 (ultra)');
     assert.equal(composerLabels.composerMaximumEffortValue({ options: [
       { value: '' },
       { value: 'xhigh' },
