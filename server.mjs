@@ -12683,7 +12683,7 @@ function composerModelLabel(value){
   }).join(' ');
   return titled.replace(/\\bDeepseek\\b/g,'DeepSeek');
 }
-function composerEffortLabel(value){return({'':'默认',low:'轻度',medium:'中',high:'高',xhigh:'极高',max:'最高',ultra:'超高'})[String(value||'')]||String(value||'默认')}
+function composerEffortLabel(value){return({'':'默认',low:'轻度 (low)',medium:'中 (medium)',high:'高 (high)',xhigh:'极高 (xhigh)',max:'最高 (max)',ultra:'超高 (ultra)'})[String(value||'')]||String(value||'默认')}
 function composerModelSwitchConfirm(previous,next){
   const oldModel=String(previous||'').trim();
   const newModel=String(next||'').trim();
