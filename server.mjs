@@ -24451,16 +24451,16 @@ async function loadConversation(id,source='web',options={}){
   const messages=conversation.messages||[];
   const activeTurnMessages=activeNativeTurnId?messages.filter((msg)=>String(msg.turnId||'')===activeNativeTurnId):[];
   const activeStartedAt=conversation.activeTurnStartedAt||activeTurnMessages.find((msg)=>msg.role==='process'&&msg.kind==='task_started')?.at||activeTurnMessages.find((msg)=>msg.at)?.at||conversation.updatedAt||'';
-  // Only open a live process shell for an actually running turn. Idle history hydration
-  // should paint static transcript cards and must not mount an empty live panel.
-  if(webRunActive)beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);
-  else resetTurnProcessCollection();
   const deferHistoryIcons=Boolean(options.historyScrollAnchor)||messages.length>=NATIVE_HISTORY_PAGE_SIZE;
   if(deferHistoryIcons)beginDeferredIconRefresh();
   try{
     // Clear only when the next snapshot is ready to render, so refresh/boot does not
     // flash an empty Ask Codex / 新任务 shell between title restore and content paint.
     chat.replaceChildren();
+    // Only open a live process shell for an actually running turn. Idle history hydration
+    // should paint static transcript cards and must not mount an empty live panel.
+    if(webRunActive)beginTurnProcessCollection(activeStartedAt,true,activeNativeTurnId);
+    else resetTurnProcessCollection();
     messages.forEach((msg,index)=>{
       if(webRunActive&&activeNativeTurnId&&String(msg.turnId||'')===activeNativeTurnId&&msg.role!=='user'&&msg.kind!=='task_started'&&(!collectingTurnProcess||!turnProcessElapsedMatches(activeNativeTurnId)))beginTurnProcessCollection(activeStartedAt||msg.at,true,activeNativeTurnId);
       addMsg(msg.role==='log'?'log':msg.role,msg.content,{messageIndex:currentConversationSource==='web'?index:undefined,nativeMessageSeq:currentConversationSource==='codex'?msg.seq:undefined,turnId:currentConversationSource==='codex'?msg.turnId:undefined,autoTrackAgent:currentConversationSource==='codex'&&conversation.status==='running'&&String(msg.turnId||'')===String(conversation.activeTurnId||''),autoScroll:false,kind:msg.kind,at:msg.at,annotationCount:msg.annotationCount,browserTarget:msg.browserTarget,responseAnnotations:msg.responseAnnotations,fileChanges:msg.fileChanges,tokenUsage:messageTokenUsage(msg),hydrating:true});

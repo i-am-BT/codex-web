@@ -38,6 +38,73 @@ const referencePlan = [
   { step: '运行回归测试', status: 'pending' },
 ];
 
+test('returning to a running conversation keeps its restored process panel attached', () => {
+  const loadSource = sourceBetween('async function loadConversation', 'function updateConversationStatus');
+  const hydrationStart = loadSource.indexOf('  const messages=conversation.messages||[];');
+  const hydrationEnd = loadSource.indexOf("  if(currentConversationSource==='codex')renderNativeForkDivider(messages);", hydrationStart);
+  assert.ok(hydrationStart >= 0 && hydrationEnd > hydrationStart);
+  const headerSource = sourceBetween('function ensureTurnProcessHeader', 'function formatMessageTime');
+  const createElement = () => ({
+    children: [], dataset: {}, parentNode: null,
+    appendChild(element) {
+      element.remove();
+      this.children.push(element);
+      element.parentNode = this;
+    },
+    replaceChildren() {
+      for (const element of this.children) element.parentNode = null;
+      this.children = [];
+    },
+    remove() {
+      if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((element) => element !== this);
+      this.parentNode = null;
+    },
+  });
+  const restore = new Function('chat', 'document', 'conversation', `
+    let turnProcessHeader = null, turnProcessTimeline = null, collectingTurnProcess = false;
+    const webRunActive = conversation.status === 'running';
+    const activeNativeTurnId = webRunActive ? 'first-turn' : '';
+    const currentConversationSource = 'codex', options = {}, restorePaint = false;
+    const NATIVE_HISTORY_PAGE_SIZE = 80;
+    const turnProcessElapsedMatches = () => true;
+    const beginDeferredIconRefresh = () => {};
+    const endDeferredIconRefresh = () => {};
+    const messageTokenUsage = () => null;
+    ${headerSource}
+    function beginTurnProcessCollection() { collectingTurnProcess = true; ensureTurnProcessHeader(); }
+    function resetTurnProcessCollection() { collectingTurnProcess = false; }
+    function addMsg(role, text, options) {
+      if (options.kind === 'task_started') return;
+      const element = document.createElement('div');
+      element.textContent = text;
+      if (role === 'user' || !webRunActive) chat.appendChild(element);
+      else { ensureTurnProcessHeader(); turnProcessTimeline.appendChild(element); }
+    }
+    ${loadSource.slice(hydrationStart, hydrationEnd)}
+    return { header: turnProcessHeader, timeline: turnProcessTimeline, addMsg };
+  `);
+  const messages = [
+    { role: 'user', content: 'First question', turnId: 'first-turn', seq: 1 },
+    { role: 'process', kind: 'task_started', content: 'Started', turnId: 'first-turn', seq: 2 },
+    { role: 'assistant', kind: 'commentary', content: 'Checking the workspace', turnId: 'first-turn', seq: 3 },
+    { role: 'tool', kind: 'function_call', content: 'exec_command', turnId: 'first-turn', seq: 4 },
+    { role: 'process', kind: 'reasoning_summary', content: 'Reviewing results', turnId: 'first-turn', seq: 5 },
+  ];
+  const chat = createElement();
+  chat.appendChild(createElement());
+  const restored = restore(chat, { createElement }, { status: 'running', messages });
+  assert.equal(restored.header.parentNode, chat, 'restored progress must belong to the current chat');
+  assert.deepEqual(restored.timeline.children.map((element) => element.textContent), [
+    'Checking the workspace', 'exec_command', 'Reviewing results',
+  ]);
+  restored.addMsg('assistant', 'Further progress after switching back', {});
+  assert.equal(restored.timeline.parentNode.parentNode, chat);
+  assert.equal(restored.timeline.children.at(-1).textContent, 'Further progress after switching back');
+  const completedChat = createElement();
+  const completed = restore(completedChat, { createElement }, { status: 'done', messages });
+  assert.equal(completed.header, null, 'completed history must not open a live panel');
+});
+
 test('live input context, user questions, and browser comments stay before a live panel while steering keeps its send position', () => {
   const appendSource = sourceBetween('function appendConversationElement', 'function addMsg');
   const chat = {
