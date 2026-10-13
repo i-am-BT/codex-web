@@ -6,6 +6,7 @@ import {
   readFileSync,
   readSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   watch,
@@ -16,6 +17,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { estimateTokenCost } from './cycle-usage.mjs';
 
 const SESSION_UUID_SOURCE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const SESSION_UUID_PATTERN = new RegExp(`^${SESSION_UUID_SOURCE}$`, 'i');
+const MAX_HISTORY_BASE_DEPTH = 64;
 const SESSION_ID_PATTERN = new RegExp(`(${SESSION_UUID_SOURCE})\\.jsonl$`, 'i');
 const SESSION_FILE_PATTERN = new RegExp(
   `(${SESSION_UUID_SOURCE})(?:_${SESSION_UUID_SOURCE})?\\.jsonl$`,
@@ -69,6 +72,7 @@ export class NativeSessionStore extends EventEmitter {
     this.runningWindowMs = positiveNumber(options.runningWindowMs, DEFAULT_RUNNING_WINDOW_MS);
     this.watchChanges = options.watchChanges !== false;
     this.entries = new Map();
+    this.historyEntries = null;
     this.subagentEntries = new Map();
     this.subagentThreads = new Map();
     this.titles = new Map();
@@ -185,6 +189,7 @@ export class NativeSessionStore extends EventEmitter {
       ]),
     ];
     this.entries = nextEntries;
+    this.historyEntries = null;
     this.subagentEntries = nextSubagentEntries;
     pruneSessionMetadataCache(this.sessionMetadataCache, nextEntries);
 
@@ -790,6 +795,7 @@ export class NativeSessionStore extends EventEmitter {
     return sortedEntries
       .filter((entry) => selectedIds.has(entry.id))
       .map((entry) => {
+        let historyFailed = false;
         let cached = this.details.get(entry.id);
         let cacheIsCurrent = cached
           && cached.filePath === entry.filePath
@@ -799,18 +805,16 @@ export class NativeSessionStore extends EventEmitter {
         // still running. Parse changed recent sessions so a task_complete at
         // the end of the JSONL is reflected in the sidebar immediately.
         if (!cacheIsCurrent && now - entry.mtimeMs <= this.runningWindowMs) {
-          this.get(entry.id);
+          try { this.get(entry.id); } catch { historyFailed = true; }
           cached = this.details.get(entry.id);
           cacheIsCurrent = cached
             && cached.filePath === entry.filePath
             && cached.size === entry.size;
         }
 
-        const status = cacheIsCurrent
+        const status = historyFailed ? 'error' : cacheIsCurrent
           ? effectiveSessionStatus(cached.status, entry.mtimeMs, this.runningWindowMs, now)
-          : now - entry.mtimeMs <= this.runningWindowMs
-            ? 'running'
-            : 'done';
+          : 'done';
         const summary = sessionSummary(entry, status);
         if (this.isSideChatThread(entry.id)) {
           summary.sideChat = true;
@@ -906,14 +910,14 @@ export class NativeSessionStore extends EventEmitter {
         generation: ++this.cacheGeneration,
         maxReadBytes: this.maxReadBytes,
         runningWindowMs: this.runningWindowMs,
-      });
+      }, this);
       this.details.set(id, cache);
     } else if (entry.size === cache.offset && entry.mtimeMs !== cache.mtimeMs) {
       cache = createDetailCache(entry, {
         generation: ++this.cacheGeneration,
         maxReadBytes: this.maxReadBytes,
         runningWindowMs: this.runningWindowMs,
-      });
+      }, this);
       this.details.set(id, cache);
     }
 
@@ -1271,7 +1275,7 @@ function pruneSessionMetadataCache(cache, entries) {
   }
 }
 
-function createDetailCache(entry, options) {
+function createDetailCache(entry, options, store) {
   const maxReadBytes = Number(options.maxReadBytes);
   const startOffset = Number.isFinite(maxReadBytes) && maxReadBytes > 0
     ? Math.max(0, entry.size - maxReadBytes)
@@ -1298,7 +1302,10 @@ function createDetailCache(entry, options) {
     currentTurnId: '',
     activeTaskTurnId: '',
     previousTurnId: '',
-    status: Date.now() - entry.mtimeMs <= options.runningWindowMs ? 'running' : 'done',
+    // Metadata/settings writes are not tasks. Only task events (or explicit turn
+    // metadata in a bounded tail) can establish a running state.
+    status: 'done',
+    turnStatusKnown: false,
     latestTurnId: '',
     currentTurnStartedAt: '',
     currentTurnTokenUsage: null,
@@ -1317,8 +1324,115 @@ function createDetailCache(entry, options) {
   };
 
   const firstRecord = readFirstRecord(entry.filePath);
+  if (firstRecord?.payload?.history_base) {
+    readInheritedSessionHistory(cache, entry, firstRecord, options, store);
+  }
   if (firstRecord) applyMetadataRecord(cache, firstRecord);
   return cache;
+}
+
+function paginatedHistoryError(detail) {
+  return new Error(`读取分页分支历史失败：${detail}`);
+}
+
+function historySourceEntry(store, id) {
+  const known = store?.entries.get(id) || store?.subagentEntries.get(id);
+  if (known) return known;
+  if (!store) return null;
+  // Archived or hidden ancestors remain valid snapshot sources, but never become
+  // visible sidebar entries just because a child references them.
+  if (!store.historyEntries) {
+    store.historyEntries = new Map([
+      ...scanSessionFiles(store.sessionsDir, store.titles),
+      ...scanSessionFiles(path.join(store.codexHome, 'archived_sessions'), store.titles),
+    ]);
+  }
+  return store.historyEntries.get(id) || null;
+}
+
+function inheritedHistorySegments(entry, firstRecord, store) {
+  const segments = [];
+  const seen = new Set([entry.id]);
+  let reference = firstRecord.payload.history_base;
+  while (reference) {
+    const id = String(reference.thread_id || '').toLowerCase();
+    if (!SESSION_UUID_PATTERN.test(id) || seen.has(id) || seen.size > MAX_HISTORY_BASE_DEPTH) {
+      throw paginatedHistoryError('父历史标识无效、循环引用或嵌套过深');
+    }
+    if (!Number.isSafeInteger(reference.end_ordinal_exclusive) || reference.end_ordinal_exclusive < 1
+      || !Number.isSafeInteger(reference.end_byte_offset) || reference.end_byte_offset < 1) {
+      throw paginatedHistoryError('父历史截断位置无效');
+    }
+    seen.add(id);
+    const parent = historySourceEntry(store, id);
+    if (!parent) throw paginatedHistoryError('父历史不存在');
+    let fd;
+    let parentMeta;
+    try {
+      const resolved = realpathSync(parent.filePath);
+      const root = realpathSync(store.codexHome);
+      const relative = path.relative(root, resolved);
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw paginatedHistoryError('父历史不在会话存储内');
+      }
+      const stat = statSync(resolved);
+      if (!stat.isFile() || reference.end_byte_offset > stat.size) {
+        throw paginatedHistoryError('父历史截断位置超过文件大小');
+      }
+      fd = openSync(resolved, 'r');
+      const boundary = Buffer.alloc(1);
+      if (readSync(fd, boundary, 0, 1, reference.end_byte_offset - 1) !== 1 || boundary[0] !== 10) {
+        throw paginatedHistoryError('父历史截断位置不是完整记录边界');
+      }
+      parentMeta = readFirstRecord(resolved);
+      if (parentMeta?.type !== 'session_meta' || String(parentMeta.payload?.id || '').toLowerCase() !== id) {
+        throw paginatedHistoryError('父历史元信息无效');
+      }
+      if (parentMeta.payload.history_base
+        && reference.end_ordinal_exclusive <= parentMeta.payload.history_base.end_ordinal_exclusive) {
+        throw paginatedHistoryError('父历史序号超出所属分段');
+      }
+      segments.unshift({ ...parent, filePath: resolved, size: reference.end_byte_offset, ino: stat.ino, mtimeMs: stat.mtimeMs });
+    } catch (error) {
+      if (String(error.message).includes('分页分支历史')) throw error;
+      throw paginatedHistoryError('父历史无法读取');
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+    reference = parentMeta.payload.history_base;
+  }
+  return segments;
+}
+
+function readInheritedSessionHistory(cache, entry, firstRecord, options, store) {
+  const segments = inheritedHistorySegments(entry, firstRecord, store);
+  let budget = options.maxReadBytes > 0 ? Math.max(0, options.maxReadBytes - entry.size) : Infinity;
+  const ranges = [];
+  for (const segment of [...segments].reverse()) {
+    const start = Math.max(0, segment.size - budget);
+    if (start > 0) cache.messagesTruncated = true;
+    if (budget > 0) ranges.unshift({ ...segment, start });
+    budget = Math.max(0, budget - segment.size);
+  }
+  const localReader = {
+    offset: cache.offset, size: cache.size, mtimeMs: cache.mtimeMs,
+    remainder: cache.remainder, skipFirstPartial: cache.skipFirstPartial,
+  };
+  for (const range of ranges) {
+    cache.offset = range.start;
+    cache.remainder = Buffer.alloc(0);
+    cache.skipFirstPartial = range.start > 0;
+    readSessionUpdates(cache, range, store.maxMessages, store);
+    if (cache.offset !== range.size || cache.remainder.length) {
+      throw paginatedHistoryError('父历史快照不完整');
+    }
+  }
+  Object.assign(cache, localReader);
+  // A fork copies history, not its parent's live ownership. Only local task
+  // events may start a new turn after this immutable snapshot.
+  cache.status = 'done';
+  cache.activeTaskTurnId = '';
+  cache.turnStatusKnown = cache.startOffset === 0;
 }
 
 function readFirstRecord(file) {
@@ -1678,6 +1792,7 @@ function applyEventRecord(cache, record, payload, maxMessages, store = null) {
     if (contextWindowTokens !== null) cache.contextWindowTokens = contextWindowTokens;
   }
   const terminalTask = TURN_TERMINAL_PROCESS_KINDS.has(payload.type);
+  if (payload.type === 'task_started' || terminalTask) cache.turnStatusKnown = true;
   if (terminalTask && turnId) updateNativeTurnId(cache, turnId, true);
   switch (payload.type) {
     case 'thread_settings_applied': {
@@ -2956,6 +3071,7 @@ function isProgressStyleText(text) {
 function updateNativeTurnId(cache, value, force = false) {
   const turnId = String(value || '').trim();
   if (!turnId) return;
+  if (cache.startOffset > 0 && !cache.turnStatusKnown) cache.status = 'running';
   // Recent runtimes use per-response internal IDs while the app-server stream
   // keeps the outer task ID. Keep one logical turn until its terminal event.
   if (!force && cache.activeTaskTurnId && turnId !== cache.activeTaskTurnId) return;
