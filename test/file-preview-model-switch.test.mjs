@@ -76,6 +76,10 @@ function settingsHarness(defaultProvider = '') {
     CODEX_EXISTING_THREAD_APP_SERVER_FALLBACK: true, parseBoolean: (value, fallback) => value ?? fallback,
     nativeSessions: { get: () => ({ metadata: {} }), applyThreadSettings: (value) => calls.push(['persist', value]), scheduleRefresh() {} },
     activeNativeTurns: new Map(),
+    nativeThreadProviderChanges: new Set(), nativeTurnReservations: new Set(),
+    nativeActiveTurnFor: () => null, appServerThreadIsBusy: () => false,
+    releaseAppServerThreadForProviderChange: async () => {},
+    scheduleAppServerWriterIdleStop() {},
     requestLoadedAppServerThread: async (method, params) => { calls.push([method, params]); return {}; },
     requestThreadAppServer: async (method, params) => { calls.push([method, params]); return {}; },
     releaseAppServerThreadAfterTurn: async () => calls.push(['release']),
@@ -113,6 +117,7 @@ test('model-only composer writes omit provider and preserve the requested model'
   let request;
   const context = vm.createContext({
     currentConversationSource: 'codex', currentConversationId: 'thread', nativeComposerSettingsWriteId: 0,
+    nativeComposerSettingsError: null,
     nativeComposerSettingsQueue: Promise.resolve(), nativeComposerOverride: null,
     rememberNativeComposerOverride() {},
     fetch: async (url, options) => { request = JSON.parse(options.body); return { ok: true, json: async () => ({}) }; },

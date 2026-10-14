@@ -389,6 +389,7 @@ const desktopIpcClient = new CodexDesktopIpcClient({
 const sessionEventClients = new Set();
 const activeNativeTurns = new Map();
 const nativeTurnReservations = new Set();
+const nativeThreadProviderChanges = new Set();
 const promptQueueItemReservations = new Map();
 const serverPromptQueueDispatchTimers = new Map();
 const serverPromptQueueDispatchingThreads = new Set();
@@ -2130,6 +2131,9 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
       error: nativeAppHandoffRequiredError({ settingsChanged: true }).message,
     });
   }
+  if (nativeThreadProviderChanges.has(threadId)) {
+    return res.status(409).json({ error: '该 Codex App 会话正在切换服务商，请稍后重试' });
+  }
 
   const resumeLoadedThreadForSettings = async (params) => {
     try {
@@ -2149,6 +2153,8 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
     }
   };
 
+  let providerChangeReserved = false;
+  let settingsStarted = false;
   try {
     if (hasTitle) {
       await requestThreadAppServer('thread/name/set', { threadId, name: title });
@@ -2164,12 +2170,21 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
           || activeNativeTurns.get(threadId)?.provider
           || '',
         );
-        if (currentProvider && currentProvider !== provider) {
-          assertAppServerConfigChangeAllowed();
-          // Resuming an already loaded thread only rejoins it and ignores modelProvider.
-          // Reload app-server so resume can apply the new provider to the thread.
-          await appServerClient.restart({ env: buildCodexProcessEnvironment() });
+        if (!currentProvider || currentProvider !== provider) {
+          nativeActiveTurnFor(threadId, current);
+          if (appServerThreadIsBusy(threadId, current)) {
+            const error = new Error('该 Codex App 会话任务正在运行或等待处理，请完成后再切换服务商');
+            error.statusCode = 409;
+            throw error;
+          }
+          // Reserve only this thread while replacing its owner. A cold resume
+          // applies modelProvider; rejoining an existing owner silently ignores it.
+          nativeTurnReservations.add(threadId);
+          nativeThreadProviderChanges.add(threadId);
+          providerChangeReserved = true;
+          await releaseAppServerThreadForProviderChange(threadId);
         }
+        settingsStarted = true;
         await resumeLoadedThreadForSettings({
           threadId,
           modelProvider: provider,
@@ -2177,6 +2192,7 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
           excludeTurns: true,
         });
       } else {
+        settingsStarted = true;
         try {
           await resumeLoadedThreadForSettings({ threadId });
         } catch (resumeErr) {
@@ -2217,14 +2233,33 @@ app.patch('/api/native-sessions/:id', requireAuth, async (req, res) => {
     if (hasModel) payload.model = model;
     if (hasReasoningEffort) payload.reasoningEffort = reasoningEffort;
     if (hasServiceTier) payload.serviceTier = serviceTier;
+    if (providerChangeReserved) {
+      // A successful switch must already be ready for the next turn. Sending
+      // 200 before async cleanup leaves an invisible reservation that rejects it.
+      const released = await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'settings-update' });
+      if (released === false) throw appServerThreadReleaseError(threadId, '新服务商设置已保存，会话进程尚未安全释放');
+      settingsStarted = false;
+      nativeThreadProviderChanges.delete(threadId);
+      nativeTurnReservations.delete(threadId);
+      providerChangeReserved = false;
+      scheduleAppServerWriterIdleStop('provider-change');
+    }
     res.json(payload);
   } catch (err) {
     const hasSettings = hasProvider || hasModel || hasReasoningEffort || hasServiceTier;
     const action = hasSettings && !hasTitle ? '会话设置' : hasTitle && !hasSettings ? '会话标题' : '会话设置';
     res.status(nativeAppErrorStatus(err)).json({ error: `修改 Codex App ${action}失败: ${err.message}` });
   } finally {
-    if (hasProvider || hasModel || hasReasoningEffort || hasServiceTier) {
-      await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'settings-update' });
+    try {
+      if (settingsStarted) {
+        await releaseAppServerThreadAfterTurn(threadId, '', { reason: 'settings-update' });
+      }
+    } finally {
+      if (providerChangeReserved) {
+        nativeThreadProviderChanges.delete(threadId);
+        nativeTurnReservations.delete(threadId);
+        scheduleAppServerWriterIdleStop('provider-change');
+      }
     }
   }
 });
@@ -4649,6 +4684,34 @@ async function respondToNativeRequest(pending, response) {
   }
 }
 
+async function releaseAppServerThreadForProviderChange(threadId) {
+  await waitForAppServerThreadUnsubscribe(threadId);
+  const record = appServerLoadedThreads.get(threadId);
+  if (!record) return;
+  const client = appServerClientForRecord(record);
+  // Confirm the owner's latest turn is idle, then close only that thread's
+  // dedicated process. Never restart the shared client for a thread setting.
+  const result = await reconcileUnconfirmedAppServerThread(threadId, '', {
+    record,
+    reason: 'provider-change',
+    allowProbeWhileBusy: true,
+    allowReservationRelease: true,
+    retryDelays: [0],
+  });
+  if (!result?.released) {
+    throw appServerThreadReleaseError(threadId, '目标会话仍在运行或尚未安全释放');
+  }
+  if (client === appServerClient) {
+    // Legacy shared-client subscriptions can retain their writer lock after
+    // unsubscribe. Stop that writer only when no work it owns is still active.
+    const stopped = await stopAppServerWriterIfIdle({
+      ignoreReservationThreadId: threadId,
+      reason: 'provider-change',
+    });
+    if (!stopped) throw appServerThreadReleaseError(threadId, '共享会话进程仍有未完成的工作');
+  }
+}
+
 async function requestThreadAppServer(method, params = {}, options = {}) {
   const {
     requireLoadedThread = false,
@@ -4992,21 +5055,39 @@ function appServerWriterHasBlockingWork(connection, { ignoreReservationThreadId 
   if (Number(appServerClient.operationCount || 0) > 0) return true;
   if (Number(appServerClient.pending?.size || 0) > 0) return true;
   if (appServerClient.startPromise || appServerClient.restartPromise) return true;
+  const usesSharedClient = (threadId) => {
+    const client = appServerLoadedThreads.get(cleanNativeThreadId(threadId))?.client;
+    // Unknown ownership stays conservative; a known dedicated owner cannot
+    // be interrupted by stopping the shared process.
+    return !client || client === appServerClient;
+  };
   for (const request of pendingNativeRequests.values()) {
-    if (request?.sourceClient === appServerClient || request?.transport === 'app-server') return true;
+    if (
+      request?.sourceClient === appServerClient
+      || (!request?.sourceClient && request?.transport === 'app-server' && usesSharedClient(request.threadId))
+    ) return true;
   }
   for (const [threadId, turn] of activeNativeTurns) {
     if (
       turn?.status === 'running'
-      && turn?.transport === 'app-server'
+      && ['app-server', 'app-server-status'].includes(turn?.transport)
+      && usesSharedClient(threadId)
     ) {
       return true;
     }
   }
-  if (appServerThreadReconcileRequests.size > 0) return true;
-  if (serverPromptQueueDispatchingThreads.size > 0) return true;
+  for (const [threadId, request] of appServerThreadReconcileRequests) {
+    const client = request?.__appServerRecord?.client;
+    if (client ? client === appServerClient : usesSharedClient(threadId)) return true;
+  }
+  for (const threadId of serverPromptQueueDispatchingThreads) {
+    if (usesSharedClient(threadId)) return true;
+  }
   for (const threadId of nativeTurnReservations) {
-    if (cleanNativeThreadId(threadId) !== cleanNativeThreadId(ignoreReservationThreadId)) return true;
+    if (
+      cleanNativeThreadId(threadId) !== cleanNativeThreadId(ignoreReservationThreadId)
+      && usesSharedClient(threadId)
+    ) return true;
   }
   return false;
 }
@@ -12403,6 +12484,7 @@ let composerAtSyncRevision = 0;
 let nativeComposerOverride = null;
 let nativeComposerSettingsQueue = Promise.resolve();
 let nativeComposerSettingsWriteId = 0;
+let nativeComposerSettingsError = null;
 let modelLoadRevision = 0;
 let modelOptionsProvider = null;
 let modelListCache = new Map();
@@ -23746,6 +23828,7 @@ function syncNativeComposerSettings(changes={}){
   if(Object.hasOwn(changes,'reasoningEffort'))payload.reasoningEffort=String(changes.reasoningEffort||'').trim()||null;
   if(!Object.keys(payload).length)return Promise.resolve(true);
   const writeId=++nativeComposerSettingsWriteId;
+  nativeComposerSettingsError=null;
   rememberNativeComposerOverride({pending:true,writeId});
   const write=async()=>{
     try{
@@ -23766,10 +23849,11 @@ function syncNativeComposerSettings(changes={}){
       return true;
     }catch(error){
       if(currentConversationSource==='codex'&&currentConversationId===threadId&&nativeComposerOverride?.writeId===writeId){
+        nativeComposerSettingsError={threadId,message:error?.message||'设置同步到 Codex App 失败'};
         clearNativeComposerOverride();
         syncComposerChrome();
         void syncCurrentNativeConversation();
-        statusEl.textContent=error?.message||'设置同步到 Codex App 失败';
+        statusEl.textContent=nativeComposerSettingsError.message;
       }
       return false;
     }
@@ -24624,7 +24708,8 @@ function updateConversationStatus(conversation){
     return;
   }
   if(conversation.source==='codex'){
-    if(running)showNativeRunningTimestamp(conversation.updatedAt||conversation.createdAt);
+    if(nativeComposerSettingsError?.threadId===conversation.id)setTopStatusText(nativeComposerSettingsError.message,{running});
+    else if(running)showNativeRunningTimestamp(conversation.updatedAt||conversation.createdAt);
     else{
       const limitPaused=isPromptQueuePausedLocal(conversation.id)||conversationHasResumableLimitPause(conversation.id);
       const stateLabel=conversation.status==='interrupted'||limitPaused
